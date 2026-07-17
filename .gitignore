@@ -1,0 +1,138 @@
+# =============================================================================
+# MyGPT — root .gitignore
+# Monorepo: Python / FastAPI backend (/backend) + Next.js 14 frontend (/frontend)
+#           orchestrated with Docker Compose at the repo root.
+# This single file covers the whole tree. backend/.gitignore and
+# frontend/.gitignore add per-app defense-in-depth.
+# =============================================================================
+
+# ---- Secrets / environment --------------------------------------------------
+# Real env files carry secrets (JWT key, Fernet key, API keys) and must never
+# be committed. The two tracked safe files:
+#   .env.example  documented template (no secrets)
+#   dev.env       native-dev port overrides only (no secrets)
+.env
+.env.*
+!.env.example
+
+# ---- Python / FastAPI (backend) ---------------------------------------------
+# Bytecode & interpreter
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+sdist/
+wheels/
+
+# Test, lint & type-check caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# ---- Node.js / Next.js 14 (frontend) ----------------------------------------
+# Dependencies
+node_modules/
+
+# Next.js build output & cache
+.next/
+out/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Lint / test caches and reports
+.eslintcache
+coverage/
+.nyc_output/
+
+# ---- Logs & runtime data ----------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+pids/
+*.pid
+*.seed
+
+# App runtime data directories (created by the backend at runtime)
+data/
+uploads/
+
+# Local SQLite scratch files (e.g. test DBs)
+*.sqlite
+*.sqlite3
+
+# ---- Generated artifacts ----------------------------------------------------
+# repomix single-file dumps, etc. (root only)
+/repomix-output.xml
+
+# ---- Operating systems ------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Icon?
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ---- IDEs / editors ---------------------------------------------------------
+# JetBrains (IntelliJ, PyCharm, WebStorm, ...)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code — ignore per-user state, keep shared project config
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Visual Studio / .NET
+.vs/
+*.suo
+*.user
+
+# Other editors
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+.cursor/
+.windsurf/
+.history/

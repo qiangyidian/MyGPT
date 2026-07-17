@@ -1,0 +1,49 @@
+# =============================================================================
+# Databases-only stack for NATIVE development.
+# Run the app (backend + frontend) on the host; start these once with:
+#     docker compose -f docker-compose.dev.yml up -d
+# These are official images - they NEVER need rebuilding when your code changes.
+#
+# Includes only the two services the app truly needs for chat + RAG:
+#   postgres -> host 5432    qdrant -> host 6333
+# Redis is intentionally omitted: it's only used for the refresh-token
+# blacklist, which falls back to in-memory when Redis is absent (fine for
+# single-process dev). If you have a local redis on 6379, the backend will
+# use it automatically; otherwise it degrades silently.
+#
+# Volumes reuse the same names as the full stack so your data persists.
+# =============================================================================
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_chat
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_chat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  qdrant_data:

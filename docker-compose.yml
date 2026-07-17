@@ -1,0 +1,95 @@
+services:
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_chat}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Data services are internal to the compose network (the backend reaches them
+    # by service name). Host ports are not published to avoid conflicts with any
+    # local postgres/redis/qdrant already running on this machine. To inspect a
+    # service from the host, add a `ports:` mapping here temporarily.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ai_chat}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------------- redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------------------------ qdrant
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ----------------------------------------------------------------- backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - uploads_data:${STORAGE_DIR:-/data/uploads}
+      - ./backend:/app         # live reload in dev; remove for prod build-only
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ---------------------------------------------------------------- frontend
+  # Dev mode with hot reload: builds the `dev` stage (node_modules + source) and
+  # bind-mounts ./frontend so edits recompile live. node_modules/.next are kept as
+  # anonymous volumes so the host copies never shadow the image's.
+  # To run the production server instead: set `target: prod` and delete the volumes.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: dev
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      NEXT_TELEMETRY_DISABLED: "1"
+      WATCHPACK_POLLING: "true"   # reliable file-watch on Windows bind mounts
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      - ./frontend:/app          # source mount -> edits hot-reload in the container
+      - /app/node_modules        # keep the image's node_modules (don't shadow)
+      - /app/.next               # isolated dev build cache
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  uploads_data:

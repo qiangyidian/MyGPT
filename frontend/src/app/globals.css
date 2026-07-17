@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 224 71% 4%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 71% 4%;
+    --primary: 220.9 39.4% 11%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 220.9 39.4% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 96%;
+    --accent-foreground: 220.9 39.4% 11%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 224 71% 4%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 71% 4%;
+    --radius: 0.6rem;
+  }
+  .dark {
+    --background: 224 71% 4%;
+    --foreground: 210 40% 98%;
+    --card: 224 41% 7%;
+    --card-foreground: 210 40% 98%;
+    --primary: 210 40% 98%;
+    --primary-foreground: 220.9 39.4% 11%;
+    --secondary: 215 28% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 215 28% 17%;
+    --muted-foreground: 217 11% 65%;
+    --accent: 215 28% 17%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 215 28% 17%;
+    --input: 215 28% 17%;
+    --ring: 216 12% 84%;
+    --popover: 224 41% 7%;
+    --popover-foreground: 210 40% 98%;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; }
+}
+
+/* highlight.js minimal token colors (rehype-highlight) */
+.hljs { color: hsl(var(--foreground)); background: hsl(var(--muted)); border-radius: var(--radius); }
+.hljs-keyword, .hljs-built_in, .hljs-type { color: #c678dd; }
+.hljs-string, .hljs-attr { color: #98c379; }
+.hljs-number, .hljs-literal { color: #d19a66; }
+.hljs-comment { color: #7f848e; font-style: italic; }
+.hljs-function .hljs-title, .hljs-title { color: #61afef; }
+.hljs-variable, .hljs-params { color: #e06c75; }
