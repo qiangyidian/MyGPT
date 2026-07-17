@@ -432,10 +432,17 @@ class DbQueryTool(BaseTool):
         sql = str(kwargs.get("sql") or "").strip()
         if not sql:
             raise ToolError("'sql' is required")
-        if not sql.lower().startswith("select"):
+        # Defense in depth: the ToolGateway also validates, but this path is
+        # reached directly by /api/tools/test, so enforce the same hardening
+        # here. Rejects multi-statement, DML/DDL, and session-control keywords.
+        from app.agents.policies.tool_policy import UnsafeSQLError, validate_readonly_sql
+
+        try:
+            sql = validate_readonly_sql(sql)
+        except UnsafeSQLError as exc:
             return {
                 "ok": False,
-                "error": "only SELECT statements are allowed",
+                "error": str(exc),
                 "rows": [],
             }
 

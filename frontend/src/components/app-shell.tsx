@@ -88,7 +88,7 @@ export function AppShell({ children }: AppShellProps) {
   if (!user) return null;
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
+    <div className="app-shell-height flex overflow-hidden bg-background">
       {/* Desktop sidebar */}
       <div className="hidden w-72 shrink-0 border-r border-border md:block">
         <Sidebar

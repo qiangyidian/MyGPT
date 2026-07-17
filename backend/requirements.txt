@@ -42,6 +42,12 @@ beautifulsoup4>=4.12
 # ---- Tokenization ----
 tiktoken>=0.6
 
+# ---- Agent orchestration (optional runtime; imported lazily, guarded) ----
+# Pin crewai core only (NOT crewai[tools]) — we have our own tool layer and
+# want to avoid browser/vector/OTel dependency conflicts. The app boots fine
+# without this installed; set CREWAI_ENABLED=true to activate the CrewAI runtime.
+crewai==1.15.3
+
 # ---- Logging ----
 structlog>=24.1
 

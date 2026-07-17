@@ -32,6 +32,12 @@ os.environ["ENV"] = "test"
 os.environ["AUTO_CREATE_TABLES"] = "false"
 # Redis is not available in tests -> auth_service degrades to in-memory set.
 os.environ["REDIS_URL"] = "redis://localhost:6399/0"
+# CrewAI (Phase 1+) uses an internal memory cache + telemetry that try to talk
+# to Redis/analytics endpoints on Crew construction. In tests there is no
+# Redis, so opt out of telemetry and disable CrewAI's short-term memory path.
+os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "True"
+os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ["CREWAI_DISABLE_MEMORY"] = "true"
 # A fixed Fernet key (generated once, base64 of 32 url-safe bytes) so
 # encrypt/decrypt round-trips deterministically within a test run.
 os.environ.setdefault(
@@ -132,6 +138,42 @@ def _get_app():
 # --------------------------------------------------------------------------- #
 # 4. Pytest hooks / fixtures.
 # --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session", autouse=True)
+def _crewai_in_process_locks():
+    """Force CrewAI's lock backend to an in-process one in tests.
+
+    CrewAI's task-output storage locks via Redis when ``REDIS_URL`` is set, but
+    tests have no Redis. Swap the backend for a trivial in-process lock so
+    building/running a Crew never blocks on a dead Redis connection.
+    """
+    from contextlib import contextmanager
+    import threading
+
+    _lock = threading.Lock()
+
+    @contextmanager
+    def _inproc_lock(name, timeout=120, **kwargs):
+        import time
+
+        deadline = time.monotonic() + timeout
+        while not _lock.acquire(False):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"lock {name} timeout")
+            time.sleep(0.01)
+        try:
+            yield
+        finally:
+            _lock.release()
+
+    try:
+        from crewai_core.lock_store import set_lock_backend
+
+        set_lock_backend(_inproc_lock)
+    except Exception:
+        pass  # crewai not installed -> nothing to do
+    yield
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """One event loop for the whole session so session-scoped async fixtures work."""

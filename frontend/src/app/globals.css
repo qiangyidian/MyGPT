@@ -53,6 +53,17 @@
   body { @apply bg-background text-foreground; }
 }
 
+/* App-shell viewport height: prefer the dynamic viewport unit (100dvh) so the
+   shell fits the real visible area on mobile (excluding the address bar), with
+   a 100vh fallback for older browsers. The shell itself is overflow-hidden, so
+   only inner regions (message list, conversation list) scroll — never the page. */
+@layer utilities {
+  .app-shell-height {
+    height: 100vh;
+    height: 100dvh;
+  }
+}
+
 /* highlight.js minimal token colors (rehype-highlight) */
 .hljs { color: hsl(var(--foreground)); background: hsl(var(--muted)); border-radius: var(--radius); }
 .hljs-keyword, .hljs-built_in, .hljs-type { color: #c678dd; }

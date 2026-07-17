@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { MessageList } from "@/components/message-list";
 import { Composer } from "@/components/composer";
+import { ApprovalCard } from "@/components/approval-card";
 import { useConversationDetail } from "@/hooks/useConversations";
 import { useChatStream } from "@/hooks/useChatStream";
 import { useModels } from "@/hooks/useModels";
@@ -89,12 +90,16 @@ function ChatPanel({
 
   const messages = detail.data?.messages ?? [];
 
-  const handleSend = (content: string, opts: { enableTools: boolean }) => {
+  const handleSend = (
+    content: string,
+    opts: { enableTools: boolean; executionMode?: "auto" | "chat" | "agent" }
+  ) => {
     void chat.send(content, {
       conversationId: activeConversationId,
       modelId,
       knowledgeBaseId: kbId,
       enableTools: opts.enableTools,
+      executionMode: opts.executionMode ?? "auto",
     });
   };
 
@@ -110,7 +115,20 @@ function ChatPanel({
         onRegenerate={() => void chat.regenerate()}
       />
 
+      {/* Human-approval gates for dangerous tools in the live run. */}
+      <div className="mx-auto w-full shrink-0 max-w-3xl px-4">
+        {chat.pendingApprovals.map((ap) => (
+          <ApprovalCard
+            key={ap.approvalId}
+            approval={ap}
+            onApprove={(id) => chat.approveTool(id)}
+            onReject={(id) => chat.rejectTool(id)}
+          />
+        ))}
+      </div>
+
       <Composer
+        className="shrink-0"
         onSend={handleSend}
         onStop={chat.stop}
         isStreaming={chat.isStreaming}

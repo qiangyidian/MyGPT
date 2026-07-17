@@ -17,7 +17,10 @@ import { ModelSelector } from "@/components/model-selector";
 import type { KnowledgeBase } from "@/lib/types";
 
 interface ComposerProps {
-  onSend: (content: string, opts: { enableTools: boolean }) => void;
+  onSend: (
+    content: string,
+    opts: { enableTools: boolean; executionMode?: "auto" | "chat" | "agent" }
+  ) => void;
   onStop: () => void;
   isStreaming: boolean;
   modelId: string | null;
@@ -41,6 +44,8 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [deepSearch, setDeepSearch] = useState(false);
+  // "auto" = native decides; "agent" = force the CrewAI runtime (when enabled).
+  const [executionMode, setExecutionMode] = useState<"auto" | "agent">("auto");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -54,7 +59,10 @@ export function Composer({
   const handleSend = () => {
     const trimmed = value.trim();
     if (!trimmed || isStreaming) return;
-    onSend(trimmed, { enableTools: deepSearch });
+    onSend(trimmed, {
+      enableTools: deepSearch,
+      executionMode: deepSearch ? executionMode : "auto",
+    });
     setValue("");
     // Reset textarea height.
     if (textareaRef.current) {
@@ -77,18 +85,35 @@ export function Composer({
         <div className="mb-2 flex flex-wrap items-center gap-2">
           <ModelSelector value={modelId} onChange={onModelChange} />
 
-          {/* Deep search / agent toggle: enables multi-round web search + steps */}
+          {/* Deep search / agent toggle: enables multi-round tool use + steps */}
           <Button
             type="button"
             variant={deepSearch ? "default" : "outline"}
             size="sm"
             className="h-9 gap-1.5 text-sm font-medium"
             onClick={() => setDeepSearch((v) => !v)}
-            title="开启后，AI 会多轮联网搜索并展示思考/搜索步骤（需模型支持工具调用）"
+            title="开启后，AI 会多轮调用工具并展示执行过程（需模型支持工具调用）"
           >
             <Globe className="h-4 w-4" />
             深度搜索
           </Button>
+
+          {/* Execution runtime selector — only relevant in deep-search mode.
+              "auto" = native loop; "agent" = CrewAI runtime (when enabled). */}
+          {deepSearch && (
+            <Select
+              value={executionMode}
+              onValueChange={(v) => setExecutionMode(v as "auto" | "agent")}
+            >
+              <SelectTrigger className="h-9 w-[120px] text-sm font-medium">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">原生 (auto)</SelectItem>
+                <SelectItem value="agent">CrewAI (agent)</SelectItem>
+              </SelectContent>
+            </Select>
+          )}
 
           {/* Knowledge base selector — only shown if KBs exist */}
           {knowledgeBases && knowledgeBases.length > 0 && (

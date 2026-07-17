@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
     admin,
+    agent_runs,
     auth,
     chat,
     conversations,
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(retrieval.router)
     app.include_router(tools.router)
     app.include_router(admin.router)
+    app.include_router(agent_runs.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

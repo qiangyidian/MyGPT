@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     # ---- Background worker ----
     BACKGROUND_WORKER: str = "inprocess"
 
+    # ---- Agent platform (CrewAI / tool safety) ----
+    # Master switch for the CrewAI runtime. Even when True, the runtime is only
+    # used when execution_mode="agent" and the `crewai` package is importable;
+    # native chat is unaffected. Off => native-only, zero crewai imports.
+    CREWAI_ENABLED: bool = False
+    # python_exec is NOT a real sandbox (subprocess with process perms). In prod
+    # it stays disabled unless one of these opts it in AND a sandbox is configured.
+    ALLOW_PYTHON_EXEC: bool = False
+    PYTHON_SANDBOX: str = ""  # e.g. "docker" | "e2b" | "gvisor" — reserved for Phase 5
+    # Agent hard-stop budgets (see app.agents.policies.budget_policy).
+    AGENT_MAX_STEPS: int = 8
+    AGENT_MAX_TOOL_CALLS: int = 12
+    AGENT_MAX_RUNTIME_SECONDS: int = 120
+
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
     ADMIN_USERNAME: str = "admin"

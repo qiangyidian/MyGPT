@@ -1,0 +1,329 @@
+"""Unified agent event protocol, turn context, and flow state.
+
+This is the contract every runtime speaks. A runtime consumes an
+:class:`AgentTurnContext` and yields :class:`AgentEvent` objects; the
+:class:`~app.agents.orchestrator.ChatOrchestrator` forwards each event to the
+SSE layer unchanged. Keeping the event vocabulary in one place means the
+frontend, the runtimes, and the persisted audit trail (``agent_steps``) all
+agree on shapes.
+
+Event vocabulary (the SSE ``event:`` name is ``AgentEvent.kind``):
+
+  * ``run_started``       — a run began (run_id, runtime, conversation/message ids)
+  * ``meta``              — backward-compatible message/conversation resolution
+  * ``plan_created``      — the agent published a short structured plan
+  * ``step_started``      — a plan/agent/review step began
+  * ``step_completed``    — a step finished
+  * ``tool_call``         — the agent is invoking a tool (id, name, arguments)
+  * ``tool_result``       — a tool returned (ok reflects the *real* outcome)
+  * ``approval_required`` — a dangerous tool is blocked pending human approval
+  * ``token``             — streamed answer text delta
+  * ``citations``         — RAG citations for this turn
+  * ``done``              — turn finished (finish_reason)
+  * ``error``             — turn failed (code, message)
+"""
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Optional
+
+from pydantic import BaseModel, Field
+
+from app.schemas import ChatRequest, Citation
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids runtime DB imports
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.models import Conversation, Message, ModelConfig, User
+
+
+# --------------------------------------------------------------------------- #
+# Enums
+# --------------------------------------------------------------------------- #
+class RuntimeKind(str, Enum):
+    native = "native"
+    crewai = "crewai"
+
+
+class RunStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    waiting_approval = "waiting_approval"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class StepType(str, Enum):
+    plan = "plan"
+    llm = "llm"
+    tool = "tool"
+    review = "review"
+    approval = "approval"
+
+
+class StepStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    waiting = "waiting"
+    done = "done"
+    error = "error"
+
+
+class RiskLevel(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+class ExecutionMode(str, Enum):
+    """How the orchestrator should pick a runtime for this turn."""
+
+    auto = "auto"      # router decides (default)
+    chat = "chat"      # force native simple chat
+    agent = "agent"    # force the agent runtime (CrewAI when available)
+
+
+# --------------------------------------------------------------------------- #
+# AgentEvent
+# --------------------------------------------------------------------------- #
+class AgentEvent(BaseModel):
+    """One event yielded by a runtime. ``kind`` is the SSE event name."""
+
+    kind: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    def to_sse_envelope(self) -> dict[str, Any]:
+        """Return ``{"event": kind, "data": data}`` — the shape the router emits."""
+        return {"event": self.kind, "data": self.data}
+
+
+# ---- event constructors ----------------------------------------------------
+def ev_run_started(
+    *, run_id: uuid.UUID | str, runtime: str, conversation_id: uuid.UUID | str, message_id: uuid.UUID | str
+) -> AgentEvent:
+    return AgentEvent(
+        kind="run_started",
+        data={
+            "run_id": str(run_id),
+            "runtime": runtime,
+            "conversation_id": str(conversation_id),
+            "message_id": str(message_id),
+        },
+    )
+
+
+def ev_meta(*, message_id: uuid.UUID | str, conversation_id: uuid.UUID | str) -> AgentEvent:
+    return AgentEvent(kind="meta", data={"message_id": str(message_id), "conversation_id": str(conversation_id)})
+
+
+def ev_plan_created(*, summary: str, steps: list[dict[str, Any]]) -> AgentEvent:
+    return AgentEvent(kind="plan_created", data={"summary": summary, "steps": steps})
+
+
+def ev_step_started(*, step_id: str, title: str, step_type: str = "llm", agent: str | None = None) -> AgentEvent:
+    data: dict[str, Any] = {"step_id": step_id, "title": title, "type": step_type}
+    if agent:
+        data["agent"] = agent
+    return AgentEvent(kind="step_started", data=data)
+
+
+def ev_step_completed(*, step_id: str, status: str = "done") -> AgentEvent:
+    return AgentEvent(kind="step_completed", data={"step_id": step_id, "status": status})
+
+
+def ev_tool_call(
+    *, id: str, name: str, arguments: dict[str, Any], dangerous: bool = False, approval_id: str | None = None
+) -> AgentEvent:
+    data: dict[str, Any] = {"id": id, "name": name, "arguments": arguments, "dangerous": dangerous}
+    if approval_id:
+        data["approval_id"] = approval_id
+    return AgentEvent(kind="tool_call", data=data)
+
+
+def ev_tool_result(*, id: str, name: str, ok: bool, result: Any = None, error: str | None = None) -> AgentEvent:
+    return AgentEvent(kind="tool_result", data={"id": id, "name": name, "ok": ok, "result": result, "error": error})
+
+
+def ev_approval_required(
+    *,
+    run_id: uuid.UUID | str,
+    approval_id: uuid.UUID | str,
+    tool_name: str,
+    summary: str,
+    risk_level: str,
+    arguments_preview: dict[str, Any],
+) -> AgentEvent:
+    return AgentEvent(
+        kind="approval_required",
+        data={
+            "run_id": str(run_id),
+            "approval_id": str(approval_id),
+            "tool_name": tool_name,
+            "summary": summary,
+            "risk_level": risk_level,
+            "arguments_preview": arguments_preview,
+        },
+    )
+
+
+def ev_token(*, delta: str) -> AgentEvent:
+    return AgentEvent(kind="token", data={"delta": delta})
+
+
+def ev_citations(*, citations: list[Citation]) -> AgentEvent:
+    return AgentEvent(kind="citations", data={"citations": [c.model_dump(mode="json") for c in citations]})
+
+
+def ev_done(*, message_id: uuid.UUID | str, finish_reason: str = "stop") -> AgentEvent:
+    return AgentEvent(kind="done", data={"message_id": str(message_id), "finish_reason": finish_reason})
+
+
+def ev_error(*, code: str, message: str) -> AgentEvent:
+    return AgentEvent(kind="error", data={"code": code, "message": message})
+
+
+# --------------------------------------------------------------------------- #
+# Turn context
+# --------------------------------------------------------------------------- #
+@dataclass
+class AgentTurnContext:
+    """Everything a runtime needs to execute one user turn.
+
+    ChatService builds this after resolving the conversation/model, running RAG,
+    composing the system prompt, loading+trimming history, and creating the
+    pending assistant :class:`~app.models.Message` row. The runtime owns the
+    model+tool loop and mutates ``assistant_msg.content`` as it streams.
+    """
+
+    db: "AsyncSession"
+    user: "User"
+    conversation: "Conversation"
+    model_config: "ModelConfig"
+    request: ChatRequest
+    user_content: str
+    system_prompt: str
+    # OpenAI-format messages, system prompt first, already trimmed to the budget.
+    messages: list[dict[str, Any]]
+    rag_context: str
+    citations: list[Citation]
+    assistant_msg: "Message"
+    run_id: uuid.UUID
+    execution_mode: ExecutionMode = ExecutionMode.auto
+    agent_profile: str = "general"
+    enable_tools: bool = False
+    knowledge_base_id: Optional[uuid.UUID] = None
+    # Populated by the orchestrator; runtimes may attach extra bookkeeping here.
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Tool execution result (returned by ToolGateway)
+# --------------------------------------------------------------------------- #
+@dataclass
+class ToolExecution:
+    """Outcome of one tool call through the gateway."""
+
+    ok: bool
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    # success | error | needs_approval | blocked | timeout
+    status: str
+    result: Any = None
+    error: str | None = None
+    approval_id: Optional[uuid.UUID] = None
+    truncated: bool = False
+    latency_ms: int | None = None
+
+    def to_openai_tool_message(self) -> dict[str, Any]:
+        """Render as an OpenAI ``tool``-role message for the next model round."""
+        if self.ok:
+            content = self.result if isinstance(self.result, str) else _stringify(self.result)
+        else:
+            content = _stringify({"error": self.error or "tool failed"})
+        return {
+            "role": "tool",
+            "tool_call_id": self.tool_call_id,
+            "name": self.tool_name,
+            "content": content,
+        }
+
+
+def _stringify(value: Any) -> str:
+    import json
+
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# --------------------------------------------------------------------------- #
+# Exceptions
+# --------------------------------------------------------------------------- #
+class ApprovalRequired(Exception):
+    """Raised when a dangerous tool call has no valid approval.
+
+    Phase 0: the gateway returns a ``needs_approval`` :class:`ToolExecution`
+    instead of raising, so the agent loop can emit the event and continue.
+    Phase 3 resume path raises this to pause the flow.
+    """
+
+    def __init__(
+        self,
+        *,
+        approval_id: uuid.UUID,
+        tool_name: str,
+        arguments: dict[str, Any],
+        risk_level: str,
+        summary: str,
+    ) -> None:
+        self.approval_id = approval_id
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.risk_level = risk_level
+        self.summary = summary
+        super().__init__(f"approval required for tool {tool_name!r}")
+
+
+class BudgetExceeded(Exception):
+    """Raised when an agent run crosses a hard stop (steps/tools/time/tokens)."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+# --------------------------------------------------------------------------- #
+# Flow state (Phase 2/3) — persisted via agent_runs + conversation_memories
+# --------------------------------------------------------------------------- #
+class ConversationFlowState(BaseModel):
+    """Structured, cross-turn state for an agent flow.
+
+    Mirrors the plan's ``ConversationFlowState``. ``recent_messages`` and the
+    summary together form the rolling context; ``plan``/``completed_steps``/
+    ``pending_steps`` track task progress across turns; ``pending_approval``
+    captures an in-flight human gate so a resumed run knows where to continue.
+    """
+
+    conversation_id: str
+    user_id: str
+    turn_id: str = ""
+    user_goal: str = ""
+    intent: str = "chat"  # chat | knowledge | deep_research | action
+    recent_messages: list[dict[str, Any]] = Field(default_factory=list)
+    conversation_summary: str = ""
+    long_term_facts: list[dict[str, Any]] = Field(default_factory=list)
+    plan: list[dict[str, Any]] = Field(default_factory=list)
+    completed_steps: list[str] = Field(default_factory=list)
+    pending_steps: list[str] = Field(default_factory=list)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    tool_calls_used: int = 0
+    token_budget_used: int = 0
+    pending_approval: dict[str, Any] | None = None
+    final_answer: str = ""

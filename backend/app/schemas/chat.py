@@ -41,6 +41,9 @@ class ChatRequest(BaseModel):
     regenerate: bool = False          # regenerate last assistant turn
     stream: bool = True
     enable_tools: bool = False        # P2 toggle
+    # Agent platform: how the orchestrator picks a runtime.
+    execution_mode: str = "auto"      # auto | chat | agent
+    agent_profile: str = "general"    # general | research | analyst | ...
 
 
 # ---- SSE event payloads ----------------------------------------------------

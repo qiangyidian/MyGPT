@@ -9,7 +9,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Markdown } from "@/components/markdown";
 import { Citations } from "@/components/citations";
 import { ResearchSteps } from "@/components/research-steps";
-import type { Citation, Message, ResearchStep } from "@/lib/types";
+import type { AgentStep, Citation, Message, ResearchStep } from "@/lib/types";
 
 interface MessageBubbleProps {
   message: Message;
@@ -71,12 +71,30 @@ export const MessageBubble = memo(function MessageBubble({
       ? (message.metadata!.citations as Citation[])
       : undefined);
 
-  // Resolve agent steps: prefer prop (live), then fall back to metadata.
-  const resolvedSteps =
+  // Resolve agent steps: prefer prop (live), then fall back to metadata. Older
+  // persisted steps used the legacy {name, arguments, result} shape; normalize
+  // them to the current AgentStep model so the panel renders either cleanly.
+  const rawSteps =
     steps ??
     (Array.isArray(message.metadata?.steps)
       ? (message.metadata!.steps as ResearchStep[])
       : undefined);
+  const resolvedSteps = rawSteps?.map((s, i) =>
+    s.type
+      ? s
+      : {
+          id: s.id ?? `legacy-${i}`,
+          sequence: i,
+          type: "tool" as const,
+          title: (s as { name?: string }).name ?? "工具",
+          status: ((s as { status?: string }).status ?? "done") as AgentStep["status"],
+          tool: {
+            name: (s as { name?: string }).name ?? "",
+            argumentsPreview: (s as { arguments?: Record<string, unknown> }).arguments,
+            resultPreview: (s as { result?: string }).result,
+          },
+        }
+  );
 
   return (
     <div

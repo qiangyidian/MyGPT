@@ -143,10 +143,15 @@ export interface ToolInfo {
 // ---- SSE stream events from /api/chat/stream ----
 export type ChatStreamEvent =
   | { event: "meta"; data: { message_id: string; conversation_id: string } }
+  | { event: "run_started"; data: { run_id: string; runtime: string; conversation_id: string; message_id: string } }
+  | { event: "plan_created"; data: { summary: string; steps: AgentPlanStep[] } }
+  | { event: "step_started"; data: { step_id: string; title: string; type: string; agent?: string } }
+  | { event: "step_completed"; data: { step_id: string; status: string } }
+  | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string } }
+  | { event: "tool_result"; data: { id: string; name: string; ok: boolean; result: unknown; error: string | null } }
+  | { event: "approval_required"; data: { run_id: string; approval_id: string; tool_name: string; summary: string; risk_level: string; arguments_preview: Record<string, unknown> } }
   | { event: "token"; data: { delta: string } }
   | { event: "citations"; data: { citations: Citation[] } }
-  | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown> } }
-  | { event: "tool_result"; data: { id: string; name: string; ok: boolean; result: unknown; error: string | null } }
   | { event: "done"; data: { message_id: string; finish_reason: string } }
   | { event: "error"; data: { code: string; message: string } };
 
@@ -157,14 +162,91 @@ export interface ChatRequest {
   content: string;
   regenerate?: boolean;
   enable_tools?: boolean;
+  execution_mode?: "auto" | "chat" | "agent";
+  agent_profile?: string;
 }
 
-// A single agent step (tool call + its result) shown in the "research" panel.
-export interface ResearchStep {
+// A short step in a published plan (plan_created event).
+export interface AgentPlanStep {
   id: string;
-  name: string;
-  arguments?: Record<string, unknown>;
-  result?: string;
-  status: "running" | "done" | "error";
+  title: string;
+}
+
+// A single agent execution step shown in the "执行过程" panel.
+// The richer model supersedes the old ResearchStep; it carries plan/agent/tool/
+// review/approval step types plus the lifecycle status the backend emits.
+export interface AgentStep {
+  id: string;
+  sequence: number;
+  type: "plan" | "agent" | "tool" | "review" | "approval";
+  title: string;
+  summary?: string;
+  status: "pending" | "running" | "waiting" | "done" | "error";
+  startedAt?: string;
+  finishedAt?: string;
+  tool?: {
+    name: string;
+    dangerous?: boolean;
+    argumentsPreview?: Record<string, unknown>;
+    resultPreview?: string;
+    ok?: boolean;
+  };
+}
+
+// Legacy alias kept for back-compat with existing code paths.
+export type ResearchStep = AgentStep;
+
+// An in-flight human-approval request for a dangerous tool call.
+export interface PendingApproval {
+  runId: string;
+  approvalId: string;
+  toolName: string;
+  summary: string;
+  riskLevel: string;
+  argumentsPreview: Record<string, unknown>;
+}
+
+// Agent run detail (GET /api/agent-runs/{id}).
+export interface AgentRunStep {
+  id: string;
+  sequence: number;
+  step_type: string;
+  agent_name: string;
+  tool_name: string;
+  status: string;
+  input_redacted: Record<string, unknown> | null;
+  output_redacted: Record<string, unknown> | null;
+  latency_ms: number | null;
+  created_at: string;
+}
+
+export interface AgentRunApproval {
+  id: string;
+  run_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  risk_level: string;
+  status: string;
+  reason: string | null;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface AgentRun {
+  id: string;
+  conversation_id: string;
+  message_id: string | null;
+  runtime: string;
+  flow_name: string;
+  status: string;
+  current_step: string;
+  input: Record<string, unknown>;
+  output: Record<string, unknown> | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
+  created_at: string;
+  steps: AgentRunStep[];
+  approvals: AgentRunApproval[];
 }
 

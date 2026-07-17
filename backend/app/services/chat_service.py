@@ -1,28 +1,31 @@
 """Chat orchestration service.
 
-This is the linchpin that ties together conversations, model providers, RAG
-retrieval, and tool execution into a single streaming pipeline.
+Ties together conversations, model providers, RAG retrieval, and the agent
+platform into a single streaming pipeline. The model<->tool loop itself now
+lives in :class:`~app.agents.runtime.native_runtime.NativeChatRuntime` (selected
+by :class:`~app.agents.orchestrator.ChatOrchestrator`); this service keeps the
+app-level concerns: conversation/model resolution, user-message persistence,
+RAG, system-prompt assembly, history trimming, the pending assistant
+:class:`~app.models.Message`, and final persistence.
 
 The public entry point is ``ChatService.stream(db, user, request)`` — an async
 generator yielding SSE event dicts shaped ``{"event": <name>, "data": {...}}``.
 A thin router layer translates these into ``text/event-stream`` frames; this
 module stays free of FastAPI types so it can be unit-tested in isolation.
 
-Pipeline (per the cross-module contract):
+Pipeline:
   1. Resolve or create the conversation; resolve the ModelConfig to use.
   2. Persist the user message (skipped on regenerate).
   3. Build the message list: system prompt (+ optional RAG context + citations).
   4. Trim history to fit ``cfg.max_context_tokens`` (tiktoken-based, oldest first).
   5. Create a pending assistant Message row; emit a ``meta`` event.
-  6. Stream from the provider; on a tool-calling finish, run the tools, append
-     results, and re-stream (up to 4 rounds). Yield ``token`` events live; save
-     partial output if the client disconnects.
-  7. Persist the final assistant content + metadata; emit ``done`` (or ``error``).
+  6. Build an :class:`AgentTurnContext` and delegate to the orchestrator, which
+     runs the chosen runtime and yields unified :class:`AgentEvent`s. Terminal
+     ``done``/``error`` events are intercepted here to finalize persistence.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from typing import Any, AsyncIterator
@@ -32,20 +35,25 @@ from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agents.orchestrator import chat_orchestrator
+from app.agents.planning import (
+    extract_goal,
+    should_summarize,
+    summarize_history,
+)
+from app.agents.schemas import (
+    AgentEvent,
+    AgentTurnContext,
+    ExecutionMode,
+)
+from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.core.exceptions import AppException
 from app.models import Conversation, Message, ModelConfig, ToolCall, User
-from app.providers.base import ChatOptions, ProviderError, ToolCallDef
 from app.providers.registry import get_provider_for_config
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
-from app.tools.executor import execute_tool_calls
-from app.tools.registry_init import get_default_registry
 
 logger = logging.getLogger(__name__)
-
-# How many tool-calling rounds we allow before giving up and returning whatever
-# text accumulated. Prevents runaway loops where a model keeps requesting tools.
-_MAX_TOOL_ROUNDS = 8
 
 # Fallback context budget when a config has no usable token limit configured.
 _DEFAULT_MAX_CONTEXT_TOKENS = 8192
@@ -57,17 +65,17 @@ _CHARS_PER_TOKEN = 4
 # Default system prompt when a conversation defines none.
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
-# Prepended when the user enables "deep search / agent" mode. Drives the
-# multi-round chain-of-thought + repeated web search behaviour (like OpenAI's
-# browsing): decompose, search iteratively, read, search again, then answer.
-_AGENT_PREAMBLE = (
-    "你具有工具调用能力（包含 web_search 和 http_get），并且可以多次调用。\n"
-    "请按“思维链”方式逐步推进：\n"
-    "1) 先把用户问题拆成若干子问题；\n"
-    "2) 对每个子问题调用 web_search 获取最新信息，阅读返回结果；\n"
-    "3) 如信息不足，继续发起更具体的搜索（可多次）；\n"
-    "4) 证据充分后，再写出简洁、有条理的最终回答，并用 [source N] 标注来源。\n"
-    "偏好“多次小而精准的搜索”，而不是一次大搜索。最终回答之外的思考过程会以步骤形式展示给用户。"
+# Prepended when the user enables "agent / tools" mode. Drives iterative tool
+# use WITHOUT soliciting a raw chain-of-thought: the model decomposes and acts,
+# and the *structured execution trace* (tool calls, steps) is what the UI shows
+# — not the model's internal narration. (Replaces the old CoT preamble.)
+_AGENT_TASK_PREAMBLE = (
+    "你具有工具调用能力（web_search、http_get 等），可以多次调用以获取所需信息。\n"
+    "工作方式：\n"
+    "1) 如需最新或外部信息，调用工具获取，不要凭空臆造；\n"
+    "2) 工具返回不足时可继续调用，但避免重复相同的查询；\n"
+    "3) 证据充分后给出简洁、有条理的最终回答，并用 [source N] 标注来源。\n"
+    "不要在回答中暴露你的内部推理过程，直接给出结论与依据。"
 )
 
 
@@ -185,8 +193,12 @@ def _trim_history(
         return messages
 
     def total() -> int:
+        # Count the whole serialized entry (incl. tool_calls payloads) so we
+        # don't underestimate the true prompt size.
+        import json
+
         return sum(
-            _estimate_tokens(str(m.get("content") or ""), model_name)
+            _estimate_tokens(json.dumps(m, ensure_ascii=False, default=str), model_name)
             for m in messages
         )
 
@@ -309,9 +321,6 @@ class ChatService:
             raise
         except AppException as exc:
             yield _event("error", {"code": exc.code, "message": exc.message})
-        except ProviderError as exc:
-            logger.exception("provider error during chat: %s", exc)
-            yield _event("error", {"code": "provider_error", "message": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive last resort
             logger.exception("unexpected error during chat: %s", exc)
             yield _event("error", {"code": "internal", "message": "Internal error"})
@@ -357,10 +366,29 @@ class ChatService:
                 {"citations": [c.model_dump(mode="json") for c in citations]},
             )
 
+        # 3b. Load cross-turn state (goal + rolling summary + facts).
+        flow_state = await load_state(db, conversation.id, user.id)
+
         system_prompt = _build_system_prompt(conversation, rag_context)
+        prefix = ""
         if request.enable_tools:
-            # Agent / deep-search mode: instruct iterative search + reasoning.
-            system_prompt = _AGENT_PREAMBLE + "\n\n" + system_prompt
+            # Agent / tools mode: structured execution, no raw chain-of-thought.
+            prefix += _AGENT_TASK_PREAMBLE + "\n\n"
+        if flow_state.conversation_summary:
+            prefix += (
+                "Earlier in this conversation (summary):\n"
+                f"{flow_state.conversation_summary}\n\n"
+            )
+        if flow_state.user_goal:
+            prefix += f"User's ongoing goal: {flow_state.user_goal}\n\n"
+        system_prompt = prefix + system_prompt
+
+        # Remember the user's goal for this conversation (single 'task' memory).
+        if user_content.strip():
+            await upsert_goal(
+                db, conversation.id, user.id, extract_goal(user_content),
+                source_message_id=None,
+            )
 
         # 4. Load + trim history.
         history = await _load_history(db, conversation.id)
@@ -388,179 +416,67 @@ class ChatService:
             },
         )
 
-        # 6. Provider stream + tool loop.
-        provider = get_provider_for_config(cfg)
-        registry = get_default_registry() if request.enable_tools else None
-        # Tools run when the model declares capability, OR it's the mock provider
-        # (which simulates a search step so the agent UX is demoable offline).
-        tools_enabled = bool(
-            registry is not None
-            and (getattr(cfg, "supports_tools", False) or (cfg.provider or "") == "mock")
-        )
-        tool_schemas = registry.openai_schemas() if tools_enabled else None
-
-        options = ChatOptions(
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            max_tokens=_safe_int(cfg.max_tokens, 1024),
-            tools=tool_schemas,
-            tool_choice="auto",
-        )
-
-        finish_reason = "stop"
-        holder: dict[str, Any] = {}
+        # 6. Build turn context and delegate to the orchestrator/runtime.
         try:
-            async for evt in self._stream_with_tools(
-                db,
-                provider,
-                messages,
-                options,
-                cfg,
-                assistant_msg,
-                conversation.id,
-                tools_enabled,
-                holder,
-            ):
-                yield evt
+            mode = ExecutionMode(request.execution_mode or "auto")
+        except ValueError:
+            mode = ExecutionMode.auto
+
+        ctx = AgentTurnContext(
+            db=db,
+            user=user,
+            conversation=conversation,
+            model_config=cfg,
+            request=request,
+            user_content=user_content,
+            system_prompt=system_prompt,
+            messages=messages,
+            rag_context=rag_context,
+            citations=citations,
+            assistant_msg=assistant_msg,
+            run_id=uuid.uuid4(),  # placeholder; orchestrator overwrites with the real run id
+            execution_mode=mode,
+            agent_profile=request.agent_profile or "general",
+            enable_tools=request.enable_tools,
+            knowledge_base_id=kb_id,
+            extra={"state": flow_state},
+        )
+
+        try:
+            async for evt in chat_orchestrator.stream(ctx):
+                if evt.kind == "done":
+                    finish = evt.data.get("finish_reason", "stop")
+                    assistant_msg.metadata_ = self._meta(
+                        cfg, citations, finish, assistant_msg.metadata_
+                    )
+                    if ctx.extra.get("budget"):
+                        assistant_msg.metadata_["budget"] = ctx.extra["budget"]
+                    if ctx.extra.get("intent"):
+                        assistant_msg.metadata_["intent"] = ctx.extra["intent"]
+                    await db.commit()
+                    # Rolling summary: if history grew past the budget, roll the
+                    # older messages into a summary memory for future turns.
+                    try:
+                        await self._maybe_summarize(db, conversation, cfg, user.id)
+                    except Exception:  # pragma: no cover - never block done on summary
+                        logger.warning("post-turn summary failed", exc_info=True)
+                    yield evt.to_sse_envelope()
+                    return
+                if evt.kind == "error":
+                    await self._finalize_error(
+                        db, assistant_msg, evt.data.get("message", "error")
+                    )
+                    yield evt.to_sse_envelope()
+                    return
+                yield evt.to_sse_envelope()
         except asyncio.CancelledError:
             # Client disconnected: persist whatever text we have so far.
             logger.info("chat stream cancelled by client; saving partial output")
             assistant_msg.metadata_ = self._meta(
-                cfg, citations, "length", assistant_msg.metadata_
+                cfg, citations, "cancelled", assistant_msg.metadata_
             )
             await _persist_partial(db, assistant_msg)
             raise
-        except ProviderError as exc:
-            await self._finalize_error(db, assistant_msg, str(exc))
-            raise
-        except Exception:
-            await self._finalize_error(
-                db, assistant_msg, "Internal error during generation"
-            )
-            raise
-
-        # 7. Finalize + done.
-        finish_reason = holder.get("finish_reason", finish_reason)
-        assistant_msg.metadata_ = self._meta(cfg, citations, finish_reason, None)
-        await db.commit()
-        yield _event(
-            "done",
-            {"message_id": str(assistant_msg.id), "finish_reason": finish_reason},
-        )
-
-    async def _stream_with_tools(
-        self,
-        db: AsyncSession,
-        provider: Any,
-        messages: list[dict[str, Any]],
-        options: ChatOptions,
-        cfg: ModelConfig,
-        assistant_msg: Message,
-        conversation_id: uuid.UUID,
-        tools_enabled: bool,
-        holder: dict[str, Any],
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Run the stream + tool loop, yielding token events inline.
-
-        The final ``finish_reason`` is written into ``holder["finish_reason"]``
-        (a generator cannot ``return`` a value). ``messages`` is treated
-        read-only here; per-round tool turns are tracked in a local ``working``
-        list so we can replay the full transcript (history + this turn's tool
-        turns) on each round without mutating the caller's view.
-        """
-        working = list(messages)
-        rounds = 0
-        finish_reason = "stop"
-
-        while rounds <= _MAX_TOOL_ROUNDS:
-            rounds += 1
-            accumulated: list[str] = []
-            pending_tool_calls: list[ToolCallDef] = []
-
-            async for delta in provider.stream_chat(working, options):
-                if delta.content:
-                    accumulated.append(delta.content)
-                    # Yield the token to the caller immediately as it arrives.
-                    yield _event("token", {"delta": delta.content})
-                if delta.tool_calls:
-                    pending_tool_calls.extend(delta.tool_calls)
-                if delta.finish_reason:
-                    finish_reason = delta.finish_reason
-
-            # Fold this round's streamed text into the assistant message so a
-            # mid-loop disconnect still leaves recoverable content.
-            assistant_msg.content = (assistant_msg.content or "") + "".join(accumulated)
-
-            # Tool-calling branch: execute, append results, and re-stream.
-            if (
-                tools_enabled
-                and finish_reason == "tool_calls"
-                and pending_tool_calls
-                and rounds <= _MAX_TOOL_ROUNDS
-            ):
-                assistant_turn = {
-                    "role": "assistant",
-                    "content": "".join(accumulated) or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                            },
-                        }
-                        for tc in pending_tool_calls
-                    ],
-                }
-                # Emit tool_call events so the UI can show each search/thinking step.
-                for tc in pending_tool_calls:
-                    try:
-                        args = json.loads(tc.arguments) if tc.arguments else {}
-                    except Exception:
-                        args = {}
-                    yield _event(
-                        "tool_call", {"id": tc.id, "name": tc.name, "arguments": args}
-                    )
-
-                working.append(assistant_turn)
-                # Persist the assistant turn + mark tool-calling in progress.
-                assistant_msg.metadata_ = {
-                    **(assistant_msg.metadata_ or {}),
-                    "tool_calls": assistant_turn["tool_calls"],
-                    "status": "tool_calling",
-                }
-                await db.commit()
-                try:
-                    tool_messages = await execute_tool_calls(
-                        db,
-                        conversation_id,
-                        assistant_msg.id,
-                        pending_tool_calls,
-                    )
-                except Exception as exc:
-                    logger.exception("tool execution failed: %s", exc)
-                    raise
-                # Emit tool_result events so the UI can show each step's outcome.
-                for tc, tm in zip(pending_tool_calls, tool_messages):
-                    yield _event(
-                        "tool_result",
-                        {
-                            "id": tc.id,
-                            "name": tc.name,
-                            "ok": True,
-                            "result": tm.get("content"),
-                            "error": None,
-                        },
-                    )
-                working.extend(tool_messages)
-                continue
-
-            # No further tool calls (or tool budget exhausted) — done.
-            break
-
-        holder["finish_reason"] = finish_reason
-        return
 
     @staticmethod
     def _meta(
@@ -573,7 +489,7 @@ class ChatService:
             **(prev or {}),
             "model": cfg.model_name,
             "finish_reason": finish_reason,
-            "status": "complete",
+            "status": "complete" if finish_reason != "cancelled" else "cancelled",
         }
         if citations:
             metadata["citations"] = [c.model_dump(mode="json") for c in citations]
@@ -588,6 +504,36 @@ class ChatService:
             "error": message,
         }
         await db.commit()
+
+    async def _maybe_summarize(
+        self,
+        db: AsyncSession,
+        conversation: Conversation,
+        cfg: ModelConfig,
+        user_id: uuid.UUID,
+    ) -> None:
+        """Roll older history into a summary memory when the prompt is large.
+
+        Best-effort: a summarization failure is logged and swallowed so it can
+        never block the turn. The summary is picked up by ``load_state`` on the
+        next turn and injected into the system prompt.
+        """
+        history = await _load_history(db, conversation.id)
+        messages = _messages_to_dicts(None, history)  # no system prompt
+        if not messages:
+            return
+        total = sum(
+            _estimate_tokens(str(m.get("content") or ""), cfg.model_name)
+            for m in messages
+        )
+        max_ctx = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
+        if not should_summarize(total, max_ctx):
+            return
+        provider = get_provider_for_config(cfg)
+        summary = await summarize_history(provider, messages, keep_recent=6)
+        if summary:
+            await save_summary(db, conversation.id, user_id, summary)
+            await db.commit()
 
 
 # Module-level singleton — the service is stateless, so one shared instance.

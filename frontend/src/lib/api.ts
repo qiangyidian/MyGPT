@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  AgentRun,
+  AgentStep,
   ChatRequest,
   Citation,
   Conversation,
@@ -10,6 +12,7 @@ import {
   ModelConfig,
   ModelConfigInput,
   ModelTestResult,
+  PendingApproval,
   ToolInfo,
   User,
 } from "./types";
@@ -186,6 +189,31 @@ export const api = {
     request<User>("PATCH", `/api/admin/users/${id}`, body),
   adminStats: () =>
     request<{ usage: unknown[]; status: unknown }>("GET", "/api/admin/stats"),
+
+  // ---- Agent runs (Phase 3) ----
+  listAgentRuns: (conversationId?: string) =>
+    request<AgentRun[]>(
+      "GET",
+      conversationId ? `/api/agent-runs?conversation_id=${conversationId}` : "/api/agent-runs"
+    ),
+  getAgentRun: (runId: string) => request<AgentRun>("GET", `/api/agent-runs/${runId}`),
+  approveToolCall: (runId: string, approvalId: string) =>
+    request<{ ok: boolean; status: string; message: string | null }>(
+      "POST",
+      `/api/agent-runs/${runId}/approve`,
+      { approval_id: approvalId }
+    ),
+  rejectToolCall: (runId: string, approvalId: string, reason?: string) =>
+    request<{ ok: boolean; status: string; message: string | null }>(
+      "POST",
+      `/api/agent-runs/${runId}/reject`,
+      { approval_id: approvalId, reason: reason ?? null }
+    ),
+  cancelAgentRun: (runId: string) =>
+    request<{ ok: boolean; status: string; message: string | null }>(
+      "POST",
+      `/api/agent-runs/${runId}/cancel`
+    ),
 };
 
 // ===========================================================================
@@ -193,10 +221,15 @@ export const api = {
 // ===========================================================================
 export interface ChatStreamHandlers {
   onMeta?: (conversationId: string, messageId: string) => void;
+  onRunStarted?: (e: { runId: string; runtime: string; conversationId: string; messageId: string }) => void;
+  onPlanCreated?: (e: { summary: string; steps: { id: string; title: string }[] }) => void;
+  onStepStarted?: (e: { stepId: string; title: string; type: string; agent?: string }) => void;
+  onStepCompleted?: (e: { stepId: string; status: string }) => void;
   onToken?: (delta: string) => void;
   onCitations?: (citations: Citation[]) => void;
-  onToolCall?: (e: { id: string; name: string; arguments: Record<string, unknown> }) => void;
+  onToolCall?: (e: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string }) => void;
   onToolResult?: (e: { id: string; name: string; ok: boolean; result: unknown; error: string | null }) => void;
+  onApprovalRequired?: (e: PendingApproval) => void;
   onDone?: (e: { messageId: string; finishReason: string }) => void;
   onError?: (e: { code: string; message: string }) => void;
 }
@@ -244,6 +277,28 @@ export async function streamChat(
         case "meta":
           handlers.onMeta?.(data.conversation_id, data.message_id);
           break;
+        case "run_started":
+          handlers.onRunStarted?.({
+            runId: data.run_id,
+            runtime: data.runtime,
+            conversationId: data.conversation_id,
+            messageId: data.message_id,
+          });
+          break;
+        case "plan_created":
+          handlers.onPlanCreated?.({ summary: data.summary, steps: data.steps ?? [] });
+          break;
+        case "step_started":
+          handlers.onStepStarted?.({
+            stepId: data.step_id,
+            title: data.title,
+            type: data.type,
+            agent: data.agent,
+          });
+          break;
+        case "step_completed":
+          handlers.onStepCompleted?.({ stepId: data.step_id, status: data.status });
+          break;
         case "token":
           handlers.onToken?.(data.delta ?? "");
           break;
@@ -255,6 +310,16 @@ export async function streamChat(
           break;
         case "tool_result":
           handlers.onToolResult?.(data);
+          break;
+        case "approval_required":
+          handlers.onApprovalRequired?.({
+            runId: data.run_id,
+            approvalId: data.approval_id,
+            toolName: data.tool_name,
+            summary: data.summary,
+            riskLevel: data.risk_level,
+            argumentsPreview: data.arguments_preview ?? {},
+          });
           break;
         case "done":
           handlers.onDone?.({ messageId: data.message_id, finishReason: data.finish_reason });

@@ -1,4 +1,12 @@
 """Pydantic schemas (request/response DTOs). Re-exported for convenient imports."""
+from app.schemas.agent import (
+    AgentRunOut,
+    AgentStepOut,
+    ApproveRequest,
+    ActionResult,
+    RejectRequest,
+    ToolApprovalOut,
+)
 from app.schemas.admin import AuditLogOut, AdminUserUpdate, SystemStatus, UsageStat
 from app.schemas.auth import (
     LoginRequest,
@@ -50,6 +58,9 @@ from app.schemas.tool import (
 __all__ = [
     # common
     "Ok", "ErrorDetail", "ORMModel", "Page",
+    # agent runs (Phase 3)
+    "AgentRunOut", "AgentStepOut", "ToolApprovalOut",
+    "ApproveRequest", "RejectRequest", "ActionResult",
     # auth
     "RegisterRequest", "LoginRequest", "TokenResponse", "RefreshResponse", "UserOut",
     # model config
