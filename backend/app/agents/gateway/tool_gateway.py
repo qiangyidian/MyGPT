@@ -76,6 +76,16 @@ class ToolGateway:
         self.user = user
         self._registry = registry or get_default_registry()
         self._step_seq = 0
+        # Current agent attribution (set per-stage by the CrewAI runtime via
+        # :meth:`set_attribution`; native runtime leaves it blank). Persisted on
+        # every AgentStep row so tools map back to the graph node that ran them.
+        self._agent_id = ""
+        self._task_id = ""
+
+    def set_attribution(self, *, agent_id: str = "", task_id: str = "") -> None:
+        """Set the agent/task id for subsequent tool executions in this run."""
+        self._agent_id = agent_id or ""
+        self._task_id = task_id or ""
 
     # ------------------------------------------------------------------ #
     async def execute(
@@ -85,10 +95,22 @@ class ToolGateway:
         tool_name: str,
         arguments: dict[str, Any],
         strict: bool | None = None,
+        agent_id: str | None = None,
+        task_id: str | None = None,
     ) -> ToolExecution:
-        """Run one tool call end to end. Never raises — failures become error results."""
+        """Run one tool call end to end. Never raises — failures become error results.
+
+        ``agent_id``/``task_id`` (or the run-wide attribution set via
+        :meth:`set_attribution`) are persisted on the AgentStep row so the tool
+        maps back to the graph node that invoked it.
+        """
         started = time.monotonic()
         args = arguments or {}
+        # Per-call attribution overrides the run-wide default.
+        aid = agent_id if agent_id is not None else self._agent_id
+        tid = task_id if task_id is not None else self._task_id
+        self._agent_id = aid
+        self._task_id = tid
 
         # 1. Resolve.
         try:
@@ -255,7 +277,9 @@ class ToolGateway:
                 run_id=self.run_id,
                 sequence=self._step_seq,
                 step_type=step_type,
-                agent_name="native",
+                agent_name=self._agent_id or "native",
+                agent_id=self._agent_id,
+                task_id=self._task_id,
                 tool_name=tool_name,
                 status=step_status or ("done" if ok else "error"),
                 input_redacted=preview(arguments),
@@ -269,6 +293,21 @@ class ToolGateway:
         except Exception:
             logger.exception("failed to flush tool audit rows for conversation %s", self.conversation_id)
             await self.db.rollback()
+
+        # Audit the tool execution (best-effort, isolated session).
+        from app.services import audit_service
+        await audit_service.log(
+            actor_id=self.user.id if self.user else None,
+            action="tool_call",
+            target=tool_name,
+            detail={
+                "run_id": str(self.run_id) if self.run_id else None,
+                "conversation_id": str(self.conversation_id),
+                "status": status,
+                "ok": ok,
+                "arguments": preview(arguments),
+            },
+        )
 
         return ToolExecution(
             ok=ok,

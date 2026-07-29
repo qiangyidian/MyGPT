@@ -96,6 +96,8 @@ ehthumbs_vista.db
 Desktop.ini
 $RECYCLE.BIN/
 *.lnk
+# Git Bash / MSYS2 crash dumps (e.g. bash.exe.stackdump)
+*.stackdump
 
 # macOS
 .DS_Store
@@ -134,5 +136,13 @@ $RECYCLE.BIN/
 *.swp
 *.swo
 .cursor/
+.trae/
 .windsurf/
 .history/
+
+# ---- Misc / temp ------------------------------------------------------------
+# Merge leftovers, editor scratch files, Jupyter checkpoint dirs
+*.orig
+*.bak
+*.tmp
+.ipynb_checkpoints/

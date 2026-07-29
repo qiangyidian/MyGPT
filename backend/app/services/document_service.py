@@ -145,6 +145,16 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         for start in range(0, len(chunk_rows), _EMBED_BATCH):
             batch = chunk_rows[start:start + _EMBED_BATCH]
             vectors = await embedder.embed([c.content for c in batch])
+            if len(vectors) != len(batch):
+                # An OpenAI-compatible endpoint can return fewer vectors than
+                # inputs (e.g. when it skips items with a null embedding). zip()
+                # would silently drop those chunks' Qdrant points while the doc
+                # is still marked "indexed" with the full chunk_count — a silent
+                # partial index. Fail loudly so the doc flips to "failed".
+                raise RuntimeError(
+                    f"embedding provider returned {len(vectors)} vectors "
+                    f"for {len(batch)} chunks"
+                )
             points = [
                 VectorPoint(
                     id=str(c.id),

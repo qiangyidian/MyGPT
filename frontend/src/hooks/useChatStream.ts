@@ -1,18 +1,32 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamChat, type ChatStreamHandlers } from "@/lib/api";
+import { buildChatBody } from "@/lib/chat-request";
 import {
   CONVERSATIONS_QUERY_KEY,
   CONVERSATION_DETAIL_QUERY_KEY,
 } from "@/hooks/useConversations";
 import type { AgentStep, Citation, Message, PendingApproval } from "@/lib/types";
+import type { AgentEdgeStatus, AgentGraphNode } from "@/lib/agent-graph-types";
+import { coerceGraph } from "@/hooks/useAgentRunGraph";
+import { useAgentRunStore } from "@/stores/agent-run-store";
+import { useContextPanelStore } from "@/stores/context-panel-store";
+import { useAttachmentStore } from "@/stores/attachment-store";
+import type { UserChatMode } from "@/lib/types";
 
 export interface SendOptions {
   conversationId?: string | null;
   modelId?: string | null;
   knowledgeBaseId?: string | null;
+  /** Per-turn multi-KB selection. */
+  knowledgeBaseIds?: string[];
+  /** User-facing capability mode (Phase 1). */
+  mode?: UserChatMode;
+  /** Attachment ids to bind to the outgoing user message. */
+  attachmentIds?: string[];
+  /** Legacy/advanced overrides — not used by the new UI. */
   enableTools?: boolean;
   executionMode?: "auto" | "chat" | "agent";
   agentProfile?: string;
@@ -56,6 +70,15 @@ export interface ChatStreamState {
 export function useChatStream(): ChatStreamState {
   const queryClient = useQueryClient();
   const abortRef = useRef<AbortController | null>(null);
+
+  // Abort any in-flight stream when the consumer unmounts, so navigating away
+  // mid-stream doesn't leak the SSE connection and let the backend run to
+  // completion.
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
@@ -106,6 +129,13 @@ export function useChatStream(): ChatStreamState {
       setSteps([]);
       setPendingApprovals([]);
       setError(null);
+      // Reset the multi-agent graph store for a new turn (a new agent_graph
+      // event will repopulate it; this also clears any dismissal so the panel
+      // can auto-open for the new run).
+      const store = useAgentRunStore.getState();
+      store.resetActive();
+      // New task clears the Context Panel suppression + sources from prior turn.
+      useContextPanelStore.getState().resetForNewTask();
 
       if (!isRegenerate) {
         lastSendRef.current = { content, opts };
@@ -137,16 +167,32 @@ export function useChatStream(): ChatStreamState {
       // Optimistically append the user's own message into the cache so it
       // appears instantly in the message list.
       if (initialConversationId && content && !isRegenerate) {
+        // Snapshot the composer's attachment drafts onto the optimistic message
+        // so attachment cards render immediately; the backend-provided metadata
+        // replaces them once the turn reloads.
+        const draftAttachments = useAttachmentStore
+          .getState()
+          .getDrafts(initialConversationId)
+          .map((d) => ({
+            id: d.id,
+            filename: d.filename,
+            mime_type: d.mime_type,
+            size_bytes: d.size_bytes,
+            status: d.status,
+            parse_status: d.parse_status,
+          }));
         const optimisticUser: Message = {
           id: `optimistic-user-${Date.now()}`,
           conversation_id: initialConversationId,
           role: "user",
           content,
-          metadata: {},
+          metadata: draftAttachments.length ? { attachments: draftAttachments } : {},
           model_name: null,
           created_at: new Date().toISOString(),
         };
         appendMessage(initialConversationId, optimisticUser);
+        // Drafts are now bound to the outgoing message — clear the composer tray.
+        useAttachmentStore.getState().clearDrafts(initialConversationId);
       }
 
       const handlers: ChatStreamHandlers = {
@@ -160,6 +206,47 @@ export function useChatStream(): ChatStreamState {
         onRunStarted: (e) => {
           resolvedRunId = e.runId;
           setCurrentRunId(e.runId);
+        },
+        // ---- multi-agent graph events → store ----
+        onAgentGraph: (e) => {
+          const g = coerceGraph(e.runId, e.graph);
+          if (!g) return;
+          resolvedRunId = e.runId;
+          setCurrentRunId(e.runId);
+          useAgentRunStore.getState().setActiveRun(e.runId);
+          useAgentRunStore.getState().dispatch({ type: "GRAPH_INITIALIZED", runId: e.runId, graph: g });
+        },
+        onAgentStatus: (e) => {
+          useAgentRunStore.getState().dispatch({
+            type: "AGENT_STATUS",
+            runId: e.runId,
+            agentId: e.agentId,
+            patch: {
+              status: e.status as AgentGraphNode["status"],
+              taskTitle: e.taskTitle,
+              startedAt: e.startedAt,
+              finishedAt: e.finishedAt,
+              durationMs: e.durationMs,
+              outputSummary: e.outputSummary,
+              error: e.error,
+            },
+          });
+        },
+        onAgentEdge: (e) => {
+          useAgentRunStore.getState().dispatch({
+            type: "EDGE_STATUS",
+            runId: e.runId,
+            edgeId: e.edgeId,
+            status: e.status as AgentEdgeStatus,
+            label: e.label,
+          });
+        },
+        onRunStatus: (e) => {
+          useAgentRunStore.getState().dispatch({
+            type: "RUN_STATUS",
+            runId: e.runId,
+            status: e.status as never,
+          });
         },
         onPlanCreated: (e) => {
           e.steps.forEach((p) => {
@@ -211,6 +298,8 @@ export function useChatStream(): ChatStreamState {
         onCitations: (cits) => {
           accumulatedCitations = cits;
           setCitations(cits);
+          // Mirror into the Context Panel so the Sources tab can render them.
+          useContextPanelStore.getState().setSources(cits);
         },
         onToolCall: (e) => {
           stepSeq += 1;
@@ -229,6 +318,17 @@ export function useChatStream(): ChatStreamState {
           };
           stepById.set(e.id, step);
           upsertStep(step);
+          // Attribute the tool to its agent in the multi-agent graph store.
+          if (e.agent_id) {
+            useAgentRunStore.getState().dispatch({
+              type: "TOOL_STARTED",
+              runId: resolvedRunId,
+              agentId: e.agent_id,
+              callId: e.id,
+              name: e.name,
+              title: (e.arguments?.query as string) || (e.arguments?.url as string),
+            });
+          }
         },
         onToolResult: (e) => {
           const existing = stepById.get(e.id);
@@ -252,6 +352,15 @@ export function useChatStream(): ChatStreamState {
             });
             upsertStep(stepById.get(e.id) as AgentStep);
           }
+          if (e.agent_id) {
+            useAgentRunStore.getState().dispatch({
+              type: "TOOL_COMPLETED",
+              runId: resolvedRunId,
+              agentId: e.agent_id,
+              callId: e.id,
+              ok: e.ok,
+            });
+          }
         },
         onApprovalRequired: (ap) => {
           setPendingApprovals((prev) =>
@@ -261,6 +370,8 @@ export function useChatStream(): ChatStreamState {
         onDone: ({ messageId, finishReason }) => {
           const finalId = messageId || assistantMessageId;
           if (resolvedConversationId) {
+            // multi_agent is true only if an agent_graph event arrived this turn.
+            const isMulti = useAgentRunStore.getState().active.nodes.length >= 2;
             const msg: Message = {
               id: finalId,
               conversation_id: resolvedConversationId,
@@ -271,6 +382,7 @@ export function useChatStream(): ChatStreamState {
                 citations: accumulatedCitations,
                 steps: accumulatedStepsRef.current,
                 run_id: resolvedRunId || undefined,
+                multi_agent: isMulti || undefined,
               },
               model_name: null,
               created_at: new Date().toISOString(),
@@ -288,16 +400,18 @@ export function useChatStream(): ChatStreamState {
 
       try {
         await streamChat(
-          {
-            conversation_id: initialConversationId,
-            model_id: opts.modelId ?? null,
-            knowledge_base_id: opts.knowledgeBaseId ?? null,
+          buildChatBody({
+            conversationId: initialConversationId,
+            modelId: opts.modelId,
+            knowledgeBaseId: opts.knowledgeBaseId,
+            knowledgeBaseIds: opts.knowledgeBaseIds,
             content,
             regenerate: isRegenerate,
-            enable_tools: opts.enableTools,
-            execution_mode: opts.executionMode ?? "auto",
-            agent_profile: opts.agentProfile ?? "general",
-          },
+            // Phase 1: send the user-facing mode + bound attachments. The
+            // backend IntentRouter derives the runtime/profile/tools.
+            mode: opts.mode ?? "auto",
+            attachmentIds: opts.attachmentIds,
+          }),
           handlers,
           controller.signal
         );

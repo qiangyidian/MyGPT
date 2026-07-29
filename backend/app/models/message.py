@@ -22,7 +22,13 @@ class Message(Base, TimestampMixin):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    conversation = relationship("Conversation", back_populates="messages")
+    conversation = relationship(
+        "Conversation",
+        back_populates="messages",
+        # Disambiguate from conversations.branch_from_message_id (a second
+        # messages<->conversations FK path): this scalar uses conversation_id.
+        foreign_keys="Message.conversation_id",
+    )
     tool_calls = relationship(
         "ToolCall", back_populates="message", cascade="all, delete-orphan", lazy="selectin"
     )

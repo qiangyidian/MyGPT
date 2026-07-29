@@ -25,12 +25,17 @@ class Retriever:
         collection: str,
         top_k: int = 5,
         filters: dict | None = None,
+        overfetch: int = 1,
     ) -> list[SearchHit]:
         vectors = await self._embedder.embed([question])
         if not vectors:
             return []
-        hits = await self._store.search(collection, vectors[0], top_k=top_k, filters=filters)
+        # Over-fetch when a real reranker is present so it has a wider recall
+        # window to re-order; the reranker trims back to top_k.
+        fetch_k = max(top_k, top_k * max(1, overfetch))
+        hits = await self._store.search(collection, vectors[0], top_k=fetch_k, filters=filters)
         if self._reranker is not None and hits:
-            # Rerankers may want a wider recall window; pass top_k as the final cap.
             hits = await self._reranker.rerank(question, hits, top_k=top_k)
+        else:
+            hits = sorted(hits, key=lambda h: h.score, reverse=True)[:top_k]
         return hits

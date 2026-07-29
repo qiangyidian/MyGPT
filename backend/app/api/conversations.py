@@ -14,14 +14,16 @@ from sqlalchemy.orm import selectinload
 
 from app.core.deps import get_current_user
 from app.db import get_db
-from app.models import Conversation, Message, User
+from app.models import Conversation, KnowledgeBase, Message, ModelConfig, User
 from app.schemas import (
+    ConversationBranchRequest,
     ConversationCreate,
     ConversationDetail,
     ConversationOut,
     ConversationUpdate,
     MessageOut,
 )
+from app.services.conversation_service import branch_from_message, list_for_user
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -43,18 +45,38 @@ async def _load_owned(
     return conv
 
 
+async def _validate_refs(
+    db: AsyncSession,
+    user: User,
+    *,
+    model_id: uuid.UUID | None = None,
+    knowledge_base_id: uuid.UUID | None = None,
+) -> None:
+    """404 (not a 500 on FK violation) when a referenced model/kb doesn't exist
+    or belongs to another user. Models may be system-wide (user_id NULL)."""
+    if model_id is not None:
+        mc = await db.get(ModelConfig, model_id)
+        if mc is None or (mc.user_id is not None and mc.user_id != user.id):
+            raise HTTPException(NOT_FOUND, "Model not found")
+    if knowledge_base_id is not None:
+        kb = await db.get(KnowledgeBase, knowledge_base_id)
+        if kb is None or kb.user_id != user.id:
+            raise HTTPException(NOT_FOUND, "Knowledge base not found")
+
+
 @router.get("", response_model=list[ConversationOut])
 async def list_conversations(
+    q: str | None = None,
+    archived: bool = False,
+    limit: int = 50,
+    offset: int = 0,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[ConversationOut]:
-    stmt = (
-        select(Conversation)
-        .where(Conversation.user_id == user.id)
-        .order_by(Conversation.updated_at.desc())
+    rows = await list_for_user(
+        db, user.id, q=q, archived=archived, limit=limit, offset=offset
     )
-    res = await db.execute(stmt)
-    return [ConversationOut.model_validate(c) for c in res.scalars().all()]
+    return [ConversationOut.model_validate(c) for c in rows]
 
 
 @router.post("", response_model=ConversationDetail, status_code=status.HTTP_201_CREATED)
@@ -63,6 +85,9 @@ async def create_conversation(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationDetail:
+    await _validate_refs(
+        db, user, model_id=payload.model_id, knowledge_base_id=payload.knowledge_base_id
+    )
     conv = Conversation(
         user_id=user.id,
         title=payload.title or "新对话",
@@ -99,11 +124,85 @@ async def update_conversation(
 ) -> ConversationOut:
     conv = await _load_owned(db, conv_id, user)
     data = payload.model_dump(exclude_unset=True)
+    # Validate referenced ids before persisting (avoids a 500 on FK violation).
+    await _validate_refs(
+        db, user,
+        model_id=data.get("model_id"),
+        knowledge_base_id=data.get("knowledge_base_id"),
+    )
+    # Map the user-facing alias fields to the model columns.
+    if "pinned" in data:
+        conv.is_pinned = bool(data.pop("pinned"))
+    if "archived" in data:
+        conv.is_archived = bool(data.pop("archived"))
+    if "title" in data and data["title"] is not None:
+        data["title"] = (data["title"] or "").strip() or conv.title
     for field, value in data.items():
         setattr(conv, field, value)
     await db.commit()
     await db.refresh(conv)
     return ConversationOut.model_validate(conv)
+
+
+@router.post("/{conv_id}/branch", response_model=ConversationDetail,
+             status_code=status.HTTP_201_CREATED)
+async def branch_conversation(
+    conv_id: uuid.UUID,
+    payload: ConversationBranchRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConversationDetail:
+    """Edit-and-resend: fork history before a message into a new conversation."""
+    await _load_owned(db, conv_id, user)
+    branch = await branch_from_message(
+        db,
+        user_id=user.id,
+        conversation_id=conv_id,
+        message_id=payload.message_id,
+        new_content=payload.new_content,
+    )
+    if branch is None:
+        raise HTTPException(NOT_FOUND, "Conversation or message not found")
+    detail = ConversationDetail.model_validate(branch)
+    detail.messages = [
+        MessageOut.model_validate(m)
+        for m in sorted(branch.messages, key=lambda m: m.created_at)
+    ]
+    return detail
+
+
+@router.get("/{conv_id}/branches")
+async def list_branches(
+    conv_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the parent + child branches of a conversation (branch tree)."""
+    conv = await _load_owned(db, conv_id, user)
+    parent = None
+    if conv.parent_conversation_id is not None:
+        p = (
+            await db.execute(
+                select(Conversation).where(Conversation.id == conv.parent_conversation_id)
+            )
+        ).scalars().first()
+        if p is not None and (p.user_id == user.id or user.role == "admin"):
+            parent = ConversationOut.model_validate(p)
+    children = (
+        await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.parent_conversation_id == conv.id,
+                Conversation.user_id == user.id,
+            )
+            .order_by(Conversation.updated_at.desc())
+        )
+    ).scalars().all()
+    return {
+        "current": ConversationOut.model_validate(conv),
+        "parent": parent,
+        "children": [ConversationOut.model_validate(c) for c in children],
+    }
 
 
 @router.delete("/{conv_id}", status_code=status.HTTP_204_NO_CONTENT)

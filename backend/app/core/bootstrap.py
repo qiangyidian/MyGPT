@@ -14,8 +14,6 @@ All seed rows are system-wide (``user_id=None``).
 """
 from __future__ import annotations
 
-from contextlib import suppress
-
 from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -163,8 +161,14 @@ async def init_db(app: FastAPI) -> None:
     settings = get_settings()
 
     if settings.AUTO_CREATE_TABLES:
-        with suppress(Exception):
+        try:
             await _create_tables()
+        except Exception:
+            # Don't silently swallow schema-creation failures — create_all can't
+            # ALTER existing tables to add new columns, so a masked error here
+            # surfaces later as confusing 500s on endpoints that SELECT the
+            # missing column. Log loudly; the app still starts.
+            logger.exception("create_all failed; schema may be incomplete")
 
     async with AsyncSessionLocal() as session:
         await _seed_admin(session)

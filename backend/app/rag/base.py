@@ -20,6 +20,10 @@ class SearchHit:
     id: str
     score: float
     payload: dict[str, Any] = field(default_factory=dict)
+    # Set by a real reranker (None when no reranker ran). Kept separate from
+    # ``score`` (the raw vector similarity) so the UI can show vector vs rerank
+    # scores independently in debug mode.
+    rerank_score: float | None = None
 
 
 class DocumentParser(ABC):

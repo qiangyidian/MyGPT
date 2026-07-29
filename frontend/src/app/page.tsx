@@ -1,18 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { AppShell } from "@/components/app-shell";
 import { MessageList } from "@/components/message-list";
 import { Composer } from "@/components/composer";
 import { ApprovalCard } from "@/components/approval-card";
-import { useConversationDetail } from "@/hooks/useConversations";
+import { ContextPanel } from "@/components/context/context-panel";
+import { ContextPanelTrigger } from "@/components/context/context-panel-trigger";
+import { useConversationDetail, useConversations } from "@/hooks/useConversations";
 import { useChatStream } from "@/hooks/useChatStream";
+import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
+import { useBranchConversation } from "@/hooks/useMessageActions";
 import { useModels } from "@/hooks/useModels";
-import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { KnowledgeBase } from "@/lib/types";
+import { useChatUiStore } from "@/stores/chat-ui-store";
+import { useContextPanelStore } from "@/stores/context-panel-store";
+import { useAgentRunStore } from "@/stores/agent-run-store";
+import type { Citation, KnowledgeBase } from "@/lib/types";
 
 export default function HomePage() {
   return (
@@ -27,11 +34,6 @@ export default function HomePage() {
   );
 }
 
-/**
- * Inner panel that holds the message list + composer for the active
- * conversation. Separated from page so that hooks are only called when
- * auth has resolved (i.e. AppShell children render).
- */
 function ChatPanel({
   activeConversationId,
   setActiveConversationId,
@@ -41,103 +43,191 @@ function ChatPanel({
 }) {
   const { chatModels } = useModels();
   const detail = useConversationDetail(activeConversationId);
+  const { create: createConversation } = useConversations();
+  const branchConversation = useBranchConversation();
 
-  // Fetch knowledge bases for the composer selector.
   const kbsQuery = useQuery<KnowledgeBase[]>({
     queryKey: ["knowledge-bases"],
     queryFn: () => api.listKnowledgeBases(),
   });
 
-  // Local UI state for model / KB selection.
-  const [modelId, setModelId] = useState<string | null>(null);
-  const [kbId, setKbId] = useState<string | null>(null);
+  const mode = useChatUiStore((s) => s.mode);
 
-  // Sync model from the active conversation's saved model_id.
+  const [modelId, setModelId] = useState<string | null>(null);
+  const [kbIds, setKbIds] = useState<string[]>([]);
+
+  // Default the selector to the conversation's model, else the first chat
+  // model. A null modelId ("默认模型") lets the backend choose.
   useEffect(() => {
-    if (detail.data?.model_id) {
-      setModelId(detail.data.model_id);
-    } else if (modelId === null && chatModels.length > 0) {
-      setModelId(chatModels[0].id);
-    }
+    if (detail.data?.model_id) setModelId(detail.data.model_id);
+    else if (modelId === null && chatModels.length > 0) setModelId(chatModels[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail.data?.model_id, chatModels]);
 
-  // Sync KB from the active conversation.
   useEffect(() => {
     if (detail.data?.knowledge_base_id !== undefined) {
-      setKbId(detail.data.knowledge_base_id);
+      setKbIds(detail.data.knowledge_base_id ? [detail.data.knowledge_base_id] : []);
     }
   }, [detail.data?.knowledge_base_id]);
 
   const chat = useChatStream();
+  const lastRestoredRunRef = useRef<string | null>(null);
 
-  // If a stream created a conversation while NONE was selected (send from the
-  // empty state), switch to it so the thread loads. We only do this when
-  // activeConversationId is null — otherwise we'd fight the sidebar/"新建对话"
-  // selection and keep reverting to the last-streamed conversation.
+  // If a stream created a conversation while NONE was selected, switch to it.
   useEffect(() => {
     if (!activeConversationId && chat.currentConversationId) {
       setActiveConversationId(chat.currentConversationId);
     }
   }, [chat.currentConversationId, activeConversationId, setActiveConversationId]);
 
-  // Surface stream errors (e.g. upstream 502) instead of silently losing them.
   useEffect(() => {
-    if (chat.error) {
-      toast.error("生成失败", { description: chat.error });
-    }
+    if (chat.error) toast.error("生成失败", { description: chat.error });
   }, [chat.error]);
 
-  const messages = detail.data?.messages ?? [];
+  // Restore the multi-agent graph after refresh.
+  useEffect(() => {
+    if (chat.isStreaming) return;
+    const msgs = detail.data?.messages ?? [];
+    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+    const runId = (lastAssistant?.metadata as { run_id?: string } | undefined)?.run_id;
+    if (runId && runId !== lastRestoredRunRef.current) {
+      lastRestoredRunRef.current = runId;
+      void restoreAgentGraph(runId);
+    } else if (!runId) {
+      lastRestoredRunRef.current = null;
+    }
+  }, [detail.data?.messages, chat.isStreaming]);
 
-  const handleSend = (
-    content: string,
-    opts: { enableTools: boolean; executionMode?: "auto" | "chat" | "agent" }
-  ) => {
+  // ---- Context Panel auto-open rules (respect per-run suppression) ----
+  // Waiting on a dangerous-tool approval -> open Execution.
+  useEffect(() => {
+    if (chat.pendingApprovals.length > 0) {
+      const runId = useAgentRunStore.getState().active.runId;
+      if (runId && !useContextPanelStore.getState().isSuppressed(runId)) {
+        useContextPanelStore.getState().openWith("execution");
+      }
+    }
+  }, [chat.pendingApprovals.length]);
+
+  const runStatus = useAgentRunStore((s) => s.active.status);
+  useEffect(() => {
+    if (runStatus === "failed") {
+      const runId = useAgentRunStore.getState().active.runId;
+      if (runId && !useContextPanelStore.getState().isSuppressed(runId)) {
+        useContextPanelStore.getState().openWith("execution");
+      }
+    }
+  }, [runStatus]);
+
+  const ensureConversationId = useCallback(async () => {
+    const conv = await createConversation({});
+    setActiveConversationId(conv.id);
+    return conv.id;
+  }, [createConversation, setActiveConversationId]);
+
+  const messages = detail.data?.messages ?? [];
+  // Only render the live stream for the conversation it belongs to — otherwise
+  // switching conversations mid-stream paints the other conversation's reply.
+  const isThisConvStreaming =
+    chat.isStreaming && chat.currentConversationId === activeConversationId;
+
+  const handleSend = (content: string, opts: { mode: typeof mode; attachmentIds: string[] }) => {
     void chat.send(content, {
       conversationId: activeConversationId,
       modelId,
-      knowledgeBaseId: kbId,
-      enableTools: opts.enableTools,
-      executionMode: opts.executionMode ?? "auto",
+      knowledgeBaseIds: kbIds,
+      mode: opts.mode,
+      attachmentIds: opts.attachmentIds,
+    });
+  };
+
+  const handleBranch = async (messageId: string, newContent: string) => {
+    if (!activeConversationId) return;
+    try {
+      const branch = await branchConversation(activeConversationId, messageId, newContent);
+      setActiveConversationId(branch.id);
+      await chat.send(newContent, {
+        conversationId: branch.id,
+        modelId,
+        knowledgeBaseIds: kbIds,
+        mode,
+        attachmentIds: [],
+      });
+    } catch (err) {
+      toast.error("编辑分支失败", { description: err instanceof Error ? err.message : undefined });
+    }
+  };
+
+  const handleSourceClick = useCallback((index: number, cits: Citation[]) => {
+    useContextPanelStore.getState().setSources(cits);
+    useContextPanelStore.getState().openWith("sources", { sourceIndex: index });
+  }, []);
+
+  const handleOpenAttachment = useCallback((attachmentId: string) => {
+    useContextPanelStore.getState().openWith("files", { attachmentId });
+  }, []);
+
+  const handlePickSuggestion = (prompt: string) => {
+    void chat.send(prompt, {
+      conversationId: activeConversationId,
+      modelId,
+      knowledgeBaseIds: kbIds,
+      mode,
+      attachmentIds: [],
     });
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <MessageList
-        messages={messages}
-        streamingText={chat.isStreaming ? chat.streamingText : undefined}
-        isStreaming={chat.isStreaming}
-        streamingCitations={chat.isStreaming ? chat.citations : undefined}
-        streamingSteps={chat.isStreaming ? chat.steps : undefined}
-        canRegenerate={messages.length > 0 && !chat.isStreaming}
-        onRegenerate={() => void chat.regenerate()}
-      />
-
-      {/* Human-approval gates for dangerous tools in the live run. */}
-      <div className="mx-auto w-full shrink-0 max-w-3xl px-4">
-        {chat.pendingApprovals.map((ap) => (
-          <ApprovalCard
-            key={ap.approvalId}
-            approval={ap}
-            onApprove={(id) => chat.approveTool(id)}
-            onReject={(id) => chat.rejectTool(id)}
+    <div className="flex min-h-0 flex-1">
+      <main className="flex min-w-0 flex-1 flex-col">
+        <div className="flex shrink-0 items-center justify-end px-4 py-2">
+          <ContextPanelTrigger
+            conversationId={activeConversationId}
+            hasPendingApproval={chat.pendingApprovals.length > 0}
           />
-        ))}
-      </div>
+        </div>
 
-      <Composer
-        className="shrink-0"
-        onSend={handleSend}
-        onStop={chat.stop}
-        isStreaming={chat.isStreaming}
-        modelId={modelId}
-        onModelChange={setModelId}
-        knowledgeBaseId={kbId}
-        onKnowledgeBaseChange={setKbId}
-        knowledgeBases={kbsQuery.data}
-      />
+        <MessageList
+          messages={messages}
+          streamingText={isThisConvStreaming ? chat.streamingText : undefined}
+          isStreaming={isThisConvStreaming}
+          streamingCitations={isThisConvStreaming ? chat.citations : undefined}
+          streamingSteps={isThisConvStreaming ? chat.steps : undefined}
+          canRegenerate={messages.length > 0 && !chat.isStreaming}
+          onRegenerate={() => void chat.regenerate()}
+          onBranch={(id, content) => void handleBranch(id, content)}
+          onSourceClick={handleSourceClick}
+          onOpenAttachment={handleOpenAttachment}
+          onPickSuggestion={handlePickSuggestion}
+        />
+
+        <div className="mx-auto w-full shrink-0 max-w-3xl px-4">
+          {chat.pendingApprovals.map((ap) => (
+            <ApprovalCard
+              key={ap.approvalId}
+              approval={ap}
+              onApprove={(id) => chat.approveTool(id)}
+              onReject={(id) => chat.rejectTool(id)}
+            />
+          ))}
+        </div>
+
+        <Composer
+          className="shrink-0"
+          onSend={handleSend}
+          onStop={chat.stop}
+          isStreaming={chat.isStreaming}
+          modelId={modelId}
+          onModelChange={setModelId}
+          knowledgeBaseIds={kbIds}
+          onKnowledgeBaseIdsChange={setKbIds}
+          knowledgeBases={kbsQuery.data}
+          conversationId={activeConversationId}
+          ensureConversationId={ensureConversationId}
+        />
+      </main>
+
+      <ContextPanel conversationId={activeConversationId} />
     </div>
   );
 }

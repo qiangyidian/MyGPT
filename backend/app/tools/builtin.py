@@ -13,6 +13,8 @@ All run() methods are async and return JSON-serialisable values.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import socket
 import tempfile
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +32,30 @@ from app.tools.base import BaseTool, ToolError, ToolParameter
 _HTTP_MAX_CHARS = 4000
 # Sync DB query safety cap — read-only-ish, bounded row count.
 _DB_ROW_LIMIT = 50
+
+
+def _is_public_host(host: str) -> bool:
+    """True only if every resolved address for ``host`` is a public IP.
+
+    Blocks the SSRF vector of pointing http_get at internal/metadata hosts
+    (e.g. 169.254.169.254, 127.0.0.1, 10.x, 192.168.x, ::1)."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except (ValueError, IndexError):
+            return False
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            return False
+    return True
 
 
 class DateTimeNowTool(BaseTool):
@@ -84,13 +110,27 @@ class HttpGetTool(BaseTool):
         if max_chars <= 0:
             max_chars = _HTTP_MAX_CHARS
 
+        # SSRF guard: only http/https, and the host must resolve to public IPs
+        # (blocks metadata/loopback/private/link-local addresses).
+        try:
+            parsed = httpx.URL(url)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"invalid url: {exc}")
+        if parsed.scheme not in ("http", "https"):
+            raise ToolError("only http/https URLs are allowed")
+        if not _is_public_host(parsed.host):
+            raise ToolError("URL host resolves to a blocked (internal/private) address")
+
         timeout = httpx.Timeout(15.0, connect=10.0)
         headers = {
             "User-Agent": "MyGPT-Tool/1.0 (+https://example.com/bot)",
             "Accept": "text/html,application/json,text/plain,*/*",
         }
+        # follow_redirects=False: don't let an external server redirect us to an
+        # internal host (DNS-rebind). status_code is returned so the caller can
+        # follow a redirect explicitly if it chooses.
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 resp = await client.get(url, headers=headers)
         except httpx.TimeoutException as exc:
             return {"ok": False, "error": f"timeout: {exc}", "status_code": None, "body": ""}

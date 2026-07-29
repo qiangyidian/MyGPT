@@ -2,6 +2,18 @@
 
 export type Role = "system" | "user" | "assistant" | "tool";
 
+/**
+ * User-facing capability modes — the ONLY chat-mode concept the UI exposes.
+ * The backend IntentRouter maps each to a runtime/profile/tools. Internal
+ * execution_mode/agent_profile are never shown to end users.
+ */
+export type UserChatMode =
+  | "auto"
+  | "search"
+  | "deep_research"
+  | "create"
+  | "data_analysis";
+
 export interface User {
   id: string;
   email: string;
@@ -78,21 +90,95 @@ export interface Conversation {
   model_id: string | null;
   knowledge_base_id: string | null;
   system_prompt: string | null;
+  is_pinned: boolean;
+  is_archived: boolean;
+  last_message_preview: string | null;
+  parent_conversation_id: string | null;
+  branch_from_message_id: string | null;
+  /** Soft reference to a Project (Phase 3); null = unfiled. */
+  project_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  color: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectInput {
+  name: string;
+  description?: string | null;
+  color?: string | null;
 }
 
 export interface ConversationDetail extends Conversation {
   messages: Message[];
 }
 
+/** A per-message/per-conversation file attachment summary stored on the message. */
+export interface AttachmentRef {
+  id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  status: string;
+  parse_status?: string;
+}
+
+/** A full chat attachment row (from /api/chat-attachments). */
+export interface ChatAttachment {
+  id: string;
+  conversation_id: string;
+  message_id: string | null;
+  filename: string;
+  original_filename: string;
+  mime_type: string;
+  size_bytes: number;
+  status: "uploading" | "uploaded" | "parsing" | "ready" | "failed" | "deleted";
+  parse_status: "pending" | "parsing" | "ready" | "failed" | "skipped";
+  preview_metadata: Record<string, unknown> | null;
+  error_message: string | null;
+  is_temporary: boolean;
+  knowledge_base_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type MessageFeedbackRating = "up" | "down";
+
+export interface MessageFeedback {
+  id: string;
+  message_id: string;
+  conversation_id: string;
+  rating: MessageFeedbackRating;
+  reason: string | null;
+  comment: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Citation {
-  document_id: string;
+  document_id: string | null;
   document_name: string;
   chunk_id: string | null;
   chunk_index: number;
   snippet: string;
   score: number;
+  /** web | document | attachment | database */
+  source_type?: string;
+  url?: string | null;
+  attachment_id?: string | null;
+  page_number?: number | null;
+  published_at?: string | null;
+  accessed_at?: string | null;
+  /** Reranker score (debug/eval only; not shown to regular users). */
+  rerank_score?: number | null;
+  metadata?: Record<string, unknown>;
 }
 
 export interface KnowledgeBase {
@@ -147,20 +233,43 @@ export type ChatStreamEvent =
   | { event: "plan_created"; data: { summary: string; steps: AgentPlanStep[] } }
   | { event: "step_started"; data: { step_id: string; title: string; type: string; agent?: string } }
   | { event: "step_completed"; data: { step_id: string; status: string } }
-  | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string } }
-  | { event: "tool_result"; data: { id: string; name: string; ok: boolean; result: unknown; error: string | null } }
+  | { event: "agent_graph"; data: { run_id: string; graph: unknown } }
+  | { event: "agent_status"; data: { run_id: string; agent_id: string; status: string; task_title?: string; started_at?: string; finished_at?: string; duration_ms?: number; output_summary?: string; error?: string } }
+  | { event: "agent_edge"; data: { run_id: string; edge_id: string; status: string; label?: string } }
+  | { event: "run_status"; data: { run_id: string; status: string; current_agent_ids?: string[] } }
+  | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string; agent_id?: string; task_id?: string } }
+  | { event: "tool_result"; data: { id: string; name: string; ok: boolean; result: unknown; error: string | null; agent_id?: string; task_id?: string } }
   | { event: "approval_required"; data: { run_id: string; approval_id: string; tool_name: string; summary: string; risk_level: string; arguments_preview: Record<string, unknown> } }
   | { event: "token"; data: { delta: string } }
   | { event: "citations"; data: { citations: Citation[] } }
+  | { event: "research_plan"; data: { run_id: string; status: string; summary: string; steps: ResearchPlanStep[]; requires_confirmation: boolean } }
+  | { event: "research_plan_updated"; data: { run_id: string; status: string; summary: string; steps: ResearchPlanStep[]; requires_confirmation: boolean } }
+  | { event: "run_instruction_received"; data: { run_id: string; instruction: string; acknowledged: boolean } }
+  | { event: "run_paused"; data: { run_id: string; reason: string; paused_at?: string } }
+  | { event: "run_resumed"; data: { run_id: string; resumed_at?: string } }
   | { event: "done"; data: { message_id: string; finish_reason: string } }
   | { event: "error"; data: { code: string; message: string } };
+
+export interface ResearchPlanStep {
+  id: string;
+  title: string;
+  description?: string;
+  sources?: string[];
+}
 
 export interface ChatRequest {
   conversation_id?: string | null;
   model_id?: string | null;
   knowledge_base_id?: string | null;
+  /** Per-turn multi-KB selection (Phase 1+). */
+  knowledge_base_ids?: string[];
   content: string;
   regenerate?: boolean;
+  /** User-facing capability mode (Phase 1). The backend derives the route. */
+  mode?: UserChatMode;
+  /** Attachment ids bound to this user message. */
+  attachment_ids?: string[];
+  // ---- legacy fields (still accepted by the backend; not exposed in the UI) ----
   enable_tools?: boolean;
   execution_mode?: "auto" | "chat" | "agent";
   agent_profile?: string;
@@ -173,8 +282,6 @@ export interface AgentPlanStep {
 }
 
 // A single agent execution step shown in the "执行过程" panel.
-// The richer model supersedes the old ResearchStep; it carries plan/agent/tool/
-// review/approval step types plus the lifecycle status the backend emits.
 export interface AgentStep {
   id: string;
   sequence: number;
@@ -212,6 +319,8 @@ export interface AgentRunStep {
   sequence: number;
   step_type: string;
   agent_name: string;
+  agent_id?: string;
+  task_id?: string;
   tool_name: string;
   status: string;
   input_redacted: Record<string, unknown> | null;
@@ -232,6 +341,17 @@ export interface AgentRunApproval {
   expires_at: string | null;
 }
 
+/** A persisted tool call's full input/output — the on-prem audit surface. */
+export interface ToolCallAudit {
+  id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+}
+
 export interface AgentRun {
   id: string;
   conversation_id: string;
@@ -248,5 +368,11 @@ export interface AgentRun {
   created_at: string;
   steps: AgentRunStep[];
   approvals: AgentRunApproval[];
+  /** Persisted tool-call audit trail (full arguments/result) for this run. */
+  tool_calls: ToolCallAudit[];
+  /** Multi-agent graph snapshot (null for single-agent / native runs). */
+  graph: Record<string, unknown> | null;
 }
 
+// ---- Context panel ----
+export type ContextTab = "execution" | "sources" | "files" | "artifact";

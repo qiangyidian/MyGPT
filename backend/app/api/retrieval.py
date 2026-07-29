@@ -43,6 +43,6 @@ async def search(
     if kb.user_id != user.id and user.role != "admin":
         raise HTTPException(404, "Knowledge base not found")
     context, citations = await rag_service.retrieve(
-        db, payload.query, kb.id, top_k=payload.top_k
+        db, payload.query, [kb.id], top_k=payload.top_k
     )
     return SearchResponse(context=context, citations=citations)

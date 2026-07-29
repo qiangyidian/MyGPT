@@ -72,3 +72,39 @@
 .hljs-comment { color: #7f848e; font-style: italic; }
 .hljs-function .hljs-title, .hljs-title { color: #61afef; }
 .hljs-variable, .hljs-params { color: #e06c75; }
+
+/* ------------------------------------------------------------------ */
+/* Multi-agent panel: active edge flow + running-node pulse.           */
+/* Restrained (no high-frequency flashing) and disabled under          */
+/* prefers-reduced-motion.                                             */
+/* ------------------------------------------------------------------ */
+.agent-edge-active {
+  animation: agent-edge-flow 1.2s linear infinite;
+}
+@keyframes agent-edge-flow {
+  to { stroke-dashoffset: -20; }
+}
+
+.agent-node-running {
+  animation: agent-node-pulse 2.4s ease-in-out infinite;
+}
+@keyframes agent-node-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.0); }
+  50% { box-shadow: 0 0 0 4px hsl(var(--primary) / 0.12); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-edge-active,
+  .agent-node-running {
+    animation: none !important;
+  }
+  .agent-edge-active {
+    stroke-dasharray: 0 !important;
+  }
+  /* Respect reduced motion across the new UI affordances too. */
+  .animate-pulse,
+  .animate-ping,
+  .animate-bounce {
+    animation: none !important;
+  }
+}

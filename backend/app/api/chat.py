@@ -9,6 +9,7 @@ ChatService.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any, AsyncIterator
@@ -18,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.db import get_db
 from app.models import Conversation, User
@@ -49,28 +51,54 @@ async def _event_generator(
     user: User,
     payload: ChatRequest,
 ) -> AsyncIterator[str]:
-    """Bridge ChatService.stream into SSE frames, bailing out on client disconnect."""
+    """Bridge ChatService.stream into SSE frames with a heartbeat.
+
+    The chat stream runs in a producer task feeding a queue; the consumer races
+    ``queue.get`` against a heartbeat timer so a long agent run keeps the
+    connection alive (proxies/CDNs otherwise drop idle streams). On client
+    disconnect the producer is cancelled — ChatService sees CancelledError and
+    persists whatever partial content it has.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    async def _producer() -> None:
+        try:
+            async for event in chat_service.stream(db=db, user=user, request=payload):
+                await queue.put(event)
+        except HTTPException:
+            await queue.put({"event": "error", "data": {"code": "chat_error", "message": "chat failed"}})
+        except Exception as exc:  # noqa: BLE001 — never kill the stream silently
+            await queue.put({"event": "error", "data": {"code": "internal_error", "message": str(exc)}})
+        finally:
+            await queue.put(sentinel)
+
+    heartbeat = max(5, get_settings().SSE_HEARTBEAT_SECONDS)
+    task = asyncio.create_task(_producer())
     try:
-        async for event in chat_service.stream(db=db, user=user, request=payload):
-            # Stop producing frames once the client is gone (stop/regenerate).
+        while True:
             if await request.is_disconnected():
                 break
-
-            etype = event.get("event", "message")
-            body = event.get("data", {})
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=heartbeat)
+            except asyncio.TimeoutError:
+                # SSE comment frame: keeps the connection alive, ignored by clients.
+                yield ": keepalive\n\n"
+                continue
+            if item is sentinel:
+                return
+            etype = item.get("event", "message")
+            body = item.get("data", {})
             yield _sse(etype, body)
-
-            if etype == "done":
+            if etype in ("done", "error"):
                 return
-            if etype == "error":
-                return
-    except HTTPException:
-        # Once we are streaming we can no longer return a 4xx; surface as an error event.
-        yield _sse("error", {"code": "chat_error", "message": "chat failed"})
-        return
-    except Exception as exc:  # noqa: BLE001 — never let an exception kill the stream silently
-        yield _sse("error", {"code": "internal_error", "message": str(exc)})
-        return
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 async def _assert_owned(db: AsyncSession, conv_id: uuid.UUID, user: User) -> None:

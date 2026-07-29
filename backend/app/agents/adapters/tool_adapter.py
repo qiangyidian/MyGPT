@@ -6,6 +6,15 @@ audit / truncation path as the native runtime. Because CrewAI invokes ``_run``
 from its own execution context (often a worker thread), each call opens a
 **fresh** :class:`~app.db.AsyncSessionLocal` — the gateway never shares a
 session across threads. Audit rows are linked back to the run via stored ids.
+
+Real-time tool events + agent attribution (multi-agent visualization):
+  * A shared :class:`~app.agents.stage_context.StageContext` is captured at
+    adapter-build time. The executor sets ``stage_ctx.agent_id`` before each
+    stage; the adapter reads it inside ``_run``.
+  * Around each tool call the adapter emits ``tool_call``/``tool_result`` events
+    tagged with the current ``agent_id``/``task_id`` via ``stage_ctx.emit``
+    (which is thread-safe — it forwards to the main-loop queue).
+  * The gateway persists ``agent_id``/``task_id`` on the ``AgentStep`` row.
 """
 from __future__ import annotations
 
@@ -15,7 +24,8 @@ import uuid
 from typing import Any
 
 from app.agents.gateway.tool_gateway import ToolGateway
-from app.agents.schemas import ToolExecution
+from app.agents.schemas import ToolExecution, ev_tool_call, ev_tool_result
+from app.agents.stage_context import StageContext
 from app.tools.base import BaseTool as AppBaseTool
 
 
@@ -43,7 +53,7 @@ def _build_args_schema(source: AppBaseTool):
 def _bridge_async(coro):
     """Run a coroutine from sync ``_run`` whether or not an event loop is running.
 
-    CrewAI may call ``_run`` from inside ``kickoff_async`` (a running loop) or
+    CrewAI may call ``_run`` from inside ``aexecute_task`` (a running loop) or
     from a sync ``kickoff``. The former is handled by running the coro in a
     worker thread with its own loop, so we never recurse into a running loop.
     """
@@ -70,6 +80,8 @@ async def _execute_via_gateway(
     message_id,
     run_id,
     user_id,
+    agent_id: str,
+    task_id: str,
 ) -> ToolExecution:
     """Open a fresh session, run the tool through the gateway, commit, return."""
     from sqlalchemy import select
@@ -90,10 +102,13 @@ async def _execute_via_gateway(
             run_id=run_id,
             user=user,
         )
+        gw.set_attribution(agent_id=agent_id, task_id=task_id)
         exec_ = await gw.execute(
             tool_call_id=str(uuid.uuid4()),
             tool_name=tool_name,
             arguments=kwargs,
+            agent_id=agent_id,
+            task_id=task_id,
         )
         await db.commit()
         return exec_
@@ -109,6 +124,32 @@ def _format_for_crewai(exec_: ToolExecution) -> str:
     return json.dumps({"error": exec_.error or "tool failed"}, ensure_ascii=False)
 
 
+def _blocked_execution(orig: ToolExecution, reason: str) -> ToolExecution:
+    """Return a copy of ``orig`` marked blocked (ok=False) with the given reason.
+
+    Used when a dangerous tool's approval is rejected / cancelled / timed out
+    so the agent sees a clean error instead of a half-resolved result.
+    """
+    return ToolExecution(
+        ok=False,
+        tool_call_id=orig.tool_call_id,
+        tool_name=orig.tool_name,
+        arguments=orig.arguments,
+        status="blocked",
+        result=None,
+        error=reason,
+        approval_id=orig.approval_id,
+        truncated=False,
+        latency_ms=orig.latency_ms,
+    )
+
+
+def _result_preview(exec_: ToolExecution) -> Any:
+    if exec_.ok and isinstance(exec_.result, dict):
+        return exec_.result.get("content")
+    return None
+
+
 def build_crewai_tool(
     source: AppBaseTool,
     *,
@@ -116,8 +157,14 @@ def build_crewai_tool(
     message_id,
     run_id,
     user_id,
+    stage_ctx: StageContext | None = None,
 ) -> Any:
-    """Construct a CrewAI ``BaseTool`` wrapping an app tool."""
+    """Construct a CrewAI ``BaseTool`` wrapping an app tool.
+
+    ``stage_ctx`` is required for the multi-agent path (real-time tool events +
+    attribution). When ``None`` (legacy/test path) the adapter still works but
+    emits no live events and attributes to the empty agent.
+    """
     from pydantic import PrivateAttr
 
     from crewai.tools import BaseTool
@@ -125,10 +172,9 @@ def build_crewai_tool(
     schema = _build_args_schema(source)
     tool_name = source.name
     conv_id, msg_id, rid, uid = conversation_id, message_id, run_id, user_id
+    ctx = stage_ctx
 
     class _Adapter(BaseTool):
-        # name/description/args_schema are BaseTool fields; set as class defaults
-        # (the bare-name clash on the right side is avoided by aliasing above).
         name: str = source.name
         description: str = source.description
         args_schema: type = schema
@@ -139,13 +185,56 @@ def build_crewai_tool(
         _user_id = PrivateAttr(default=uid)
 
         def _run(self, **kwargs: Any) -> str:
+            agent_id = ctx.agent_id if ctx is not None else ""
+            task_id = ctx.task_id if ctx is not None else ""
+            call_id = str(uuid.uuid4())
+
+            if ctx is not None:
+                ctx.emit(ev_tool_call(
+                    id=call_id, name=tool_name, arguments=kwargs,
+                    agent_id=agent_id, task_id=task_id,
+                ))
+
             exec_ = _bridge_async(
                 _execute_via_gateway(
                     tool_name, kwargs,
                     self._conversation_id, self._message_id,
                     self._run_id, self._user_id,
+                    agent_id, task_id,
                 )
             )
+
+            # Dangerous tool awaiting approval: pause for a human decision if a
+            # bridge is wired (CrewAI multi-agent path). The worker thread
+            # blocks here while the main loop emits waiting + awaits the
+            # coordinator; on approve we re-run the gateway (which now finds
+            # the approved ToolApproval and executes for real).
+            bridge = ctx.approval_bridge if ctx is not None else None
+            if exec_.status == "needs_approval" and exec_.approval_id is not None and bridge is not None:
+                decision, reason = bridge.request_pause(
+                    approval_id=exec_.approval_id,
+                    agent_id=agent_id,
+                    tool_name=tool_name,
+                )
+                if decision == "approved":
+                    exec_ = _bridge_async(
+                        _execute_via_gateway(
+                            tool_name, kwargs,
+                            self._conversation_id, self._message_id,
+                            self._run_id, self._user_id,
+                            agent_id, task_id,
+                        )
+                    )
+                else:
+                    exec_ = _blocked_execution(exec_, reason or f"approval {decision}")
+
+            if ctx is not None:
+                ctx.emit(ev_tool_result(
+                    id=call_id, name=tool_name, ok=exec_.ok,
+                    result=_result_preview(exec_), error=exec_.error,
+                    agent_id=agent_id, task_id=task_id,
+                ))
+
             return _format_for_crewai(exec_)
 
     return _Adapter()

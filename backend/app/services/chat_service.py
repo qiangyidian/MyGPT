@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import replace
 from typing import Any, AsyncIterator
 
 import tiktoken
@@ -36,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.agents.orchestrator import chat_orchestrator
+from app.agents.intent_router import decide_route
 from app.agents.planning import (
     extract_goal,
     should_summarize,
@@ -48,10 +50,11 @@ from app.agents.schemas import (
 )
 from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.core.exceptions import AppException
-from app.models import Conversation, Message, ModelConfig, ToolCall, User
+from app.models import Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.providers.registry import get_provider_for_config
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
+from app.services.attachment_service import resolve_and_bind_attachments
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +260,24 @@ def _build_system_prompt(conversation: Conversation | None, rag_context: str) ->
     return base
 
 
+def _augment_with_attachments(user_content: str, attachment_text: str) -> str:
+    """Append parsed attachment text to the user content for this turn.
+
+    The attachment bytes live in storage; only the extracted text is spliced in
+    so a text-only model can reason over the file. Larger files / structured
+    data are meant to go through file tools in data_analysis mode; here we keep
+    a bounded inline snippet so it never blows the context budget.
+    """
+    snippet = (attachment_text or "").strip()
+    if not snippet:
+        return user_content
+    # Bound the inline injection; full text stays on the attachment row.
+    max_chars = 8000
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars] + "\n…（内容已截断，完整内容见附件）"
+    return f"{user_content}\n\n[附件内容]\n{snippet}"
+
+
 async def _delete_last_assistant_message(
     db: AsyncSession, conversation_id: uuid.UUID
 ) -> str:
@@ -332,6 +353,46 @@ class ChatService:
         conversation = await _get_or_create_conversation(db, user, request)
         cfg = await _resolve_model_config(db, request, conversation)
 
+        # 1b. Resolve the execution route from the user-facing mode. The UI sends
+        # ``mode`` (auto | search | deep_research | create | data_analysis); the
+        # intent router turns it into execution_mode / profile / tools. Legacy
+        # explicit execution_mode='agent' (with default mode) still forces the
+        # multi-agent runtime so existing clients/tests keep working.
+        # Effective KB set: explicit per-turn multi-select wins, else the legacy
+        # single id, else the conversation's stored KB.
+        kb_ids: list[uuid.UUID] = list(request.knowledge_base_ids or [])
+        if not kb_ids and request.knowledge_base_id is not None:
+            kb_ids = [request.knowledge_base_id]
+        elif not kb_ids and conversation.knowledge_base_id is not None:
+            kb_ids = [conversation.knowledge_base_id]
+        # Ownership: a user may only run against their own (or system-wide) model
+        # config and their own knowledge bases — never another user's.
+        if cfg.user_id is not None and cfg.user_id != user.id:
+            raise AppException(404, "model_not_found", "Model config not found")
+        for _kb_id in kb_ids:
+            kb_row = await db.get(KnowledgeBase, _kb_id)
+            if kb_row is None or kb_row.user_id != user.id:
+                raise AppException(404, "knowledge_base_not_found", "Knowledge base not found")
+        route = decide_route(
+            request.mode,
+            has_knowledge_base=bool(kb_ids),
+            has_attachment=bool(request.attachment_ids),
+        )
+        enable_tools = route.enable_tools or request.enable_tools
+        execution_mode = route.execution_mode
+        agent_profile = route.agent_profile
+        if (request.execution_mode or "auto").lower() == "agent" and request.mode == "auto":
+            execution_mode = ExecutionMode.agent
+            agent_profile = request.agent_profile or "deep_research"
+            enable_tools = True
+            route = replace(
+                route,
+                execution_mode=execution_mode,
+                agent_profile=agent_profile,
+                enable_tools=True,
+                use_multi_agent=True,
+            )
+
         # 2. Persist the user message (unless regenerating).
         user_content = request.content or ""
         if request.regenerate:
@@ -345,15 +406,29 @@ class ChatService:
                 )
                 db.add(user_msg)
                 await db.flush()
+                # Bind chat attachments to this user message (ownership-checked).
+                if request.attachment_ids:
+                    try:
+                        summaries, attachment_text = await resolve_and_bind_attachments(
+                            db, user.id, conversation.id, user_msg.id, request.attachment_ids
+                        )
+                        user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
+                        if attachment_text:
+                            user_content = _augment_with_attachments(user_content, attachment_text)
+                    except AppException:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 — attachments are best-effort
+                        logger.warning("attachment binding failed: %s", exc)
+                # Cheap sidebar preview (last user message text).
+                conversation.last_message_preview = (user_content or "").strip()[:280]
 
         # 3. System prompt + optional RAG retrieval.
         citations: list[Citation] = []
         rag_context = ""
-        kb_id = request.knowledge_base_id or conversation.knowledge_base_id
-        if kb_id is not None:
+        if kb_ids:
             try:
                 rag_context, citations = await rag_service.retrieve(
-                    db, user_content, kb_id, top_k=5
+                    db, user_content, kb_ids, top_k=5
                 )
             except Exception as exc:
                 # RAG is best-effort: a retrieval failure must not kill the chat.
@@ -371,7 +446,7 @@ class ChatService:
 
         system_prompt = _build_system_prompt(conversation, rag_context)
         prefix = ""
-        if request.enable_tools:
+        if enable_tools:
             # Agent / tools mode: structured execution, no raw chain-of-thought.
             prefix += _AGENT_TASK_PREAMBLE + "\n\n"
         if flow_state.conversation_summary:
@@ -417,11 +492,6 @@ class ChatService:
         )
 
         # 6. Build turn context and delegate to the orchestrator/runtime.
-        try:
-            mode = ExecutionMode(request.execution_mode or "auto")
-        except ValueError:
-            mode = ExecutionMode.auto
-
         ctx = AgentTurnContext(
             db=db,
             user=user,
@@ -435,11 +505,12 @@ class ChatService:
             citations=citations,
             assistant_msg=assistant_msg,
             run_id=uuid.uuid4(),  # placeholder; orchestrator overwrites with the real run id
-            execution_mode=mode,
-            agent_profile=request.agent_profile or "general",
-            enable_tools=request.enable_tools,
-            knowledge_base_id=kb_id,
-            extra={"state": flow_state},
+            execution_mode=execution_mode,
+            agent_profile=agent_profile,
+            enable_tools=enable_tools,
+            knowledge_base_id=kb_ids[0] if kb_ids else None,
+            mode=route.mode,
+            extra={"state": flow_state, "route": route},
         )
 
         try:
@@ -449,10 +520,22 @@ class ChatService:
                     assistant_msg.metadata_ = self._meta(
                         cfg, citations, finish, assistant_msg.metadata_
                     )
+                    # Drop the live tool_calls trace from the persisted metadata:
+                    # the UI reads the execution trace from ToolCall/AgentStep rows,
+                    # and a dangling tool_calls here would make the NEXT turn's
+                    # transcript invalid (assistant tool_calls with no matching
+                    # role:tool rows → provider HTTP 400).
+                    assistant_msg.metadata_.pop("tool_calls", None)
                     if ctx.extra.get("budget"):
                         assistant_msg.metadata_["budget"] = ctx.extra["budget"]
                     if ctx.extra.get("intent"):
                         assistant_msg.metadata_["intent"] = ctx.extra["intent"]
+                    if ctx.extra.get("multi_agent"):
+                        # Mark multi-agent runs so the UI shows the compact
+                        # "查看执行过程" entry (single-agent runs keep ResearchSteps).
+                        assistant_msg.metadata_["multi_agent"] = True
+                    # Refresh the sidebar preview with the final assistant text.
+                    conversation.last_message_preview = (assistant_msg.content or "")[:280]
                     await db.commit()
                     # Rolling summary: if history grew past the budget, roll the
                     # older messages into a summary memory for future turns.

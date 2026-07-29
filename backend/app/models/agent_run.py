@@ -46,7 +46,7 @@ class AgentRun(Base, TimestampMixin):
     # native | crewai
     runtime: Mapped[str] = mapped_column(String(32), default="native", nullable=False)
     flow_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
-    # pending | running | waiting_approval | completed | failed | cancelled
+    # pending | running | waiting_approval | paused | completed | failed | cancelled
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     current_step: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     input: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
@@ -55,3 +55,21 @@ class AgentRun(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ---- multi-agent graph (Phase: multi-agent visualization) ----
+    # Static topology: nodes + edges + mode (written once at run start).
+    graph_definition: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Live state snapshot: the same graph with updated node/edge statuses,
+    # active_agent_ids, run status, timing. Updated as agents progress so a
+    # GET /api/agent-runs/{id} after a refresh restores the exact picture.
+    graph_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # ---- Phase 1+: research plan + run-time instructions (reserved) ----
+    # Draft research plan for deep_research mode (steps, summary, sources).
+    plan: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # draft | confirmed | rejected | updated
+    plan_status: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    # Free-form mid-run guidance the user appends while a run is in flight.
+    user_instructions: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Explicit user-driven pause (distinct from waiting_approval).
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Opaque token/version for safe resume (reserved).
+    resume_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)

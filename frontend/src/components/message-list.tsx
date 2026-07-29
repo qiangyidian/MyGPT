@@ -1,23 +1,31 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { MessageSquare } from "lucide-react";
+import { BarChart3, FileSearch, MessageSquare, PenLine, Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { MessageBubble } from "@/components/message-bubble";
 import type { Citation, Message, ResearchStep } from "@/lib/types";
 
+const SUGGESTIONS = [
+  { icon: FileSearch, title: "总结文档", prompt: "请帮我总结一份文档的主要观点。" },
+  { icon: Search, title: "搜索最新资料", prompt: "帮我搜索某个主题的最新资料并给出带来源的汇总。" },
+  { icon: BarChart3, title: "分析数据", prompt: "我上传了一份表格，请帮我分析其中的趋势与异常。" },
+  { icon: PenLine, title: "编写方案", prompt: "请帮我起草一份项目方案的初稿。" },
+];
+
 interface MessageListProps {
   messages: Message[];
-  /** Live streaming text for the in-flight assistant reply. */
   streamingText?: string;
   isStreaming?: boolean;
-  /** Live citations during streaming. */
   streamingCitations?: Citation[];
-  /** Live agent steps (search/thinking) during streaming. */
   streamingSteps?: ResearchStep[];
   canRegenerate?: boolean;
   onRegenerate?: () => void;
+  onBranch?: (messageId: string, newContent: string) => void;
+  onSourceClick?: (index: number, citations: Citation[]) => void;
+  onOpenAttachment?: (attachmentId: string) => void;
+  onPickSuggestion?: (prompt: string) => void;
   className?: string;
 }
 
@@ -29,33 +37,25 @@ export function MessageList({
   streamingSteps,
   canRegenerate,
   onRegenerate,
+  onBranch,
+  onSourceClick,
+  onOpenAttachment,
+  onPickSuggestion,
   className,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when messages or streaming text change.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-
-    // Only auto-scroll if the user is near the bottom (within 120px).
     const nearBottom =
-      container.scrollHeight -
-        container.scrollTop -
-        container.clientHeight <
-      120;
-
-    if (nearBottom) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
+      container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+    if (nearBottom) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingText, isStreaming]);
 
   const isEmpty = messages.length === 0 && !streamingText && !isStreaming;
 
-  // While streaming, the persisted "pending" assistant message (empty content)
-  // is represented by the live streaming bubble below — drop it to avoid a
-  // duplicate "思考中..." bubble alongside the live one.
   const shownMessages =
     isStreaming && streamingText !== undefined
       ? messages.filter(
@@ -65,30 +65,40 @@ export function MessageList({
 
   if (isEmpty) {
     return (
-      <div
-        className={cn(
-          "flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center",
-          className
-        )}
-      >
+      <div className={cn("flex flex-1 flex-col items-center justify-center gap-5 p-8 text-center", className)}>
         <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-muted">
           <MessageSquare className="h-7 w-7 text-muted-foreground" />
         </div>
         <div className="space-y-1">
-          <h2 className="text-lg font-semibold">开始新的对话</h2>
+          <h2 className="text-lg font-semibold">有什么可以帮你？</h2>
           <p className="max-w-sm text-sm text-muted-foreground">
-            输入你的问题，AI 将为你解答。你可以选择不同的模型与知识库来获得更精准的回答。
+            选择合适的能力，或直接描述你的目标。系统会自动选择最合适的方式。
           </p>
         </div>
+        {onPickSuggestion && (
+          <div className="grid w-full max-w-xl grid-cols-1 gap-2 sm:grid-cols-2">
+            {SUGGESTIONS.map((s) => {
+              const Icon = s.icon;
+              return (
+                <button
+                  key={s.title}
+                  type="button"
+                  onClick={() => onPickSuggestion(s.prompt)}
+                  className="flex items-center gap-2.5 rounded-lg border border-border bg-card px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent"
+                >
+                  <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <span className="font-medium">{s.title}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   }
 
   return (
-    <div
-      ref={containerRef}
-      className={cn("min-h-0 flex-1 overflow-y-auto", className)}
-    >
+    <div ref={containerRef} className={cn("min-h-0 flex-1 overflow-y-auto", className)}>
       <div className="mx-auto w-full max-w-3xl px-1 py-4">
         {shownMessages.map((msg, i) => (
           <MessageBubble
@@ -97,10 +107,12 @@ export function MessageList({
             isLast={i === shownMessages.length - 1 && !streamingText}
             canRegenerate={canRegenerate && !isStreaming}
             onRegenerate={onRegenerate}
+            onBranch={onBranch}
+            onSourceClick={onSourceClick}
+            onOpenAttachment={onOpenAttachment}
           />
         ))}
 
-        {/* Live streaming bubble */}
         {streamingText !== undefined && isStreaming && (
           <MessageBubble
             message={{
@@ -116,6 +128,7 @@ export function MessageList({
             steps={streamingSteps}
             isStreaming
             isLast
+            onSourceClick={onSourceClick}
           />
         )}
 

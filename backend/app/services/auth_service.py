@@ -48,15 +48,22 @@ _mem_blacklist: set[str] = set()
 
 
 async def _get_redis() -> Any:
-    """Return an async Redis client, or None if Redis is unavailable."""
+    """Return an async Redis client, or None if Redis is unavailable.
+
+    A missing redis package is cached as "permanently unavailable"; a transient
+    connection failure is NOT cached so a brief Redis outage at startup doesn't
+    silently disable cross-process refresh-token revocation forever."""
     global _redis_client, _redis_checked
-    if _redis_checked:
+    if _redis_client is not None:
         return _redis_client
-    _redis_checked = True
+    if _redis_checked:
+        # Only the "package not installed" case is cached permanently below.
+        return None
     try:
         # Imported lazily so the module imports cleanly without redis installed.
         from redis.asyncio import Redis  # type: ignore
     except Exception:  # pragma: no cover - optional dep
+        _redis_checked = True  # no package → don't keep retrying the import
         logger.warning("redis package not installed; using in-memory refresh blacklist")
         return None
     try:
@@ -68,8 +75,9 @@ async def _get_redis() -> Any:
         _redis_client = client
         logger.info("Connected to Redis for refresh-token blacklist")
     except Exception as exc:  # pragma: no cover - environment dependent
+        # Transient (Redis briefly down): do NOT cache so the next call retries.
         logger.warning("Redis unavailable (%s); using in-memory refresh blacklist", exc)
-        _redis_client = None
+        return None
     return _redis_client
 
 

@@ -1,61 +1,81 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronDown, FileText } from "lucide-react";
+import { FileText, Globe, Paperclip } from "lucide-react";
 
-import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import type { Citation } from "@/lib/types";
 
-function CitationChip({ citation, index }: { citation: Citation; index: number }) {
-  const [expanded, setExpanded] = useState(false);
+function sourceIcon(c: Citation) {
+  const t = c.source_type ?? (c.url ? "web" : "document");
+  if (t === "web") return Globe;
+  if (t === "attachment") return Paperclip;
+  return FileText;
+}
 
-  const scorePct = Math.round((citation.score ?? 0) * 100);
+/**
+ * Qualitative relevance band. Vector/rerank scores are debug/eval metrics and
+ * are NOT shown to end users as a confidence percentage — only a label.
+ */
+function relevanceLabel(score?: number): { label: string; tone: string } {
+  if (score == null) return { label: "相关", tone: "secondary" };
+  if (score >= 0.75) return { label: "高相关", tone: "default" };
+  if (score >= 0.5) return { label: "相关", tone: "secondary" };
+  return { label: "一般", tone: "outline" };
+}
+
+function CitationChip({
+  citation,
+  index,
+  onSourceClick,
+}: {
+  citation: Citation;
+  index: number;
+  onSourceClick?: (index: number) => void;
+}) {
+  const Icon = sourceIcon(citation);
+  const rel = relevanceLabel(citation.rerank_score ?? citation.score);
 
   return (
-    <div className="rounded-md border border-border bg-card text-card-foreground">
+    <div className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5">
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/50"
-        onClick={() => setExpanded((v) => !v)}
+        className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+        onClick={() => onSourceClick?.(index)}
+        title="查看来源详情"
       >
-        <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium">
-          <span className="text-muted-foreground">[{index + 1}]</span>{" "}
-          {citation.document_name}
+        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">
+          <span className="text-muted-foreground">[{index + 1}]</span> {citation.document_name}
         </span>
-        <span className="shrink-0 text-muted-foreground">{scorePct}%</span>
-        <ChevronDown
-          className={cn(
-            "h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
-            expanded && "rotate-180"
-          )}
-        />
       </button>
-      {expanded && (
-        <div className="border-t border-border px-3 py-2">
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {citation.snippet}
-          </p>
-        </div>
-      )}
+      <Badge variant={rel.tone as never} className="shrink-0 text-[10px]">{rel.label}</Badge>
     </div>
   );
 }
 
 /**
- * Renders an array of Citation objects as expandable source chips.
- * Each chip shows the document name, relevance score, and an expandable
- * snippet of the matched text.
+ * Renders citations as compact source chips. Clicking a chip opens the Sources
+ * tab of the Context Panel focused on that source (via onSourceClick).
  */
-export function Citations({ citations }: { citations: Citation[] }) {
+export function Citations({
+  citations,
+  onSourceClick,
+}: {
+  citations: Citation[];
+  onSourceClick?: (index: number) => void;
+}) {
   if (!citations.length) return null;
-
   return (
     <div className="mt-3 space-y-1.5">
       <p className="text-xs font-medium text-muted-foreground">引用来源</p>
-      <div className="space-y-1.5">
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {citations.map((c, i) => (
-          <CitationChip key={`${c.document_id}-${c.chunk_index}-${i}`} citation={c} index={i} />
+          <CitationChip
+            key={`${c.document_id ?? c.url}-${i}`}
+            citation={c}
+            index={i}
+            onSourceClick={onSourceClick}
+          />
         ))}
       </div>
     </div>

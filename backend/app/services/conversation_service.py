@@ -11,7 +11,7 @@ from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import noload, selectinload
 
 from app.models import Conversation, Message
 from app.schemas import ConversationCreate, ConversationUpdate
@@ -21,14 +21,30 @@ _AUTO_TITLE_MAX = 40
 
 
 async def list_for_user(
-    db: AsyncSession, user_id: uuid.UUID
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    q: str | None = None,
+    archived: bool = False,
+    limit: int = 50,
+    offset: int = 0,
 ) -> list[Conversation]:
-    """Return all conversations owned by ``user_id``, newest first."""
-    result = await db.execute(
-        select(Conversation)
-        .where(Conversation.user_id == user_id)
-        .order_by(Conversation.updated_at.desc())
-    )
+    """Return the user's conversations, pinned-first then newest, with search.
+
+    ``archived`` selects the archived set (default: only active conversations).
+    ``q`` is a case-insensitive title substring. Limit/offset paginate.
+    """
+    stmt = select(Conversation).where(
+        Conversation.user_id == user_id,
+        Conversation.is_archived.is_(archived),
+    ).options(noload(Conversation.messages))  # sidebar list must not pull messages
+    if q:
+        stmt = stmt.where(Conversation.title.ilike(f"%{q}%"))
+    stmt = stmt.order_by(
+        Conversation.is_pinned.desc(),
+        Conversation.updated_at.desc(),
+    ).limit(max(1, min(limit, 200))).offset(max(0, offset))
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -97,6 +113,68 @@ async def delete(
     await db.delete(conv)
     await db.commit()
     return True
+
+
+async def branch_from_message(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    new_content: str | None = None,
+) -> Conversation:
+    """Create a branch: copy history *before* ``message_id`` into a new
+    conversation, then return it. The caller sends ``new_content`` as a fresh
+    chat turn to the returned conversation.
+
+    The source conversation is never mutated. ``parent_conversation_id`` and
+    ``branch_from_message_id`` link the branch back for traceability.
+    """
+    src = await get(db, conversation_id, user_id)
+    if src is None:
+        return None  # caller maps to 404
+
+    target = await db.get(Message, message_id)
+    if target is None or target.conversation_id != conversation_id:
+        return None
+
+    # History strictly before the edited message (oldest-first).
+    res = await db.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.created_at < target.created_at,
+        )
+        .order_by(Message.created_at.asc())
+    )
+    prior = list(res.scalars().all())
+
+    title_hint = (new_content or target.content or src.title or "").strip()
+    branch = Conversation(
+        user_id=user_id,
+        title=_truncate_title(title_hint) or src.title,
+        model_id=src.model_id,
+        knowledge_base_id=src.knowledge_base_id,
+        system_prompt=src.system_prompt,
+        parent_conversation_id=src.id,
+        branch_from_message_id=message_id,
+    )
+    db.add(branch)
+    await db.flush()  # populate branch.id
+
+    for m in prior:
+        if m.role == "system":
+            continue
+        db.add(Message(
+            conversation_id=branch.id,
+            role=m.role,
+            content=m.content or "",
+            model_name=m.model_name,
+            metadata_=dict(m.metadata_ or {}),
+        ))
+    await db.commit()
+    await db.refresh(branch)
+    return branch
 
 
 async def maybe_autotitle(

@@ -17,10 +17,17 @@ Event vocabulary (the SSE ``event:`` name is ``AgentEvent.kind``):
   * ``tool_call``         — the agent is invoking a tool (id, name, arguments)
   * ``tool_result``       — a tool returned (ok reflects the *real* outcome)
   * ``approval_required`` — a dangerous tool is blocked pending human approval
+  * ``agent_graph``      — full multi-agent topology, sent once at run start
+  * ``agent_status``     — one agent's status changed (running/completed/…)
+  * ``agent_edge``       — a handoff/dependency edge changed status
+  * ``run_status``       — overall run status + currently-running agent ids
   * ``token``             — streamed answer text delta
   * ``citations``         — RAG citations for this turn
   * ``done``              — turn finished (finish_reason)
   * ``error``             — turn failed (code, message)
+
+  ``tool_call``/``tool_result`` carry an optional ``agent_id``/``task_id`` so the
+  frontend can nest a tool under the agent that invoked it (multi-agent runs).
 """
 from __future__ import annotations
 
@@ -135,16 +142,41 @@ def ev_step_completed(*, step_id: str, status: str = "done") -> AgentEvent:
 
 
 def ev_tool_call(
-    *, id: str, name: str, arguments: dict[str, Any], dangerous: bool = False, approval_id: str | None = None
+    *,
+    id: str,
+    name: str,
+    arguments: dict[str, Any],
+    dangerous: bool = False,
+    approval_id: str | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {"id": id, "name": name, "arguments": arguments, "dangerous": dangerous}
     if approval_id:
         data["approval_id"] = approval_id
+    if agent_id:
+        data["agent_id"] = agent_id
+    if task_id:
+        data["task_id"] = task_id
     return AgentEvent(kind="tool_call", data=data)
 
 
-def ev_tool_result(*, id: str, name: str, ok: bool, result: Any = None, error: str | None = None) -> AgentEvent:
-    return AgentEvent(kind="tool_result", data={"id": id, "name": name, "ok": ok, "result": result, "error": error})
+def ev_tool_result(
+    *,
+    id: str,
+    name: str,
+    ok: bool,
+    result: Any = None,
+    error: str | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {"id": id, "name": name, "ok": ok, "result": result, "error": error}
+    if agent_id:
+        data["agent_id"] = agent_id
+    if task_id:
+        data["task_id"] = task_id
+    return AgentEvent(kind="tool_result", data=data)
 
 
 def ev_approval_required(
@@ -185,6 +217,119 @@ def ev_error(*, code: str, message: str) -> AgentEvent:
     return AgentEvent(kind="error", data={"code": code, "message": message})
 
 
+# ---- multi-agent graph events (Phase: multi-agent visualization) -----------
+def ev_agent_graph(*, run_id: uuid.UUID | str, graph: dict[str, Any]) -> AgentEvent:
+    """Send the full topology once at run start. ``graph`` is the public dict
+    from :class:`~app.agents.graph.AgentGraph.to_public_dict`."""
+    return AgentEvent(kind="agent_graph", data={"run_id": str(run_id), "graph": graph})
+
+
+def ev_agent_status(
+    *,
+    run_id: uuid.UUID | str,
+    agent_id: str,
+    status: str,
+    task_title: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    duration_ms: int | None = None,
+    output_summary: str | None = None,
+    error: str | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {
+        "run_id": str(run_id),
+        "agent_id": agent_id,
+        "status": status,
+    }
+    if task_title is not None:
+        data["task_title"] = task_title
+    if started_at is not None:
+        data["started_at"] = started_at
+    if finished_at is not None:
+        data["finished_at"] = finished_at
+    if duration_ms is not None:
+        data["duration_ms"] = duration_ms
+    if output_summary is not None:
+        data["output_summary"] = output_summary
+    if error is not None:
+        data["error"] = error
+    return AgentEvent(kind="agent_status", data=data)
+
+
+def ev_agent_edge(
+    *,
+    run_id: uuid.UUID | str,
+    edge_id: str,
+    status: str,
+    label: str | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {"run_id": str(run_id), "edge_id": edge_id, "status": status}
+    if label is not None:
+        data["label"] = label
+    return AgentEvent(kind="agent_edge", data=data)
+
+
+def ev_run_status(
+    *,
+    run_id: uuid.UUID | str,
+    status: str,
+    current_agent_ids: list[str] | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {"run_id": str(run_id), "status": status}
+    if current_agent_ids is not None:
+        data["current_agent_ids"] = current_agent_ids
+    return AgentEvent(kind="run_status", data=data)
+
+
+# ---- Phase 1+: research-plan + run-control events (reserved for deep_research) ----
+def ev_research_plan(
+    *,
+    run_id: uuid.UUID | str,
+    status: str = "draft",
+    summary: str = "",
+    steps: list[dict[str, Any]] | None = None,
+    requires_confirmation: bool = True,
+    updated: bool = False,
+) -> AgentEvent:
+    return AgentEvent(
+        kind="research_plan_updated" if updated else "research_plan",
+        data={
+            "run_id": str(run_id),
+            "status": status,
+            "summary": summary,
+            "steps": steps or [],
+            "requires_confirmation": requires_confirmation,
+        },
+    )
+
+
+def ev_run_instruction_received(
+    *, run_id: uuid.UUID | str, instruction: str, acknowledged: bool = True
+) -> AgentEvent:
+    return AgentEvent(
+        kind="run_instruction_received",
+        data={"run_id": str(run_id), "instruction": instruction, "acknowledged": acknowledged},
+    )
+
+
+def ev_run_paused(
+    *, run_id: uuid.UUID | str, reason: str = "user", paused_at: str | None = None
+) -> AgentEvent:
+    data: dict[str, Any] = {"run_id": str(run_id), "reason": reason}
+    if paused_at is not None:
+        data["paused_at"] = paused_at
+    return AgentEvent(kind="run_paused", data=data)
+
+
+def ev_run_resumed(
+    *, run_id: uuid.UUID | str, resumed_at: str | None = None
+) -> AgentEvent:
+    data: dict[str, Any] = {"run_id": str(run_id)}
+    if resumed_at is not None:
+        data["resumed_at"] = resumed_at
+    return AgentEvent(kind="run_resumed", data=data)
+
+
 # --------------------------------------------------------------------------- #
 # Turn context
 # --------------------------------------------------------------------------- #
@@ -215,6 +360,9 @@ class AgentTurnContext:
     agent_profile: str = "general"
     enable_tools: bool = False
     knowledge_base_id: Optional[uuid.UUID] = None
+    # Phase 1: the user-facing capability mode the UI sent (auto | search |
+    # deep_research | create | data_analysis). Runtimes may read this for telemetry.
+    mode: str = "auto"
     # Populated by the orchestrator; runtimes may attach extra bookkeeping here.
     extra: dict[str, Any] = field(default_factory=dict)
 

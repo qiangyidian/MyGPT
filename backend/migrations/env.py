@@ -21,8 +21,14 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 settings = get_settings()
-# Alembic needs a sync URL; convert asyncpg -> psycopg if needed, else use raw.
-sync_url = settings.DATABASE_URL.replace("+asyncpg", "+psycopg2").replace("postgresql://", "postgresql+psycopg2://")
+# Alembic needs a sync URL; convert async drivers to their sync equivalents so a
+# single DATABASE_URL works for both the app (async) and Alembic (sync).
+sync_url = (
+    settings.DATABASE_URL
+    .replace("+asyncpg", "+psycopg2")
+    .replace("postgresql://", "postgresql+psycopg2://")
+    .replace("+aiosqlite", "")
+)
 config.set_main_option("sqlalchemy.url", sync_url)
 
 target_metadata = Base.metadata

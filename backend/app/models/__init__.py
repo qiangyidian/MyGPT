@@ -1,19 +1,25 @@
 """Import every model so SQLAlchemy registers them on Base.metadata
 (matters for create_all and alembic autogenerate)."""
+from app.models.audit_event import AuditEvent
 from app.models.agent_run import AgentRun
 from app.models.agent_step import AgentStep
+from app.models.background_task import BackgroundTask
+from app.models.chat_attachment import ChatAttachment
 from app.models.conversation import Conversation
 from app.models.conversation_memory import ConversationMemory
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
+from app.models.message_feedback import MessageFeedback
 from app.models.model_config import ModelConfig
+from app.models.project import Project
 from app.models.tool_approval import ToolApproval
 from app.models.tool_call import ToolCall
 from app.models.user import User
 
 __all__ = [
+    "AuditEvent",
     "User",
     "ModelConfig",
     "Conversation",
@@ -27,4 +33,10 @@ __all__ = [
     "AgentStep",
     "ConversationMemory",
     "ToolApproval",
+    # ---- Phase 1: product upgrade ----
+    "ChatAttachment",
+    "MessageFeedback",
+    # ---- Phase 3: projects + background tasks ----
+    "Project",
+    "BackgroundTask",
 ]

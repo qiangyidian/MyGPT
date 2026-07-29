@@ -18,9 +18,11 @@ from app.core.config import get_settings
 from app.models import KnowledgeBase, ModelConfig
 from app.providers.registry import get_provider_for_config
 from app.rag.embedder import ProviderEmbedder
+from app.rag.fusion import compress_context, rrf_fuse
+from app.rag.keyword import KeywordRetriever
 from app.rag.prompts import build_rag_context, format_context_block
 from app.rag.qdrant_store import get_vector_store
-from app.rag.reranker import NoopReranker
+from app.rag.reranker import NoopReranker, make_reranker
 from app.rag.retriever import Retriever
 from app.schemas import Citation
 
@@ -61,36 +63,69 @@ class RagService:
         self,
         db: AsyncSession,
         question: str,
-        kb_id: uuid.UUID | str,
+        kb_ids: list[uuid.UUID | str],
         top_k: int | None = None,
     ) -> tuple[str, list[Citation]]:
-        """Return (rag_context, citations) for the question against the given KB.
+        """Return (rag_context, citations) for the question across one or more KBs.
 
-        Best-effort: any failure (no KB, no collection yet, store error) returns
-        ("", []) so chat never breaks because of RAG.
+        Multi-KB: each KB has its own collection (and possibly its own embedding
+        model), so we run the hybrid retrieval per-KB, then RRF-fuse the union
+        across KBs, rerank, and dedup. Each hit is tagged with its source KB so
+        citations name where a chunk came from. Best-effort: any failure
+        (no KB, no collection yet, store error) returns ("", []).
         """
-        if not question or not str(question).strip():
+        if not question or not str(question).strip() or not kb_ids:
             return "", []
         settings = get_settings()
         top_k = top_k or settings.RAG_TOP_K
+        reranker = make_reranker(settings)
+        overfetch = settings.RERANKER_OVERFETCH if not isinstance(reranker, NoopReranker) else 1
+        fetch_k = top_k * max(1, overfetch)
 
-        kb = await db.get(KnowledgeBase, uuid.UUID(str(kb_id)))
-        if kb is None:
+        all_v: list = []
+        all_k: list = []
+        saw_kb = False
+        for kb_id in kb_ids:
+            kb = await db.get(KnowledgeBase, uuid.UUID(str(kb_id)))
+            if kb is None:
+                continue
+            saw_kb = True
+            try:
+                cfg = await _resolve_embedding_config(db, kb)
+                provider = get_provider_for_config(cfg)
+                embedder = ProviderEmbedder(provider, model=cfg.embedding_model_name)
+                store = get_vector_store()
+                if settings.RAG_HYBRID:
+                    v_hits = await Retriever(embedder, store, None).retrieve(
+                        question, collection_name(kb.id), top_k=fetch_k
+                    )
+                    k_hits = await KeywordRetriever(db).retrieve(
+                        question, kb.id, top_k=fetch_k
+                    )
+                    all_v.extend(_tag_kb(v_hits, kb))
+                    all_k.extend(_tag_kb(k_hits, kb))
+                else:
+                    v_hits = await Retriever(embedder, store, reranker).retrieve(
+                        question, collection_name(kb.id), top_k=fetch_k, overfetch=overfetch
+                    )
+                    all_v.extend(_tag_kb(v_hits, kb))
+            except Exception as exc:  # noqa: BLE001 — RAG is best-effort per-KB
+                logger.warning("RAG retrieval failed for kb %s: %s", kb_id, exc)
+                continue
+
+        if not saw_kb:
             return "", []
 
-        try:
-            cfg = await _resolve_embedding_config(db, kb)
-            provider = get_provider_for_config(cfg)
-            embedder = ProviderEmbedder(provider, model=cfg.embedding_model_name)
-            store = get_vector_store()
-            retriever = Retriever(embedder, store, NoopReranker())
-            hits = await retriever.retrieve(
-                question, collection_name(kb.id), top_k=top_k
-            )
-        except Exception as exc:  # noqa: BLE001 — RAG is best-effort
-            logger.warning("RAG retrieval failed for kb %s: %s", kb_id, exc)
-            return "", []
-
+        if settings.RAG_HYBRID:
+            fused = rrf_fuse(all_v, all_k, k=settings.RAG_RRF_K)
+        else:
+            fused = all_v
+        if not isinstance(reranker, NoopReranker) and fused:
+            fused = await reranker.rerank(question, fused, top_k=fetch_k)
+        hits = fused[:fetch_k]
+        if settings.RAG_COMPRESS_DEDUP:
+            hits = compress_context(hits)
+        hits = hits[:top_k]
         if not hits:
             return "", []
 
@@ -102,14 +137,32 @@ class RagService:
     def _hit_to_citation(hit: Any, index: int) -> Citation:
         payload = hit.payload or {}
         text = payload.get("text") or payload.get("content") or ""
+        rerank = getattr(hit, "rerank_score", None)
         return Citation(
-            document_id=payload.get("document_id", ""),
+            document_id=payload.get("document_id") or None,
             document_name=payload.get("document_name", "未知来源"),
             chunk_id=payload.get("chunk_id"),
             chunk_index=int(payload.get("chunk_index", index - 1) or 0),
             snippet=text[:300],
             score=float(hit.score or 0.0),
+            source_type="document",
+            rerank_score=float(rerank) if rerank is not None else None,
+            metadata={
+                "collection": payload.get("collection"),
+                "kb_id": payload.get("kb_id"),
+                "kb_name": payload.get("kb_name"),
+            },
         )
+
+
+def _tag_kb(hits: list, kb: KnowledgeBase) -> list:
+    """Stamp each hit's payload with its source KB id/name (for citations)."""
+    for h in hits:
+        p = dict(h.payload or {})
+        p.setdefault("kb_id", str(kb.id))
+        p.setdefault("kb_name", kb.name)
+        h.payload = p
+    return hits
 
 
 # Module-level singleton — ChatService imports this name directly.

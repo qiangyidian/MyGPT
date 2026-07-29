@@ -1,0 +1,285 @@
+"""Per-stage agent execution, abstracted for testability.
+
+A "stage" is one agent running one task. The :class:`CrewAIRuntime` orchestrates
+stages sequentially or in parallel and drives the
+:class:`~app.agents.lifecycle.AgentLifecycleEmitter` around each. The actual
+execution — calling the LLM, running tools — is hidden behind the
+:class:`StageExecutor` protocol so the lifecycle ordering can be unit-tested
+with :class:`FakeStageExecutor` (no live LLM, no CrewAI).
+
+Threading note: CrewAI's ``aexecute_task`` may invoke the adapted tools in
+worker threads. Those adapters read :attr:`StageContext.agent_id` (set here
+before each stage) and forward ``tool_call``/``tool_result`` events back to the
+main-loop queue via :meth:`StageContext.emit` (thread-safe). So tool events
+arrive in real time, attributed to the right agent, even though the tool runs
+off-loop.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from app.agents.stage_context import StageContext
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StageResult:
+    """Outcome of one agent stage."""
+
+    agent_id: str
+    raw: str = ""
+    output_summary: str = ""
+    # Structured payload (e.g. parsed evidence) — optional, passed as context
+    # to downstream stages.
+    structured: Any = None
+    # Tool calls that occurred during this stage (for the activity feed /
+    # audit). Populated by the executor from events it observed.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
+@runtime_checkable
+class StageExecutor(Protocol):
+    """Execute one agent stage. Raises on failure (runtime emits agent_failed)."""
+
+    async def execute(
+        self,
+        *,
+        agent_id: str,
+        agent: Any,
+        task: Any,
+        context: str | None,
+        stage_ctx: StageContext,
+    ) -> StageResult: ...
+
+
+# --------------------------------------------------------------------------- #
+# Real executor: CrewAI aexecute_task
+# --------------------------------------------------------------------------- #
+class CrewAIStageExecutor:
+    """Runs a single agent's task via ``Agent.aexecute_task``.
+
+    Real LLM call, real tools (through the gateway adapters). The agent's
+    tools were built with the shared ``StageContext`` so tool events are
+    attributed and forwarded in real time.
+    """
+
+    def __init__(self, *, summarize_chars: int = 160) -> None:
+        self._summarize_chars = summarize_chars
+
+    async def execute(
+        self,
+        *,
+        agent_id: str,
+        agent: Any,
+        task: Any,
+        context: str | None,
+        stage_ctx: StageContext,
+    ) -> StageResult:
+        stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
+        output = await agent.aexecute_task(task, context=context)
+        raw = _extract_raw(output)
+        return StageResult(
+            agent_id=agent_id,
+            raw=raw,
+            output_summary=_summarize(raw, self._summarize_chars),
+            structured=output,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Fake executor: deterministic, no LLM — for tests + offline demos
+# --------------------------------------------------------------------------- #
+class FakeStageExecutor:
+    """Simulates a stage: optional tool calls, a delay, then a canned result.
+
+    The ``behavior`` map is ``{agent_id: FakeBehavior}``. Unknown agents get a
+    default success with a short delay. This lets tests script scenarios A/B/C/D
+    (serial, parallel, approval, failure) precisely.
+    """
+
+    @dataclass
+    class Behavior:
+        delay: float = 0.05
+        output: str = ""
+        summary: str = ""
+        tools: list[dict[str, Any]] = field(default_factory=list)  # [{name, args, ok, result}]
+        fail: str | None = None  # error message -> raise
+        # When set, the named tool simulates a dangerous-tool approval cycle:
+        # emits tool_call, pauses via stage_ctx.approval_bridge, then on approve
+        # emits a success tool_result. {"tool": "db_query", "approval_id": <uuid>}
+        approval: dict[str, Any] | None = None
+
+    def __init__(self, behaviors: dict[str, "FakeStageExecutor.Behavior"] | None = None) -> None:
+        self.behaviors = behaviors or {}
+        # Track which agents started/finished, for assertion helpers in tests.
+        self.started: list[str] = []
+        self.finished: list[str] = []
+
+    async def execute(
+        self,
+        *,
+        agent_id: str,
+        agent: Any,
+        task: Any,
+        context: str | None,
+        stage_ctx: StageContext,
+    ) -> StageResult:
+        from app.agents.schemas import ev_tool_call, ev_tool_result
+
+        b = self.behaviors.get(agent_id, self.Behavior())
+        stage_ctx.set_stage(agent_id=agent_id, task_id="fake-task")
+        self.started.append(agent_id)
+        # Emit tool events in real time (routed through the stage ctx queue).
+        tool_calls: list[dict[str, Any]] = []
+        for t in b.tools:
+            call_id = f"call-{agent_id}-{uuid.uuid4().hex[:6]}"
+            stage_ctx.emit(ev_tool_call(
+                id=call_id, name=t["name"], arguments=t.get("args", {}),
+                agent_id=agent_id, task_id="fake-task",
+            ))
+            await asyncio.sleep(0.01)  # observable as "running"
+
+            # Simulate a dangerous-tool approval pause if configured. The fake
+            # executor runs on the main loop, so it uses the async entry point
+            # (the real adapter, off-loop, uses the sync request_pause).
+            if b.approval and b.approval.get("tool") == t["name"] and stage_ctx.approval_bridge is not None:
+                decision, _reason = await stage_ctx.approval_bridge.request_pause_async(
+                    approval_id=b.approval["approval_id"],
+                    agent_id=agent_id,
+                    tool_name=t["name"],
+                )
+                ok = decision == "approved"
+                stage_ctx.emit(ev_tool_result(
+                    id=call_id, name=t["name"], ok=ok,
+                    result=t.get("result") if ok else None,
+                    error=None if ok else f"approval {decision}",
+                    agent_id=agent_id, task_id="fake-task",
+                ))
+                tool_calls.append({"name": t["name"], "ok": ok})
+                continue
+
+            stage_ctx.emit(ev_tool_result(
+                id=call_id, name=t["name"], ok=t.get("ok", True),
+                result=t.get("result"), error=t.get("error"),
+                agent_id=agent_id, task_id="fake-task",
+            ))
+            tool_calls.append({"name": t["name"], "ok": t.get("ok", True)})
+
+        if b.delay:
+            await asyncio.sleep(b.delay)
+
+        if b.fail is not None:
+            raise RuntimeError(b.fail)
+
+        self.finished.append(agent_id)
+        return StageResult(
+            agent_id=agent_id,
+            raw=b.output or f"[{agent_id}] done",
+            output_summary=b.summary or (b.output or f"[{agent_id}] done")[:160],
+            tool_calls=tool_calls,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Demo executor: no LLM, but produces realistic per-role behaviour so the full
+# multi-agent panel can be exercised live (real SSE, real graph, real tool
+# attribution) without an external model endpoint. Enabled by AGENT_DEMO_MODE.
+# --------------------------------------------------------------------------- #
+class DemoStageExecutor(FakeStageExecutor):
+    """FakeStageExecutor with sensible default behaviours keyed by agent role.
+
+    Used when ``AGENT_DEMO_MODE=true`` so the panel can be hand-verified. The
+    defaults simulate a research crew: researchers call web_search, the analyst
+    cross-checks, the writer produces a short cited answer. Override per-agent
+    via the ``behaviours`` map (e.g. to script a failure for scenario D).
+    """
+
+    def __init__(self, behaviours: dict[str, "FakeStageExecutor.Behavior"] | None = None) -> None:
+        defaults = self._defaults()
+        if behaviours:
+            for k, v in behaviours.items():
+                merged = defaults.get(k, self.Behavior())
+                # let caller override fields (e.g. fail) while keeping defaults
+                merged = self.Behavior(
+                    delay=v.delay if v.delay != 0.05 else merged.delay,
+                    output=v.output or merged.output,
+                    summary=v.summary or merged.summary,
+                    tools=v.tools or merged.tools,
+                    fail=v.fail,
+                )
+                defaults[k] = merged
+        super().__init__(defaults)
+
+    @staticmethod
+    def _defaults() -> dict[str, "FakeStageExecutor.Behavior"]:
+        return {
+            "researcher": FakeStageExecutor.Behavior(
+                delay=1.2,
+                output=(
+                    "Evidence gathered:\n"
+                    "[source 1] CrewAI Flows support stateful, router-based orchestration.\n"
+                    "[source 2] Sequential crews run one agent at a time; gather enables parallel.\n"
+                    "Gap: none."
+                ),
+                summary="已收集 2 条证据，无缺口",
+                tools=[{"name": "web_search", "args": {"query": "crewai flows"}, "ok": True, "result": "2 hits"}],
+            ),
+            "web-researcher": FakeStageExecutor.Behavior(
+                delay=1.4,
+                output="[source 1] Web evidence: CrewAI 1.15 supports aexecute_task.",
+                summary="网络证据 1 条",
+                tools=[{"name": "web_search", "args": {"query": "crewai aexecute_task"}, "ok": True, "result": "1 hit"}],
+            ),
+            "kb-researcher": FakeStageExecutor.Behavior(
+                delay=1.1,
+                output="[source 2] KB evidence: internal docs confirm dual-runtime design.",
+                summary="知识库证据 1 条",
+                tools=[{"name": "file_analyze", "args": {"document_id": "demo"}, "ok": True, "result": "doc text"}],
+            ),
+            "coordinator": FakeStageExecutor.Behavior(
+                delay=0.4,
+                output="web line: 'crewai parallel'; kb line: 'dual runtime'",
+                summary="已拆分为网络与知识库两条检索线",
+            ),
+            "analyst": FakeStageExecutor.Behavior(
+                delay=0.9,
+                output=(
+                    "Finding: sufficient=true; conflicts=[]; "
+                    "verified_facts=[flows are stateful, gather enables parallel]; conclusion=ok"
+                ),
+                summary="证据充分，无冲突",
+            ),
+            "writer": FakeStageExecutor.Behavior(
+                delay=0.8,
+                output=(
+                    "CrewAI supports stateful Flows [source 1] and parallel agent "
+                    "execution via gather [source 2]. The dual-runtime design keeps "
+                    "native chat unaffected [source 2]."
+                ),
+                summary="已生成带引用的最终答案",
+            ),
+        }
+
+
+# --------------------------------------------------------------------------- #
+def _extract_raw(output: Any) -> str:
+    """Best-effort: pull a string out of a CrewAI TaskOutput / CrewOutput."""
+    if output is None:
+        return ""
+    for attr in ("raw", "content", "output"):
+        v = getattr(output, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    if isinstance(output, str):
+        return output
+    return str(output)
+
+
+def _summarize(text: str, n: int) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text[:n] + ("…" if len(text) > n else "")

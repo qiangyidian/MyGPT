@@ -25,11 +25,16 @@ from app.api import (
     admin,
     agent_runs,
     auth,
+    background_tasks,
     chat,
+    chat_attachments,
     conversations,
     documents,
     knowledge_bases,
+    memories,
+    messages,
     models as models_api,
+    projects,
     retrieval,
     tools,
 )
@@ -45,7 +50,13 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging("DEBUG" if settings.is_dev else "INFO")
     await init_db(app)
-    yield
+    # Start the cross-worker approval signal subscriber (no-op without Redis).
+    from app.agents.approval_bus import approval_bus
+    await approval_bus.start_subscriber()
+    try:
+        yield
+    finally:
+        await approval_bus.stop()
 
 
 def create_app() -> FastAPI:
@@ -73,6 +84,8 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(conversations.router)
     app.include_router(chat.router)
+    app.include_router(chat_attachments.router)
+    app.include_router(messages.router)
     app.include_router(models_api.router)
     app.include_router(knowledge_bases.router)
     app.include_router(documents.router)
@@ -80,6 +93,9 @@ def create_app() -> FastAPI:
     app.include_router(tools.router)
     app.include_router(admin.router)
     app.include_router(agent_runs.router)
+    app.include_router(projects.router)
+    app.include_router(memories.router)
+    app.include_router(background_tasks.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

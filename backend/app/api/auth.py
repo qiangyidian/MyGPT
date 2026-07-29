@@ -24,6 +24,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db import get_db
+from app.services import audit_service
 from app.models import User
 from app.schemas import (
     LoginRequest,
@@ -69,6 +70,7 @@ async def register(
     await db.commit()
     await db.refresh(user)
 
+    await audit_service.log(actor_id=user.id, action="auth:register", target=f"user:{user.id}")
     return _issue_tokens(user, response)
 
 
@@ -86,6 +88,7 @@ async def login(
     if not user.is_active:
         raise HTTPException(CRED, "Account disabled")
 
+    await audit_service.log(actor_id=user.id, action="auth:login", target=f"user:{user.id}")
     return _issue_tokens(user, response)
 
 
@@ -111,6 +114,11 @@ async def refresh(
     except Exception:
         raise HTTPException(CRED, "Invalid or expired refresh token")
 
+    # Reject tokens that were revoked (logout / already rotated).
+    from app.services import auth_service
+    if not await auth_service.is_refresh_valid(token):
+        raise HTTPException(CRED, "Invalid or expired refresh token")
+
     if payload.get("type") != REFRESH_TOKEN_TYPE:
         raise HTTPException(CRED, "Wrong token type")
 
@@ -124,8 +132,10 @@ async def refresh(
     if not user.is_active:
         raise HTTPException(CRED, "Account disabled")
 
-    # Rotate: mint a brand-new refresh token (overwrites the cookie).
-    new_refresh = create_refresh_token(str(user.id))
+    # Rotate: revoke the consumed token (so it can't be replayed), then mint a
+    # brand-new one carrying a fresh jti (overwrites the cookie).
+    await auth_service.revoke_refresh(token)
+    new_refresh = create_refresh_token(str(user.id), extra={"jti": uuid.uuid4().hex})
     _set_refresh_cookie(response, new_refresh)
 
     access = create_access_token(str(user.id))
@@ -157,26 +167,18 @@ async def logout(
         # Invalid/expired token — nothing to blacklist, but we still clear the cookie.
         return
 
-    # Blacklist the refresh token's jti/exp so it can't be reused.
-    # Implementation note: the in-memory/Redis blacklist store is owned by the token
-    # revocation layer; if unavailable we simply drop the entry. The cookie is cleared
-    # regardless, which is the user-visible effect of logout.
-    jti = payload.get("jti") or payload.get("sub")
-    exp = payload.get("exp")
+    # Blacklist the refresh token (by its jti) so it can't be reused after logout.
+    from app.services import auth_service
     try:
-        from app.core.token_blacklist import blacklist_refresh  # lazy, optional
-
-        if jti is not None:
-            await blacklist_refresh(db, str(jti), exp)
-    except Exception:
-        # Revocation store not present / unreachable — fail open (cookie cleared).
+        await auth_service.revoke_refresh(token)
+    except Exception:  # noqa: BLE001 — revocation store unavailable; cookie still cleared
         pass
 
 
 # ---- helpers ---------------------------------------------------------------
 def _issue_tokens(user: User, response: Response) -> TokenResponse:
     access = create_access_token(str(user.id))
-    refresh_tok = create_refresh_token(str(user.id))
+    refresh_tok = create_refresh_token(str(user.id), extra={"jti": uuid.uuid4().hex})
     _set_refresh_cookie(response, refresh_tok)
     return TokenResponse(
         access_token=access,

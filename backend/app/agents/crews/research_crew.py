@@ -1,4 +1,5 @@
-"""The Researcher -> Analyst -> Writer research crew (Phase 4).
+"""The Researcher -> Analyst -> Writer research flow (Phase 4, refactored for
+real per-agent lifecycle in the multi-agent visualization phase).
 
 Three single-purpose CrewAI agents, each with a strict role so evidence
 provenance is preserved and the Writer can't invent unverified facts:
@@ -10,18 +11,22 @@ provenance is preserved and the Writer can't invent unverified facts:
   * **Writer** — writes the final cited answer from the Analyst's finding.
     No tools, no new facts — it may only use verified evidence.
 
-The handoff between agents is a Pydantic model (``ResearchEvidence``,
-``AnalystFinding``) serialized into the next task's description, so the
-structure is inspectable and the reviewer gate can enforce it.
+:func:`build_research_stages` returns the static graph + a list of
+:class:`~app.agents.crews.stage.StageSpec` (one per agent). The runtime
+executes each spec via ``Agent.aexecute_task`` and feeds prior outputs in as
+the task ``context`` string — so each agent's lifecycle (running/completed) is
+real and the handoff edges fire exactly when the data is available.
 """
 from __future__ import annotations
 
-import json
 import logging
-import uuid
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+from app.agents.crews.stage import StageSpec
+from app.agents.graph import build_deep_research_graph
+from app.agents.graph import AgentGraph
 
 logger = logging.getLogger(__name__)
 
@@ -77,20 +82,111 @@ _WRITER_BACKSTORY = (
 
 
 # --------------------------------------------------------------------------- #
-# Crew builder
+# Stage builder (replaces the old single-Crew builder)
+# --------------------------------------------------------------------------- #
+def build_research_stages(
+    *,
+    llm: Any,
+    tools: list[Any],
+    question: str,
+) -> tuple[AgentGraph, list[StageSpec]]:
+    """Build the sequential Researcher -> Analyst -> Writer flow.
+
+    Returns the static :class:`AgentGraph` (all nodes pending) plus one
+    :class:`StageSpec` per agent. The runtime executes them in order, feeding
+    each prior agent's raw output into the next as the task ``context``.
+    """
+    from crewai import Agent, Task
+
+    researcher = Agent(
+        role="Researcher",
+        goal="Gather sufficient, well-sourced evidence to answer the question.",
+        backstory=_RESEARCHER_BACKSTORY,
+        llm=llm,
+        tools=tools or None,
+        allow_delegation=False,
+        verbose=False,
+    )
+    analyst = Agent(
+        role="Analyst",
+        goal="Verify the evidence, flag conflicts, decide if it's sufficient.",
+        backstory=_ANALYST_BACKSTORY,
+        llm=llm,
+        allow_delegation=False,
+        verbose=False,
+    )
+    writer = Agent(
+        role="Writer",
+        goal="Write the final cited answer from verified evidence only.",
+        backstory=_WRITER_BACKSTORY,
+        llm=llm,
+        allow_delegation=False,
+        verbose=False,
+    )
+
+    research_task = Task(
+        description=(
+            f"Research question: {question}\n\n"
+            "Decompose it into sub-questions, gather evidence with your tools, "
+            "and report: the sub-questions, every evidence item with its source "
+            "and a relevant snippet, and any gaps you couldn't fill."
+        ),
+        expected_output=(
+            "Structured evidence: sub_questions, evidence list "
+            "{source, snippet, note}, and gaps."
+        ),
+        agent=researcher,
+    )
+    analyze_task = Task(
+        description=(
+            "Review the evidence provided in context. Cross-check sources, flag "
+            "conflicting claims (with the positions and their sources), list "
+            "verified facts, note unresolved questions, and state whether the "
+            f"evidence is sufficient to answer the original question: {question}"
+        ),
+        expected_output=(
+            "Structured finding: sufficient (bool), conflicts, verified_facts, "
+            "unresolved, conclusion."
+        ),
+        agent=analyst,
+    )
+    write_task = Task(
+        description=(
+            "Using ONLY the verified facts and approved evidence in context, "
+            f"write the final answer to: {question}\n\n"
+            "Cite each fact with [source N]. Do not add any fact not present in "
+            "the evidence. If insufficient, say so explicitly."
+        ),
+        expected_output="A concise, well-structured, cited final answer.",
+        agent=writer,
+    )
+
+    graph = build_deep_research_graph(question)
+    stages = [
+        StageSpec(agent_id="researcher", agent=researcher, task=research_task, depends_on=[], stage=0),
+        StageSpec(agent_id="analyst", agent=analyst, task=analyze_task, depends_on=["researcher"], stage=1),
+        StageSpec(agent_id="writer", agent=writer, task=write_task, depends_on=["analyst"], stage=2),
+    ]
+    return graph, stages
+
+
+# --------------------------------------------------------------------------- #
+# Back-compat: the old single-Crew builder (still used by tests that assert
+# the three-role structure; the live runtime now uses build_research_stages).
 # --------------------------------------------------------------------------- #
 def build_research_crew(
     *,
     llm: Any,
     tools: list[Any],
     question: str,
-    run_id: uuid.UUID,
+    run_id: Any,
 ) -> Any:
     """Construct the sequential Researcher -> Analyst -> Writer Crew.
 
-    Phase 4 keeps it sequential (no delegation) for traceability. The tasks
-    chain evidence through their descriptions: the Analyst sees the Researcher's
-    output, the Writer sees the Analyst's.
+    .. deprecated::
+       Kept for structural tests. The live multi-agent runtime uses
+       :func:`build_research_stages` + explicit per-stage execution so that
+       agent lifecycle events reflect real execution.
     """
     from crewai import Agent, Crew, Process, Task
 

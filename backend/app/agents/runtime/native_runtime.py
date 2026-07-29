@@ -77,7 +77,14 @@ class NativeChatRuntime:
             ctx.enable_tools
             and (getattr(cfg, "supports_tools", False) or (cfg.provider or "") == "mock")
         )
-        tool_schemas = registry.openai_schemas() if tools_enabled else None
+        # Advertise only the tools the intent route allows (e.g. search mode =>
+        # web_search/http_get only), never the whole registry.
+        tool_names = [t.name for t in registry.list()]
+        route = ctx.extra.get("route")
+        if route is not None:
+            from app.agents.intent_router import filter_tool_names
+            tool_names = list(filter_tool_names(tool_names, route))
+        tool_schemas = registry.openai_schemas(only=tool_names) if tools_enabled else None
 
         options = ChatOptions(
             temperature=cfg.temperature,
@@ -100,6 +107,11 @@ class NativeChatRuntime:
 
         try:
             while True:
+                # Cooperative cancel: /api/agent-runs/{id}/cancel sets this event.
+                ctl = ctx.extra.get("run_control")
+                if ctl is not None and ctl.cancel.is_set():
+                    finish_reason = "cancelled"
+                    break
                 try:
                     guard.enter_step()
                 except BudgetExceeded as exc:
@@ -112,6 +124,10 @@ class NativeChatRuntime:
 
                 try:
                     async for delta in provider.stream_chat(working, options):
+                        ctl = ctx.extra.get("run_control")
+                        if ctl is not None and ctl.cancel.is_set():
+                            finish_reason = "cancelled"
+                            break
                         if delta.content:
                             accumulated.append(delta.content)
                             yield ev_token(delta=delta.content)

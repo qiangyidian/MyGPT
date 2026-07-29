@@ -10,6 +10,24 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+
+# When running on SQLite (dev / demo / tests without the conftest shim), the ORM
+# models use PostgreSQL-only types (UUID, JSONB). Teach SQLite how to render
+# them so ``create_all`` succeeds and dev-on-sqlite works out of the box. These
+# compilers are no-ops on Postgres (they only apply to the sqlite dialect).
+if settings.DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy.dialects.postgresql import JSONB, UUID
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(UUID, "sqlite")
+    def _compile_uuid_sqlite(type_, compiler, **kw):  # noqa: ANN001
+        return "VARCHAR(36)"
+
+    @compiles(JSONB, "sqlite")
+    def _compile_jsonb_sqlite(type_, compiler, **kw):  # noqa: ANN001
+        return "JSON"
+
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,

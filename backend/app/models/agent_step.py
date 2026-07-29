@@ -33,6 +33,14 @@ class AgentStep(Base, TimestampMixin):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     step_type: Mapped[str] = mapped_column(String(32), nullable=False)
     agent_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    # ---- multi-agent attribution (Phase: multi-agent visualization) ----
+    # Stable graph node id this step belongs to (e.g. "researcher"), and the
+    # CrewAI task id when available. Never hidden inside input_redacted.
+    agent_id: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
+    task_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    parent_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     tool_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     input_redacted: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -40,3 +48,6 @@ class AgentStep(Base, TimestampMixin):
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Extra structured metadata (tool args preview, edge id, etc.) — never
+    # secrets; the gateway redacts before persisting.
+    step_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)

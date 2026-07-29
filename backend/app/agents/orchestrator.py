@@ -22,6 +22,7 @@ from typing import AsyncIterator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.runtime.native_runtime import NativeChatRuntime
+from app.agents.run_controls import drop as drop_run_control, get_or_create as get_run_control
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -47,17 +48,22 @@ class ChatOrchestrator:
     # ------------------------------------------------------------------ #
     async def stream(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
         run = await self._create_run(ctx)
-        yield ev_run_started(
-            run_id=run.id,
-            runtime=run.runtime,
-            conversation_id=ctx.conversation.id,
-            message_id=ctx.assistant_msg.id,
-        )
+        # Register cooperative pause/instruction controls for this run.
+        ctx.extra["run_control"] = get_run_control(run.id)
 
+        # Select the runtime BEFORE emitting run_started so the event reports the
+        # real runtime (native vs crewai), not the placeholder "native".
         runtime = self._select_runtime(ctx)
         run.runtime = runtime.name
         run.status = "running"
         await ctx.db.commit()
+
+        yield ev_run_started(
+            run_id=run.id,
+            runtime=runtime.name,
+            conversation_id=ctx.conversation.id,
+            message_id=ctx.assistant_msg.id,
+        )
 
         try:
             async for evt in runtime.stream_turn(ctx):
@@ -71,6 +77,8 @@ class ChatOrchestrator:
             await self._fail_run(ctx.db, run, str(exc))
             yield ev_error(code="internal", message=str(exc))
             return
+        finally:
+            drop_run_control(run.id)
 
     # ------------------------------------------------------------------ #
     def _select_runtime(self, ctx: AgentTurnContext):
@@ -91,7 +99,9 @@ class ChatOrchestrator:
         if not self._crewai_checked:
             self._crewai_checked = True
             settings = get_settings()
-            if not getattr(settings, "CREWAI_ENABLED", False):
+            # Demo mode also activates the CrewAI runtime (with a fake executor),
+            # so the multi-agent panel can run without an external LLM endpoint.
+            if not (getattr(settings, "CREWAI_ENABLED", False) or getattr(settings, "AGENT_DEMO_MODE", False)):
                 self._crewai = None
             else:
                 self._crewai = self._crewai_runtime()
@@ -146,7 +156,12 @@ class ChatOrchestrator:
         run.finished_at = datetime.now(timezone.utc)
         run.output = dict(evt.data)
         if evt.kind == "done":
-            run.status = "completed"
+            # Preserve a user-initiated cancel instead of overwriting it with
+            # "completed" (the runtime emits ev_done with finish_reason=cancelled).
+            if evt.data.get("finish_reason") == "cancelled" or run.status == "cancelled":
+                run.status = "cancelled"
+            else:
+                run.status = "completed"
         else:
             run.status = "failed"
             run.error_message = str(evt.data.get("message", ""))

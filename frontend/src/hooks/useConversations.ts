@@ -8,40 +8,57 @@ export const CONVERSATIONS_QUERY_KEY = ["conversations"] as const;
 export const CONVERSATION_DETAIL_QUERY_KEY = (id: string) =>
   ["conversation", id] as const;
 
+interface ListOpts {
+  archived?: boolean;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}
+
 /**
- * Lists the current user's conversations (summary only, no messages).
- * Caches under CONVERSATIONS_QUERY_KEY and invalidates it on mutations.
+ * Lists the current user's conversations (summary only, no messages). Supports
+ * the archived view and title search; defaults to active conversations,
+ * pinned-first. Mutations invalidate the list cache.
  */
-export function useConversations() {
+export function useConversations(opts: ListOpts = {}) {
   const queryClient = useQueryClient();
+  const { archived, q, limit, offset } = opts;
 
   const list = useQuery<Conversation[]>({
-    queryKey: CONVERSATIONS_QUERY_KEY,
-    queryFn: () => api.listConversations(),
+    queryKey: [...CONVERSATIONS_QUERY_KEY, { archived: !!archived, q: q ?? "", limit: limit ?? 0, offset: offset ?? 0 }],
+    queryFn: () => api.listConversations({ archived, q, limit, offset }),
   });
 
   const createMutation = useMutation({
     mutationFn: (body?: Parameters<typeof api.createConversation>[0]) =>
       api.createConversation(body ?? {}),
-    onSuccess: (conv) => {
-      queryClient.setQueryData<Conversation[]>(CONVERSATIONS_QUERY_KEY, (old) =>
-        old ? [conv, ...old] : [conv]
-      );
+    onSuccess: () => {
+      // The list query is keyed by {archived,q,limit,offset}, so writing to the
+      // base key was a silent no-op; rely on the invalidate to refetch correctly.
+      queryClient.invalidateQueries({ queryKey: CONVERSATIONS_QUERY_KEY });
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.deleteConversation(id),
     onSuccess: (_data, deletedId) => {
-      // Remove from list cache.
-      queryClient.setQueryData<Conversation[]>(
-        CONVERSATIONS_QUERY_KEY,
-        (old) => (old ?? []).filter((c) => c.id !== deletedId)
-      );
-      // Invalidate detail cache for the deleted conversation.
       queryClient.removeQueries({
         queryKey: CONVERSATION_DETAIL_QUERY_KEY(deletedId),
       });
+      queryClient.invalidateQueries({ queryKey: CONVERSATIONS_QUERY_KEY });
+    },
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: (args: { id: string; body: Parameters<typeof api.updateConversation>[1] }) =>
+      api.updateConversation(args.id, args.body),
+    onSuccess: (conv) => {
+      queryClient.setQueryData<Conversation>(
+        CONVERSATION_DETAIL_QUERY_KEY(conv.id),
+        (old) => (old ? { ...old, ...conv } : old)
+      );
+      // Pin/archive changes can reorder the list.
+      queryClient.invalidateQueries({ queryKey: CONVERSATIONS_QUERY_KEY });
     },
   });
 
@@ -57,6 +74,9 @@ export function useConversations() {
     delete: deleteMutation.mutate,
     deleteAsync: deleteMutation.mutateAsync,
     isDeleting: deleteMutation.isPending,
+    update: updateMutation.mutate,
+    updateAsync: updateMutation.mutateAsync,
+    isUpdating: updateMutation.isPending,
   };
 }
 

@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_admin, get_current_user
 from app.db import get_db
-from app.models import User
-from app.schemas import AdminUserUpdate, SystemStatus, UsageStat, UserOut
+from app.models import AuditEvent, User
+from app.schemas import AdminUserUpdate, AuditLogOut, SystemStatus, UsageStat, UserOut
 from app.services import admin_service
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -78,10 +78,28 @@ async def get_status(
     return await admin_service.system_status(db)
 
 
-@router.get("/audit")
+@router.get("/audit", response_model=list[AuditLogOut])
 async def audit_log(
+    limit: int = 200,
     admin: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
-):
-    """Audit log placeholder — returns [] until a dedicated audit table is added."""
-    return []
+) -> list[AuditLogOut]:
+    """Return the most recent audit events (tool calls, approvals, auth)."""
+    rows = (
+        await db.execute(
+            select(AuditEvent)
+            .order_by(AuditEvent.created_at.desc())
+            .limit(max(1, min(limit, 1000)))
+        )
+    ).scalars().all()
+    return [
+        AuditLogOut(
+            id=r.id,
+            actor_id=r.actor_id,
+            action=r.action,
+            target=r.target,
+            detail=r.detail,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]

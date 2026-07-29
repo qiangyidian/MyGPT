@@ -23,8 +23,14 @@ class StorageBackend(ABC):
     """Interface every storage backend implements."""
 
     @abstractmethod
-    async def save(self, upload_file: UploadFile, user_id) -> str:
-        """Persist ``upload_file`` for ``user_id``; return the stored path/key."""
+    async def save(
+        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
+    ) -> str:
+        """Persist ``upload_file`` for ``user_id``; return the stored path/key.
+
+        ``allowed_extensions`` overrides the configured allow-list (used by chat
+        attachments, which accept a broader set than KB uploads, e.g. images).
+        """
 
     @abstractmethod
     def open(self, path: str) -> IO[bytes]:
@@ -59,10 +65,13 @@ class LocalStorage(StorageBackend):
         self.base_dir = Path(base_dir if base_dir is not None else settings.STORAGE_DIR)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-    async def save(self, upload_file: UploadFile, user_id) -> str:
+    async def save(
+        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
+    ) -> str:
         settings = get_settings()
         ext = self._safe_suffix(upload_file.filename or "")
-        if ext and ext not in settings.allowed_extensions:
+        allow = allowed_extensions if allowed_extensions is not None else settings.allowed_extensions
+        if ext and ext not in allow:
             # Let callers decide policy; here we reject disallowed types up front.
             raise ValueError(f"File type {ext or '(none)'} is not allowed")
 
@@ -110,7 +119,9 @@ class MinioStorage(StorageBackend):
         self.endpoint = settings.MINIO_ENDPOINT
         self.bucket = settings.MINIO_BUCKET
 
-    async def save(self, upload_file: UploadFile, user_id) -> str:
+    async def save(
+        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
+    ) -> str:
         raise NotImplementedError("MinIO storage backend is not implemented yet; use 'local'")
 
     def open(self, path: str) -> IO[bytes]:
