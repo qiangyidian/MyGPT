@@ -5,7 +5,8 @@
 // running state uses a restrained pulse (respects prefers-reduced-motion via
 // the .reduce-motion utility in globals.css).
 
-import { Wrench } from "lucide-react";
+import { useState } from "react";
+import { ChevronDown, Wrench } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { AgentGraphNode } from "@/lib/agent-graph-types";
@@ -39,7 +40,9 @@ export function AgentNodeCard({
   now?: number;
   className?: string;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const running = node.status === "running";
+  const hasDetail = !!(node.taskSummary || node.outputSummary || node.error);
   // Live duration while running: startedAt -> now; else stored durationMs.
   let durationLabel = "";
   if (node.status === "running" && node.startedAt) {
@@ -101,12 +104,26 @@ export function AgentNodeCard({
         )}
       </div>
 
-      {node.status === "failed" && node.error && (
-        <div className="mt-1.5 line-clamp-2 text-[11px] text-destructive">{node.error}</div>
+      {hasDetail && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1.5 inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+          aria-expanded={expanded}
+        >
+          <ChevronDown className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")} />
+          {expanded ? "收起" : "详情"}
+        </button>
       )}
-      {node.status === "completed" && node.outputSummary && (
-        <div className="mt-1.5 line-clamp-2 text-[11px] text-muted-foreground">
-          {node.outputSummary}
+      {expanded && (
+        <div className="mt-1.5 space-y-1 text-[11px]">
+          {node.taskSummary && (
+            <div className="text-muted-foreground">{node.taskSummary}</div>
+          )}
+          {node.error && <div className="break-words text-destructive">{node.error}</div>}
+          {node.outputSummary && (
+            <div className="break-words text-muted-foreground">{node.outputSummary}</div>
+          )}
         </div>
       )}
     </div>

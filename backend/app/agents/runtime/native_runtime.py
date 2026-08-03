@@ -23,20 +23,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from app.agents.approval_coordinator import approval_coordinator
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies import BudgetExceeded, BudgetGuard
+from app.agents.graph import build_single_agent_graph
 from app.agents.planning import build_plan, classify_intent
 from app.agents.runtime.stage_executor import safe_positive_int
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
+    ev_agent_graph,
+    ev_agent_status,
     ev_approval_required,
     ev_done,
     ev_error,
     ev_plan_created,
+    ev_run_status,
+    ev_step_completed,
+    ev_step_started,
     ev_token,
     ev_tool_call,
     ev_tool_result,
@@ -95,23 +102,46 @@ class NativeChatRuntime:
             tool_choice="auto",
         )
 
+        # Scope C: surface even single-agent native turns in the agent panel.
+        # One 'assistant' node runs for the whole turn; plan/answer are phases.
+        _graph = build_single_agent_graph(ctx.user_content)
+        _graph.run_id = str(ctx.run_id)
+        _assistant_started = _now_iso()
+        _node_terminal = "completed"
+        yield ev_agent_graph(run_id=ctx.run_id, graph=_graph.to_public_dict())
+        yield ev_agent_status(
+            run_id=ctx.run_id, agent_id="assistant", status="running",
+            started_at=_assistant_started, task_title="理解问题并生成回答",
+        )
+        yield ev_run_status(
+            run_id=ctx.run_id, status="running", current_agent_ids=["assistant"],
+        )
+
         # Agent mode: classify intent + publish a short structured plan. The
         # plan is shown to the user (plan_created) instead of raw chain-of-thought.
         if ctx.enable_tools:
+            yield ev_step_started(
+                step_id="plan", title="理解问题与规划", step_type="llm", agent="assistant",
+            )
             intent = classify_intent(ctx.user_content)
             ctx.extra["intent"] = intent
             plan_summary, plan_steps = build_plan(intent, ctx.user_content)
             yield ev_plan_created(summary=plan_summary, steps=plan_steps)
+            yield ev_step_completed(step_id="plan")
 
         working: list[dict[str, Any]] = list(ctx.messages)
         finish_reason = "stop"
 
+        yield ev_step_started(
+            step_id="answer", title="生成回答", step_type="llm", agent="assistant",
+        )
         try:
             while True:
                 # Cooperative cancel: /api/agent-runs/{id}/cancel sets this event.
                 ctl = ctx.extra.get("run_control")
                 if ctl is not None and ctl.cancel.is_set():
                     finish_reason = "cancelled"
+                    _node_terminal = "cancelled"
                     break
                 try:
                     guard.enter_step()
@@ -128,6 +158,7 @@ class NativeChatRuntime:
                         ctl = ctx.extra.get("run_control")
                         if ctl is not None and ctl.cancel.is_set():
                             finish_reason = "cancelled"
+                            _node_terminal = "cancelled"
                             break
                         if delta.content:
                             accumulated.append(delta.content)
@@ -145,6 +176,9 @@ class NativeChatRuntime:
                     yield ev_error(
                         code=getattr(exc, "code", "provider_error"), message=str(exc)
                     )
+                    _node_terminal = "failed"
+                    for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
+                        yield _evt
                     return
 
                 # Fold this round's streamed text into the assistant message so a
@@ -182,7 +216,8 @@ class NativeChatRuntime:
                         parsed_calls.append((tc, args))
                         dangerous = _is_dangerous(registry, tc.name)
                         yield ev_tool_call(
-                            id=tc.id, name=tc.name, arguments=args, dangerous=dangerous
+                            id=tc.id, name=tc.name, arguments=args, dangerous=dangerous,
+                            agent_id="assistant",
                         )
 
                     working.append(assistant_turn)
@@ -204,6 +239,7 @@ class NativeChatRuntime:
                             yield ev_tool_result(
                                 id=tc.id, name=tc.name, ok=False,
                                 result=None, error=f"budget exceeded: {exc.reason}",
+                                agent_id="assistant",
                             )
                             continue
 
@@ -254,6 +290,7 @@ class NativeChatRuntime:
                                 yield ev_tool_result(
                                     id=tc.id, name=tc.name, ok=False,
                                     result=None, error=reason,
+                                    agent_id="assistant",
                                 )
                                 working.append({
                                     "role": "tool",
@@ -267,6 +304,7 @@ class NativeChatRuntime:
                                 yield ev_tool_result(
                                     id=tc.id, name=tc.name, ok=False,
                                     result=None, error="approval timed out",
+                                    agent_id="assistant",
                                 )
                                 working.append({
                                     "role": "tool",
@@ -282,6 +320,7 @@ class NativeChatRuntime:
                             ok=execution.ok,
                             result=execution.result.get("content") if execution.ok and isinstance(execution.result, dict) else execution.result,
                             error=execution.error,
+                            agent_id="assistant",
                         )
                         working.append(execution.to_openai_tool_message())
 
@@ -293,14 +332,20 @@ class NativeChatRuntime:
                 break
         except ProviderError as exc:
             yield ev_error(code="provider_error", message=str(exc))
+            for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
+                yield _evt
             return
         except Exception as exc:  # noqa: BLE001 — never let the stream die silently
             logger.exception("unexpected error in native run: %s", exc)
             yield ev_error(code="internal", message="Internal error during generation")
+            for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
+                yield _evt
             return
 
         ctx.extra["finish_reason"] = finish_reason
         ctx.extra["budget"] = guard.snapshot()
+        for _evt in _native_terminal_events(ctx, _node_terminal, _assistant_started):
+            yield _evt
         yield ev_done(message_id=assistant_msg.id, finish_reason=finish_reason)
 
     @staticmethod
@@ -339,3 +384,35 @@ def _approval_summary(tool_name: str, args: dict[str, Any]) -> str:
     from app.agents.policies import risk_summary
 
     return risk_summary(tool_name, args)
+
+
+def _now_iso() -> str:
+    """UTC now as an ISO-8601 string (for started_at / finished_at fields)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _elapsed_ms(start_iso: str) -> int:
+    """Whole-ms between ``start_iso`` and now; 0 if unparseable."""
+    try:
+        start = datetime.fromisoformat(start_iso)
+        return max(0, int((datetime.now(timezone.utc) - start).total_seconds() * 1000))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _native_terminal_events(ctx: AgentTurnContext, status: str, started_iso: str):
+    """Yield the answer-step completion + node/run terminal status events.
+
+    Single source for every exit point of :meth:`NativeChatRuntime.stream_turn`
+    (normal done, cancel, budget, mid-stream/outer/generic errors). Iterated
+    with ``for _evt in ...: yield _evt`` because ``yield from`` is illegal in
+    an async generator.
+    """
+    yield ev_step_completed(
+        step_id="answer", status="done" if status == "completed" else "error",
+    )
+    yield ev_agent_status(
+        run_id=ctx.run_id, agent_id="assistant", status=status,
+        finished_at=_now_iso(), duration_ms=_elapsed_ms(started_iso),
+    )
+    yield ev_run_status(run_id=ctx.run_id, status=status, current_agent_ids=[])

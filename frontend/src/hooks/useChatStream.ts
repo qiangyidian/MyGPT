@@ -311,6 +311,16 @@ export function useChatStream(): ChatStreamState {
           setCurrentRunId(e.runId);
           useAgentRunStore.getState().setActiveRun(e.runId);
           useAgentRunStore.getState().dispatch({ type: "GRAPH_INITIALIZED", runId: e.runId, graph: g });
+          // Auto-open the Execution tab ONLY for genuine multi-agent crews
+          // (≥2 nodes). Single-agent (native) turns surface via the trigger pill
+          // + inline bubble status instead of a forced panel pop — opening the
+          // panel on every plain message would be noisy. Respect a user close.
+          if (
+            g.nodes.length >= 2 &&
+            !useContextPanelStore.getState().isSuppressed(e.runId)
+          ) {
+            useContextPanelStore.getState().openWith("execution");
+          }
         },
         onAgentStatus: (e) => {
           useAgentRunStore.getState().dispatch({

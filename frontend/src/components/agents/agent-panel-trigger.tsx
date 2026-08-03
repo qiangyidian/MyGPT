@@ -1,11 +1,15 @@
 "use client";
 
-// The multi-agent panel trigger, shown at the top-right of the chat area.
-// Visible whenever there's an active multi-agent run (≥2 nodes), even if the
-// panel was dismissed (so the user can reopen it, including for finished runs).
-// A pulsing dot appears when ≥1 agent is running; the label shows running count.
+// The agent-panel trigger pill, shown at the top of the chat area.
+//
+// Visible whenever there's an active agent run worth looking at: a genuine
+// multi-agent crew (≥2 nodes — even when finished, so it can be reopened), or a
+// single-agent (native) turn while it's still running. A pulsing dot appears
+// while ≥1 agent is running; the label distinguishes multi-agent vs the
+// single assistant. Clicking toggles the right-side Context Panel onto the
+// Execution tab (shares the panel store with ContextPanelTrigger).
 
-import { AlertTriangle, UsersRound } from "lucide-react";
+import { AlertTriangle, Bot, UsersRound } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -16,24 +20,27 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
+  isRunFinished,
+  selectHasAgentRun,
+  selectIsMultiAgent,
+  selectRunningCount,
   selectRuntimeFallback,
-  selectShouldShowPanel,
   useAgentRunStore,
 } from "@/stores/agent-run-store";
+import { useContextPanelStore } from "@/stores/context-panel-store";
 
 export function AgentPanelTrigger({ className }: { className?: string }) {
   const active = useAgentRunStore((s) => s.active);
-  const open = selectShouldShowPanel(useAgentRunStore.getState());
-  const fallback = selectRuntimeFallback(useAgentRunStore.getState());
-  const dismissActive = useAgentRunStore((s) => s.dismissActive);
-  const reopenActive = useAgentRunStore((s) => s.reopenActive);
+  const fallback = useAgentRunStore(selectRuntimeFallback);
+  const hasRun = useAgentRunStore(selectHasAgentRun);
+  const multi = useAgentRunStore(selectIsMultiAgent);
+  const running = useAgentRunStore(selectRunningCount);
+  const finished = isRunFinished(active);
+  const panelOpen = useContextPanelStore((s) => s.open);
+  const openWith = useContextPanelStore((s) => s.openWith);
+  const close = useContextPanelStore((s) => s.close);
 
-  const total = active.nodes.length;
-  const running = active.activeAgentIds.length;
-  const multi = total >= 2;
-
-  // Fallback: a multi-agent request couldn't run for real. Show a warning badge
-  // (NOT a fake agent panel — there are no nodes) so the user knows.
+  // Fallback: a multi-agent request couldn't run for real — warn, don't fake.
   if (fallback) {
     return (
       <TooltipProvider delayDuration={300}>
@@ -63,10 +70,17 @@ export function AgentPanelTrigger({ className }: { className?: string }) {
     );
   }
 
-  if (!multi) return null;
+  // Show for any viewable run: multi-agent (even finished) or a running single.
+  const show = hasRun && (multi || !finished);
+  if (!show) return null;
 
-  const label =
-    running > 0 ? `${running} 个运行中` : `${total} 个 Agent`;
+  const total = active.nodes.length;
+  const label = multi
+    ? running > 0
+      ? `多 Agent · ${running} 运行中`
+      : `多 Agent · ${total} 个`
+    : "助手 · 运行中";
+  const Icon = multi ? UsersRound : Bot;
 
   return (
     <TooltipProvider delayDuration={300}>
@@ -74,16 +88,14 @@ export function AgentPanelTrigger({ className }: { className?: string }) {
         <TooltipTrigger asChild>
           <Button
             type="button"
-            variant={open ? "default" : "outline"}
+            variant={panelOpen ? "default" : "outline"}
             size="sm"
-            aria-label={`多 Agent 协作：${total} 个 Agent${
-              running > 0 ? `，${running} 个运行中` : ""
-            }。${open ? "点击关闭面板" : "点击打开面板"}`}
-            aria-pressed={open}
-            onClick={() => (open ? dismissActive() : reopenActive())}
+            aria-label={`${label}。${panelOpen ? "点击关闭面板" : "点击查看执行过程"}`}
+            aria-pressed={panelOpen}
+            onClick={() => (panelOpen ? close(active.runId) : openWith("execution"))}
             className={cn("h-8 gap-1.5 text-xs font-medium", className)}
           >
-            <UsersRound className="h-4 w-4" />
+            <Icon className="h-4 w-4" />
             <span>{label}</span>
             {running > 0 && (
               <span className="relative ml-0.5 flex h-2 w-2">
@@ -94,7 +106,7 @@ export function AgentPanelTrigger({ className }: { className?: string }) {
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          {open ? "关闭多 Agent 面板" : "查看多 Agent 执行过程"}
+          {panelOpen ? "关闭执行面板" : "查看执行过程"}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

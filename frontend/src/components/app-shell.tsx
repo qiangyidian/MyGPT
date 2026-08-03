@@ -7,6 +7,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Sidebar } from "@/components/sidebar";
+import { AgentGlobalProgress } from "@/components/agents/agent-global-progress";
 import { useAuth } from "@/hooks/useAuth";
 import { useConversationDetail, useConversations } from "@/hooks/useConversations";
 import { useProjects } from "@/hooks/useProjects";
@@ -264,6 +265,8 @@ export function AppShell({ children }: AppShellProps) {
 
         {children({ activeConversationId: activeId, setActiveConversationId })}
       </div>
+
+      <AgentGlobalProgress />
     </div>
   );
 }

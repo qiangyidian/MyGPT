@@ -112,6 +112,29 @@ export const useAgentRunStore = create<AgentRunStoreState>((set, get) => ({
 }));
 
 // ---- selectors ---------------------------------------------------------------
+/** True if there is an active agent run with ≥1 node (multi OR single-agent).
+ *  Scope C: native single-agent turns also surface — drives the trigger pill
+ *  and inline status, so users perceive "an agent is working" on every turn. */
+export function selectHasAgentRun(state: AgentRunStoreState): boolean {
+  const { active, dismissedRunIds } = state;
+  if (!active.runId) return false;
+  if (active.nodes.length < 1) return false;
+  // A finished+dismissed run hides the pill; a dismissed-but-running run stays
+  // visible so the user can reopen it.
+  if (dismissedRunIds.has(active.runId) && isRunFinished(active)) return false;
+  return true;
+}
+
+/** True if the active run is a genuine multi-agent crew (≥2 nodes). */
+export function selectIsMultiAgent(state: AgentRunStoreState): boolean {
+  return state.active.nodes.length >= 2;
+}
+
+/** Number of agents currently running in the active graph. */
+export function selectRunningCount(state: AgentRunStoreState): number {
+  return state.active.activeAgentIds.length;
+}
+
 /** True if the active run is a multi-agent run (≥2 nodes) and not dismissed. */
 export function selectShouldShowPanel(state: AgentRunStoreState): boolean {
   const { active, dismissedRunIds } = state;

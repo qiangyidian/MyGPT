@@ -44,6 +44,7 @@ export function AgentRunHeader({
   const meta = RUN_STATUS_META[graph.status] ?? RUN_STATUS_META.pending;
   const running = graph.activeAgentIds.length;
   const total = graph.nodes.length;
+  const multi = total >= 2;
   const flowLabel = flowNameLabel(graph.flowName);
 
   return (
@@ -51,13 +52,17 @@ export function AgentRunHeader({
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <h2 className="truncate text-sm font-semibold text-foreground">
-            多 Agent 协作
+            {multi ? "多 Agent 协作" : "智能助手"}
           </h2>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
             <span className="truncate">{flowLabel}</span>
             <span aria-hidden>·</span>
             <span className="inline-flex items-center gap-0.5">
-              <Cpu className="h-3 w-3" /> {graph.runtime === "crewai" ? "CrewAI" : graph.runtime}
+              <Cpu className="h-3 w-3" /> {runtimeLabel(graph.runtime)}
+            </span>
+            <span aria-hidden>·</span>
+            <span className="inline-flex items-center gap-0.5 rounded bg-muted/60 px-1 py-px font-medium text-foreground/80">
+              {modeLabel(graph.mode)}
             </span>
           </div>
         </div>
@@ -97,6 +102,23 @@ function flowNameLabel(flow: string): string {
   const map: Record<string, string> = {
     deep_research: "深度研究",
     parallel_research: "并行研究",
+    debate: "辩论",
+    single_agent: "单 Agent 对话",
   };
   return map[flow] ?? flow ?? "";
+}
+
+function runtimeLabel(runtime: string): string {
+  if (runtime === "crewai") return "CrewAI";
+  if (runtime === "native") return "原生";
+  return runtime;
+}
+
+function modeLabel(mode: AgentGraphState["mode"]): string {
+  const map: Record<AgentGraphState["mode"], string> = {
+    sequential: "顺序",
+    parallel: "并行",
+    hybrid: "混合",
+  };
+  return map[mode] ?? mode;
 }

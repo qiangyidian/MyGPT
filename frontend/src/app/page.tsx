@@ -11,6 +11,7 @@ import { Composer } from "@/components/composer";
 import { ApprovalCard } from "@/components/approval-card";
 import { ContextPanel } from "@/components/context/context-panel";
 import { ContextPanelTrigger } from "@/components/context/context-panel-trigger";
+import { AgentPanelTrigger } from "@/components/agents/agent-panel-trigger";
 import { useConversationDetail, useConversations } from "@/hooks/useConversations";
 import { useChatStream } from "@/hooks/useChatStream";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
@@ -136,6 +137,21 @@ function ChatPanel({
     }
   }, [runStatus]);
 
+  // Multi-agent completion: a light confirmation toast (the panel + trigger
+  // already reflect status; this is the gentle "it's done" nudge). Fires once
+  // per run.
+  const lastToastRunRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (runStatus !== "completed") return;
+    const st = useAgentRunStore.getState();
+    const runId = st.active.runId;
+    if (!runId || lastToastRunRef.current === runId) return;
+    if (st.active.nodes.length >= 2) {
+      lastToastRunRef.current = runId;
+      toast.success(`多 Agent 协作完成 · ${st.active.nodes.length} 个 Agent`);
+    }
+  }, [runStatus]);
+
   const ensureConversationId = useCallback(async () => {
     const conv = await createConversation({});
     setActiveConversationId(conv.id);
@@ -197,7 +213,8 @@ function ChatPanel({
   return (
     <div className="flex min-h-0 flex-1">
       <main className="flex min-w-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-center justify-end px-4 py-2">
+        <div className="flex shrink-0 items-center justify-end gap-2 px-4 py-2">
+          <AgentPanelTrigger />
           <ContextPanelTrigger
             conversationId={activeConversationId}
             hasPendingApproval={chat.pendingApprovals.length > 0}

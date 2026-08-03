@@ -272,6 +272,31 @@ def build_debate_graph(side_a: str, side_b: str) -> AgentGraph:
     )
 
 
+def build_single_agent_graph(question: str = "") -> AgentGraph:
+    """Single-node graph for the native runtime.
+
+    Scope C: even single-agent turns (auto/search/create/data_analysis/chat, and
+    every crewai fallback) surface in the agent panel. One ``assistant`` node at
+    stage 0; ``runtime="native"`` so the UI can label it distinctly from crews.
+    """
+    return AgentGraph(
+        run_id="",
+        runtime="native",
+        flow_name="single_agent",
+        mode=GraphMode.sequential,
+        status="pending",
+        nodes=[
+            AgentGraphNode(
+                id="assistant", name="助手", role="智能助手",
+                task_title="理解问题并生成回答",
+                task_summary="单 agent 模式：模型与工具循环",
+                stage=0, lane=0,
+            ),
+        ],
+        edges=[],
+    )
+
+
 def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
     """Pick the topology by agent_profile / intent."""
     if profile == "parallel_research":

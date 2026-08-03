@@ -146,3 +146,7 @@ $RECYCLE.BIN/
 *.bak
 *.tmp
 .ipynb_checkpoints/
+
+# ---- Brainstorming / visual companion ---------------------------------------
+# Superpowers brainstorm mockups are session-local scratch; do not commit.
+.superpowers/

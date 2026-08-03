@@ -125,23 +125,39 @@ export function AgentFlowGraph({
       </svg>
 
       {/* Node layers */}
-      <div className="relative space-y-[ROW_GAP]" style={{ ["--ROW_GAP" as string]: `${ROW_GAP}px` }}>
-        {stages.map((row, i) => (
-          <div
-            key={i}
-            className={cn(
-              "flex flex-wrap justify-center gap-[COL_GAP]",
-              row.length > 1 ? "gap-x-4" : ""
-            )}
-            style={{ gap: `${COL_GAP}px`, marginBottom: `${ROW_GAP}px` }}
-          >
-            {row.map((node) => (
-              <div key={node.id} data-node-id={node.id} style={{ width: NODE_W }}>
-                <AgentNodeCard node={node} now={now} />
+      <div className="relative">
+        {stages.map((row, i) => {
+          const parallel = row.length > 1;
+          return (
+            <div key={i} style={{ marginBottom: `${ROW_GAP}px` }}>
+              {parallel && (
+                <div className="mb-1 flex justify-center">
+                  <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
+                    </span>
+                    {row.length} 并行
+                  </span>
+                </div>
+              )}
+              <div
+                className={cn(
+                  "flex flex-wrap justify-center",
+                  parallel &&
+                    "rounded-lg border border-dashed border-primary/40 bg-primary/5 p-2"
+                )}
+                style={{ gap: `${COL_GAP}px` }}
+              >
+                {row.map((node) => (
+                  <div key={node.id} data-node-id={node.id} style={{ width: NODE_W }}>
+                    <AgentNodeCard node={node} now={now} />
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -158,6 +174,3 @@ function groupByStage(nodes: AgentGraphNode[]): AgentGraphNode[][] {
     .sort((a, b) => a - b)
     .map((stage) => byStage.get(stage)!.sort((a, b) => (a.lane ?? 0) - (b.lane ?? 0)));
 }
-
-// Keep ROW_GAP referenced for the CSS var (avoids dead-code lint).
-void ROW_GAP;

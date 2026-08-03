@@ -27,6 +27,7 @@ import { Citations } from "@/components/citations";
 import { ResearchSteps } from "@/components/research-steps";
 import { AttachmentList } from "@/components/attachments/attachment-list";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
+import { AgentInlineStatus } from "@/components/agents/agent-inline-status";
 import { useMessageFeedback } from "@/hooks/useMessageActions";
 import type {
   AgentStep,
@@ -339,12 +340,7 @@ export const MessageBubble = memo(function MessageBubble({
                 )}
               </div>
             ) : (
-              isStreaming && (
-                <span className="inline-flex items-center gap-1 text-sm text-muted-foreground" aria-live="polite">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
-                  思考中…
-                </span>
-              )
+              isStreaming && <AgentInlineStatus />
             )}
           </div>
         )}

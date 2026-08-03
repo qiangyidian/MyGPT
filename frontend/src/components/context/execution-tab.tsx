@@ -9,29 +9,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { AgentFlowGraph } from "@/components/agents/agent-flow-graph";
 import { AgentActivityFeed } from "@/components/agents/agent-activity-feed";
+import { AgentRunHeader } from "@/components/agents/agent-run-header";
 import { useAgentRunStore } from "@/stores/agent-run-store";
 
-const STATUS_LABEL: Record<string, string> = {
-  pending: "等待中",
-  running: "运行中",
-  waiting_approval: "等待确认",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const STATUS_DOT: Record<string, string> = {
-  running: "bg-primary",
-  waiting_approval: "bg-amber-500",
-  completed: "bg-green-500",
-  failed: "bg-destructive",
-  cancelled: "bg-muted-foreground",
-  pending: "bg-muted-foreground",
-};
-
 /**
- * The Execution tab: real multi-agent lifecycle (graph + activity) sourced
- * entirely from the backend-driven agent-run-store — no frontend simulation.
+ * The Execution tab: real agent lifecycle (graph + activity) sourced entirely
+ * from the backend-driven agent-run-store — no frontend simulation. Works for
+ * both multi-agent crews and single-agent (native) turns (scope C).
  */
 export function ExecutionTab() {
   const active = useAgentRunStore((s) => s.active);
@@ -43,23 +27,14 @@ export function ExecutionTab() {
     return (
       <div className="flex flex-col items-center justify-center gap-2 py-12 text-center text-xs text-muted-foreground">
         <Network className="h-5 w-5" />
-        <span>暂无执行过程。深度研究运行后，这里会展示实时链路。</span>
+        <span>暂无执行过程。发起深度研究 / 辩论，或发送任意消息，这里会展示 Agent 实时链路。</span>
       </div>
     );
   }
 
-  const running = active.activeAgentIds.length;
-  const total = active.nodes.length;
-
   return (
     <ScrollArea className="h-full">
-      <div className="flex items-center justify-between px-3 py-2">
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span className={cn("h-2 w-2 rounded-full", STATUS_DOT[active.status] ?? "bg-muted-foreground")} />
-          <span>{STATUS_LABEL[active.status] ?? active.status}</span>
-          <span>· {running > 0 ? `${running} / ${total} 进行中` : `${total} 个步骤`}</span>
-        </div>
-      </div>
+      <AgentRunHeader graph={active} now={now} />
       <div className="px-3 pb-3">
         <AgentFlowGraph nodes={active.nodes} edges={active.edges} now={now} />
         <div className="mt-4">
@@ -112,7 +87,7 @@ function ToolCallAudit({ runId }: { runId: string }) {
             <li key={c.id} className="rounded-md border border-border bg-card p-2 text-[11px]">
               <div className="flex items-center justify-between">
                 <span className="font-medium">{c.tool_name}</span>
-                <span className={cn("text-[10px]", c.status === "success" ? "text-green-600" : "text-destructive")}>
+                <span className={cn(c.status === "success" ? "text-green-600" : "text-destructive")}>
                   {c.status}
                 </span>
               </div>
