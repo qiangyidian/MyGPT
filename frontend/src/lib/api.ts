@@ -23,6 +23,8 @@ import {
   User,
 } from "./types";
 import { getAccessToken, setAccessToken } from "./auth";
+import { parseSSEStream } from "./sse-parser";
+import type { FinishReason } from "./types";
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
@@ -319,6 +321,18 @@ export const projectsApi = {
 export interface ChatStreamHandlers {
   onMeta?: (conversationId: string, messageId: string) => void;
   onRunStarted?: (e: { runId: string; runtime: string; conversationId: string; messageId: string }) => void;
+  onRuntimeSelected?: (e: {
+    runId: string;
+    requestedMode: string;
+    effectiveMode: string;
+    requestedRuntime: string;
+    effectiveRuntime: string;
+    agentProfile: string;
+    multiAgentRequested: boolean;
+    multiAgentExecuted: boolean;
+    fallbackReason: string | null;
+    isDemo: boolean;
+  }) => void;
   onPlanCreated?: (e: { summary: string; steps: { id: string; title: string }[] }) => void;
   onStepStarted?: (e: { stepId: string; title: string; type: string; agent?: string }) => void;
   onStepCompleted?: (e: { stepId: string; status: string }) => void;
@@ -346,7 +360,7 @@ export interface ChatStreamHandlers {
   onRunInstructionReceived?: (e: { runId: string; instruction: string; acknowledged: boolean }) => void;
   onRunPaused?: (e: { runId: string; reason: string; pausedAt?: string }) => void;
   onRunResumed?: (e: { runId: string; resumedAt?: string }) => void;
-  onDone?: (e: { messageId: string; finishReason: string }) => void;
+  onDone?: (e: { messageId: string; finishReason: FinishReason }) => void;
   onError?: (e: { code: string; message: string }) => void;
 }
 
@@ -384,13 +398,8 @@ export async function streamChat(
     return;
   }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let curEvent = "message";
-
   let terminated = false;
-  const dispatch = (dataStr: string) => {
+  const dispatch = (eventName: string, dataStr: string) => {
     if (!dataStr) return;
     let data: any;
     try {
@@ -399,7 +408,7 @@ export async function streamChat(
       return; // malformed JSON payload — drop this one event only
     }
     try {
-      switch (curEvent) {
+      switch (eventName) {
         case "meta":
           handlers.onMeta?.(data.conversation_id, data.message_id);
           break;
@@ -409,6 +418,20 @@ export async function streamChat(
             runtime: data.runtime,
             conversationId: data.conversation_id,
             messageId: data.message_id,
+          });
+          break;
+        case "runtime_selected":
+          handlers.onRuntimeSelected?.({
+            runId: data.run_id,
+            requestedMode: data.requested_mode,
+            effectiveMode: data.effective_mode,
+            requestedRuntime: data.requested_runtime,
+            effectiveRuntime: data.effective_runtime,
+            agentProfile: data.agent_profile,
+            multiAgentRequested: !!data.multi_agent_requested,
+            multiAgentExecuted: !!data.multi_agent_executed,
+            fallbackReason: data.fallback_reason ?? null,
+            isDemo: !!data.is_demo,
           });
           break;
         case "plan_created":
@@ -518,38 +541,22 @@ export async function streamChat(
     } catch (err) {
       // Surface handler bugs to the console instead of silently masking them as
       // a "malformed chunk"; the stream continues past a single bad event.
-      console.error("[streamChat] handler error for event", curEvent, err);
+      console.error("[streamChat] handler error for event", eventName, err);
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    let dataLines: string[] = [];
-    for (const raw of lines) {
-      const line = raw.trimEnd();
-      if (line === "") {
-        if (dataLines.length) dispatch(dataLines.join("\n"));
-        dataLines = [];
-        curEvent = "message";
-        continue;
-      }
-      if (line.startsWith(":")) continue; // comment / keepalive
-      if (line.startsWith("event:")) {
-        curEvent = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trim());
-      }
-    }
+  // Robust SSE framing: the parser keeps its buffer/event/data accumulators
+  // ACROSS network chunks (the old code re-declared `dataLines` inside the read
+  // loop, so any event split across two chunks was silently dropped — the cause
+  // of random missing tokens / lost `done`). Abort returns cleanly (not a throw).
+  for await (const frame of parseSSEStream(res.body, signal)) {
+    dispatch(frame.event || "message", frame.data);
+    if (terminated) break;
   }
-  if (buffer.trim()) dispatch(buffer.trim());
-  // If the socket closed without a terminal done/error frame (proxy absolute
-  // timeout, backend restart mid-run), surface it — otherwise the caller's
-  // finally would silently erase the partial reply with no error shown.
-  if (!terminated) {
+  // If the socket closed without a terminal done/error frame (and the user did
+  // NOT abort), surface a disconnect — otherwise the caller's finally would
+  // silently erase the partial reply with no error shown.
+  if (!terminated && !signal?.aborted) {
     handlers.onError?.({ code: "stream_disconnected", message: "连接已中断，请重试" });
   }
 }

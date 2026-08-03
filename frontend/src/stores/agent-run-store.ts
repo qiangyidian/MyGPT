@@ -12,6 +12,7 @@
 import { create } from "zustand";
 import {
   AgentGraphState,
+  RuntimeSelection,
 } from "@/lib/agent-graph-types";
 import {
   AgentGraphAction,
@@ -41,6 +42,8 @@ interface AgentRunStoreState {
   reopenActive: () => void;
   /** Clear the active run (e.g. on new chat). */
   resetActive: () => void;
+  /** Record the explicit runtime selection (runtime_selected SSE). */
+  setRuntimeSelection: (sel: { runId: string } & RuntimeSelection) => void;
   /** Shared clock tick — called once per second by the panel while mounted. */
   tick: () => void;
 }
@@ -93,6 +96,18 @@ export const useAgentRunStore = create<AgentRunStoreState>((set, get) => ({
 
   resetActive: () => set({ active: emptyGraph() }),
 
+  setRuntimeSelection: (sel) =>
+    set((s) => {
+      // Attach to the active run; if a different run is selected, make it active
+      // (it arrives right after run_started, before any graph event).
+      const base =
+        s.active.runId === sel.runId
+          ? s.active
+          : { ...emptyGraph(), runId: sel.runId };
+      const next: AgentGraphState = { ...base, selection: sel };
+      return { active: next };
+    }),
+
   tick: () => set((s) => ({ clock: s.clock + 1 })),
 }));
 
@@ -110,6 +125,21 @@ export function selectShouldShowPanel(state: AgentRunStoreState): boolean {
 
 export function isRunFinished(g: AgentGraphState): boolean {
   return ["completed", "failed", "cancelled"].includes(g.status);
+}
+
+/** True when a multi-agent request fell back to native (no real multi-agent).
+ *  The UI shows a warning banner instead of opening a fake agent panel. */
+export function selectRuntimeFallback(state: AgentRunStoreState): RuntimeSelection | null {
+  const sel = state.active.selection;
+  if (!sel) return null;
+  return sel.multiAgentRequested && !sel.multiAgentExecuted ? sel : null;
+}
+
+/** True when the active run's answer came from the deterministic demo executor
+ *  (canned, non-real content). The UI MUST render a persistent warning so a
+ *  demo answer is never mistaken for a genuine model reply. */
+export function selectIsDemo(state: AgentRunStoreState): boolean {
+  return !!state.active.selection?.isDemo;
 }
 
 /** Convenience: dispatch helper bound to a specific runId. */

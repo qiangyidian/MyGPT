@@ -32,4 +32,11 @@ describe("buildChatBody (mode → request mapping)", () => {
     expect(body.knowledge_base_id).toBe("k1");
     expect(body.regenerate).toBe(true);
   });
+
+  it("supports the debate mode (sends mode only, no runtime enum)", () => {
+    const body = buildChatBody({ content: "Python vs Go", mode: "debate" });
+    expect(body.mode).toBe("debate");
+    expect(body.execution_mode).toBeUndefined();
+    expect(body.agent_profile).toBeUndefined();
+  });
 });

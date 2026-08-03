@@ -1,11 +1,14 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState, type FormEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { Loader2, MessageSquare } from "lucide-react";
 
 import { api, ApiError } from "@/lib/api";
+import { resolveReturnTo } from "@/lib/navigation";
+import { useAuth } from "@/hooks/useAuth";
+import { NavSuspense } from "@/components/navigation/page-loading";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -27,7 +30,17 @@ import {
 type Mode = "login" | "register";
 
 export default function LoginPage() {
+  return (
+    <NavSuspense>
+      <LoginForm />
+    </NavSuspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const { user, isLoading: authLoading } = useAuth();
   const [mode, setMode] = useState<Mode>("login");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,6 +52,15 @@ export default function LoginPage() {
   // Register-only fields
   const [username, setUsername] = useState("");
   const [confirm, setConfirm] = useState("");
+
+  // Destination after a successful login/register: a validated `next` param, or "/".
+  const next = resolveReturnTo(searchParams, "/");
+
+  // Already authenticated? Skip straight to the destination.
+  useEffect(() => {
+    if (authLoading || !user) return;
+    router.replace(next);
+  }, [authLoading, user, next, router]);
 
   function resetError() {
     if (error) setError(null);
@@ -55,7 +77,7 @@ export default function LoginPage() {
     try {
       const { user } = await api.login(email.trim(), password);
       toast.success(`欢迎回来，${user.username}`);
-      router.replace("/");
+      router.replace(next);
     } catch (err) {
       setError(toMessage(err));
     } finally {
@@ -84,7 +106,7 @@ export default function LoginPage() {
       // Auto-login after register for smoother UX.
       const { user } = await api.login(email.trim(), password);
       toast.success(`注册成功，欢迎 ${user.username}`);
-      router.replace("/");
+      router.replace(next);
     } catch (err) {
       setError(toMessage(err));
     } finally {

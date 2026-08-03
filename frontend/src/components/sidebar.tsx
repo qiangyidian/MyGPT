@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { cn, relativeTime } from "@/lib/utils";
+import { withReturnTo } from "@/lib/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -54,6 +55,12 @@ interface SidebarProps {
   onAssignToProject?: (conversationId: string, projectId: string) => void;
   onRemoveFromProject?: (conversationId: string) => void;
   onCreateProject?: (name: string) => void;
+  /**
+   * Sanitised "return to chat" target (e.g. `/?conversation=<id>`) forwarded as
+   * `returnTo` on the 知识库 / 设置 / 管理 links so leaving and coming back
+   * restores the current conversation.
+   */
+  returnTo?: string;
   className?: string;
 }
 
@@ -95,6 +102,7 @@ export function Sidebar({
   onAssignToProject,
   onRemoveFromProject,
   onCreateProject,
+  returnTo,
   className,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
@@ -363,20 +371,20 @@ export function Sidebar({
             {viewMode === "archived" ? "返回对话" : "归档"}
           </Button>
           <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
-            <Link href="/knowledge-bases">
+            <Link href={withReturnTo("/knowledge-bases", returnTo)}>
               <Boxes className="h-4 w-4" />
               知识库
             </Link>
           </Button>
           <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
-            <Link href="/settings">
+            <Link href={withReturnTo("/settings", returnTo)}>
               <Settings className="h-4 w-4" />
               设置
             </Link>
           </Button>
           {user?.role === "admin" && (
             <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
-              <Link href="/admin">
+              <Link href={withReturnTo("/admin", returnTo)}>
                 <Shield className="h-4 w-4" />
                 管理
               </Link>

@@ -27,7 +27,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.agents.runtime.stage_executor import StageExecutor, StageResult
+from app.agents.runtime.stage_executor import StageExecutor, StageResult, safe_positive_int
 from app.agents.run_controls import get as get_run_control
 from app.agents.schemas import ev_token
 from app.agents.stage_context import StageContext
@@ -48,6 +48,20 @@ _SYSTEM = (
     "4) 若已验证内容不足以回答，明确说明缺口。"
 )
 
+# Writer prompt for a CODE deliverable (research-then-code requests). The
+# research-prose prompt would truncate code and demand per-line citations; this
+# one prioritizes complete, runnable code over narration.
+_CODE_SYSTEM = (
+    "你是团队的交付工程师。请基于分析师已验证的研究结论，直接产出完整、可运行的代码交付物。\n"
+    "要求：\n"
+    "1) 先输出完整代码（代码块必须闭合），再给必要的运行说明；\n"
+    "2) 允许进行合理的代码结构组织；不要求每一行代码都有来源引用；\n"
+    "3) 仅对外部事实或第三方 API 约束引用来源编号 [source N]，代码本身无需逐行引用；\n"
+    "4) 不要只写“我来帮你实现”之类的开场白后结束；\n"
+    "5) 若输出预算（max_tokens）紧张，优先保证代码完整性，减少解释性文字；\n"
+    "6) 使用用户的语言。"
+)
+
 
 class StreamingWriterExecutor:
     """Wraps a base executor; streams the writer stage, delegates the rest.
@@ -57,8 +71,10 @@ class StreamingWriterExecutor:
     factory without changing the ``StageExecutor`` signature.
     """
 
-    def __init__(self, base: StageExecutor, *, max_tokens: int = 1024) -> None:
+    def __init__(self, base: StageExecutor, *, max_tokens: int = 4096) -> None:
         self._base = base
+        # Fallback only. The real budget comes from the user's ModelConfig
+        # (read in _stream_writer) so the Writer no longer hard-caps at 1024.
         self._max_tokens = max_tokens
 
     async def execute(
@@ -94,8 +110,11 @@ class StreamingWriterExecutor:
     ) -> StageResult:
         provider = stage_ctx.provider
         assistant_msg = stage_ctx.assistant_msg
+        # The user's literal request is the authoritative question; the CrewAI
+        # task.description is only a synthesized framing fallback (it used to be
+        # preferred, which mangled code-generation prompts).
         question = (
-            getattr(task, "description", "") or getattr(stage_ctx, "user_content", "") or ""
+            getattr(stage_ctx, "user_content", "") or getattr(task, "description", "") or ""
         ).strip()
         verified = (context or "").strip()
 
@@ -104,11 +123,24 @@ class StreamingWriterExecutor:
             f"已验证内容：\n{verified or '（无已验证内容，请如实说明缺口）'}\n\n"
             "请基于以上已验证内容生成最终回答。"
         )
+        # Pick the Writer prompt by deliverable kind: code requests need a
+        # code-output prompt (complete code, no per-line citations), not the
+        # research-prose prompt that would truncate long code.
+        from app.agents.planning import deliverable_kind
+
+        kind = deliverable_kind(getattr(stage_ctx, "user_content", "") or question)
+        system_prompt = _CODE_SYSTEM if kind == "code" else _SYSTEM
         messages = [
-            {"role": "system", "content": _SYSTEM},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        options = ChatOptions(temperature=0.5, max_tokens=self._max_tokens)
+        # Output budget comes from the user's ModelConfig (e.g. 8192), not a
+        # hard-coded 1024 — the old cap truncated long code answers.
+        model_config = getattr(stage_ctx, "model_config", None)
+        configured = safe_positive_int(
+            getattr(model_config, "max_tokens", None), self._max_tokens
+        )
+        options = ChatOptions(temperature=0.5, max_tokens=configured)
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
 
@@ -116,16 +148,23 @@ class StreamingWriterExecutor:
         finish_reason = "stop"
         try:
             async for delta in provider.stream_chat(messages, options):
-                # Cooperative cancel between chunks (client disconnect / stop).
+                ctl = get_run_control(stage_ctx.run_id)
+                # Cooperative cancel between chunks: the Stop button / cancel API
+                # sets ctl.cancel (the real signal). cancel_event is kept as a
+                # defensive secondary check. Honor either -> cancelled.
                 cancel_evt = getattr(stage_ctx, "cancel_event", None)
-                if cancel_evt is not None and cancel_evt.is_set():
+                if (ctl is not None and ctl.cancel.is_set()) or (
+                    cancel_evt is not None and cancel_evt.is_set()
+                ):
                     finish_reason = "cancelled"
                     break
                 # Phase 2: honor a user-initiated pause mid-stream.
-                ctl = get_run_control(stage_ctx.run_id)
                 if ctl is not None:
                     while ctl.is_paused() and not ctl.cancel.is_set():
                         await asyncio.sleep(0.1)
+                    if ctl.cancel.is_set():
+                        finish_reason = "cancelled"
+                        break
                 if delta.content:
                     accumulated.append(delta.content)
                     # Mutate incrementally so partial content survives cancel.

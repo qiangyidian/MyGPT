@@ -7,11 +7,41 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
+
+
+# Canonical termination reasons carried end-to-end (provider → runtime → SSE →
+# persistence → UI). Extend this, never pass arbitrary strings.
+FinishReason = Literal[
+    "stop",
+    "length",
+    "tool_calls",
+    "cancelled",
+    "timeout",
+    "content_filter",
+    "provider_error",
+    "stream_disconnected",
+    "budget",
+    "error",
+]
+
+# Stable machine codes for provider-side failures, so upstream can map them to a
+# FinishReason (e.g. "provider_timeout") instead of a generic "error".
+PROVIDER_ERR_TIMEOUT = "provider_timeout"
+PROVIDER_ERR_NETWORK = "provider_error"
+PROVIDER_ERR_AUTH = "provider_auth"
 
 
 class ProviderError(RuntimeError):
-    """Raised on transport/timeout/auth errors talking to a model endpoint."""
+    """Raised on transport/timeout/auth errors talking to a model endpoint.
+
+    `code` is a stable machine string (see PROVIDER_ERR_*) so callers can map the
+    failure to a specific FinishReason rather than a generic "error".
+    """
+
+    def __init__(self, message: str, *, code: str = PROVIDER_ERR_NETWORK) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -37,7 +67,7 @@ class ChatDelta:
     """One streaming chunk."""
     content: str = ""
     tool_calls: list[ToolCallDef] | None = None
-    finish_reason: str | None = None
+    finish_reason: FinishReason | None = None
 
 
 @dataclass
@@ -45,7 +75,7 @@ class ChatResult:
     """Non-streaming result."""
     content: str = ""
     tool_calls: list[ToolCallDef] | None = None
-    finish_reason: str = "stop"
+    finish_reason: FinishReason = "stop"
     usage: dict[str, int] | None = None   # {prompt_tokens, completion_tokens, total_tokens}
 
 

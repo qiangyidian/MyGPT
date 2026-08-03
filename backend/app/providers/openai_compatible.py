@@ -22,10 +22,14 @@ from app.providers.base import (
     ChatDelta,
     ChatOptions,
     ChatResult,
+    FinishReason,
     ModelProvider,
+    PROVIDER_ERR_NETWORK,
+    PROVIDER_ERR_TIMEOUT,
     ProviderError,
     ToolCallDef,
 )
+from app.core.config import get_settings
 
 # Retried transient failures: network blips, timeouts, and 5xx.
 _RETRYABLE_EXC = (
@@ -40,6 +44,19 @@ def _is_retryable_response(resp: httpx.Response) -> bool:
     return resp.status_code in _RETRYABLE_STATUS
 
 
+def _to_provider_error(exc: Exception, *, where: str) -> ProviderError:
+    """Map an httpx exception to a typed ProviderError.
+
+    Timeouts get a distinct code (PROVIDER_ERR_TIMEOUT) so the runtime can map
+    them to finish_reason="timeout" instead of a generic "error".
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return ProviderError(
+            f"model endpoint timed out ({where})", code=PROVIDER_ERR_TIMEOUT
+        )
+    return ProviderError(f"transport failure ({where}): {exc}", code=PROVIDER_ERR_NETWORK)
+
+
 class OpenAICompatibleProvider(ModelProvider):
     """OpenAI-shaped chat + embeddings over an async HTTP client."""
 
@@ -47,7 +64,15 @@ class OpenAICompatibleProvider(ModelProvider):
 
     def __init__(self, *, base_url: str, api_key: str = "", model: str = "", **_: Any) -> None:
         super().__init__(base_url=base_url, api_key=api_key, model=model)
-        self._timeout = httpx.Timeout(30.0, connect=10.0)
+        # Generous read timeout so slow / long (code) generations aren't killed
+        # mid-stream; connect stays short. Driven by Settings, not hardcoded.
+        s = get_settings()
+        self._timeout = httpx.Timeout(
+            read=s.MODEL_READ_TIMEOUT_SECONDS,
+            connect=s.MODEL_CONNECT_TIMEOUT_SECONDS,
+            write=s.MODEL_WRITE_TIMEOUT_SECONDS,
+            pool=s.MODEL_POOL_TIMEOUT_SECONDS,
+        )
 
     # -- HTTP helpers --------------------------------------------------------
     def _headers(self) -> dict[str, str]:
@@ -148,7 +173,7 @@ class OpenAICompatibleProvider(ModelProvider):
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await self._request(client, self._chat_url(), payload)
         except _RETRYABLE_EXC as exc:
-            raise ProviderError(f"transport failure talking to model: {exc}") from exc
+            raise _to_provider_error(exc, where="chat") from exc
 
         self._raise_for_status(resp, self._chat_url())
 
@@ -214,12 +239,19 @@ class OpenAICompatibleProvider(ModelProvider):
                             yield chunk
                         return
         except _RETRYABLE_EXC as exc:
-            raise ProviderError(f"transport failure during stream: {exc}") from exc
+            raise _to_provider_error(exc, where="stream") from exc
 
     async def _iter_sse(self, resp: httpx.Response) -> AsyncIterator[ChatDelta]:
-        """Parse OpenAI-style SSE: lines `data: {json}`, terminator `data: [DONE]`."""
+        """Parse OpenAI-style SSE: lines `data: {json}`, terminator `data: [DONE]`.
+
+        Preserves the REAL upstream finish_reason: a `[DONE]` marker is a transport
+        terminator only. If the stream already carried an explicit finish_reason
+        (length/content_filter/stop/...), we do NOT emit a synthetic `stop` that
+        would overwrite it (the old code did, clobbering `length`).
+        """
         # Accumulate per-tool-call deltas (id/function.name/arguments stream in pieces).
         tool_accum: dict[int, dict[str, Any]] = {}
+        seen_real_finish: FinishReason | None = None
         async for raw_line in resp.aiter_lines():
             if not raw_line:
                 continue
@@ -233,7 +265,14 @@ class OpenAICompatibleProvider(ModelProvider):
                 if tool_accum:
                     yield self._flush_tool_accum(tool_accum)
                     tool_accum.clear()
-                yield ChatDelta(finish_reason="stop")
+                    # A tool-call flush carries finish_reason="tool_calls" — treat
+                    # it as the real reason so we don't then emit a synthetic
+                    # "stop" that would clobber it (and drop the tool calls).
+                    seen_real_finish = "tool_calls"
+                # Only synthesize a `stop` if the stream never carried an explicit
+                # finish_reason; otherwise the real reason already went out.
+                if seen_real_finish is None:
+                    yield ChatDelta(content="", tool_calls=None, finish_reason="stop")
                 return
             try:
                 obj = json.loads(data_str)
@@ -242,13 +281,13 @@ class OpenAICompatibleProvider(ModelProvider):
                 continue
             choices = obj.get("choices") or []
             if not choices:
+                # usage-only / routing chunk — must not end generation.
                 continue
             choice = choices[0]
             delta = choice.get("delta") or {}
             content = delta.get("content") or ""
             finish_reason = choice.get("finish_reason")
             raw_tcs = delta.get("tool_calls")
-            tool_calls: list[ToolCallDef] | None = None
             if raw_tcs:
                 # delta tool_calls carry an `index` to identify which call they extend.
                 for tc in raw_tcs:
@@ -267,12 +306,17 @@ class OpenAICompatibleProvider(ModelProvider):
             # so callers see well-formed ToolCallDefs.
             if content:
                 yield ChatDelta(content=content, tool_calls=None, finish_reason=finish_reason)
-            elif finish_reason and not raw_tcs:
-                # Some endpoints send a final chunk with only finish_reason.
+                if finish_reason:
+                    seen_real_finish = finish_reason
+            elif finish_reason:
+                # Terminal chunk (possibly alongside tool calls). Flush tools first
+                # and always carry the real reason — the old `and not raw_tcs` guard
+                # dropped finish_reason when a terminal chunk also held tool calls.
                 if tool_accum:
                     yield self._flush_tool_accum(tool_accum)
                     tool_accum.clear()
                 yield ChatDelta(content="", tool_calls=None, finish_reason=finish_reason)
+                seen_real_finish = finish_reason
 
     @staticmethod
     def _flush_tool_accum(tool_accum: dict[int, dict[str, Any]]) -> ChatDelta:
@@ -296,7 +340,7 @@ class OpenAICompatibleProvider(ModelProvider):
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await self._request(client, url, payload)
         except _RETRYABLE_EXC as exc:
-            raise ProviderError(f"transport failure talking to embeddings endpoint: {exc}") from exc
+            raise _to_provider_error(exc, where="embeddings") from exc
 
         self._raise_for_status(resp, url)
 

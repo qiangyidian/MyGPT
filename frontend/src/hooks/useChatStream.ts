@@ -2,13 +2,22 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { api, streamChat, type ChatStreamHandlers } from "@/lib/api";
 import { buildChatBody } from "@/lib/chat-request";
 import {
   CONVERSATIONS_QUERY_KEY,
   CONVERSATION_DETAIL_QUERY_KEY,
 } from "@/hooks/useConversations";
-import type { AgentStep, Citation, Message, PendingApproval } from "@/lib/types";
+import type {
+  AgentStep,
+  Citation,
+  FinishReason,
+  GenerationStatus,
+  Message,
+  PendingApproval,
+} from "@/lib/types";
+import { finishReasonToStatus } from "@/lib/types";
 import type { AgentEdgeStatus, AgentGraphNode } from "@/lib/agent-graph-types";
 import { coerceGraph } from "@/hooks/useAgentRunGraph";
 import { useAgentRunStore } from "@/stores/agent-run-store";
@@ -45,8 +54,14 @@ export interface ChatStreamState {
   currentConversationId: string | null;
   currentRunId: string | null;
   error: string | null;
+  /** Terminal status of the last turn (complete/truncated/cancelled/error/interrupted). */
+  status: GenerationStatus;
+  /** Raw finish_reason of the last turn (null until the turn ends). */
+  finishReason: FinishReason | null;
   /** Re-send the last user message to get a new assistant reply. */
   regenerate: () => Promise<void>;
+  /** Continue a truncated/interrupted/cancelled answer (new turn, no repeat). */
+  continueGeneration: () => Promise<void>;
   /** Approve a pending dangerous-tool call (resumes the run). */
   approveTool: (approvalId: string) => Promise<void>;
   /** Reject a pending dangerous-tool call (run continues without it). */
@@ -90,6 +105,8 @@ export function useChatStream(): ChatStreamState {
   >(null);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<GenerationStatus>("complete");
+  const [finishReason, setFinishReason] = useState<FinishReason | null>(null);
 
   // Remember the last send so regenerate() can replay it.
   const lastSendRef = useRef<{
@@ -129,6 +146,8 @@ export function useChatStream(): ChatStreamState {
       setSteps([]);
       setPendingApprovals([]);
       setError(null);
+      setStatus("complete");
+      setFinishReason(null);
       // Reset the multi-agent graph store for a new turn (a new agent_graph
       // event will repopulate it; this also clears any dismissal so the panel
       // can auto-open for the new run).
@@ -163,6 +182,60 @@ export function useChatStream(): ChatStreamState {
         setSteps(next);
       };
       const accumulatedStepsRef = { current: [] as AgentStep[] };
+
+      // Terminal-once guard: a single turn commits exactly one assistant
+      // message, whether it ends via done, error, cancel, or a dropped socket.
+      // Without this, onDone + the React Query refetch + a stray second done
+      // could append duplicate assistant messages.
+      let terminated = false;
+
+      const errorFinish = (code?: string): FinishReason => {
+        switch (code) {
+          case "provider_timeout":
+            return "timeout";
+          case "stream_disconnected":
+            return "stream_disconnected";
+          case "provider_error":
+            return "provider_error";
+          default:
+            return "error";
+        }
+      };
+
+      /** Commit the (possibly partial) assistant message exactly once. */
+      const commitAssistant = (
+        convId: string,
+        content: string,
+        fr: FinishReason,
+        msgId: string,
+        extraMeta: Record<string, unknown> = {}
+      ) => {
+        if (terminated) return;
+        terminated = true;
+        const isMulti = useAgentRunStore.getState().active.nodes.length >= 2;
+        const msg: Message = {
+          id: msgId,
+          conversation_id: convId,
+          role: "assistant",
+          content,
+          metadata: {
+            finish_reason: fr,
+            citations: accumulatedCitations,
+            steps: accumulatedStepsRef.current,
+            run_id: resolvedRunId || undefined,
+            multi_agent: isMulti || undefined,
+            ...extraMeta,
+          },
+          model_name: null,
+          created_at: new Date().toISOString(),
+        };
+        appendMessage(convId, msg);
+        queryClient.invalidateQueries({
+          queryKey: CONVERSATION_DETAIL_QUERY_KEY(convId),
+        });
+        setFinishReason(fr);
+        setStatus(finishReasonToStatus(fr));
+      };
 
       // Optimistically append the user's own message into the cache so it
       // appears instantly in the message list.
@@ -206,6 +279,29 @@ export function useChatStream(): ChatStreamState {
         onRunStarted: (e) => {
           resolvedRunId = e.runId;
           setCurrentRunId(e.runId);
+        },
+        onRuntimeSelected: (e) => {
+          resolvedRunId = e.runId;
+          setCurrentRunId(e.runId);
+          // Track the runtime selection on the agent-run store so the panel
+          // can show runtime/profile and, crucially, a FALLBACK warning when a
+          // multi-agent request couldn't run (never a silent single-model run).
+          useAgentRunStore.getState().setRuntimeSelection({
+            runId: e.runId,
+            requestedRuntime: e.requestedRuntime,
+            effectiveRuntime: e.effectiveRuntime,
+            agentProfile: e.agentProfile,
+            multiAgentRequested: e.multiAgentRequested,
+            multiAgentExecuted: e.multiAgentExecuted,
+            fallbackReason: e.fallbackReason,
+            isDemo: e.isDemo,
+          });
+          if (e.multiAgentRequested && !e.multiAgentExecuted) {
+            const reason = e.fallbackReason || "不可用";
+            toast.warning("多 Agent 运行时当前不可用，本次已回退为普通模式", {
+              description: `原因：${reason}。请在根目录 .env 启用 CREWAI_ENABLED=true 或 AGENT_DEMO_MODE=true 并重启后端。`,
+            });
+          }
         },
         // ---- multi-agent graph events → store ----
         onAgentGraph: (e) => {
@@ -367,34 +463,27 @@ export function useChatStream(): ChatStreamState {
             prev.some((p) => p.approvalId === ap.approvalId) ? prev : [...prev, ap]
           );
         },
-        onDone: ({ messageId, finishReason }) => {
+        onDone: ({ messageId, finishReason: fr }) => {
           const finalId = messageId || assistantMessageId;
           if (resolvedConversationId) {
-            // multi_agent is true only if an agent_graph event arrived this turn.
-            const isMulti = useAgentRunStore.getState().active.nodes.length >= 2;
-            const msg: Message = {
-              id: finalId,
-              conversation_id: resolvedConversationId,
-              role: "assistant",
-              content: accumulated,
-              metadata: {
-                finish_reason: finishReason,
-                citations: accumulatedCitations,
-                steps: accumulatedStepsRef.current,
-                run_id: resolvedRunId || undefined,
-                multi_agent: isMulti || undefined,
-              },
-              model_name: null,
-              created_at: new Date().toISOString(),
-            };
-            appendMessage(resolvedConversationId, msg);
-            queryClient.invalidateQueries({
-              queryKey: CONVERSATION_DETAIL_QUERY_KEY(resolvedConversationId),
-            });
+            commitAssistant(resolvedConversationId, accumulated, fr, finalId);
+          } else {
+            terminated = true;
+            setFinishReason(fr);
+            setStatus(finishReasonToStatus(fr));
           }
         },
-        onError: ({ message }) => {
+        onError: ({ code, message }) => {
+          const fr = errorFinish(code);
           setError(message);
+          if (resolvedConversationId) {
+            // Preserve whatever was streamed before the error.
+            commitAssistant(resolvedConversationId, accumulated, fr, assistantMessageId);
+          } else {
+            terminated = true;
+            setFinishReason(fr);
+            setStatus(finishReasonToStatus(fr));
+          }
         },
       };
 
@@ -416,30 +505,51 @@ export function useChatStream(): ChatStreamState {
           controller.signal
         );
       } catch (err) {
-        if (controller.signal.aborted) {
-          // User cancelled — keep partial text as a frozen message if we can.
-          if (resolvedConversationId && accumulated) {
-            const msg: Message = {
-              id: assistantMessageId || `aborted-${Date.now()}`,
-              conversation_id: resolvedConversationId,
-              role: "assistant",
-              content: accumulated,
-              metadata: { finish_reason: "aborted" },
-              model_name: null,
-              created_at: new Date().toISOString(),
-            };
-            appendMessage(resolvedConversationId, msg);
-          }
-          // Also cancel the backend run if we know its id.
-          if (resolvedRunId) {
-            api.cancelAgentRun(resolvedRunId).catch(() => undefined);
-          }
-        } else {
-          const message =
-            err instanceof Error ? err.message : "发生未知错误";
+        if (!controller.signal.aborted) {
+          // Genuine error (fetch failure, etc.). User aborts are handled in the
+          // `finally` — parseSSEStream swallows AbortError so streamChat resolves
+          // without throwing on a mid-stream Stop, and the cancel must still run.
+          const message = err instanceof Error ? err.message : "发生未知错误";
           setError(message);
+          if (resolvedConversationId && accumulated) {
+            commitAssistant(resolvedConversationId, accumulated, "error", assistantMessageId);
+          } else {
+            terminated = true;
+            setFinishReason("error");
+            setStatus("error");
+          }
         }
       } finally {
+        if (!terminated) {
+          if (controller.signal.aborted) {
+            // User Stop (button) or unmount-abort. Preserve partial as cancelled
+            // (NOT a connection drop) and explicitly cancel the backend run.
+            if (resolvedConversationId && accumulated) {
+              commitAssistant(
+                resolvedConversationId,
+                accumulated,
+                "cancelled",
+                assistantMessageId || `cancelled-${Date.now()}`
+              );
+            } else {
+              terminated = true;
+              setFinishReason("cancelled");
+              setStatus("cancelled");
+            }
+            if (resolvedRunId) {
+              api.cancelAgentRun(resolvedRunId).catch(() => undefined);
+            }
+          } else if (resolvedConversationId && accumulated) {
+            // Socket dropped with NO terminal event and NO user abort.
+            setError("连接中断，已保留已生成内容");
+            commitAssistant(
+              resolvedConversationId,
+              accumulated,
+              "stream_disconnected",
+              assistantMessageId || `interrupted-${Date.now()}`
+            );
+          }
+        }
         setIsStreaming(false);
         abortRef.current = null;
         setStreamingText("");
@@ -464,6 +574,18 @@ export function useChatStream(): ChatStreamState {
     if (!last) return;
     await run(last.content, last.opts, true);
   }, [run]);
+
+  // Continue a truncated/interrupted/cancelled answer. The partial assistant
+  // text is already in the conversation history (committed), so a short user
+  // turn lets the model resume. Kept concise + user-readable (it becomes a
+  // normal user message bubble and is persisted like one — no internal
+  // directive leaked into the transcript).
+  const continueGeneration = useCallback(async () => {
+    const last = lastSendRef.current;
+    const convId = currentConversationId;
+    if (!last || !convId) return;
+    await run("请继续上面的生成，不要重复已有内容。", { ...last.opts, conversationId: convId }, false);
+  }, [run, currentConversationId]);
 
   // Resolve a pending approval; removes it from the list on success.
   const approveTool = useCallback(
@@ -506,7 +628,10 @@ export function useChatStream(): ChatStreamState {
     currentConversationId,
     currentRunId,
     error,
+    status,
+    finishReason,
     regenerate,
+    continueGeneration,
     approveTool,
     rejectTool,
   };

@@ -2,16 +2,21 @@
 
 import { memo, useState } from "react";
 import {
+  AlertTriangle,
   Check,
   Copy,
   Pencil,
   RefreshCw,
+  Scissors,
+  Square,
   ThumbsDown,
   ThumbsUp,
   User as UserIcon,
   UsersRound,
+  WifiOff,
   X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -23,7 +28,16 @@ import { ResearchSteps } from "@/components/research-steps";
 import { AttachmentList } from "@/components/attachments/attachment-list";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
 import { useMessageFeedback } from "@/hooks/useMessageActions";
-import type { AgentStep, AttachmentRef, Citation, Message, ResearchStep } from "@/lib/types";
+import type {
+  AgentStep,
+  AttachmentRef,
+  Citation,
+  GenerationStatus,
+  Message,
+  ResearchStep,
+} from "@/lib/types";
+import { getMessageStatus } from "@/lib/types";
+import { sanitizeSourceMarkers } from "@/lib/citations";
 
 interface MessageBubbleProps {
   message: Message;
@@ -33,6 +47,8 @@ interface MessageBubbleProps {
   isStreaming?: boolean;
   canRegenerate?: boolean;
   onRegenerate?: () => void;
+  /** Continue a truncated/interrupted/cancelled answer (new turn, no repeat). */
+  onContinue?: () => void;
   /** Edit-and-resend: fork at this user message with edited content. */
   onBranch?: (messageId: string, newContent: string) => void;
   /** Open the Sources tab focused on a citation index (carries the citations). */
@@ -63,6 +79,73 @@ function CopyButton({ text }: { text: string }) {
       {copied ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
       {copied ? "已复制" : "复制"}
     </Button>
+  );
+}
+
+const STATUS_CONFIG: Partial<
+  Record<GenerationStatus, { label: string; className: string; action: "continue" | "retry"; Icon: LucideIcon }>
+> = {
+  truncated: {
+    label: "输出达到长度上限，内容可能不完整",
+    className: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    action: "continue",
+    Icon: Scissors,
+  },
+  interrupted: {
+    label: "连接中断，已保留已生成内容",
+    className: "border-orange-500/40 bg-orange-500/10 text-orange-700 dark:text-orange-400",
+    action: "continue",
+    Icon: WifiOff,
+  },
+  cancelled: {
+    label: "已停止，已保留已生成内容",
+    className: "border-border bg-muted/50 text-muted-foreground",
+    action: "continue",
+    Icon: Square,
+  },
+  error: {
+    label: "生成失败",
+    className: "border-destructive/40 bg-destructive/10 text-destructive",
+    action: "retry",
+    Icon: AlertTriangle,
+  },
+};
+
+function StatusBanner({
+  status,
+  onContinue,
+  onRegenerate,
+}: {
+  status: GenerationStatus;
+  onContinue?: () => void;
+  onRegenerate?: () => void;
+}) {
+  const cfg = STATUS_CONFIG[status];
+  if (!cfg) return null;
+  const Icon = cfg.Icon;
+  return (
+    <div className={cn("mt-1.5 flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs", cfg.className)}>
+      <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <span>{cfg.label}</span>
+      {cfg.action === "continue" && onContinue && (
+        <button
+          type="button"
+          onClick={onContinue}
+          className="ml-auto font-medium underline-offset-2 hover:underline"
+        >
+          继续生成
+        </button>
+      )}
+      {cfg.action === "retry" && onRegenerate && (
+        <button
+          type="button"
+          onClick={onRegenerate}
+          className="ml-auto font-medium underline-offset-2 hover:underline"
+        >
+          重试
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -106,6 +189,7 @@ export const MessageBubble = memo(function MessageBubble({
   isStreaming,
   canRegenerate,
   onRegenerate,
+  onContinue,
   onBranch,
   onSourceClick,
   onOpenAttachment,
@@ -113,6 +197,9 @@ export const MessageBubble = memo(function MessageBubble({
   const isUser = message.role === "user";
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
+
+  // Terminal status for an assistant message (null while streaming / complete).
+  const status = !isUser && !isStreaming ? getMessageStatus(message) : null;
 
   const resolvedCitations =
     citations ??
@@ -146,9 +233,20 @@ export const MessageBubble = memo(function MessageBubble({
     multi_agent?: boolean;
     run_id?: string;
     attachments?: AttachmentRef[];
+    citation_validation_failed?: boolean;
   };
   const isMultiAgent = !isUser && meta.multi_agent === true && !!meta.run_id;
   const attachments = isUser ? (meta.attachments ?? []) : [];
+
+  // Citation integrity: strip any in-text [source N] that has no backing
+  // citation. The structured citation chips (rendered below) are the source of
+  // truth; the text is sanitized so a hallucinated/demo marker never shows as a
+  // dangling "[source 5]". Applies to both the live stream and persisted msgs.
+  const citationCount = resolvedCitations?.length ?? 0;
+  const safeContent = !isUser
+    ? sanitizeSourceMarkers(message.content, citationCount)
+    : message.content;
+  const citationFlagged = !isUser && meta.citation_validation_failed === true;
 
   const commitEdit = () => {
     const next = draft.trim();
@@ -233,7 +331,12 @@ export const MessageBubble = memo(function MessageBubble({
               <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
             ) : message.content ? (
               <div className="text-sm">
-                <Markdown content={message.content} />
+                <Markdown content={safeContent} />
+                {citationFlagged && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    已自动移除缺少真实引用支持的来源标记。
+                  </p>
+                )}
               </div>
             ) : (
               isStreaming && (
@@ -255,6 +358,11 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
+        {/* Termination status banner (truncated / interrupted / cancelled / error). */}
+        {!isUser && status && status !== "complete" && (
+          <StatusBanner status={status} onContinue={onContinue} onRegenerate={onRegenerate} />
+        )}
+
         {/* Action row */}
         {!editing && (
           <div
@@ -263,7 +371,7 @@ export const MessageBubble = memo(function MessageBubble({
               isUser ? "flex-row-reverse" : "flex-row"
             )}
           >
-            {!isUser && message.content && <CopyButton text={message.content} />}
+            {!isUser && message.content && <CopyButton text={safeContent} />}
             {!isUser && !isStreaming && <FeedbackButtons messageId={message.id} />}
             {!isUser && isLast && canRegenerate && !isStreaming && (
               <Button

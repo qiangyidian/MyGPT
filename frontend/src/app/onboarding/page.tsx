@@ -6,6 +6,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { api, ApiError } from "@/lib/api";
+import { buildLoginUrl } from "@/lib/navigation";
+import {
+  clearOnboardingSkipped,
+  markOnboardingSkipped,
+} from "@/lib/onboarding-preference";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,7 +36,8 @@ export default function OnboardingPage() {
   useEffect(() => {
     if (isLoading) return;
     if (!user) {
-      router.replace("/login");
+      // Carry /onboarding as the post-login destination.
+      router.replace(buildLoginUrl("/onboarding"));
     } else if (user.role !== "admin") {
       router.replace("/");
     }
@@ -65,6 +71,9 @@ export default function OnboardingPage() {
         });
       }
       await qc.invalidateQueries({ queryKey: ["models"] });
+      // A real model now exists — clear any prior "skip" so AppShell's gate is
+      // based on model state alone going forward.
+      if (user) clearOnboardingSkipped(user.id);
       toast.success("模型已配置，正在进入对话…");
       router.replace("/");
     } catch (e) {
@@ -104,7 +113,16 @@ export default function OnboardingPage() {
         </div>
 
         <div className="flex items-center justify-between gap-2">
-          <Button variant="ghost" size="sm" onClick={() => router.replace("/")} disabled={busy}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              // Record the dismissal so AppShell no longer bounces us back here.
+              if (user) markOnboardingSkipped(user.id);
+              router.replace("/");
+            }}
+            disabled={busy}
+          >
             稍后配置（用 Mock 体验）
           </Button>
           <Button onClick={submit} disabled={busy}>

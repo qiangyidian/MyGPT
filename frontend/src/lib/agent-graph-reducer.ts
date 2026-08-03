@@ -19,10 +19,12 @@ import {
   canTransitionTo,
   computeActiveAgents,
   GraphRunStatus,
+  RuntimeSelection,
 } from "./agent-graph-types";
 
 export type AgentGraphAction =
   | { type: "GRAPH_INITIALIZED"; runId: string; graph: AgentGraphState }
+  | { type: "RUNTIME_SELECTED"; runId: string; selection: RuntimeSelection }
   | { type: "AGENT_STATUS"; runId: string; agentId: string; patch: Partial<AgentGraphNode> & { status: AgentNodeStatus } }
   | { type: "EDGE_STATUS"; runId: string; edgeId: string; status: AgentGraphEdge["status"]; label?: string }
   | { type: "RUN_STATUS"; runId: string; status: GraphRunStatus; currentAgentIds?: string[] }
@@ -66,6 +68,13 @@ export function reducer(state: AgentGraphState, action: AgentGraphAction): Agent
 
     case "RESET_RUN":
       return emptyGraph();
+
+    case "RUNTIME_SELECTED": {
+      // The runtime actually used + whether multi-agent was honored. Set before
+      // any graph event; for a fallback there is no graph (multi_agent_executed
+      // is false) and the UI shows a warning instead of a fake agent panel.
+      return finalize({ ...state, selection: action.selection });
+    }
 
     case "AGENT_STATUS": {
       const nodes = state.nodes.map((n) => {

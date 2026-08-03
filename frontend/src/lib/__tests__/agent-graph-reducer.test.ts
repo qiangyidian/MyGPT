@@ -132,4 +132,33 @@ describe("agent-graph-reducer", () => {
     expect(sLate.nodes.map((n) => n.id)).toEqual(["only"]);
     expect(sLate.activeAgentIds).toEqual([]);
   });
+
+  describe("RUNTIME_SELECTED (anti-fake-multi-agent)", () => {
+    const sel = (multiExecuted: boolean, reason: string | null = null) => ({
+      runId: "r1",
+      requestedRuntime: "crewai",
+      effectiveRuntime: multiExecuted ? "crewai" : "native",
+      agentProfile: "debate",
+      multiAgentRequested: true,
+      multiAgentExecuted: multiExecuted,
+      fallbackReason: reason,
+      isDemo: false,
+    });
+
+    it("records a real multi-agent selection", () => {
+      const s = reducer(emptyGraph(), { type: "RUNTIME_SELECTED", runId: "r1", selection: sel(true) });
+      expect(s.selection?.multiAgentExecuted).toBe(true);
+      expect(s.selection?.fallbackReason).toBeNull();
+    });
+
+    it("records a fallback (multi-agent requested, NOT executed) — no fake panel", () => {
+      // A fallback carries NO graph (the reducer keeps whatever nodes exist,
+      // which is none here), so the UI shows a warning, never a fake agent graph.
+      const s = reducer(emptyGraph(), { type: "RUNTIME_SELECTED", runId: "r1", selection: sel(false, "crewai_disabled") });
+      expect(s.selection?.multiAgentRequested).toBe(true);
+      expect(s.selection?.multiAgentExecuted).toBe(false);
+      expect(s.selection?.fallbackReason).toBe("crewai_disabled");
+      expect(s.nodes).toHaveLength(0); // no fake agent nodes
+    });
+  });
 });

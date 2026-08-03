@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { USER_MODES, getModeMeta, isUserChatMode } from "@/lib/user-modes";
 
 describe("user-modes", () => {
-  it("exposes exactly the five user-facing modes", () => {
+  it("exposes exactly the six user-facing modes (incl. debate)", () => {
     const values = USER_MODES.map((m) => m.value);
     expect(values).toEqual([
       "auto",
@@ -10,7 +10,21 @@ describe("user-modes", () => {
       "deep_research",
       "create",
       "data_analysis",
+      "debate",
     ]);
+  });
+
+  it("debate mode has friendly copy and hides internal runtime names", () => {
+    const meta = getModeMeta("debate");
+    expect(meta.label).toBe("多 Agent 辩论");
+    expect(meta.description).toContain("裁判");
+    // Internal runtime enums must NOT leak into user-facing copy.
+    expect(meta.label + meta.description).not.toMatch(/CrewAI|NativeRuntime|execution_mode|agent_profile/);
+  });
+
+  it("isUserChatMode accepts debate", () => {
+    expect(isUserChatMode("debate")).toBe(true);
+    expect(isUserChatMode("nope")).toBe(false);
   });
 
   it("never leaks internal runtime concepts to end users", () => {

@@ -117,14 +117,25 @@ def test_plain_chat_never_uses_crewai(monkeypatch):
     orch = ChatOrchestrator()
     # chat and auto always use native, even with crewai available.
     for mode in (ExecutionMode.chat, ExecutionMode.auto):
-        ctx = types.SimpleNamespace(execution_mode=mode)
-        assert isinstance(orch._select_runtime(ctx), NativeChatRuntime)
+        ctx = types.SimpleNamespace(
+            execution_mode=mode,
+            extra={"route": types.SimpleNamespace(
+                use_multi_agent=False, requested_mode="auto", mode="auto", agent_profile="general",
+            )},
+        )
+        runtime, _ = orch._select_runtime(ctx)
+        assert isinstance(runtime, NativeChatRuntime)
 
-    # agent mode selects CrewAI.
-    assert isinstance(
-        orch._select_runtime(types.SimpleNamespace(execution_mode=ExecutionMode.agent)),
-        CrewAIRuntime,
+    # agent mode (multi-agent) selects CrewAI.
+    ctx = types.SimpleNamespace(
+        execution_mode=ExecutionMode.agent,
+        extra={"route": types.SimpleNamespace(
+            use_multi_agent=True, requested_mode="debate", mode="debate", agent_profile="debate",
+        )},
     )
+    runtime, sel = orch._select_runtime(ctx)
+    assert isinstance(runtime, CrewAIRuntime)
+    assert sel.multi_agent_executed is True
 
 
 def test_research_intent_routes_to_crew_in_runtime():

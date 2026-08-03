@@ -35,6 +35,7 @@ from app.agents.approval_bridge import ApprovalBridge
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.crews import (
+    build_debate_stages,
     build_parallel_research_stages,
     build_research_stages,
 )
@@ -66,12 +67,59 @@ from app.agents.stage_context import StageContext, make_stage_context
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.core.config import get_settings
 from app.models import AgentRun
+from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
 from app.providers.registry import get_provider_for_config
 
 logger = logging.getLogger(__name__)
 
 # Profiles that use the multi-agent graph + right-side panel.
-_MULTI_AGENT_PROFILES = {"deep_research", "parallel_research"}
+_MULTI_AGENT_PROFILES = {"deep_research", "parallel_research", "debate"}
+
+
+def _demo_executor_enabled(settings: Any, request: Any) -> bool:
+    """Decide whether the deterministic DemoStageExecutor should run this turn.
+
+    Demo is a STRICT double opt-in: the env flag (AGENT_DEMO_MODE) AND the
+    per-request flag (request.demo) must both be set, AND no real CrewAI
+    runtime may be configured (CREWAI_ENABLED) — real CrewAI always wins. This
+    MUST stay in lock-step with ChatOrchestrator's ``is_demo`` computation so the
+    ``runtime_selected`` event's is_demo (which drives the UI warning banner)
+    matches the executor that actually ran. Diverging here would serve canned
+    demo content with no visible warning — the exact regression this guards.
+    """
+    return (
+        bool(getattr(settings, "AGENT_DEMO_MODE", False))
+        and bool(getattr(request, "demo", False))
+        and not bool(getattr(settings, "CREWAI_ENABLED", False))
+    )
+
+
+def _writer_finish_reason(stages: list[StageSpec], outputs: dict[str, StageResult]) -> str:
+    """Pull the writer stage's REAL finish_reason out of its StageResult.
+
+    The writer records the upstream reason (length/stop/cancelled/...) in
+    ``StageResult.structured["finish_reason"]``; default to ``stop`` only when no
+    writer result exists. This replaces the old hard-coded ``stop`` that clobbered
+    a real ``length`` truncation.
+    """
+    for spec in stages:
+        if getattr(spec, "agent_id", "") == "writer":
+            res = outputs.get(spec.agent_id)
+            if res and isinstance(res.structured, dict):
+                fr = res.structured.get("finish_reason")
+                if fr:
+                    return fr
+            break
+    return "stop"
+
+
+def _map_run_error(exc: Exception) -> tuple[str, str]:
+    """Map a multi-agent flow exception to (finish_reason, ev_error code)."""
+    if isinstance(exc, ProviderError):
+        if getattr(exc, "code", "") == PROVIDER_ERR_TIMEOUT:
+            return "timeout", "provider_timeout"
+        return "provider_error", "provider_error"
+    return "error", "crewai_run_error"
 
 
 class CrewAIRuntime:
@@ -187,6 +235,10 @@ class CrewAIRuntime:
                 graph, stages = build_parallel_research_stages(
                     llm=llm, tools=tools, question=ctx.user_content
                 )
+            elif profile == "debate":
+                graph, stages = build_debate_stages(
+                    llm=llm, tools=tools, question=ctx.user_content
+                )
             else:
                 graph, stages = build_research_stages(
                     llm=llm, tools=tools, question=ctx.user_content
@@ -198,9 +250,16 @@ class CrewAIRuntime:
 
         executor: StageExecutor = ctx.extra.get("stage_executor")
         if executor is None:
-            # Demo mode lets the full panel run live without an external LLM.
-            if getattr(get_settings(), "AGENT_DEMO_MODE", False):
+            # Demo isolation: the deterministic DemoStageExecutor (canned,
+            # non-real answers) runs ONLY on the strict double opt-in resolved by
+            # _demo_executor_enabled (env flag + per-request flag, and real
+            # CrewAI NOT enabled). A normal /api/chat/stream turn has demo=False,
+            # so it ALWAYS runs the real executor below — the canned "CrewAI
+            # supports stateful Flows…" text can never reach a real user this
+            # way. (Tests inject their own executor via ctx.extra["stage_executor"].)
+            if _demo_executor_enabled(get_settings(), ctx.request):
                 executor = DemoStageExecutor()
+                ctx.extra["is_demo"] = True
             else:
                 # Real path: wrap the CrewAI executor so the writer stage
                 # streams its answer token-by-token (see StreamingWriterExecutor)
@@ -251,10 +310,10 @@ class CrewAIRuntime:
 
         # ---- concurrent run + drain ----
         outputs: dict[str, StageResult] = {}
-        run_error: str | None = None
+        run_exc: Exception | None = None
 
         async def run_flow() -> None:
-            nonlocal run_error
+            nonlocal run_exc
             try:
                 emitter.emit_graph_initialized()
                 emitter.emit_run_status("running")
@@ -264,7 +323,7 @@ class CrewAIRuntime:
                 emitter.emit_run_status("cancelled")
                 raise
             except Exception as exc:  # noqa: BLE001
-                run_error = str(exc)
+                run_exc = exc
                 logger.exception("multi-agent flow failed: %s", exc)
                 emitter.emit_run_status("failed")
             finally:
@@ -293,10 +352,12 @@ class CrewAIRuntime:
             # Final snapshot persist.
             await self._persist_graph(ctx, emitter, definition=False)
 
-        if run_error is not None:
-            ctx.assistant_msg.content = ""
-            ctx.extra["finish_reason"] = "error"
-            yield ev_error(code="crewai_run_error", message=run_error)
+        if run_exc is not None:
+            # Preserve any partial content the writer streamed before failing
+            # (the old code wiped assistant_msg.content here, losing partials).
+            finish, code = _map_run_error(run_exc)
+            ctx.extra["finish_reason"] = finish
+            yield ev_error(code=code, message=str(run_exc))
             return
 
         # The final stage (writer) holds the answer — unless it already streamed
@@ -311,11 +372,14 @@ class CrewAIRuntime:
                     final_text = res.raw
                     break
             ctx.assistant_msg.content = final_text
-        ctx.extra["finish_reason"] = "stop"
+        # Recover the writer's REAL finish_reason (length/stop/cancelled/...)
+        # instead of clobbering it with a hard-coded "stop".
+        finish = _writer_finish_reason(stages, outputs)
+        ctx.extra["finish_reason"] = finish
         ctx.extra["multi_agent"] = True
         if not streamed and final_text:
             yield ev_token(delta=final_text)
-        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason="stop")
+        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason=finish)
 
     async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:
         """Honor user pause/resume + drain appended instructions between stages."""

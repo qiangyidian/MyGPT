@@ -79,6 +79,23 @@ export interface AgentGraphState {
   activeAgentIds: string[];
   startedAt?: string;
   finishedAt?: string;
+
+  /** The explicit runtime selection (runtime_selected SSE). Lets the panel
+   *  distinguish a REAL multi-agent run from a native fallback. */
+  selection?: RuntimeSelection;
+}
+
+/** Mirror of the backend RuntimeSelection / ev_runtime_selected payload. */
+export interface RuntimeSelection {
+  requestedRuntime: string;
+  effectiveRuntime: string;
+  agentProfile: string;
+  multiAgentRequested: boolean;
+  multiAgentExecuted: boolean;
+  fallbackReason: string | null;
+  /** True only when the answer came from the deterministic demo executor
+   *  (canned, non-real content). The UI MUST show a persistent warning. */
+  isDemo: boolean;
 }
 
 // A monotonic status rank — used to prevent regressions (a completed node can't

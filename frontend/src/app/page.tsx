@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { AppShell } from "@/components/app-shell";
+import { NavSuspense } from "@/components/navigation/page-loading";
 import { MessageList } from "@/components/message-list";
 import { Composer } from "@/components/composer";
 import { ApprovalCard } from "@/components/approval-card";
@@ -18,19 +19,21 @@ import { useModels } from "@/hooks/useModels";
 import { api } from "@/lib/api";
 import { useChatUiStore } from "@/stores/chat-ui-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
-import { useAgentRunStore } from "@/stores/agent-run-store";
+import { useAgentRunStore, selectIsDemo } from "@/stores/agent-run-store";
 import type { Citation, KnowledgeBase } from "@/lib/types";
 
 export default function HomePage() {
   return (
-    <AppShell>
-      {({ activeConversationId, setActiveConversationId }) => (
-        <ChatPanel
-          activeConversationId={activeConversationId}
-          setActiveConversationId={setActiveConversationId}
-        />
-      )}
-    </AppShell>
+    <NavSuspense>
+      <AppShell>
+        {({ activeConversationId, setActiveConversationId }) => (
+          <ChatPanel
+            activeConversationId={activeConversationId}
+            setActiveConversationId={setActiveConversationId}
+          />
+        )}
+      </AppShell>
+    </NavSuspense>
   );
 }
 
@@ -52,6 +55,7 @@ function ChatPanel({
   });
 
   const mode = useChatUiStore((s) => s.mode);
+  const isDemo = useAgentRunStore(selectIsDemo);
 
   const [modelId, setModelId] = useState<string | null>(null);
   const [kbIds, setKbIds] = useState<string[]>([]);
@@ -73,10 +77,23 @@ function ChatPanel({
   const chat = useChatStream();
   const lastRestoredRunRef = useRef<string | null>(null);
 
-  // If a stream created a conversation while NONE was selected, switch to it.
+  // If a stream surfaces a conversation id while NONE is selected, switch to it.
+  // CRITICAL: only react to a NEWLY-streamed id (tracked via the ref below) —
+  // never re-activate a stale id merely because activeId became null (e.g. after
+  // deleting the active conversation). Otherwise this fights AppShell's
+  // invalid-conversation clear (push X → 404 → clear null → push X …) into an
+  // infinite push/replace loop and pollutes the back stack.
+  const lastStreamedConvRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!activeConversationId && chat.currentConversationId) {
-      setActiveConversationId(chat.currentConversationId);
+    const streamed = chat.currentConversationId;
+    if (!streamed) {
+      lastStreamedConvRef.current = null;
+      return;
+    }
+    if (streamed === lastStreamedConvRef.current) return; // already consumed
+    lastStreamedConvRef.current = streamed;
+    if (!activeConversationId) {
+      setActiveConversationId(streamed);
     }
   }, [chat.currentConversationId, activeConversationId, setActiveConversationId]);
 
@@ -187,6 +204,24 @@ function ChatPanel({
           />
         </div>
 
+        {isDemo && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mx-auto w-full max-w-3xl shrink-0 px-4"
+          >
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+              <span className="mt-0.5 font-bold" aria-hidden>
+                ⚠️
+              </span>
+              <span>
+                演示模式：当前回答由演示执行器生成，<strong>内容非真实模型输出</strong>，
+                仅供展示多 Agent 面板与执行流程，请勿作为真实结论使用。
+              </span>
+            </div>
+          </div>
+        )}
+
         <MessageList
           messages={messages}
           streamingText={isThisConvStreaming ? chat.streamingText : undefined}
@@ -195,6 +230,7 @@ function ChatPanel({
           streamingSteps={isThisConvStreaming ? chat.steps : undefined}
           canRegenerate={messages.length > 0 && !chat.isStreaming}
           onRegenerate={() => void chat.regenerate()}
+          onContinue={() => void chat.continueGeneration()}
           onBranch={(id, content) => void handleBranch(id, content)}
           onSourceClick={handleSourceClick}
           onOpenAttachment={handleOpenAttachment}

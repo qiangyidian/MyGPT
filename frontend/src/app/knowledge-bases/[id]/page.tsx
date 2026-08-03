@@ -1,18 +1,20 @@
 "use client";
 
 import { useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft, RefreshCw, Trash2, Upload, Search } from "lucide-react";
+import { RefreshCw, Trash2, Upload, Search } from "lucide-react";
 
 import { api, ApiError } from "@/lib/api";
 import type { Citation, DocFile } from "@/lib/types";
 import { formatBytes } from "@/lib/utils";
+import { resolveChatHome, withReturnTo } from "@/lib/navigation";
+import { NavSuspense } from "@/components/navigation/page-loading";
+import { AppPageShell } from "@/components/navigation/app-page-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Textarea } from "@/components/ui/textarea";
 
 const IN_PROGRESS = new Set(["pending", "parsing", "chunking", "embedding"]);
 
@@ -24,9 +26,20 @@ function statusVariant(s: DocFile["status"]) {
 }
 
 export default function KbDetailPage() {
+  return (
+    <NavSuspense>
+      <KbDetailContent />
+    </NavSuspense>
+  );
+}
+
+function KbDetailContent() {
   const params = useParams<{ id: string }>();
-  const router = useRouter();
   const kbId = params.id;
+  const searchParams = useSearchParams();
+  // Chat-home target forwarded to the list/breadcrumbs; always clean (preserves
+  // the conversation id), never a non-existent path.
+  const returnTo = resolveChatHome(searchParams);
   const qc = useQueryClient();
 
   const { data: kb } = useQuery({
@@ -80,22 +93,22 @@ export default function KbDetailPage() {
     onError: (e: ApiError) => toast.error(e.message),
   });
 
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <Button variant="ghost" size="sm" onClick={() => router.push("/knowledge-bases")}>
-          <ArrowLeft className="mr-1 h-4 w-4" /> 返回
-        </Button>
-        <div>
-          <h1 className="text-2xl font-semibold">{kb?.name ?? "知识库"}</h1>
-          {kb?.description && (
-            <p className="text-sm text-muted-foreground">{kb.description}</p>
-          )}
-        </div>
-      </div>
+  const kbName = kb?.name ?? "知识库";
+  const listHref = withReturnTo("/knowledge-bases", returnTo);
 
+  return (
+    <AppPageShell
+      title={kbName}
+      description={kb?.description ?? undefined}
+      breadcrumbs={[
+        { label: "对话", href: "/" },
+        { label: "知识库", href: listHref },
+        { label: kbName },
+      ]}
+      secondaryBack={{ href: listHref, label: "返回知识库" }}
+    >
       {/* Upload */}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <label>
           <input
             type="file"
@@ -107,7 +120,7 @@ export default function KbDetailPage() {
               e.currentTarget.value = "";
             }}
           />
-          <Button asChild className="gap-2 cursor-pointer" disabled={uploadMut.isPending}>
+          <Button asChild className="cursor-pointer gap-2" disabled={uploadMut.isPending}>
             <span>
               <Upload className="h-4 w-4" /> 上传文档
             </span>
@@ -119,15 +132,15 @@ export default function KbDetailPage() {
       </div>
 
       {/* Document list */}
-      <div className="rounded-lg border border-border">
+      <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-sm">
           <thead className="bg-secondary/50 text-left text-xs text-muted-foreground">
             <tr>
               <th className="p-3">文件名</th>
-              <th className="p-3">类型</th>
-              <th className="p-3">大小</th>
+              <th className="hidden p-3 md:table-cell">类型</th>
+              <th className="hidden p-3 sm:table-cell">大小</th>
               <th className="p-3">状态</th>
-              <th className="p-3">切片</th>
+              <th className="hidden p-3 sm:table-cell">切片</th>
               <th className="p-3 text-right">操作</th>
             </tr>
           </thead>
@@ -147,18 +160,21 @@ export default function KbDetailPage() {
                       <div className="text-xs text-destructive">{d.error_message}</div>
                     )}
                   </td>
-                  <td className="p-3 text-muted-foreground">{d.file_type}</td>
-                  <td className="p-3 text-muted-foreground">{formatBytes(d.file_size)}</td>
+                  <td className="hidden p-3 text-muted-foreground md:table-cell">{d.file_type}</td>
+                  <td className="hidden p-3 text-muted-foreground sm:table-cell">
+                    {formatBytes(d.file_size)}
+                  </td>
                   <td className="p-3">
                     <Badge variant={statusVariant(d.status)}>{d.status}</Badge>
                   </td>
-                  <td className="p-3 text-muted-foreground">{d.chunk_count}</td>
+                  <td className="hidden p-3 text-muted-foreground sm:table-cell">{d.chunk_count}</td>
                   <td className="p-3">
                     <div className="flex justify-end gap-1">
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => reindexMut.mutate(d.id)}
+                        aria-label={`重新向量化 ${d.filename}`}
                         title="重新向量化"
                       >
                         <RefreshCw className="h-3.5 w-3.5" />
@@ -167,8 +183,9 @@ export default function KbDetailPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() => {
-                          if (confirm(`删除「${d.filename}」？`)) deleteMut.mutate(d.id);
+                          if (window.confirm(`删除「${d.filename}」？`)) deleteMut.mutate(d.id);
                         }}
+                        aria-label={`删除 ${d.filename}`}
                       >
                         <Trash2 className="h-3.5 w-3.5 text-destructive" />
                       </Button>
@@ -184,7 +201,7 @@ export default function KbDetailPage() {
       {/* Retrieval test */}
       <div className="space-y-2 rounded-lg border border-border p-4">
         <h2 className="text-sm font-semibold">检索测试</h2>
-        <div className="flex gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row">
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -194,7 +211,7 @@ export default function KbDetailPage() {
             }}
           />
           <Button
-            className="gap-2"
+            className="gap-2 sm:w-auto"
             onClick={() => searchMut.mutate()}
             disabled={searchMut.isPending || !query.trim()}
           >
@@ -218,6 +235,6 @@ export default function KbDetailPage() {
           </div>
         )}
       </div>
-    </div>
+    </AppPageShell>
   );
 }

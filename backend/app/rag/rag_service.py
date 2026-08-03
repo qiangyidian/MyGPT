@@ -38,6 +38,19 @@ def collection_name(kb_id: uuid.UUID | str) -> str:
     return "kb_" + str(kb_id).replace("-", "")
 
 
+def _effective_score(hit: Any) -> float:
+    """Best available relevance score for a hit, for the RAG_MIN_SCORE gate.
+
+    Prefers the reranker score (a comparable, model-calibrated relevance) when a
+    reranker ran; falls back to the raw ``hit.score`` (cosine similarity in
+    pure-vector mode, or a tiny RRF value in hybrid mode).
+    """
+    rerank = getattr(hit, "rerank_score", None)
+    if rerank is not None:
+        return float(rerank)
+    return float(getattr(hit, "score", 0.0) or 0.0)
+
+
 async def _resolve_embedding_config(db: AsyncSession, kb: KnowledgeBase) -> ModelConfig:
     """Pick the embedding ModelConfig: the KB's own, else any system/user embedding config."""
     if kb.embedding_model_id is not None:
@@ -126,6 +139,26 @@ class RagService:
         if settings.RAG_COMPRESS_DEDUP:
             hits = compress_context(hits)
         hits = hits[:top_k]
+        if not hits:
+            return "", []
+
+        # Relevance gate: drop chunks below RAG_MIN_SCORE. The most comparable
+        # score is the reranker score when a reranker ran; otherwise the raw
+        # (possibly RRF-fused) score. With the default 0.0 nothing is filtered;
+        # when tuned, a turn with NO chunk clearing the bar returns empty context
+        # + empty citations so low-relevance snippets never pollute the answer.
+        retrieved_count = len(hits)
+        top_score = max((_effective_score(h) for h in hits), default=0.0)
+        min_score = float(getattr(settings, "RAG_MIN_SCORE", 0.0))
+        if min_score > 0:
+            hits = [h for h in hits if _effective_score(h) >= min_score]
+        accepted_count = len(hits)
+        logger.info(
+            "rag_retrieval kb_ids=%s retrieved_count=%d accepted_count=%d "
+            "top_score=%.4f min_score=%.4f",
+            [str(k) for k in kb_ids], retrieved_count, accepted_count,
+            top_score, min_score,
+        )
         if not hits:
             return "", []
 

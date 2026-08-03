@@ -40,6 +40,7 @@ from app.agents.orchestrator import chat_orchestrator
 from app.agents.intent_router import decide_route
 from app.agents.planning import (
     extract_goal,
+    is_casual_question,
     should_summarize,
     summarize_history,
 )
@@ -49,9 +50,11 @@ from app.agents.schemas import (
     ExecutionMode,
 )
 from app.agents.state_store import load_state, save_summary, upsert_goal
+from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.models import Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.providers.registry import get_provider_for_config
+from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
 from app.services.attachment_service import resolve_and_bind_attachments
@@ -65,8 +68,96 @@ _DEFAULT_MAX_CONTEXT_TOKENS = 8192
 # encoding for a model (e.g. obscure model names). Keeps trimming conservative.
 _CHARS_PER_TOKEN = 4
 
+# finish_reason → consumer-facing generation status, persisted in message
+# metadata so the UI can tell a real completion apart from a truncation,
+# timeout, cancel, or failure. The old code collapsed everything non-cancelled
+# to "complete", hiding length/timeout truncations.
+_FINISH_STATUS: dict[str, str] = {
+    "stop": "complete",
+    "tool_calls": "complete",
+    "length": "truncated",
+    "budget": "truncated",
+    "cancelled": "cancelled",
+    "timeout": "error",
+    "content_filter": "error",
+    "provider_error": "error",
+    "stream_disconnected": "interrupted",
+    "error": "error",
+}
+
+# ev_error `code` → finish_reason, so a provider timeout is recorded as
+# finish_reason="timeout" instead of a generic "error".
+_ERROR_FINISH: dict[str, str] = {
+    "provider_timeout": "timeout",
+    "provider_error": "provider_error",
+    "stream_disconnected": "stream_disconnected",
+}
+
+
+def _status_for_finish(finish_reason: str) -> str:
+    if not finish_reason:
+        return "complete"
+    return _FINISH_STATUS.get(finish_reason, "error")
+
+
+def _finish_for_error_code(code: str | None) -> str:
+    if not code:
+        return "error"
+    return _ERROR_FINISH.get(code, "error")
+
+
+def _log_turn_outcome(
+    label: str,
+    *,
+    sel: Any,
+    route: Any,
+    is_demo: bool,
+    rag_requested: bool,
+    rag_used: bool,
+    rag_skipped_reason: str | None,
+    citation_count: int,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Emit one structured per-turn log line for production tracing.
+
+    Called from the done / error / cancel terminal paths so EVERY turn —
+    including failed and cancelled ones — leaves a complete record of how it was
+    routed, whether multi-agent actually executed, whether demo ran, and the RAG
+    outcome. No API keys or document content are logged.
+    """
+    fields: dict[str, Any] = {
+        "requested_mode": getattr(sel, "requested_mode", None) or getattr(route, "requested_mode", "auto"),
+        "effective_mode": getattr(sel, "effective_mode", None) or getattr(route, "mode", "auto"),
+        "requested_runtime": getattr(sel, "requested_runtime", None) or "native",
+        "effective_runtime": getattr(sel, "selected_runtime", None) or "native",
+        "agent_profile": getattr(sel, "agent_profile", None) or getattr(route, "agent_profile", "general"),
+        "multi_agent_requested": bool(getattr(sel, "multi_agent_requested", False)),
+        "multi_agent_executed": bool(getattr(sel, "multi_agent_executed", False)),
+        "is_demo": is_demo,
+        "rag_requested": rag_requested,
+        "rag_used": rag_used,
+        "rag_skipped_reason": rag_skipped_reason,
+        "citation_count": citation_count,
+        "fallback_reason": getattr(sel, "fallback_reason", None),
+    }
+    if extra:
+        fields.update(extra)
+    logger.info("turn_outcome label=%s %s", label, " ".join(f"{k}={v}" for k, v in fields.items()))
+
 # Default system prompt when a conversation defines none.
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise assistant."
+
+# Anti-"fake multi-agent": a single model must not claim to have launched
+# multiple agents / sub-models / roles unless the runtime actually did. Without
+# this, a native fallback answering "use multiple agents to debate X vs Y" would
+# role-play several agents in prose and look like a real multi-agent run. This
+# is a backstop; the real fix is the routing + observable runtime selection.
+_MULTI_AGENT_HONESTY = (
+    "多 Agent 诚实约束：除非上下文中明确存在真实的多 Agent 执行证据（例如结构化的 "
+    "agent_graph / agent_status 事件），否则你不得声称已启动多个 Agent、子模型、角色或"
+    "并行执行。若用户请求多 Agent 但当前运行时未能提供，请如实说明本次未启动真实多 "
+    "Agent，而不是在回答中扮演多个角色。"
+)
 
 # Prepended when the user enables "agent / tools" mode. Drives iterative tool
 # use WITHOUT soliciting a raw chain-of-thought: the model decomposes and acts,
@@ -359,12 +450,18 @@ class ChatService:
         # explicit execution_mode='agent' (with default mode) still forces the
         # multi-agent runtime so existing clients/tests keep working.
         # Effective KB set: explicit per-turn multi-select wins, else the legacy
-        # single id, else the conversation's stored KB.
+        # single id, else the conversation's stored KB. ``kb_explicit`` records
+        # whether the user selected a KB *this turn* (vs. inheriting the
+        # conversation's bound KB) — logged for observability so we can tell a
+        # deliberate KB query apart from an inherited one.
         kb_ids: list[uuid.UUID] = list(request.knowledge_base_ids or [])
+        kb_explicit = bool(kb_ids)
         if not kb_ids and request.knowledge_base_id is not None:
             kb_ids = [request.knowledge_base_id]
+            kb_explicit = True
         elif not kb_ids and conversation.knowledge_base_id is not None:
             kb_ids = [conversation.knowledge_base_id]
+            kb_explicit = False
         # Ownership: a user may only run against their own (or system-wide) model
         # config and their own knowledge bases — never another user's.
         if cfg.user_id is not None and cfg.user_id != user.id:
@@ -377,6 +474,7 @@ class ChatService:
             request.mode,
             has_knowledge_base=bool(kb_ids),
             has_attachment=bool(request.attachment_ids),
+            user_content=request.content or "",
         )
         enable_tools = route.enable_tools or request.enable_tools
         execution_mode = route.execution_mode
@@ -423,9 +521,22 @@ class ChatService:
                 conversation.last_message_preview = (user_content or "").strip()[:280]
 
         # 3. System prompt + optional RAG retrieval.
+        # RAG is SKIPPED for social/capability chit-chat ("你好", "你是谁",
+        # "你都能干什么", "谢谢", …) so a knowledge base bound to the
+        # conversation never leaks into casual answers. An explicit per-turn KB
+        # selection still retrieves for genuine questions. rag_skipped_reason
+        # records WHY retrieval did not run (no KB / casual / retrieval error)
+        # for observability.
         citations: list[Citation] = []
         rag_context = ""
-        if kb_ids:
+        rag_requested = False
+        rag_skipped_reason: str | None = None
+        if not kb_ids:
+            rag_skipped_reason = "no_knowledge_base"
+        elif get_settings().RAG_SKIP_CASUAL and is_casual_question(user_content):
+            rag_skipped_reason = "casual_question"
+        else:
+            rag_requested = True
             try:
                 rag_context, citations = await rag_service.retrieve(
                     db, user_content, kb_ids, top_k=5
@@ -434,6 +545,13 @@ class ChatService:
                 # RAG is best-effort: a retrieval failure must not kill the chat.
                 logger.warning("RAG retrieval failed, continuing without context: %s", exc)
                 rag_context, citations = "", []
+                rag_skipped_reason = "retrieval_error"
+        rag_used = bool(rag_context)
+        logger.info(
+            "rag_decision rag_requested=%s rag_used=%s rag_skipped_reason=%s "
+            "kb_explicit=%s citation_count=%d",
+            rag_requested, rag_used, rag_skipped_reason, kb_explicit, len(citations),
+        )
 
         if citations:
             yield _event(
@@ -457,6 +575,8 @@ class ChatService:
         if flow_state.user_goal:
             prefix += f"User's ongoing goal: {flow_state.user_goal}\n\n"
         system_prompt = prefix + system_prompt
+        # Single-model honesty backstop (see _MULTI_AGENT_HONESTY).
+        system_prompt = system_prompt + "\n\n" + _MULTI_AGENT_HONESTY
 
         # Remember the user's goal for this conversation (single 'task' memory).
         if user_content.strip():
@@ -520,6 +640,20 @@ class ChatService:
                     assistant_msg.metadata_ = self._meta(
                         cfg, citations, finish, assistant_msg.metadata_
                     )
+                    # Citation integrity: strip any [source N] in the final
+                    # answer that has no real backing citation (a model may
+                    # hallucinate a marker; the deterministic demo writer emits
+                    # them unconditionally). The persisted text is cleaned so a
+                    # reload/regenerate shows honest markers; the frontend also
+                    # cleans the live stream on render. Flag the turn when any
+                    # marker had to be stripped.
+                    if assistant_msg.content:
+                        _cleaned, _cited_changed = sanitize_unbacked_source_markers(
+                            assistant_msg.content, len(citations)
+                        )
+                        if _cited_changed:
+                            assistant_msg.content = _cleaned
+                            assistant_msg.metadata_["citation_validation_failed"] = True
                     # Drop the live tool_calls trace from the persisted metadata:
                     # the UI reads the execution trace from ToolCall/AgentStep rows,
                     # and a dangling tool_calls here would make the NEXT turn's
@@ -534,6 +668,52 @@ class ChatService:
                         # Mark multi-agent runs so the UI shows the compact
                         # "查看执行过程" entry (single-agent runs keep ResearchSteps).
                         assistant_msg.metadata_["multi_agent"] = True
+                    # Observability: record the runtime selection so the UI can
+                    # tell a REAL multi-agent run from a native fallback (and
+                    # never mistake a single-model fallback for multi-agent).
+                    sel = ctx.extra.get("runtime_selection")
+                    if sel is not None:
+                        md = assistant_msg.metadata_
+                        md["requested_mode"] = sel.requested_mode
+                        md["effective_mode"] = sel.effective_mode
+                        md["requested_runtime"] = sel.requested_runtime
+                        md["effective_runtime"] = sel.selected_runtime
+                        md["agent_profile"] = sel.agent_profile
+                        md["multi_agent_requested"] = sel.multi_agent_requested
+                        md["multi_agent_executed"] = sel.multi_agent_executed
+                        if sel.fallback_reason:
+                            md["fallback_reason"] = sel.fallback_reason
+                    elif route.requested_mode and route.requested_mode != route.mode:
+                        assistant_msg.metadata_["requested_mode"] = route.requested_mode
+                        assistant_msg.metadata_["effective_mode"] = route.mode
+                    # is_demo: True only when the answer came from the
+                    # deterministic demo executor (canned, non-real content).
+                    # Drives the persistent UI warning; always False on the
+                    # public chat path (demo needs an explicit request opt-in).
+                    # ``sel`` (runtime_selection) was resolved just above.
+                    _is_demo = bool(ctx.extra.get("is_demo")) or bool(
+                        getattr(sel, "is_demo", False)
+                    )
+                    assistant_msg.metadata_["is_demo"] = _is_demo
+                    # RAG + observability fields: persisted on the message (so
+                    # the debug panel / future turns can read them) AND emitted
+                    # as one structured log line per turn for production tracing.
+                    assistant_msg.metadata_["rag_requested"] = rag_requested
+                    assistant_msg.metadata_["rag_used"] = rag_used
+                    if rag_skipped_reason:
+                        assistant_msg.metadata_["rag_skipped_reason"] = rag_skipped_reason
+                    assistant_msg.metadata_["citation_count"] = len(citations)
+                    _log_turn_outcome(
+                        "complete",
+                        sel=sel,
+                        route=route,
+                        is_demo=_is_demo,
+                        rag_requested=rag_requested,
+                        rag_used=rag_used,
+                        rag_skipped_reason=rag_skipped_reason,
+                        citation_count=len(citations),
+                        extra={"finish_reason": finish},
+                    )
                     # Refresh the sidebar preview with the final assistant text.
                     conversation.last_message_preview = (assistant_msg.content or "")[:280]
                     await db.commit()
@@ -546,17 +726,57 @@ class ChatService:
                     yield evt.to_sse_envelope()
                     return
                 if evt.kind == "error":
+                    err_code = evt.data.get("code")
+                    err_msg = evt.data.get("message", "error")
+                    err_finish = _finish_for_error_code(err_code)
                     await self._finalize_error(
-                        db, assistant_msg, evt.data.get("message", "error")
+                        db, assistant_msg, err_msg,
+                        finish_reason=err_finish, code=err_code,
+                    )
+                    # Structured record for a FAILED turn (same field set as a
+                    # completed one) so failed runs are queryable too.
+                    sel = ctx.extra.get("runtime_selection")
+                    _log_turn_outcome(
+                        "failed",
+                        sel=sel,
+                        route=route,
+                        is_demo=bool(ctx.extra.get("is_demo")) or bool(getattr(sel, "is_demo", False)),
+                        rag_requested=rag_requested,
+                        rag_used=rag_used,
+                        rag_skipped_reason=rag_skipped_reason,
+                        citation_count=len(citations),
+                        extra={"error_code": err_code, "finish_reason": err_finish},
                     )
                     yield evt.to_sse_envelope()
                     return
                 yield evt.to_sse_envelope()
         except asyncio.CancelledError:
-            # Client disconnected: persist whatever text we have so far.
-            logger.info("chat stream cancelled by client; saving partial output")
+            # The connection was cancelled. Distinguish a user-initiated stop
+            # (the cancel API sets ctl.cancel) from an ungraceful network drop
+            # so the persisted status matches what actually happened.
+            from app.agents.run_controls import get as get_run_control
+
+            ctl = get_run_control(ctx.run_id)
+            reason = (
+                "cancelled"
+                if (ctl is not None and ctl.cancel.is_set())
+                else "stream_disconnected"
+            )
+            logger.info("chat stream cancelled (%s); saving partial output", reason)
             assistant_msg.metadata_ = self._meta(
-                cfg, citations, "cancelled", assistant_msg.metadata_
+                cfg, citations, reason, assistant_msg.metadata_
+            )
+            # Structured record for a cancelled/disconnected turn too.
+            sel = ctx.extra.get("runtime_selection")
+            _log_turn_outcome(
+                reason,
+                sel=sel,
+                route=route,
+                is_demo=bool(ctx.extra.get("is_demo")) or bool(getattr(sel, "is_demo", False)),
+                rag_requested=rag_requested,
+                rag_used=rag_used,
+                rag_skipped_reason=rag_skipped_reason,
+                citation_count=len(citations),
             )
             await _persist_partial(db, assistant_msg)
             raise
@@ -572,20 +792,32 @@ class ChatService:
             **(prev or {}),
             "model": cfg.model_name,
             "finish_reason": finish_reason,
-            "status": "complete" if finish_reason != "cancelled" else "cancelled",
+            "status": _status_for_finish(finish_reason),
         }
         if citations:
             metadata["citations"] = [c.model_dump(mode="json") for c in citations]
         return metadata
 
     async def _finalize_error(
-        self, db: AsyncSession, assistant_msg: Message, message: str
+        self,
+        db: AsyncSession,
+        assistant_msg: Message,
+        message: str,
+        *,
+        finish_reason: str = "error",
+        code: str | None = None,
     ) -> None:
-        assistant_msg.metadata_ = {
+        # Preserve partial content (assistant_msg.content is mutated by the
+        # runtime as tokens stream) — only record why it stopped.
+        md: dict[str, Any] = {
             **(assistant_msg.metadata_ or {}),
-            "status": "error",
+            "finish_reason": finish_reason,
+            "status": _status_for_finish(finish_reason),
             "error": message,
         }
+        if code:
+            md["provider_error_code"] = code
+        assistant_msg.metadata_ = md
         await db.commit()
 
     async def _maybe_summarize(

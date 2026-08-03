@@ -53,7 +53,14 @@ def test_invalid_mode_falls_back_to_auto():
 
 
 def test_valid_modes_set():
-    assert VALID_MODES == {"auto", "search", "deep_research", "create", "data_analysis"}
+    assert VALID_MODES == {
+        "auto",
+        "search",
+        "deep_research",
+        "create",
+        "data_analysis",
+        "debate",
+    }
 
 
 def test_filter_tool_names_allowlist_and_disable_web():

@@ -5,7 +5,7 @@
 // panel was dismissed (so the user can reopen it, including for finished runs).
 // A pulsing dot appears when ≥1 agent is running; the label shows running count.
 
-import { UsersRound } from "lucide-react";
+import { AlertTriangle, UsersRound } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
+  selectRuntimeFallback,
   selectShouldShowPanel,
   useAgentRunStore,
 } from "@/stores/agent-run-store";
@@ -23,12 +24,44 @@ import {
 export function AgentPanelTrigger({ className }: { className?: string }) {
   const active = useAgentRunStore((s) => s.active);
   const open = selectShouldShowPanel(useAgentRunStore.getState());
+  const fallback = selectRuntimeFallback(useAgentRunStore.getState());
   const dismissActive = useAgentRunStore((s) => s.dismissActive);
   const reopenActive = useAgentRunStore((s) => s.reopenActive);
 
   const total = active.nodes.length;
   const running = active.activeAgentIds.length;
   const multi = total >= 2;
+
+  // Fallback: a multi-agent request couldn't run for real. Show a warning badge
+  // (NOT a fake agent panel — there are no nodes) so the user knows.
+  if (fallback) {
+    return (
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-label="多 Agent 运行时不可用，已回退为普通模式"
+              className={cn(
+                "h-8 gap-1.5 text-xs font-medium border-amber-500/50 text-amber-600 dark:text-amber-400",
+                className
+              )}
+            >
+              <AlertTriangle className="h-4 w-4" />
+              <span>多 Agent 不可用</span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-xs">
+            多 Agent 运行时不可用，本次已回退为普通模式。
+            {fallback.fallbackReason ? `原因：${fallback.fallbackReason}。` : ""}
+            请在根目录 .env 启用 CREWAI_ENABLED=true 或 AGENT_DEMO_MODE=true 并重启后端。
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
 
   if (!multi) return null;
 

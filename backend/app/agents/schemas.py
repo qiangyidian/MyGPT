@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import BaseModel, Field
 
+from app.providers.base import FinishReason
 from app.schemas import ChatRequest, Citation
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids runtime DB imports
@@ -126,6 +127,45 @@ def ev_meta(*, message_id: uuid.UUID | str, conversation_id: uuid.UUID | str) ->
     return AgentEvent(kind="meta", data={"message_id": str(message_id), "conversation_id": str(conversation_id)})
 
 
+def ev_runtime_selected(
+    *,
+    run_id: uuid.UUID | str,
+    requested_mode: str,
+    effective_mode: str,
+    requested_runtime: str,
+    effective_runtime: str,
+    agent_profile: str,
+    multi_agent_requested: bool,
+    multi_agent_executed: bool,
+    fallback_reason: str | None = None,
+    is_demo: bool = False,
+) -> AgentEvent:
+    """Tell the client which runtime actually ran and whether a multi-agent
+    request was honored or fell back. This is what prevents 'fake multi-agent':
+    the frontend opens the agent panel ONLY when ``multi_agent_executed`` is true
+    and shows a fallback warning when a multi-agent request couldn't run.
+
+    ``is_demo`` is True only when the answer came from the deterministic
+    DemoStageExecutor (canned, non-real content). The frontend MUST render a
+    persistent '演示模式，内容非真实生成' warning in that case so a demo answer is
+    never mistaken for a genuine model reply."""
+    return AgentEvent(
+        kind="runtime_selected",
+        data={
+            "run_id": str(run_id),
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "requested_runtime": requested_runtime,
+            "effective_runtime": effective_runtime,
+            "agent_profile": agent_profile,
+            "multi_agent_requested": bool(multi_agent_requested),
+            "multi_agent_executed": bool(multi_agent_executed),
+            "fallback_reason": fallback_reason,
+            "is_demo": bool(is_demo),
+        },
+    )
+
+
 def ev_plan_created(*, summary: str, steps: list[dict[str, Any]]) -> AgentEvent:
     return AgentEvent(kind="plan_created", data={"summary": summary, "steps": steps})
 
@@ -209,7 +249,7 @@ def ev_citations(*, citations: list[Citation]) -> AgentEvent:
     return AgentEvent(kind="citations", data={"citations": [c.model_dump(mode="json") for c in citations]})
 
 
-def ev_done(*, message_id: uuid.UUID | str, finish_reason: str = "stop") -> AgentEvent:
+def ev_done(*, message_id: uuid.UUID | str, finish_reason: FinishReason = "stop") -> AgentEvent:
     return AgentEvent(kind="done", data={"message_id": str(message_id), "finish_reason": finish_reason})
 
 

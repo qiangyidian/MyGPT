@@ -5,6 +5,7 @@ import {
   Compass,
   FileSearch,
   PenLine,
+  Scale,
   Sparkles,
   type LucideIcon,
 } from "lucide-react";
@@ -59,6 +60,13 @@ export const USER_MODES: UserModeMeta[] = [
     description: "上传表格或文件，进行分析、计算与可视化。",
     icon: BarChart3,
   },
+  {
+    value: "debate",
+    label: "多 Agent 辩论",
+    short: "辩论",
+    description: "由双方 Agent 独立论证，再由裁判 Agent 按统一标准评估并给出结论。",
+    icon: Scale,
+  },
 ];
 
 const MODE_MAP: Record<UserChatMode, UserModeMeta> = USER_MODES.reduce(
@@ -78,4 +86,21 @@ export function getModeMeta(mode: UserChatMode | string | undefined): UserModeMe
 
 export function isUserChatMode(v: unknown): v is UserChatMode {
   return typeof v === "string" && v in MODE_MAP;
+}
+
+/**
+ * Modes that meaningfully change the answer pipeline (multi-agent research,
+ * multi-agent debate, file-backed data analysis). When active the composer
+ * shows an explicit, hard-to-miss badge so the user always knows they are NOT
+ * in ordinary chat — preventing the "UI says auto, request sends deep_research"
+ * class of inconsistency.
+ */
+export const SPECIAL_MODES: ReadonlySet<UserChatMode> = new Set([
+  "deep_research",
+  "debate",
+  "data_analysis",
+]);
+
+export function isSpecialMode(m: UserChatMode | string | undefined): boolean {
+  return !!m && (SPECIAL_MODES as Set<string>).has(m);
 }

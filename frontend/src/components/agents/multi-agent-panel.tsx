@@ -9,7 +9,7 @@
 // until a different run starts.
 
 import { useEffect, useState } from "react";
-import { Network, Loader2 } from "lucide-react";
+import { AlertTriangle, Loader2, Network } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  selectRuntimeFallback,
   selectShouldShowPanel,
   useAgentRunStore,
 } from "@/stores/agent-run-store";

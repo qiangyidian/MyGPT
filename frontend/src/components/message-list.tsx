@@ -22,6 +22,8 @@ interface MessageListProps {
   streamingSteps?: ResearchStep[];
   canRegenerate?: boolean;
   onRegenerate?: () => void;
+  /** Continue a truncated/interrupted/cancelled answer (new turn, no repeat). */
+  onContinue?: () => void;
   onBranch?: (messageId: string, newContent: string) => void;
   onSourceClick?: (index: number, citations: Citation[]) => void;
   onOpenAttachment?: (attachmentId: string) => void;
@@ -37,6 +39,7 @@ export function MessageList({
   streamingSteps,
   canRegenerate,
   onRegenerate,
+  onContinue,
   onBranch,
   onSourceClick,
   onOpenAttachment,
@@ -107,6 +110,7 @@ export function MessageList({
             isLast={i === shownMessages.length - 1 && !streamingText}
             canRegenerate={canRegenerate && !isStreaming}
             onRegenerate={onRegenerate}
+            onContinue={onContinue}
             onBranch={onBranch}
             onSourceClick={onSourceClick}
             onOpenAttachment={onOpenAttachment}

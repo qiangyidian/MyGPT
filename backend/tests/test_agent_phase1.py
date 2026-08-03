@@ -29,30 +29,57 @@ _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 # --------------------------------------------------------------------------- #
 # Orchestrator selection
 # --------------------------------------------------------------------------- #
-def test_orchestrator_native_when_crewai_disabled():
+def _ctx(execution_mode, *, multi_agent: bool, mode: str = "auto", profile: str = "general"):
+    return types.SimpleNamespace(
+        execution_mode=execution_mode,
+        extra={"route": types.SimpleNamespace(
+            use_multi_agent=multi_agent, requested_mode=mode, mode=mode, agent_profile=profile,
+        )},
+    )
+
+
+def test_orchestrator_native_when_crewai_disabled(monkeypatch):
+    settings = __import__("app.core.config", fromlist=["get_settings"]).get_settings()
+    monkeypatch.setattr(settings, "CREWAI_ENABLED", False)
+    monkeypatch.setattr(settings, "AGENT_DEMO_MODE", False)
+
     orch = ChatOrchestrator()
-    assert orch._crewai_available() is False
-    ctx = types.SimpleNamespace(execution_mode=ExecutionMode.agent)
-    assert isinstance(orch._select_runtime(ctx), NativeChatRuntime)
-    ctx = types.SimpleNamespace(execution_mode=ExecutionMode.auto)
-    assert isinstance(orch._select_runtime(ctx), NativeChatRuntime)
+    available, reason = orch._crewai_status()
+    assert available is False
+    assert reason == "crewai_disabled"
+    # A multi-agent request when crewai is off → explicit native FALLBACK
+    # (observable, not silent) with multi_agent_executed=False.
+    ctx = _ctx(ExecutionMode.agent, multi_agent=True, mode="debate", profile="debate")
+    runtime, sel = orch._select_runtime(ctx)
+    assert isinstance(runtime, NativeChatRuntime)
+    assert sel.multi_agent_requested is True
+    assert sel.multi_agent_executed is False
+    assert sel.fallback_reason == "crewai_disabled"
+    # A plain (non-multi-agent) turn → native, no fallback.
+    runtime2, sel2 = orch._select_runtime(_ctx(ExecutionMode.auto, multi_agent=False))
+    assert isinstance(runtime2, NativeChatRuntime)
+    assert sel2.multi_agent_requested is False
+    assert sel2.fallback_reason is None
 
 
 def test_orchestrator_crewai_when_enabled_and_agent_mode(monkeypatch):
     settings = __import__("app.core.config", fromlist=["get_settings"]).get_settings()
     monkeypatch.setattr(settings, "CREWAI_ENABLED", True)
+    monkeypatch.setattr(settings, "AGENT_DEMO_MODE", False)
 
     orch = ChatOrchestrator()
-    assert orch._crewai_available() is True
-    ctx = types.SimpleNamespace(execution_mode=ExecutionMode.agent)
-    runtime = orch._select_runtime(ctx)
+    available, reason = orch._crewai_status()
+    assert available is True
+    assert reason is None
+    ctx = _ctx(ExecutionMode.agent, multi_agent=True, mode="debate", profile="debate")
+    runtime, sel = orch._select_runtime(ctx)
     assert isinstance(runtime, CrewAIRuntime)
+    assert sel.multi_agent_executed is True
+    assert sel.fallback_reason is None
 
     # chat/auto still use native even when crewai is available.
-    assert isinstance(
-        orch._select_runtime(types.SimpleNamespace(execution_mode=ExecutionMode.chat)),
-        NativeChatRuntime,
-    )
+    runtime2, _ = orch._select_runtime(_ctx(ExecutionMode.chat, multi_agent=False))
+    assert isinstance(runtime2, NativeChatRuntime)
 
 
 # --------------------------------------------------------------------------- #

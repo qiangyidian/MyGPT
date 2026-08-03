@@ -101,6 +101,85 @@ async def test_writer_cancel_preserves_partial_content(db_session):
     assert stage_ctx.writer_streamed is True
 
 
+class _RecordingProvider(MockProvider):
+    """Records the ChatOptions the writer passed to stream_chat."""
+    last_options = None
+
+    async def stream_chat(self, messages, options=None):
+        self.last_options = options
+        async for d in super().stream_chat(messages, options):
+            yield d
+
+
+class _LengthProvider(MockProvider):
+    """Yields tokens then finish=length, to prove the real reason is recorded."""
+
+    async def stream_chat(self, messages, options=None):
+        yield ChatDelta(content="partial code ")
+        yield ChatDelta(content="", finish_reason="length")
+
+
+async def test_writer_uses_model_config_max_tokens(db_session):
+    """The writer must derive its output budget from ModelConfig.max_tokens,
+    not the old hardcoded 1024 (which truncated long code answers)."""
+    conv = Conversation(user_id=_SEEDED, title="mt")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    rec = _RecordingProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.provider = rec
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "write a snake game in python"
+    stage_ctx.model_config = SimpleNamespace(max_tokens=8192)
+
+    executor = StreamingWriterExecutor(FakeStageExecutor())
+    await executor.execute(
+        agent_id="writer", agent=None, task=SimpleNamespace(description="q", id="t"),
+        context="verified", stage_ctx=stage_ctx,
+    )
+    await asyncio.sleep(0.05)
+
+    assert rec.last_options is not None, "writer did not call stream_chat"
+    assert rec.last_options.max_tokens == 8192, (
+        f"writer must use ModelConfig.max_tokens (8192), not the old hardcoded "
+        f"1024; got {rec.last_options.max_tokens}"
+    )
+
+
+async def test_writer_records_real_finish_reason_length(db_session):
+    """The writer records the upstream finish_reason in StageResult.structured
+    (so the runtime no longer hard-codes 'stop' over a real 'length')."""
+    conv = Conversation(user_id=_SEEDED, title="fr")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    stage_ctx.provider = _LengthProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "write code"
+    stage_ctx.model_config = SimpleNamespace(max_tokens=4096)
+
+    executor = StreamingWriterExecutor(FakeStageExecutor())
+    result = await executor.execute(
+        agent_id="writer", agent=None, task=SimpleNamespace(description="q", id="t"),
+        context="verified", stage_ctx=stage_ctx,
+    )
+    await asyncio.sleep(0.05)
+
+    assert result.structured["finish_reason"] == "length", (
+        f"writer must record the real upstream finish_reason; got "
+        f"{result.structured.get('finish_reason')}"
+    )
+    assert msg.content == "partial code "
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end: the full multi-agent run streams the writer and emits no duplicate.
 # --------------------------------------------------------------------------- #

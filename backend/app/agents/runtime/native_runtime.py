@@ -29,6 +29,7 @@ from app.agents.approval_coordinator import approval_coordinator
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies import BudgetExceeded, BudgetGuard
 from app.agents.planning import build_plan, classify_intent
+from app.agents.runtime.stage_executor import safe_positive_int
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -89,7 +90,7 @@ class NativeChatRuntime:
         options = ChatOptions(
             temperature=cfg.temperature,
             top_p=cfg.top_p,
-            max_tokens=_safe_int(cfg.max_tokens, 1024),
+            max_tokens=safe_positive_int(cfg.max_tokens, 1024),
             tools=tool_schemas,
             tool_choice="auto",
         )
@@ -136,8 +137,14 @@ class NativeChatRuntime:
                         if delta.finish_reason:
                             finish_reason = delta.finish_reason
                 except ProviderError as exc:
+                    # Fold this round's partial text before surfacing the error,
+                    # so a mid-stream timeout/network failure still preserves
+                    # everything generated so far.
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(accumulated)
                     logger.exception("provider error in native run: %s", exc)
-                    yield ev_error(code="provider_error", message=str(exc))
+                    yield ev_error(
+                        code=getattr(exc, "code", "provider_error"), message=str(exc)
+                    )
                     return
 
                 # Fold this round's streamed text into the assistant message so a
@@ -309,14 +316,6 @@ class NativeChatRuntime:
 
 
 # --------------------------------------------------------------------------- #
-def _safe_int(value: Any, default: int) -> int:
-    try:
-        v = int(value)
-        return v if v > 0 else default
-    except (TypeError, ValueError):
-        return default
-
-
 def _safe_get(registry, name: str):
     try:
         return registry.get(name)

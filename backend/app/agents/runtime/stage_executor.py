@@ -27,6 +27,19 @@ from app.agents.stage_context import StageContext
 logger = logging.getLogger(__name__)
 
 
+def safe_positive_int(value: Any, default: int) -> int:
+    """Coerce ``value`` to a positive int, falling back to ``default`` otherwise.
+
+    Shared so the Native runtime and the multi-agent Writer derive the output
+    token budget the same way (no inconsistent copies across modules).
+    """
+    try:
+        v = int(value)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class StageResult:
     """Outcome of one agent stage."""
@@ -188,15 +201,25 @@ class FakeStageExecutor:
 # --------------------------------------------------------------------------- #
 # Demo executor: no LLM, but produces realistic per-role behaviour so the full
 # multi-agent panel can be exercised live (real SSE, real graph, real tool
-# attribution) without an external model endpoint. Enabled by AGENT_DEMO_MODE.
+# attribution) without an external model endpoint.
+#
+# ⚠️ ISOLATION: this executor is reached ONLY when BOTH AGENT_DEMO_MODE is
+# enabled AND the request carries an explicit demo=True flag (see
+# CrewAIRuntime._run_multi_agent). It is NEVER a transparent substitute for the
+# real executor on a normal /api/chat/stream turn — a plain mode=deep_research
+# request runs the real executor (or falls back to native with a visible
+# reason), never this canned one. The canned content itself lives in the
+# demo-only module demo_content.py.
 # --------------------------------------------------------------------------- #
 class DemoStageExecutor(FakeStageExecutor):
     """FakeStageExecutor with sensible default behaviours keyed by agent role.
 
-    Used when ``AGENT_DEMO_MODE=true`` so the panel can be hand-verified. The
-    defaults simulate a research crew: researchers call web_search, the analyst
-    cross-checks, the writer produces a short cited answer. Override per-agent
-    via the ``behaviours`` map (e.g. to script a failure for scenario D).
+    Used ONLY on an explicit per-request demo opt-in (request.demo=True with
+    AGENT_DEMO_MODE enabled) so the panel can be hand-verified without an LLM.
+    The defaults simulate a research crew: researchers call web_search, the
+    analyst cross-checks, the writer produces a short cited answer. Override
+    per-agent via the ``behaviours`` map (e.g. to script a failure for scenario
+    D). The canned text itself is in demo_content.py.
     """
 
     def __init__(self, behaviours: dict[str, "FakeStageExecutor.Behavior"] | None = None) -> None:
@@ -217,53 +240,14 @@ class DemoStageExecutor(FakeStageExecutor):
 
     @staticmethod
     def _defaults() -> dict[str, "FakeStageExecutor.Behavior"]:
-        return {
-            "researcher": FakeStageExecutor.Behavior(
-                delay=1.2,
-                output=(
-                    "Evidence gathered:\n"
-                    "[source 1] CrewAI Flows support stateful, router-based orchestration.\n"
-                    "[source 2] Sequential crews run one agent at a time; gather enables parallel.\n"
-                    "Gap: none."
-                ),
-                summary="已收集 2 条证据，无缺口",
-                tools=[{"name": "web_search", "args": {"query": "crewai flows"}, "ok": True, "result": "2 hits"}],
-            ),
-            "web-researcher": FakeStageExecutor.Behavior(
-                delay=1.4,
-                output="[source 1] Web evidence: CrewAI 1.15 supports aexecute_task.",
-                summary="网络证据 1 条",
-                tools=[{"name": "web_search", "args": {"query": "crewai aexecute_task"}, "ok": True, "result": "1 hit"}],
-            ),
-            "kb-researcher": FakeStageExecutor.Behavior(
-                delay=1.1,
-                output="[source 2] KB evidence: internal docs confirm dual-runtime design.",
-                summary="知识库证据 1 条",
-                tools=[{"name": "file_analyze", "args": {"document_id": "demo"}, "ok": True, "result": "doc text"}],
-            ),
-            "coordinator": FakeStageExecutor.Behavior(
-                delay=0.4,
-                output="web line: 'crewai parallel'; kb line: 'dual runtime'",
-                summary="已拆分为网络与知识库两条检索线",
-            ),
-            "analyst": FakeStageExecutor.Behavior(
-                delay=0.9,
-                output=(
-                    "Finding: sufficient=true; conflicts=[]; "
-                    "verified_facts=[flows are stateful, gather enables parallel]; conclusion=ok"
-                ),
-                summary="证据充分，无冲突",
-            ),
-            "writer": FakeStageExecutor.Behavior(
-                delay=0.8,
-                output=(
-                    "CrewAI supports stateful Flows [source 1] and parallel agent "
-                    "execution via gather [source 2]. The dual-runtime design keeps "
-                    "native chat unaffected [source 2]."
-                ),
-                summary="已生成带引用的最终答案",
-            ),
-        }
+        # The canned demo content lives in a dedicated demo-only module so the
+        # fabricated "writer" answer is NOT co-located with the real executors
+        # (CrewAIStageExecutor / FakeStageExecutor) and cannot be picked up by
+        # accident on a normal runtime path. See demo_content.py for the full
+        # warning + isolation rationale.
+        from app.agents.runtime.demo_content import build_demo_behaviours
+
+        return build_demo_behaviours()
 
 
 # --------------------------------------------------------------------------- #

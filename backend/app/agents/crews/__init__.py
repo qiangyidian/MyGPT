@@ -1,4 +1,5 @@
 """Crews: multi-role agent teams for complex tasks."""
+from app.agents.crews.debate import build_debate_stages
 from app.agents.crews.parallel_research import build_parallel_research_stages
 from app.agents.crews.research_crew import (
     AnalystFinding,
@@ -16,6 +17,7 @@ __all__ = [
     "build_research_stages",
     "build_research_crew",
     "build_parallel_research_stages",
+    "build_debate_stages",
     "review_crew_output",
     "ResearchEvidence",
     "AnalystFinding",

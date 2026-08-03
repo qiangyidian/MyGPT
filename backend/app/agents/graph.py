@@ -227,8 +227,60 @@ def build_parallel_research_graph(question: str) -> AgentGraph:
     )
 
 
+def build_debate_graph(side_a: str, side_b: str) -> AgentGraph:
+    """Advocate-A ‖ Advocate-B → Judge.
+
+    Two advocates run in PARALLEL at the same stage (lanes 0/1); the Judge is a
+    JOIN that only starts once both advocates' handoff edges are completed.
+    Candidate names are dynamic (any A vs B); node ids are stable so the FE
+    reducer and persistence stay deterministic.
+    """
+    sa = (side_a or "A").strip()
+    sb = (side_b or "B").strip()
+    return AgentGraph(
+        run_id="",
+        runtime="crewai",
+        flow_name="debate",
+        mode=GraphMode.parallel,
+        status="pending",
+        nodes=[
+            AgentGraphNode(
+                id="advocate-a", name=f"{sa} Advocate", role="支持方 A",
+                task_title=f"为 {sa} 提供最强论证",
+                task_summary=f"只从 {sa} 的最佳实践出发，给出结构化论证并主动承认其局限",
+                stage=0, lane=0,
+            ),
+            AgentGraphNode(
+                id="advocate-b", name=f"{sb} Advocate", role="支持方 B",
+                task_title=f"为 {sb} 提供最强论证",
+                task_summary=f"只从 {sb} 的最佳实践出发，给出结构化论证并主动承认其局限",
+                stage=0, lane=1,
+            ),
+            AgentGraphNode(
+                id="judge", name="Judge", role="中立裁判",
+                task_title="按统一标准权衡双方",
+                task_summary="同时读取双方论证，区分事实与推测，给出条件化结论",
+                stage=1, lane=0,
+            ),
+        ],
+        edges=[
+            AgentGraphEdge(id="advocate-a-judge", source="advocate-a", target="judge",
+                           type=EdgeType.handoff, label=f"{sa} 方论证"),
+            AgentGraphEdge(id="advocate-b-judge", source="advocate-b", target="judge",
+                           type=EdgeType.handoff, label=f"{sb} 方论证"),
+        ],
+    )
+
+
 def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
     """Pick the topology by agent_profile / intent."""
     if profile == "parallel_research":
         return build_parallel_research_graph(question)
+    if profile == "debate":
+        from app.agents.planning import extract_debate_sides
+
+        sides = extract_debate_sides(question)
+        return build_debate_graph(
+            sides.side_a if sides else "A", sides.side_b if sides else "B"
+        )
     return build_deep_research_graph(question)

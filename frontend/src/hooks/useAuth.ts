@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useCallback } from "react";
 import { api } from "@/lib/api";
@@ -19,6 +19,7 @@ export const AUTH_QUERY_KEY = ["auth", "me"] as const;
  */
 export function useAuth() {
   const router = useRouter();
+  const qc = useQueryClient();
   const hasToken = typeof window !== "undefined" && !!getAccessToken();
 
   const query = useQuery<User | null>({
@@ -37,8 +38,13 @@ export function useAuth() {
     } catch {
       // Ignore errors — we clear the token locally regardless.
     }
+    // Drop the cached user so consumers (AppShell gate, /login's
+    // already-authenticated redirect) immediately observe no session. Without
+    // this the cache survives the client-side route change and the stale user
+    // bounces a logged-out user back into the app with a dead session.
+    qc.removeQueries({ queryKey: AUTH_QUERY_KEY });
     router.replace("/login");
-  }, [router]);
+  }, [router, qc]);
 
   return {
     user: query.data ?? null,

@@ -12,7 +12,7 @@ import { AttachmentDropzone } from "@/components/attachments/attachment-dropzone
 import { AttachmentList } from "@/components/attachments/attachment-list";
 import { useChatAttachments } from "@/hooks/useChatAttachments";
 import { useChatUiStore } from "@/stores/chat-ui-store";
-import { getModeMeta } from "@/lib/user-modes";
+import { getModeMeta, isSpecialMode } from "@/lib/user-modes";
 import type { KnowledgeBase, UserChatMode } from "@/lib/types";
 
 export interface ComposerSendOpts {
@@ -51,6 +51,8 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const mode = useChatUiStore((s) => s.mode);
+  const modeMeta = getModeMeta(mode);
+  const special = isSpecialMode(mode);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { drafts, upload, remove, allReady } = useChatAttachments(
     conversationId,
@@ -109,6 +111,20 @@ export function Composer({
           />
         )}
 
+        {/* Explicit special-mode badge so the user always knows ordinary chat
+            is NOT active (deep_research / debate / data_analysis change the
+            whole answer pipeline). The mode selector button also shows the
+            short label, but this badge is unmissable and carries the why. */}
+        {special && (
+          <div className="mb-1.5 flex items-center gap-1.5 text-xs" aria-live="polite">
+            <span className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/5 px-2 py-1 font-medium text-primary">
+              <modeMeta.icon className="h-3 w-3" aria-hidden />
+              {modeMeta.label}
+            </span>
+            <span className="text-muted-foreground">{modeMeta.description}</span>
+          </div>
+        )}
+
         <AttachmentDropzone onPick={(f) => void upload(f)} className="rounded-xl">
           <div className="flex items-end gap-2 rounded-xl border border-input bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
             <AttachmentPicker onPick={(f) => void upload(f)} />
@@ -121,7 +137,7 @@ export function Composer({
                 handleInput();
               }}
               onKeyDown={handleKeyDown}
-              placeholder={`输入消息…  （${getModeMeta(mode).label}）`}
+              placeholder={`输入消息…  （${modeMeta.label}）`}
               className="min-h-[40px] flex-1 resize-none border-0 bg-transparent px-1 py-1.5 focus-visible:ring-0 focus-visible:ring-offset-0"
               rows={1}
               aria-label="消息输入框"

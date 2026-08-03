@@ -12,7 +12,8 @@ export type UserChatMode =
   | "search"
   | "deep_research"
   | "create"
-  | "data_analysis";
+  | "data_analysis"
+  | "debate";
 
 export interface User {
   id: string;
@@ -71,6 +72,69 @@ export interface ModelTestResult {
   latency_ms: number;
   sample: string | null;
   error: string | null;
+}
+
+/**
+ * Canonical termination reason, carried end-to-end (provider → runtime → SSE →
+ * persisted metadata → UI). Mirrors the backend Literal.
+ */
+export type FinishReason =
+  | "stop"
+  | "length"
+  | "tool_calls"
+  | "cancelled"
+  | "timeout"
+  | "content_filter"
+  | "provider_error"
+  | "stream_disconnected"
+  | "budget"
+  | "error"
+  | "aborted"; // legacy FE-only value (mapped to cancelled on display)
+
+/** Consumer-facing generation status, derived from finish_reason. */
+export type GenerationStatus =
+  | "complete"
+  | "truncated"
+  | "cancelled"
+  | "error"
+  | "interrupted";
+
+const FINISH_TO_STATUS: Record<FinishReason, GenerationStatus> = {
+  stop: "complete",
+  tool_calls: "complete",
+  length: "truncated",
+  budget: "truncated",
+  cancelled: "cancelled",
+  aborted: "cancelled",
+  timeout: "error",
+  content_filter: "error",
+  provider_error: "error",
+  error: "error",
+  stream_disconnected: "interrupted",
+};
+
+/** Read the persisted finish_reason off a message's metadata (typed). */
+export function getMessageFinishReason(msg: Message): FinishReason | null {
+  const v = msg.metadata?.finish_reason;
+  return typeof v === "string" ? (v as FinishReason) : null;
+}
+
+/** Derive the consumer-facing status from a message's finish_reason. */
+export function getMessageStatus(msg: Message): GenerationStatus | null {
+  const fr = getMessageFinishReason(msg);
+  if (!fr) return null;
+  return FINISH_TO_STATUS[fr] ?? "error";
+}
+
+/** Derive the consumer-facing status directly from a finish_reason. */
+export function finishReasonToStatus(fr: FinishReason): GenerationStatus {
+  return FINISH_TO_STATUS[fr] ?? "error";
+}
+
+/** True when a message ended abnormally (and thus may warrant "continue"). */
+export function isPartialResult(msg: Message): boolean {
+  const st = getMessageStatus(msg);
+  return st === "truncated" || st === "interrupted" || st === "cancelled";
 }
 
 export interface Message {
@@ -230,6 +294,20 @@ export interface ToolInfo {
 export type ChatStreamEvent =
   | { event: "meta"; data: { message_id: string; conversation_id: string } }
   | { event: "run_started"; data: { run_id: string; runtime: string; conversation_id: string; message_id: string } }
+  | {
+      event: "runtime_selected";
+      data: {
+        run_id: string;
+        requested_mode: string;
+        effective_mode: string;
+        requested_runtime: string;
+        effective_runtime: string;
+        agent_profile: string;
+        multi_agent_requested: boolean;
+        multi_agent_executed: boolean;
+        fallback_reason: string | null;
+      };
+    }
   | { event: "plan_created"; data: { summary: string; steps: AgentPlanStep[] } }
   | { event: "step_started"; data: { step_id: string; title: string; type: string; agent?: string } }
   | { event: "step_completed"; data: { step_id: string; status: string } }
@@ -247,7 +325,7 @@ export type ChatStreamEvent =
   | { event: "run_instruction_received"; data: { run_id: string; instruction: string; acknowledged: boolean } }
   | { event: "run_paused"; data: { run_id: string; reason: string; paused_at?: string } }
   | { event: "run_resumed"; data: { run_id: string; resumed_at?: string } }
-  | { event: "done"; data: { message_id: string; finish_reason: string } }
+  | { event: "done"; data: { message_id: string; finish_reason: FinishReason } }
   | { event: "error"; data: { code: string; message: string } };
 
 export interface ResearchPlanStep {
