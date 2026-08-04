@@ -33,6 +33,10 @@ class CrewAILLMFactory:
             api_key=api_key,
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
+            # Stream so the gateway's per-request actor (30s on the GLM proxy)
+            # stays alive while tokens flow. Non-stream, a single 2048-token
+            # reasoning call takes ~70s and 500s ("Actor timed out").
+            stream=True,
         )
         if cfg.top_p is not None:
             kwargs["top_p"] = cfg.top_p

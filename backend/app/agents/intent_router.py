@@ -28,6 +28,10 @@ VALID_MODES = {"auto", "search", "deep_research", "create", "data_analysis", "de
 # Tools considered "web" — disabled in create mode to keep it focused.
 _WEB_TOOLS = {"web_search", "http_get"}
 
+# Minimum length for auto-mode intent-driven multi-agent escalation, so trivial
+# one-liners ("分析下", "总结下") stay native. Lower = more aggressive.
+_AUTO_MULTI_MIN_LEN = 6
+
 
 @dataclass
 class RouteDecision:
@@ -147,6 +151,7 @@ def decide_route(
     # agents to debate X vs Y" actually run a real multi-agent flow instead of
     # being answered by a single model role-playing several agents.
     from app.agents.planning import (
+        classify_intent,
         looks_like_debate_request,
         looks_like_multi_agent_request,
     )
@@ -164,6 +169,24 @@ def decide_route(
     if looks_like_multi_agent_request(user_content):
         # Explicit multi-agent ask without a clear two-sided debate → real
         # research crew (NOT native role-play).
+        profile = "parallel_research" if has_knowledge_base else "deep_research"
+        return RouteDecision(
+            execution_mode=ExecutionMode.agent,
+            agent_profile=profile,
+            enable_tools=True,
+            use_multi_agent=True,
+            mode="deep_research",
+            requested_mode="auto",
+        )
+
+    # auto: intent-driven escalation. A research / compare / analyze / summary
+    # flavored question (non-trivial length) escalates to the REAL research crew
+    # — not only explicit "多Agent" keywords. This is the "less conservative"
+    # lever; tune _AUTO_MULTI_MIN_LEN to make it more or less aggressive.
+    if (
+        len(user_content.strip()) >= _AUTO_MULTI_MIN_LEN
+        and classify_intent(user_content) == "deep_research"
+    ):
         profile = "parallel_research" if has_knowledge_base else "deep_research"
         return RouteDecision(
             execution_mode=ExecutionMode.agent,

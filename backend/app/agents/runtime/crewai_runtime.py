@@ -27,6 +27,7 @@ live LLM (tests inject a :class:`FakeStageExecutor` via ``ctx.extra``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any, AsyncIterator
@@ -122,12 +123,75 @@ def _map_run_error(exc: Exception) -> tuple[str, str]:
     return "error", "crewai_run_error"
 
 
+_CREWAI_BODY_SANITIZER_INSTALLED = False
+
+
+def _coerce_chat_body(content: bytes) -> bytes | None:
+    """Rewrite a chat-completions body so no assistant message has content=null.
+
+    CrewAI resends an assistant tool-call message with ``content: null`` (the
+    OpenAI convention when the model only emits tool_calls). Anthropic-strict
+    OpenAI-compatible gateways (e.g. the GLM proxy) reject ``null`` content
+    after extracting the system message, 422-ing a tool-calling agent on its
+    second turn. The native runtime already coerces this (``"".join(...) or
+    ""``); this applies the same fix to CrewAI's path. Returns the rewritten
+    bytes, or None if the body was unchanged / not a chat body.
+    """
+    try:
+        payload = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    msgs = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(msgs, list):
+        return None
+    changed = False
+    for m in msgs:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and m.get("content") is None
+        ):
+            m["content"] = ""
+            changed = True
+    if not changed:
+        return None
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _install_chat_body_sanitizer() -> None:
+    """Install a sync-httpx hook that runs :func:`_coerce_chat_body` on every
+    outgoing request body. Idempotent; no-ops on non-chat HTTP, so it is safe
+    to leave installed for the process lifetime. CrewAI runs its openai client
+    in an executor (sync httpx), so patching ``httpx.Client.send`` is enough.
+    """
+    global _CREWAI_BODY_SANITIZER_INSTALLED
+    if _CREWAI_BODY_SANITIZER_INSTALLED:
+        return
+    import httpx
+
+    _orig_sync = httpx.Client.send
+
+    def _send_sync(self, request, *args, **kwargs):
+        content = getattr(request, "content", None)
+        if content:
+            new = _coerce_chat_body(content)
+            if new is not None:
+                request._content = new
+        return _orig_sync(self, request, *args, **kwargs)
+
+    httpx.Client.send = _send_sync  # type: ignore[assignment]
+    _CREWAI_BODY_SANITIZER_INSTALLED = True
+
+
 class CrewAIRuntime:
     """Multi-agent CrewAI runtime. Implements the :class:`AgentRuntime` protocol."""
 
     name = "crewai"
 
     async def stream_turn(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
+        # Coerce null assistant content on CrewAI's outgoing chat body so
+        # Anthropic-strict OpenAI-compatible gateways (GLM proxy) don't 422.
+        _install_chat_body_sanitizer()
         # 1. LLM from the existing ModelConfig.
         try:
             llm = CrewAILLMFactory.from_model_config(ctx.model_config)
@@ -364,6 +428,12 @@ class CrewAIRuntime:
         # its tokens via StreamingWriterExecutor (in which case the assistant
         # message content was set incrementally and we must not re-emit).
         streamed = bool(getattr(stage_ctx, "writer_streamed", False))
+        # If the writer "streamed" but produced no content (a transient model
+        # blank even after the writer's own retry), do NOT leave a blank bubble:
+        # fall through to the upstream-output fallback so the user still sees the
+        # research (analyst findings) instead of nothing.
+        if streamed and not (ctx.assistant_msg.content or "").strip():
+            streamed = False
         final_text = ""
         if not streamed:
             for spec in reversed(stages):

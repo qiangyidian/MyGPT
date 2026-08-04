@@ -144,44 +144,57 @@ class StreamingWriterExecutor:
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
 
+        # Some OpenAI-compatible gateways (e.g. the GLM proxy) occasionally
+        # return an EMPTY stream for an otherwise-valid prompt (a transient
+        # blank). provider.stream_chat does NOT error on empty — it just yields
+        # no content — so without a retry the writer would finish "green" with a
+        # blank answer. Retry once so a transient blank doesn't cost the answer.
         accumulated: list[str] = []
         finish_reason = "stop"
-        try:
-            async for delta in provider.stream_chat(messages, options):
-                ctl = get_run_control(stage_ctx.run_id)
-                # Cooperative cancel between chunks: the Stop button / cancel API
-                # sets ctl.cancel (the real signal). cancel_event is kept as a
-                # defensive secondary check. Honor either -> cancelled.
-                cancel_evt = getattr(stage_ctx, "cancel_event", None)
-                if (ctl is not None and ctl.cancel.is_set()) or (
-                    cancel_evt is not None and cancel_evt.is_set()
-                ):
-                    finish_reason = "cancelled"
-                    break
-                # Phase 2: honor a user-initiated pause mid-stream.
-                if ctl is not None:
-                    while ctl.is_paused() and not ctl.cancel.is_set():
-                        await asyncio.sleep(0.1)
-                    if ctl.cancel.is_set():
+        for attempt in (1, 2):
+            accumulated = []
+            finish_reason = "stop"
+            try:
+                async for delta in provider.stream_chat(messages, options):
+                    ctl = get_run_control(stage_ctx.run_id)
+                    # Cooperative cancel between chunks: the Stop button / cancel
+                    # API sets ctl.cancel (the real signal). cancel_event is a
+                    # defensive secondary check. Honor either -> cancelled.
+                    cancel_evt = getattr(stage_ctx, "cancel_event", None)
+                    if (ctl is not None and ctl.cancel.is_set()) or (
+                        cancel_evt is not None and cancel_evt.is_set()
+                    ):
                         finish_reason = "cancelled"
                         break
-                if delta.content:
-                    accumulated.append(delta.content)
-                    # Mutate incrementally so partial content survives cancel.
-                    assistant_msg.content = "".join(accumulated)
-                    stage_ctx.emit(ev_token(delta=delta.content))
-                if delta.finish_reason:
-                    finish_reason = delta.finish_reason
-        except asyncio.CancelledError:
-            assistant_msg.content = "".join(accumulated)
-            stage_ctx.writer_streamed = True
-            raise
-        except ProviderError:
-            logger.warning("writer stream provider error", exc_info=True)
-            raise
-        except Exception:
-            logger.exception("writer streaming failed")
-            raise
+                    # Phase 2: honor a user-initiated pause mid-stream.
+                    if ctl is not None:
+                        while ctl.is_paused() and not ctl.cancel.is_set():
+                            await asyncio.sleep(0.1)
+                        if ctl.cancel.is_set():
+                            finish_reason = "cancelled"
+                            break
+                    if delta.content:
+                        accumulated.append(delta.content)
+                        # Mutate incrementally so partial content survives cancel.
+                        assistant_msg.content = "".join(accumulated)
+                        stage_ctx.emit(ev_token(delta=delta.content))
+                    if delta.finish_reason:
+                        finish_reason = delta.finish_reason
+            except asyncio.CancelledError:
+                assistant_msg.content = "".join(accumulated)
+                stage_ctx.writer_streamed = True
+                raise
+            except ProviderError:
+                logger.warning("writer stream provider error", exc_info=True)
+                raise
+            except Exception:
+                logger.exception("writer streaming failed")
+                raise
+            # Done if we got content, or the user cancelled.
+            if accumulated or finish_reason == "cancelled":
+                break
+            if attempt == 1:
+                logger.info("writer stream returned empty; retrying once")
 
         stage_ctx.writer_streamed = True
         full = "".join(accumulated)

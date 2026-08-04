@@ -72,3 +72,36 @@ def test_filter_tool_names_allowlist_and_disable_web():
     create = decide_route("create")
     assert "web_search" not in filter_tool_names(names, create)
     assert "file_analyze" in filter_tool_names(names, create)
+
+
+# ---- auto-mode intent-driven multi-agent escalation (less-conservative) ---- #
+def test_auto_research_intent_escalates_to_multi_agent():
+    r = decide_route("auto", user_content="请帮我深入调研一下大模型微调的主流方法与对比")
+    assert r.execution_mode == ExecutionMode.agent
+    assert r.use_multi_agent is True
+    assert r.agent_profile == "deep_research"
+    assert r.mode == "deep_research"
+    assert r.requested_mode == "auto"
+
+
+def test_auto_research_intent_with_kb_uses_parallel_crew():
+    r = decide_route(
+        "auto",
+        user_content="请帮我深入调研一下大模型微调的主流方法与对比",
+        has_knowledge_base=True,
+    )
+    assert r.use_multi_agent is True
+    assert r.agent_profile == "parallel_research"
+
+
+def test_auto_short_research_intent_stays_native():
+    # Below the min-length threshold -> stays native (no crew for one-liners).
+    r = decide_route("auto", user_content="分析下")
+    assert r.use_multi_agent is False
+    assert r.execution_mode == ExecutionMode.auto
+
+
+def test_auto_plain_chat_stays_native():
+    r = decide_route("auto", user_content="今天天气怎么样，出门要带伞吗")
+    assert r.use_multi_agent is False
+    assert r.execution_mode == ExecutionMode.auto
