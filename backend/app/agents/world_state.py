@@ -57,6 +57,36 @@ class WorldStateDiffer:
     def reset(self) -> None:
         self._last.clear()
 
+    def diff_with_retained(
+        self,
+        fragments: Iterable[ContextFragment],
+        retained_messages: list[dict] | None = None,
+    ) -> list[ContextFragment]:
+        """Diff, then additionally drop fragments already present in retained history.
+
+        Codex's ``render_history_diff(prev, retained)`` checks whether a section's
+        rendered block already lives in the retained message text before
+        re-injecting — so a fragment carried over by compaction isn't duplicated.
+        Uses :meth:`ContextFragment.contains_tag` (stable-marker identity).
+        """
+        changed = self.diff(fragments)
+        if not retained_messages:
+            return changed
+        blob = "\n\n".join(_message_text(m) for m in retained_messages)
+        return [f for f in changed if not ContextFragment.contains_tag(blob, f.tag)]
+
+
+def _message_text(message: dict) -> str:
+    """Flatten a message dict to its text content (for tag-presence checks)."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return ""
+
 
 # --------------------------------------------------------------------------- #
 # Per-conversation differ cache (process-local). Long-running backends may run

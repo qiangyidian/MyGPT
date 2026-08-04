@@ -1,0 +1,5 @@
+<recognized_intent>
+系统识别到的意图：route=native, deliverable_kind=code, confidence=0.95
+理由：写代码请求
+请据此组织回答：代码请求请直接产出完整可运行代码；研究类请求请带来源编号。
+</recognized_intent>

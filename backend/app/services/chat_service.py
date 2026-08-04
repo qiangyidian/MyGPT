@@ -688,6 +688,7 @@ class ChatService:
             from app.agents.answer_format import answer_format_fragment
             from app.agents.behavior_fragments import (
                 mode_behavior_fragment,
+                multi_agent_mode_fragment,
                 personality_fragment,
             )
             from app.agents.context_fragments import render_fragments
@@ -709,6 +710,7 @@ class ChatService:
             # Stable fragments (diffed across turns — unchanged ones emit nothing).
             _stable = [
                 mode_behavior_fragment(route.mode),
+                multi_agent_mode_fragment("explicit"),
                 project_instructions_fragment(load_project_instructions(_cwd)),
                 answer_format_fragment(),
             ]

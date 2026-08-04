@@ -1,0 +1,16 @@
+<current_mode>
+用户当前选择的模式：deep_research
+</current_mode>
+
+<deliverable_seed>
+规则初判的交付类型（仅参考，可被推翻）：code
+</deliverable_seed>
+
+<environment>
+已绑定知识库：产品手册；附件：data.csv (csv)
+</environment>
+
+<conversation_gist>
+近期用户消息（用于判断是否是追问）：
+- 先写个测试
+</conversation_gist>

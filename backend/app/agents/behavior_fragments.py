@@ -86,3 +86,61 @@ def remaining_budget_fragment(
         "减少冗余解释与不必要的工具调用。"
     )
     return ContextFragment(name="remaining_budget", tag="remaining_budget", body=body)
+
+
+# --------------------------------------------------------------------------- #
+# Multi-agent delegation policy (Codex MultiAgentMode)
+# --------------------------------------------------------------------------- #
+_MULTI_AGENT_MODES = {
+    "explicit": (
+        "多 Agent 策略：仅当用户明确要求时才派生子 Agent；不要主动派生。"
+        "此前若曾被授予主动派生权限，现予以撤销——除非明确要求，不要派生子 Agent。"
+    ),
+    "proactive": (
+        "多 Agent 策略：当并行工作能显著提升速度或质量时，可主动派生子 Agent。"
+    ),
+}
+
+
+def multi_agent_mode_fragment(mode: str = "explicit", *, custom: str = "") -> ContextFragment:
+    """A declarative delegation-policy knob (ExplicitRequestOnly | Proactive | Custom).
+
+    The ``explicit`` wording deliberately REVOKES any prior proactive grant, so
+    toggling is safe mid-conversation (Codex's careful revocation phrasing).
+    """
+    key = (mode or "explicit").strip().lower()
+    if custom and key in ("custom",):
+        body = f"多 Agent 策略（自定义）：{custom}"
+    else:
+        body = _MULTI_AGENT_MODES.get(key, _MULTI_AGENT_MODES["explicit"])
+    return ContextFragment(name="multi_agent_mode", tag="multi_agent_mode", body=body)
+
+
+def realtime_delegation_fragment(
+    *, user_input: str, transcript_delta: str = "", source: str = "handoff"
+) -> ContextFragment:
+    """A tagged handoff from a realtime/ephemeral channel to a background agent.
+
+    Carries the input + the role-tagged transcript tail so the receiving agent
+    keeps full conversational continuity across the channel switch (Codex's
+    ``<realtime_delegation>``). Generalizes to any channel→channel handoff.
+    """
+    parts = [f"source: {source}", "<input>", user_input]
+    if transcript_delta:
+        parts.append("<transcript_delta>")
+        parts.append(transcript_delta)
+    parts.append("请基于以上继续（交接自实时会话）。")
+    return ContextFragment(
+        name="realtime_delegation", tag="realtime_delegation", body="\n".join(parts)
+    )
+
+
+def model_switch_fragment(instructions: str) -> ContextFragment:
+    """Preserve model-specific persona/format instructions across a model swap.
+
+    Wraps them in ``<model_switch>`` (Codex) so the rules survive the swap even
+    when the rest of the context is re-compacted under a new model.
+    """
+    body = (instructions or "").strip()
+    return ContextFragment(name="model_switch", tag="model_switch", body=body)
+

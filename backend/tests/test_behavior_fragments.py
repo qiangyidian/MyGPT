@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from app.agents.behavior_fragments import (
     mode_behavior_fragment,
+    model_switch_fragment,
+    multi_agent_mode_fragment,
     personality_fragment,
+    realtime_delegation_fragment,
     remaining_budget_fragment,
 )
 
@@ -46,3 +49,30 @@ def test_remaining_budget_empty_when_nothing_given():
     # 0 is a real (exhausted) budget -> surfaced, not dropped.
     zero = remaining_budget_fragment(remaining_tokens=0)
     assert "0 token" in zero.body
+
+
+def test_multi_agent_mode_variants():
+    expl = multi_agent_mode_fragment("explicit")
+    assert "撤销" in expl.body or "不要主动派生" in expl.body
+    pro = multi_agent_mode_fragment("proactive")
+    assert "主动派生" in pro.body
+    custom = multi_agent_mode_fragment("custom", custom="仅用于研究场景")
+    assert "仅用于研究场景" in custom.body
+    # Tagged so it's diffable / recognizable.
+    assert "<multi_agent_mode>" in expl.render()
+
+
+def test_realtime_delegation_carries_input_and_transcript():
+    f = realtime_delegation_fragment(
+        user_input="继续重构", transcript_delta="user: 改了 X", source="handoff"
+    )
+    body = f.render()
+    assert "<realtime_delegation>" in body
+    assert "继续重构" in body and "改了 X" in body and "handoff" in body
+
+
+def test_model_switch_fragment_wraps_instructions():
+    f = model_switch_fragment("保持简洁、用中文")
+    assert f.tag == "model_switch"
+    assert "保持简洁、用中文" in f.render()
+    assert model_switch_fragment("").render() == ""

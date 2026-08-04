@@ -71,6 +71,7 @@ class ToolGateway:
         guardian_service: "object | None" = None,
         guardian_provider: "object | None" = None,
         guardian_breaker: "object | None" = None,
+        pre_tool_use_handlers: "list | None" = None,
     ) -> None:
         self.db = db
         self.conversation_id = conversation_id
@@ -91,6 +92,10 @@ class ToolGateway:
         self._guardian = guardian_service
         self._guardian_provider = guardian_provider
         self._guardian_breaker = guardian_breaker
+        # Optional PreToolUse hooks (Codex pattern). Off unless the runtime passes
+        # handlers. A handler can BLOCK (deny), REWRITE args (updated_input), or
+        # note additional context (attached to the result for the runtime).
+        self._pre_tool_use_handlers = list(pre_tool_use_handlers or [])
 
     def set_attribution(self, *, agent_id: str = "", task_id: str = "") -> None:
         """Set the agent/task id for subsequent tool executions in this run."""
@@ -130,6 +135,38 @@ class ToolGateway:
                 tool_call_id, tool_name, args, started,
                 ok=False, status="error", error=str(exc),
             )
+
+        # 1b. PreToolUse hooks (optional, Codex pattern). External handlers run
+        # before permission/approval: a handler can BLOCK (deny / continue=false),
+        # REWRITE the arguments (updated_input), or note additional_context. Off
+        # unless the runtime wires handlers in. Failure is fail-open (continue).
+        if self._pre_tool_use_handlers:
+            try:
+                from app.agents.hooks.engine import HookEngine
+
+                folded = HookEngine().run_pre_tool_use(
+                    tool_name, args, self._pre_tool_use_handlers,
+                    session_id=str(self.run_id or ""), turn_id=self._task_id or "", cwd="",
+                )
+            except Exception:  # noqa: BLE001 — hooks must never block execution
+                logger.warning("pre_tool_use hook execution failed; continuing", exc_info=True)
+                folded = None
+            if folded is not None:
+                denied = (
+                    getattr(folded, "permission_decision", None) == "deny"
+                    or getattr(folded, "continue_", True) is False
+                )
+                if denied:
+                    return await self._finalize(
+                        tool_call_id, tool_name, args, started,
+                        ok=False, status="blocked",
+                        error=f"blocked by PreToolUse hook: {getattr(folded, 'system_message', '') or 'denied'}",
+                    )
+                updated = getattr(folded, "updated_input", None)
+                if isinstance(updated, dict):
+                    args = updated  # rewrite the args used for the rest of execute()
+                # additional_context is surfaced via the result so the runtime can
+                # inject it into the model context (the gateway can't, mid-call).
 
         # 2. Permission (env-based; e.g. python_exec disabled in prod).
         if not is_tool_allowed(tool_name, self.user, strict=strict):

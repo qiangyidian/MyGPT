@@ -65,3 +65,29 @@ def test_per_conversation_cache():
     assert d3 is not d1  # different conversations isolated
     drop_differ("conv-1")
     assert differ_for("conv-1") is not d1  # fresh after drop
+
+
+def test_diff_with_retained_drops_already_present():
+    d = WorldStateDiffer()
+    env = _frag("env", "environment", "kb=docs")
+    # First turn: env is new -> emitted, and we pretend it's now in history.
+    assert {f.name for f in d.diff([env])} == {"env"}
+    retained = [{"role": "system", "content": env.render()}]
+    # Same env next turn, already in retained history -> NOT re-emitted.
+    assert d.diff_with_retained([env], retained) == []
+
+
+def test_diff_with_retained_emits_when_absent_from_history():
+    d = WorldStateDiffer()
+    env = _frag("env", "environment", "kb=docs")
+    mode = _frag("mode", "current_mode", "auto")
+    # retained history has the mode block but not environment.
+    retained = [{"role": "system", "content": "<current_mode>auto</current_mode>"}]
+    changed = {f.name for f in d.diff_with_retained([env, mode], retained)}
+    assert changed == {"env"}  # mode already in history -> skipped; env emitted
+
+
+def test_diff_with_retained_no_messages_behaves_like_plain_diff():
+    d = WorldStateDiffer()
+    env = _frag("env", "environment", "kb=docs")
+    assert {f.name for f in d.diff_with_retained([env], None)} == {"env"}
