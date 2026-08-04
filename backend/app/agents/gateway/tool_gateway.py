@@ -68,6 +68,9 @@ class ToolGateway:
         run_id: uuid.UUID | None,
         user: User | None = None,
         registry: ToolRegistry | None = None,
+        guardian_service: "object | None" = None,
+        guardian_provider: "object | None" = None,
+        guardian_breaker: "object | None" = None,
     ) -> None:
         self.db = db
         self.conversation_id = conversation_id
@@ -81,6 +84,13 @@ class ToolGateway:
         # every AgentStep row so tools map back to the graph node that ran them.
         self._agent_id = ""
         self._task_id = ""
+        # Optional Guardian pre-approval judge (Codex pattern). Off by default —
+        # runtimes opt in by passing a GuardianService + provider (+ breaker). When
+        # set, dangerous tools are LLM-judged before the human-approval gate: allow
+        # auto-proceeds, deny/uncertain escalates to the human gate.
+        self._guardian = guardian_service
+        self._guardian_provider = guardian_provider
+        self._guardian_breaker = guardian_breaker
 
     def set_attribution(self, *, agent_id: str = "", task_id: str = "") -> None:
         """Set the agent/task id for subsequent tool executions in this run."""
@@ -139,8 +149,38 @@ class ToolGateway:
                     ok=False, status="blocked", error=str(exc),
                 )
 
+        # 3.5 Guardian pre-check (optional, Codex pattern). When a guardian judge
+        # is wired in, dangerous tools are LLM-judged BEFORE the human-approval
+        # gate: allow -> auto-proceed (skip the gate); deny/uncertain -> escalate
+        # to the human gate below. The rejection circuit breaker aborts the turn
+        # after repeated denials. Off unless the runtime passes a guardian.
+        _auto_allowed = False
+        if (
+            self._guardian is not None
+            and self._guardian_provider is not None
+            and should_require_approval(tool)
+        ):
+            try:
+                verdict = await self._guardian.judge(
+                    action={"tool": tool_name, "arguments_preview": preview(arguments)},
+                    provider=self._guardian_provider,
+                )
+            except Exception:  # noqa: BLE001 — judge must never block the execution path
+                logger.warning("guardian judge raised; treating as deny", exc_info=True)
+                verdict = None
+            if verdict is not None:
+                if self._guardian_breaker is not None:
+                    self._guardian_breaker.record(verdict)
+                    if self._guardian_breaker.should_abort():
+                        return await self._finalize(
+                            tool_call_id, tool_name, args, started,
+                            ok=False, status="blocked",
+                            error="guardian: 连续多次拒绝，已中止本轮 (rejection circuit breaker)",
+                        )
+                _auto_allowed = verdict.allowed
+
         # 4. Approval gate for dangerous tools.
-        if should_require_approval(tool):
+        if should_require_approval(tool) and not _auto_allowed:
             approval = await self._find_valid_approval(tool_name, args)
             if approval is None:
                 if self.run_id is None:

@@ -31,7 +31,12 @@ from app.agents.planning import deliverable_kind
 @dataclass(frozen=True)
 class ContextFragment:
     """One typed piece of context. ``tag`` is the stable block name the model
-    sees (e.g. ``<current_mode>``); ``body`` is the human/agent-readable content."""
+    sees (e.g. ``<current_mode>``); ``body`` is the human/agent-readable content.
+
+    The ``tag`` doubles as the fragment's *identity*: the open/close markers it
+    produces let later passes detect whether a section's rendered block already
+    lives in retained history (used by world-state diffing + compaction retention).
+    """
 
     name: str   # internal id, e.g. "mode" — used in telemetry/fragment lists
     tag: str    # prompt block tag, e.g. "current_mode"
@@ -43,6 +48,19 @@ class ContextFragment:
         if not body:
             return ""
         return f"<{self.tag}>\n{body}\n</{self.tag}>"
+
+    def markers(self) -> tuple[str, str]:
+        """The stable (open, close) markers for this fragment's rendered block."""
+        return (f"<{self.tag}>", f"</{self.tag}>")
+
+    @staticmethod
+    def contains_tag(text: str, tag: str) -> bool:
+        """True if ``text`` contains a rendered fragment block with this tag.
+
+        Used to recognize a previously-injected fragment inside retained history
+        (so diffing/retention can find it without opaque ids).
+        """
+        return f"<{tag}>" in (text or "")
 
 
 @dataclass

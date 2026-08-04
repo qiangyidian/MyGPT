@@ -676,6 +676,60 @@ class ChatService:
                             messages[0].get("content") or ""
                         ) + "\n\n" + _intent_block
 
+        # 6b. Context enrichment (Codex incremental-context pattern). Assemble the
+        # stable behavioral/environment fragments + resolved $skill mentions, and
+        # inject only the ones that CHANGED since last turn (world-state diffing)
+        # so we don't re-pay their token cost every turn. Best-effort: a failure
+        # here never breaks the turn.
+        try:
+            import os as _os
+            from pathlib import Path as _Path
+
+            from app.agents.answer_format import answer_format_fragment
+            from app.agents.behavior_fragments import (
+                mode_behavior_fragment,
+                personality_fragment,
+            )
+            from app.agents.context_fragments import render_fragments
+            from app.agents.project_instructions import (
+                load_project_instructions,
+                project_instructions_fragment,
+            )
+            from app.agents.skills.loader import (
+                load_skills,
+                resolve_mentions,
+                skill_fragment,
+            )
+            from app.agents.world_state import differ_for
+
+            _settings = get_settings()
+            _cwd = getattr(_settings, "PROJECT_ROOT", None) or _os.getcwd()
+            _skill_roots = [_Path(p) for p in (getattr(_settings, "SKILLS_ROOTS", None) or [])]
+
+            # Stable fragments (diffed across turns — unchanged ones emit nothing).
+            _stable = [
+                mode_behavior_fragment(route.mode),
+                project_instructions_fragment(load_project_instructions(_cwd)),
+                answer_format_fragment(),
+            ]
+            _persona = getattr(request, "personality", None)
+            if _persona:
+                _stable.append(personality_fragment(str(_persona)))
+
+            # Per-turn skill fragments (mention-based → always injected when present).
+            _mentioned = resolve_mentions(user_content, load_skills(_skill_roots))
+            _skill_block = render_fragments([skill_fragment(s) for s in _mentioned])
+
+            _changed = differ_for(str(conversation.id)).diff(_stable)
+            _stable_block = render_fragments(_changed)
+            _enrich = "\n\n".join(b for b in (_stable_block, _skill_block) if b)
+            if _enrich:
+                system_prompt = system_prompt + "\n\n" + _enrich
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = (messages[0].get("content") or "") + "\n\n" + _enrich
+        except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+            logger.warning("context enrichment failed; continuing without it", exc_info=True)
+
         # 6. Build turn context and delegate to the orchestrator/runtime.
         ctx = AgentTurnContext(
             db=db,
