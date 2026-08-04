@@ -48,7 +48,10 @@ class ProviderError(RuntimeError):
 class ChatOptions:
     temperature: float = 0.7
     top_p: float = 1.0
-    max_tokens: int = 1024
+    # None = omit max_tokens from the request so the endpoint uses its own maximum
+    # (no output truncation). The multi-agent streaming Writer uses this so long
+    # code answers are never cut off at finish_reason=length.
+    max_tokens: int | None = 1024
     tools: list[dict[str, Any]] | None = None        # OpenAI tool schemas
     tool_choice: Any = "auto"
     stop: list[str] | None = None

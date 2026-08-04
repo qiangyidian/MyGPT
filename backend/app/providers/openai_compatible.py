@@ -135,9 +135,11 @@ class OpenAICompatibleProvider(ModelProvider):
             "messages": messages,
             "temperature": opts.temperature,
             "top_p": opts.top_p,
-            "max_tokens": opts.max_tokens,
             "stream": stream,
         }
+        # Omit max_tokens when None → endpoint uses its own maximum (no truncation).
+        if opts.max_tokens is not None:
+            payload["max_tokens"] = opts.max_tokens
         if opts.tools:
             payload["tools"] = opts.tools
             payload["tool_choice"] = opts.tool_choice

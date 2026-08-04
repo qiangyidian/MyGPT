@@ -309,6 +309,21 @@ def _casual_core(s: str) -> str:
     return s.strip().strip(_CASUAL_FILLER).strip()
 
 
+def should_recognize_intent(text: str) -> bool:
+    """True when a turn is worth a model intent-classification call.
+
+    Skips trivial / casual messages ("你好", "ok", very short turns) so we don't
+    spend a classifier call on chit-chat — those stay on the keyword default
+    (native). The bar is deliberately low: only obvious non-tasks are skipped.
+    """
+    t = (text or "").strip()
+    if len(t) < 4:
+        return False
+    if is_casual_question(t):
+        return False
+    return True
+
+
 def is_casual_question(text: str) -> bool:
     """True when ``text`` is social/capability chit-chat, not a real query.
 

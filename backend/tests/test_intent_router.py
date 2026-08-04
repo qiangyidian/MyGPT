@@ -1,8 +1,8 @@
 """Intent router: user-facing mode -> execution route mapping (pure unit tests)."""
 from __future__ import annotations
 
-from app.agents.intent_router import VALID_MODES, decide_route, filter_tool_names
-from app.agents.schemas import ExecutionMode
+from app.agents.intent_router import VALID_MODES, decide_route, decide_route_with_intent, filter_tool_names
+from app.agents.schemas import ExecutionMode, IntentDecision
 
 
 def test_auto_is_native_simple_chat():
@@ -105,3 +105,80 @@ def test_auto_plain_chat_stays_native():
     r = decide_route("auto", user_content="今天天气怎么样，出门要带伞吗")
     assert r.use_multi_agent is False
     assert r.execution_mode == ExecutionMode.auto
+
+
+# ---- decide_route_with_intent: model-driven routing ----------------------- #
+def _intent(route="native", kind="factual", confidence=0.9, hints=None):
+    return IntentDecision(
+        route=route, deliverable_kind=kind, confidence=confidence, tool_hints=hints or []
+    )
+
+
+def test_intent_code_routes_native_no_web():
+    # A code request is forced native + web off, even if the model hinted research.
+    r = decide_route_with_intent(
+        "auto", user_content="写贪吃蛇", intent=_intent(route="deep_research", kind="code"),
+    )
+    assert r.execution_mode == ExecutionMode.auto
+    assert r.use_multi_agent is False
+    assert r.disable_web is True
+    assert r.mode == "create"
+
+
+def test_intent_research_routes_crew_parallel_with_kb():
+    r = decide_route_with_intent(
+        "auto", user_content="调研X", intent=_intent(route="deep_research"), has_knowledge_base=True,
+    )
+    assert r.execution_mode == ExecutionMode.agent
+    assert r.agent_profile == "parallel_research"
+    assert r.use_multi_agent is True
+
+
+def test_intent_research_routes_sequential_without_kb():
+    r = decide_route_with_intent(
+        "auto", user_content="调研X", intent=_intent(route="deep_research"), has_knowledge_base=False,
+    )
+    assert r.agent_profile == "deep_research"
+    assert r.use_multi_agent is True
+
+
+def test_intent_debate_routes_debate_crew():
+    r = decide_route_with_intent(
+        "auto", user_content="A vs B", intent=_intent(route="debate"),
+    )
+    assert r.agent_profile == "debate"
+    assert r.use_multi_agent is True
+    assert r.disable_web is True
+
+
+def test_intent_native_with_tool_hints_enables_those_tools():
+    r = decide_route_with_intent(
+        "auto", user_content="查一下X", intent=_intent(route="native", hints=["web_search"]),
+    )
+    assert r.enable_tools is True
+    assert r.tool_allowlist == ["web_search"]
+
+
+def test_intent_none_falls_back_to_keyword_router():
+    r = decide_route_with_intent("auto", user_content="深入调研大模型微调", intent=None)
+    # Falls back to decide_route -> research escalation for a research-flavored ask.
+    assert r.use_multi_agent is True
+    assert r.agent_profile == "deep_research"
+
+
+def test_intent_low_confidence_falls_back():
+    r = decide_route_with_intent(
+        "auto", user_content="深入调研大模型微调", intent=_intent(route="native", confidence=0.2),
+    )
+    # Confidence below floor -> keyword router wins -> research crew, NOT native.
+    assert r.use_multi_agent is True
+    assert r.agent_profile == "deep_research"
+
+
+def test_intent_at_confidence_floor_is_trusted():
+    r = decide_route_with_intent(
+        "auto", user_content="写贪吃蛇", intent=_intent(route="native", kind="code", confidence=0.5),
+    )
+    # >= floor -> trusted -> code => native.
+    assert r.use_multi_agent is False
+    assert r.disable_web is True

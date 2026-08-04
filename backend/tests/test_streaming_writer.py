@@ -102,11 +102,13 @@ async def test_writer_cancel_preserves_partial_content(db_session):
 
 
 class _RecordingProvider(MockProvider):
-    """Records the ChatOptions the writer passed to stream_chat."""
+    """Records the ChatOptions + messages the writer passed to stream_chat."""
     last_options = None
+    last_messages = None
 
     async def stream_chat(self, messages, options=None):
         self.last_options = options
+        self.last_messages = messages
         async for d in super().stream_chat(messages, options):
             yield d
 
@@ -119,9 +121,17 @@ class _LengthProvider(MockProvider):
         yield ChatDelta(content="", finish_reason="length")
 
 
-async def test_writer_uses_model_config_max_tokens(db_session):
-    """The writer must derive its output budget from ModelConfig.max_tokens,
-    not the old hardcoded 1024 (which truncated long code answers)."""
+async def test_writer_does_not_cap_output_max_tokens(db_session):
+    """The Writer must NOT impose a max_tokens cap on its own answer.
+
+    Regression: the Writer derived its output budget from ModelConfig.max_tokens
+    (default 1024). A multi-agent code request (e.g. "编写贪吃蛇游戏") spent that
+    budget on the architecture preamble the Analyst handed it, then hit
+    finish_reason=length mid-code — the user saw only the architecture, never the
+    game. The fix is to not limit the Writer at all: max_tokens=None omits it
+    from the request so the endpoint streams until the model naturally stops.
+    ModelConfig.max_tokens must NOT re-cap it, even when configured small.
+    """
     conv = Conversation(user_id=_SEEDED, title="mt")
     db_session.add(conv)
     await db_session.flush()
@@ -134,7 +144,8 @@ async def test_writer_uses_model_config_max_tokens(db_session):
     stage_ctx.provider = rec
     stage_ctx.assistant_msg = msg
     stage_ctx.user_content = "write a snake game in python"
-    stage_ctx.model_config = SimpleNamespace(max_tokens=8192)
+    # A small configured budget must NOT cap the Writer — it would truncate code.
+    stage_ctx.model_config = SimpleNamespace(max_tokens=1024)
 
     executor = StreamingWriterExecutor(FakeStageExecutor())
     await executor.execute(
@@ -144,10 +155,73 @@ async def test_writer_uses_model_config_max_tokens(db_session):
     await asyncio.sleep(0.05)
 
     assert rec.last_options is not None, "writer did not call stream_chat"
-    assert rec.last_options.max_tokens == 8192, (
-        f"writer must use ModelConfig.max_tokens (8192), not the old hardcoded "
-        f"1024; got {rec.last_options.max_tokens}"
+    assert rec.last_options.max_tokens is None, (
+        f"writer must NOT cap output (max_tokens=None); a capped budget truncated "
+        f"long code answers. got {rec.last_options.max_tokens!r}"
     )
+
+
+async def test_writer_prompt_follows_code_intent(db_session):
+    """Code intent: the Writer must NOT frame the answer as 'base it on the
+    verified content' (that made it echo the Analyst's architecture prose). The
+    user prompt directs the model to write complete code, with research as
+    optional reference only."""
+    conv = Conversation(user_id=_SEEDED, title="intent-code")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    rec = _RecordingProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.provider = rec
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "用 Python 写一个贪吃蛇游戏"
+    stage_ctx.model_config = SimpleNamespace(max_tokens=1024)
+
+    executor = StreamingWriterExecutor(FakeStageExecutor())
+    await executor.execute(
+        agent_id="writer", agent=None, task=SimpleNamespace(description="q", id="t"),
+        context="架构师负责设计，开发者负责编码", stage_ctx=stage_ctx,
+    )
+    await asyncio.sleep(0.05)
+
+    user_msg = next(m["content"] for m in rec.last_messages if m["role"] == "user")
+    # Must NOT use the research framing that biases echoing architecture prose.
+    assert "基于以上已验证内容生成最终回答" not in user_msg
+    # Must direct the model to produce complete, runnable code.
+    assert "完整、可运行" in user_msg
+
+
+async def test_writer_prompt_keeps_cited_research_for_research_intent(db_session):
+    """Research intent: the answer is still built from verified evidence with
+    source citations — the code-path change must not regress research answers."""
+    conv = Conversation(user_id=_SEEDED, title="intent-research")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    rec = _RecordingProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.provider = rec
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "请深入调研大模型微调的主流方法并对比"
+    stage_ctx.model_config = SimpleNamespace(max_tokens=1024)
+
+    executor = StreamingWriterExecutor(FakeStageExecutor())
+    await executor.execute(
+        agent_id="writer", agent=None, task=SimpleNamespace(description="q", id="t"),
+        context="LoRA 与 QLoRA 是主流参数高效微调方法 [source 1]",
+        stage_ctx=stage_ctx,
+    )
+    await asyncio.sleep(0.05)
+
+    user_msg = next(m["content"] for m in rec.last_messages if m["role"] == "user")
+    assert "已验证内容" in user_msg
+    assert "来源编号" in user_msg
 
 
 async def test_writer_records_real_finish_reason_length(db_session):

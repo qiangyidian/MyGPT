@@ -27,7 +27,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.agents.runtime.stage_executor import StageExecutor, StageResult, safe_positive_int
+from app.agents.runtime.stage_executor import StageExecutor, StageResult
 from app.agents.run_controls import get as get_run_control
 from app.agents.schemas import ev_token
 from app.agents.stage_context import StageContext
@@ -71,11 +71,8 @@ class StreamingWriterExecutor:
     factory without changing the ``StageExecutor`` signature.
     """
 
-    def __init__(self, base: StageExecutor, *, max_tokens: int = 4096) -> None:
+    def __init__(self, base: StageExecutor) -> None:
         self._base = base
-        # Fallback only. The real budget comes from the user's ModelConfig
-        # (read in _stream_writer) so the Writer no longer hard-caps at 1024.
-        self._max_tokens = max_tokens
 
     async def execute(
         self,
@@ -118,29 +115,44 @@ class StreamingWriterExecutor:
         ).strip()
         verified = (context or "").strip()
 
-        user_prompt = (
-            f"用户问题：\n{question}\n\n"
-            f"已验证内容：\n{verified or '（无已验证内容，请如实说明缺口）'}\n\n"
-            "请基于以上已验证内容生成最终回答。"
-        )
-        # Pick the Writer prompt by deliverable kind: code requests need a
-        # code-output prompt (complete code, no per-line citations), not the
-        # research-prose prompt that would truncate long code.
+        # Intent-driven prompt: the Writer must shape its answer to what the user
+        # actually asked, not always "base the answer on verified content".
+        # deliverable_kind is the intent signal (code vs research/document). For a
+        # code request the research framing makes the Writer echo the Analyst's
+        # architecture prose instead of writing the program — so the user prompt
+        # follows the detected intent.
         from app.agents.planning import deliverable_kind
 
         kind = deliverable_kind(getattr(stage_ctx, "user_content", "") or question)
         system_prompt = _CODE_SYSTEM if kind == "code" else _SYSTEM
+        if kind == "code":
+            # Code intent: write the program. The Analyst's research is reference
+            # only — never restate it as prose (that is what produced
+            # "architecture-only" answers).
+            user_prompt = (
+                f"用户问题：\n{question}\n\n"
+                f"（可选参考）研究结论：\n{verified or '（无）'}\n\n"
+                "请针对用户问题直接产出完整、可运行的代码交付物；"
+                "上面的研究结论仅作参考，不要复述，除非涉及外部事实或第三方 API 约束。"
+            )
+        else:
+            # Research / document intent: answer from verified evidence, cite it.
+            user_prompt = (
+                f"用户问题：\n{question}\n\n"
+                f"已验证内容：\n{verified or '（无已验证内容，请如实说明缺口）'}\n\n"
+                "请基于以上已验证内容生成最终回答，并保留来源编号。"
+            )
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        # Output budget comes from the user's ModelConfig (e.g. 8192), not a
-        # hard-coded 1024 — the old cap truncated long code answers.
-        model_config = getattr(stage_ctx, "model_config", None)
-        configured = safe_positive_int(
-            getattr(model_config, "max_tokens", None), self._max_tokens
-        )
-        options = ChatOptions(temperature=0.5, max_tokens=configured)
+        # Do NOT cap the Writer's output (max_tokens=None). A capped budget — even
+        # the user's ModelConfig.max_tokens — truncated long code answers
+        # mid-stream (finish_reason=length): a multi-agent "编写贪吃蛇游戏" request
+        # spent the budget on the Analyst's architecture preamble and the game
+        # code never reached the user. None omits max_tokens so the endpoint
+        # streams until the model naturally stops.
+        options = ChatOptions(temperature=0.5, max_tokens=None)
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
 

@@ -30,6 +30,7 @@ from app.agents.schemas import (
     ExecutionMode,
     RuntimeKind,
     ev_error,
+    ev_intent_recognized,
     ev_run_started,
     ev_runtime_selected,
 )
@@ -110,6 +111,19 @@ class ChatOrchestrator:
             fallback_reason=selection.fallback_reason,
             is_demo=selection.is_demo,
         )
+        # Surface the model-recognized intent so the client can show WHY a turn
+        # went native vs research crew — the visible antidote to silent routing.
+        _intent = ctx.extra.get("intent_decision")
+        if _intent is not None:
+            yield ev_intent_recognized(
+                run_id=run.id,
+                route=_intent.route,
+                deliverable_kind=_intent.deliverable_kind,
+                confidence=_intent.confidence,
+                rationale=_intent.rationale,
+                tool_hints=list(getattr(_intent, "tool_hints", []) or []),
+                fragments=ctx.extra.get("intent_fragments") or [],
+            )
 
         try:
             async for evt in runtime.stream_turn(ctx):

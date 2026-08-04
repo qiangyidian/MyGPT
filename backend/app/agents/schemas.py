@@ -95,6 +95,69 @@ class ExecutionMode(str, Enum):
 
 
 # --------------------------------------------------------------------------- #
+# Intent recognition (model-driven, context-fed)
+#
+# Replaces the brittle keyword substring router. Each turn assembles a set of
+# typed context fragments (mode / deliverable seed / environment / conversation
+# gist / user instructions), feeds them to one lightweight LLM call, and gets
+# back a structured IntentDecision that drives routing (native vs research vs
+# debate crew) and is surfaced to the main model so it self-judges intent.
+# --------------------------------------------------------------------------- #
+class IntentDecision(BaseModel):
+    """The model's structured judgment of what the user wants this turn.
+
+    Fields are intentionally small + enumerable so the JSON the classifier
+    returns is easy to validate and coerce.
+    """
+
+    # Which runtime should run. "native" = single agent; the research profiles
+    # and "debate" are the multi-agent CrewAI crews.
+    route: str = "native"
+    # What the user wants delivered — shapes the writer prompt + whether web
+    # tools are allowed. "code" forces native (no research-prose crew).
+    deliverable_kind: str = "factual"
+    # Tools the model thinks are relevant, e.g. ["web_search", "python_exec"].
+    # Empty = leave the tool set open to the route's default.
+    tool_hints: list[str] = Field(default_factory=list)
+    # 0.0..1.0. Below the confidence threshold the caller falls back to the
+    # keyword router rather than trusting an unsure judgment.
+    confidence: float = 0.5
+    # One-line reason — for telemetry / the intent_recognized event.
+    rationale: str = ""
+
+
+def ev_intent_recognized(
+    *,
+    run_id: uuid.UUID | str,
+    route: str,
+    deliverable_kind: str,
+    confidence: float,
+    rationale: str = "",
+    tool_hints: list[str] | None = None,
+    fragments: list[str] | None = None,
+) -> AgentEvent:
+    """Tell the client what intent the model recognized for this turn.
+
+    Surfaces the (previously silent) routing decision so the user/UI can see
+    WHY a turn went native vs research crew — the antidote to the keyword
+    router silently mis-routing (e.g. a code request landing in the research
+    pipeline). ``fragments`` lists the context-fragment names that were fed in.
+    """
+    return AgentEvent(
+        kind="intent_recognized",
+        data={
+            "run_id": str(run_id),
+            "route": route,
+            "deliverable_kind": deliverable_kind,
+            "confidence": confidence,
+            "rationale": rationale,
+            "tool_hints": tool_hints or [],
+            "fragments": fragments or [],
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # AgentEvent
 # --------------------------------------------------------------------------- #
 class AgentEvent(BaseModel):

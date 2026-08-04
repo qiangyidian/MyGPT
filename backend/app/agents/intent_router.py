@@ -32,6 +32,10 @@ _WEB_TOOLS = {"web_search", "http_get"}
 # one-liners ("分析下", "总结下") stay native. Lower = more aggressive.
 _AUTO_MULTI_MIN_LEN = 6
 
+# Below this confidence the model's intent judgment is NOT trusted — fall back to
+# the keyword router rather than act on an unsure classification.
+_INTENT_MIN_CONFIDENCE = 0.5
+
 
 @dataclass
 class RouteDecision:
@@ -200,6 +204,96 @@ def decide_route(
     # auto: router decides. Default to native simple chat, tools off. This
     # preserves the pre-Phase-1 default behaviour.
     return RouteDecision(mode="auto", requested_mode="auto")
+
+
+def decide_route_with_intent(
+    mode: str,
+    *,
+    user_content: str,
+    intent: object | None,
+    has_knowledge_base: bool = False,
+    has_attachment: bool = False,
+) -> RouteDecision:
+    """Intent-driven routing — the model-judgment replacement for the keyword
+    router.
+
+    If ``intent`` is a trusted :class:`~app.agents.schemas.IntentDecision`
+    (present, above the confidence floor, with a valid route), build the
+    :class:`RouteDecision` from it. Otherwise fall back to :func:`decide_route`
+    (the keyword router) so intent recognition is an enhancement, never a hard
+    dependency.
+
+    Mapping (the part that actually fixes "silent mis-routing"):
+      * ``deliverable_kind == "code"``  → native, no web. Code never enters the
+        research crew (which truncates it and writes prose).
+      * ``route == "debate"``           → debate crew, no web.
+      * ``route in {deep_research, parallel_research}`` → research crew
+        (parallel when a KB is bound).
+      * else (native / factual)         → native; enable only hinted tools.
+    """
+    from app.agents.schemas import IntentDecision
+
+    trusted = (
+        isinstance(intent, IntentDecision)
+        and intent.confidence >= _INTENT_MIN_CONFIDENCE
+    )
+    if not trusted:
+        return decide_route(
+            mode,
+            has_knowledge_base=has_knowledge_base,
+            has_attachment=has_attachment,
+            user_content=user_content,
+        )
+
+    kind = intent.deliverable_kind
+    route_name = intent.route
+
+    # Code → native + no web, regardless of the suggested route. This is the
+    # direct fix for the "贪吃蛇" class of bug (code landing in the research crew).
+    if kind == "code":
+        return RouteDecision(
+            execution_mode=ExecutionMode.auto,
+            agent_profile="general",
+            enable_tools=False,
+            use_multi_agent=False,
+            disable_web=True,
+            mode="create",
+            requested_mode=mode,
+        )
+
+    if route_name == "debate":
+        return RouteDecision(
+            execution_mode=ExecutionMode.agent,
+            agent_profile="debate",
+            enable_tools=False,
+            use_multi_agent=True,
+            disable_web=True,
+            mode="debate",
+            requested_mode=mode,
+        )
+
+    if route_name in ("deep_research", "parallel_research"):
+        profile = "parallel_research" if has_knowledge_base else "deep_research"
+        return RouteDecision(
+            execution_mode=ExecutionMode.agent,
+            agent_profile=profile,
+            enable_tools=True,
+            use_multi_agent=True,
+            mode="deep_research",
+            requested_mode=mode,
+        )
+
+    # native / factual: enable only the tools the model hinted at (if any).
+    hints = list(getattr(intent, "tool_hints", []) or [])
+    return RouteDecision(
+        execution_mode=ExecutionMode.auto,
+        agent_profile="general",
+        enable_tools=bool(hints),
+        use_multi_agent=False,
+        tool_allowlist=hints or None,
+        mode=mode,
+        requested_mode=mode,
+    )
 
 
 def filter_tool_names(

@@ -37,10 +37,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.agents.orchestrator import chat_orchestrator
-from app.agents.intent_router import decide_route
+from app.agents.intent_router import decide_route, decide_route_with_intent
 from app.agents.planning import (
     extract_goal,
     is_casual_question,
+    should_recognize_intent,
     should_summarize,
     summarize_history,
 )
@@ -466,10 +467,12 @@ class ChatService:
         # config and their own knowledge bases — never another user's.
         if cfg.user_id is not None and cfg.user_id != user.id:
             raise AppException(404, "model_not_found", "Model config not found")
+        kb_names: list[str] = []
         for _kb_id in kb_ids:
             kb_row = await db.get(KnowledgeBase, _kb_id)
             if kb_row is None or kb_row.user_id != user.id:
                 raise AppException(404, "knowledge_base_not_found", "Knowledge base not found")
+            kb_names.append(kb_row.name or str(_kb_id))
         route = decide_route(
             request.mode,
             has_knowledge_base=bool(kb_ids),
@@ -611,6 +614,68 @@ class ChatService:
             },
         )
 
+        # 6a. Intent recognition (engineering-grade, model-driven). Assemble typed
+        # context fragments, run the classifier, and let a trusted judgment steer
+        # routing — replacing the silent keyword guessing that mis-routed code
+        # requests into the research crew. Skipped for casual/short turns and
+        # when the user explicitly forced agent mode (explicit intent wins).
+        intent_decision = None
+        intent_fragment_names: list[str] = []
+        agent_forced = (request.execution_mode or "auto").lower() == "agent" and request.mode == "auto"
+        if not agent_forced and should_recognize_intent(user_content):
+            from app.agents.context_fragments import (
+                IntentContextInput,
+                assemble_context_fragments,
+                fragment_names,
+                recognized_intent_fragment,
+            )
+            from app.agents.intent_service import intent_service
+            from app.providers.registry import get_provider_for_config
+
+            _ctx_fragments = assemble_context_fragments(
+                IntentContextInput(
+                    mode=request.mode,
+                    user_content=user_content,
+                    kb_names=tuple(kb_names),
+                    attachment_descriptors=(
+                        (f"{len(request.attachment_ids)} 个附件",) if request.attachment_ids else ()
+                    ),
+                    messages=messages,
+                )
+            )
+            try:
+                intent_decision = await intent_service.judge(
+                    user_content=user_content,
+                    fragments=_ctx_fragments,
+                    provider=get_provider_for_config(cfg),
+                )
+            except Exception:  # noqa: BLE001 — intent is an enhancement, never fatal
+                logger.warning("intent recognition raised; using keyword route", exc_info=True)
+                intent_decision = None
+
+            if intent_decision is not None:
+                intent_fragment_names = fragment_names(_ctx_fragments)
+                route = decide_route_with_intent(
+                    request.mode,
+                    user_content=user_content,
+                    intent=intent_decision,
+                    has_knowledge_base=bool(kb_ids),
+                    has_attachment=bool(request.attachment_ids),
+                )
+                enable_tools = route.enable_tools or request.enable_tools
+                execution_mode = route.execution_mode
+                agent_profile = route.agent_profile
+                # Surface the recognized intent to the answering model (the native
+                # runtime sends ctx.messages[0] as the system message) so it
+                # self-judges intent instead of relying on a hidden router.
+                _intent_block = recognized_intent_fragment(intent_decision).render()
+                if _intent_block:
+                    system_prompt = system_prompt + "\n\n" + _intent_block
+                    if messages and messages[0].get("role") == "system":
+                        messages[0]["content"] = (
+                            messages[0].get("content") or ""
+                        ) + "\n\n" + _intent_block
+
         # 6. Build turn context and delegate to the orchestrator/runtime.
         ctx = AgentTurnContext(
             db=db,
@@ -630,7 +695,12 @@ class ChatService:
             enable_tools=enable_tools,
             knowledge_base_id=kb_ids[0] if kb_ids else None,
             mode=route.mode,
-            extra={"state": flow_state, "route": route},
+            extra={
+                "state": flow_state,
+                "route": route,
+                "intent_decision": intent_decision,
+                "intent_fragments": intent_fragment_names,
+            },
         )
 
         try:
