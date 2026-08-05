@@ -36,16 +36,19 @@ function CitationChip({
   const rel = relevanceLabel(citation.rerank_score ?? citation.score);
 
   return (
-    <div className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5">
+    <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-transparent px-2.5 py-2 transition-colors hover:border-primary/30 hover:bg-muted/50 focus-within:border-primary/30 focus-within:bg-muted/50">
       <button
         type="button"
-        className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+        className="flex min-w-0 flex-1 items-center gap-2 text-left"
         onClick={() => onSourceClick?.(index)}
         title="查看来源详情"
       >
-        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium">
-          <span className="text-muted-foreground">[{index + 1}]</span> {citation.document_name}
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
+          <Icon className="h-3 w-3" aria-hidden />
+        </span>
+        <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+          <span className="font-semibold text-indigo-600 dark:text-indigo-400">[{index + 1}]</span>{" "}
+          {citation.document_name}
         </span>
       </button>
       <Badge variant={rel.tone as never} className="shrink-0 text-[10px]">{rel.label}</Badge>
@@ -66,9 +69,9 @@ export function Citations({
 }) {
   if (!citations.length) return null;
   return (
-    <div className="mt-3 space-y-1.5">
-      <p className="text-xs font-medium text-muted-foreground">引用来源</p>
-      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+    <div className="mt-4 space-y-2">
+      <p className="text-[11px] font-semibold text-muted-foreground">引用来源</p>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {citations.map((c, i) => (
           <CitationChip
             key={`${c.document_id ?? c.url}-${i}`}

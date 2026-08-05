@@ -8,6 +8,7 @@ import {
   Pencil,
   RefreshCw,
   Scissors,
+  Sparkles,
   Square,
   ThumbsDown,
   ThumbsUp,
@@ -75,9 +76,9 @@ function CopyButton({ text }: { text: string }) {
       size="sm"
       className="h-7 gap-1 px-2 text-xs text-muted-foreground"
       onClick={handleCopy}
-      aria-label="复制"
+      aria-label={copied ? "已复制" : "复制"}
     >
-      {copied ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+      {copied ? <Check className="h-3 w-3 text-green-500 dark:text-green-400" /> : <Copy className="h-3 w-3" />}
       {copied ? "已复制" : "复制"}
     </Button>
   );
@@ -159,7 +160,7 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
       <Button
         variant="ghost"
         size="icon"
-        className={cn("h-7 w-7 text-muted-foreground", up && "text-green-600")}
+        className={cn("h-7 w-7 text-muted-foreground", up && "text-green-600 dark:text-green-400")}
         disabled={isLoading}
         onClick={() => (up ? void clear() : void set("up"))}
         aria-label="有帮助"
@@ -264,13 +265,13 @@ export const MessageBubble = memo(function MessageBubble({
         isUser ? "flex-row-reverse" : "flex-row"
       )}
     >
-      <Avatar className="h-8 w-8 shrink-0">
+      <Avatar className="h-7 w-7 shrink-0" role="img" aria-label={isUser ? "你的消息" : "AI 助手"}>
         <AvatarFallback
           className={cn(
-            isUser ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground"
+            isUser ? "bg-indigo-500 text-white" : "bg-muted text-muted-foreground"
           )}
         >
-          {isUser ? <UserIcon className="h-4 w-4" /> : "AI"}
+          {isUser ? <UserIcon className="h-3.5 w-3.5" aria-hidden /> : <Sparkles className="h-3.5 w-3.5" aria-hidden />}
         </AvatarFallback>
       </Avatar>
 
@@ -322,31 +323,31 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           </div>
         ) : (
-          <div
-            className={cn(
-              "w-full overflow-hidden rounded-lg px-4 py-3",
-              isUser ? "bg-primary text-primary-foreground" : "bg-muted/50 text-foreground"
-            )}
-          >
-            {isUser ? (
-              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
-            ) : message.content ? (
-              <div className="text-sm">
-                <Markdown content={safeContent} />
-                {citationFlagged && (
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    已自动移除缺少真实引用支持的来源标记。
-                  </p>
-                )}
-              </div>
-            ) : (
-              isStreaming && <AgentInlineStatus />
-            )}
-          </div>
+          isUser ? (
+            <div className="w-fit max-w-[85%] rounded-2xl rounded-br-md bg-indigo-50 px-4 py-2.5 text-indigo-900 dark:bg-indigo-500/15 dark:text-indigo-100">
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+                {message.content}
+              </p>
+            </div>
+          ) : message.content ? (
+            <div className="w-full text-[0.95rem] leading-[1.7]">
+              <Markdown
+                content={safeContent}
+                className={cn("text-[0.95rem] leading-[1.7]", isStreaming && "msg-streaming")}
+              />
+              {citationFlagged && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  已自动移除缺少真实引用支持的来源标记。
+                </p>
+              )}
+            </div>
+          ) : (
+            isStreaming && <AgentInlineStatus />
+          )
         )}
 
         {!isUser && resolvedCitations && resolvedCitations.length > 0 && (
-          <div className="mt-1 w-full">
+          <div className="w-full">
             <Citations
               citations={resolvedCitations}
               onSourceClick={(i) => onSourceClick?.(i, resolvedCitations)}

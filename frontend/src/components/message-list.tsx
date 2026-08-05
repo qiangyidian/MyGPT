@@ -54,7 +54,10 @@ export function MessageList({
     if (!container) return;
     const nearBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight < 120;
-    if (nearBottom) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (nearBottom) {
+      const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      bottomRef.current?.scrollIntoView({ behavior: reduce ? "auto" : "smooth" });
+    }
   }, [messages, streamingText, isStreaming]);
 
   const isEmpty = messages.length === 0 && !streamingText && !isStreaming;
@@ -102,7 +105,7 @@ export function MessageList({
 
   return (
     <div ref={containerRef} className={cn("min-h-0 flex-1 overflow-y-auto", className)}>
-      <div className="mx-auto w-full max-w-3xl px-1 py-4">
+      <div className="mx-auto w-full max-w-3xl px-1 py-6">
         {shownMessages.map((msg, i) => (
           <MessageBubble
             key={msg.id}

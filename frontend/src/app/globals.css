@@ -64,14 +64,39 @@
   }
 }
 
-/* highlight.js minimal token colors (rehype-highlight) */
-.hljs { color: hsl(var(--foreground)); background: hsl(var(--muted)); border-radius: var(--radius); }
+/* highlight.js token colors (rehype-highlight).
+   Code blocks render on a dark surface in both light and dark mode (see
+   markdown.tsx wrapper), so token colors are tuned for a dark background and
+   the base text is forced light regardless of theme. Background/radius come
+   from the wrapper, not from .hljs. */
+.hljs { color: #e6e6e6; background: transparent; }
 .hljs-keyword, .hljs-built_in, .hljs-type { color: #c678dd; }
 .hljs-string, .hljs-attr { color: #98c379; }
 .hljs-number, .hljs-literal { color: #d19a66; }
 .hljs-comment { color: #7f848e; font-style: italic; }
 .hljs-function .hljs-title, .hljs-title { color: #61afef; }
 .hljs-variable, .hljs-params { color: #e06c75; }
+
+/* Streaming caret: injected as ::after on the LAST block of an in-flight
+   assistant message (the `msg-streaming` class is passed to <Markdown> while
+   streaming). Because ::after is the last inline child of that block, the
+   caret sits in inline flow at the text cursor — not wrapped onto its own
+   line the way a sibling span after the block-level Markdown root would. */
+@keyframes msg-caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.msg-streaming > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: -2px;
+  background: #6366f1;
+  border-radius: 1px;
+  animation: msg-caret-blink 1s infinite;
+}
 
 /* ------------------------------------------------------------------ */
 /* Multi-agent panel: active edge flow + running-node pulse.           */
@@ -104,7 +129,8 @@
   /* Respect reduced motion across the new UI affordances too. */
   .animate-pulse,
   .animate-ping,
-  .animate-bounce {
+  .animate-bounce,
+  .msg-streaming > :last-child::after {
     animation: none !important;
   }
 }
