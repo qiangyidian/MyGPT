@@ -26,9 +26,32 @@ class SearchHit:
     rerank_score: float | None = None
 
 
+@dataclass
+class ParsedDocument:
+    """Structured result of parsing one file.
+
+    ``text`` is the flat full-text used for inline context injection and RAG
+    chunking. ``pages`` carries per-page text when the format is paginated
+    (PDF/PPTX/EPUB), enabling page-number citations downstream. ``tables`` holds
+    extracted tables serialized as text blocks (already folded into ``text``;
+    kept separately for structured preview). ``metadata`` records parser hints
+    (page count, sheet names, ocr_used, parser_used, content_kind, ...) for the
+    attachment preview panel and observability.
+    """
+
+    text: str = ""
+    pages: list[str] | None = None
+    tables: list[str] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def chars(self) -> int:
+        return len(self.text or "")
+
+
 class DocumentParser(ABC):
     @abstractmethod
-    def parse(self, file_path: str, file_type: str) -> str: ...
+    def parse(self, file_path: str, file_type: str) -> ParsedDocument: ...
 
 
 class TextSplitter(ABC):

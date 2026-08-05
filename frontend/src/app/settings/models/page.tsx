@@ -39,6 +39,7 @@ const EMPTY: ModelConfigInput = {
   embedding_model_name: "",
   supports_stream: true,
   supports_tools: false,
+  supports_vision: false,
   is_embedding: false,
   temperature: 0.7,
   top_p: 1,
@@ -117,6 +118,7 @@ export default function ModelsPage() {
       embedding_model_name: m.embedding_model_name ?? "",
       supports_stream: m.supports_stream,
       supports_tools: m.supports_tools,
+      supports_vision: m.supports_vision,
       is_embedding: m.is_embedding,
       temperature: m.temperature,
       top_p: m.top_p,
@@ -178,6 +180,7 @@ export default function ModelsPage() {
                     </Badge>
                   )}
                   {m.supports_tools && <Badge variant="outline">工具</Badge>}
+                  {m.supports_vision && <Badge variant="outline">视觉</Badge>}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-muted-foreground">
                   {m.provider} · {m.model_name} · {m.api_base_url}
@@ -322,6 +325,11 @@ export default function ModelsPage() {
                 label="支持工具调用"
                 checked={!!form.supports_tools}
                 onChange={(v) => setForm({ ...form, supports_tools: v })}
+              />
+              <Toggle
+                label="支持视觉（图片输入）"
+                checked={!!form.supports_vision}
+                onChange={(v) => setForm({ ...form, supports_vision: v })}
               />
               <Toggle
                 label="作为向量模型"

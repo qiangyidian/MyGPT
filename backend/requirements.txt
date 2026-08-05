@@ -31,13 +31,29 @@ tenacity>=8.2
 # ---- Vector DB ----
 qdrant-client>=1.9
 
-# ---- Document parsing ----
-pdfplumber>=0.11
-python-docx>=1.1
-openpyxl>=3.1
-pandas>=2.2
-markdown>=3.6
-beautifulsoup4>=4.12
+# ---- Document parsing (core) ----
+pdfplumber>=0.11          # PDF text + table extraction (table-heavy fallback)
+PyMuPDF>=1.24             # fast PDF text/tables/images; imported as `pymupdf`/`fitz`
+python-docx>=1.1          # .docx
+python-pptx>=0.6          # .pptx (PowerPoint)
+openpyxl>=3.1             # .xlsx
+xlrd>=2.0                 # legacy .xls (xlrd 2.x reads only .xls; openpyxl does .xlsx)
+pandas>=2.2               # csv/xlsx/xls tabular rendering
+markdown>=3.6             # .md → html
+beautifulsoup4>=4.12      # html/xml text stripping
+
+# ---- Document parsing (extended formats) ----
+trafilatura>=1.9          # HTML main-content extraction (boilerplate stripping)
+EbookLib>=0.18            # .epub
+striprtf>=0.0.26          # .rtf → text
+
+# ---- OCR / image understanding ----
+# rapidocr ships its own ONNX models — pure pip, no system Tesseract binary
+# required (important for Windows). pytesseract is an optional alternative OCR
+# backend that wraps a system-installed Tesseract.
+rapidocr-onnxruntime>=1.2.0  # 1.3.x requires Python<3.13; 1.2.3 is the newest py3.13-compatible
+pytesseract>=0.3.10       # optional OCR backend (needs Tesseract on PATH)
+Pillow>=10.0              # image decode/resize before OCR or vision injection
 
 # ---- Tokenization ----
 tiktoken>=0.6

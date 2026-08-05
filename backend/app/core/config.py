@@ -132,12 +132,37 @@ class Settings(BaseSettings):
     # ---- Chat attachments (Phase 1) ----
     # Broader than KB uploads: includes images for multimodal chat.
     ATTACHMENT_ALLOWED_EXT: str = (
-        ".pdf,.docx,.txt,.md,.csv,.xlsx,.json,.png,.jpg,.jpeg,.webp"
+        ".pdf,.docx,.txt,.md,.csv,.xlsx,.json,.png,.jpg,.jpeg,.webp,"
+        ".pptx,.html,.htm,.epub,.rtf,.doc,.xls"
     )
     ATTACHMENT_MAX_MB: int = 20
     MAX_ATTACHMENTS_PER_MESSAGE: int = 10
     # Background parse timeout for a single attachment (seconds).
     ATTACHMENT_PARSE_TIMEOUT: int = 60
+
+    # ---- File parsing / multimodal (engineering-grade attachments) ----
+    # OCR backend for scanned PDFs / image text extraction.
+    #   rapidocr (default) — pip-installed, no system binary, cross-platform.
+    #   tesseract          — wraps a system Tesseract on PATH.
+    OCR_ENGINE: str = "rapidocr"
+    # When a PDF yields almost no selectable text, treat it as scanned and run
+    # OCR over each rendered page (the fallback behind the vision/OCR strategy).
+    OCR_SCANNED_PDF: bool = True
+    # Max pages to OCR per scanned PDF (bound the cost on huge scans).
+    OCR_SCANNED_PDF_MAX_PAGES: int = 30
+    # Inline-injection budget for attachment text, as a fraction of the model's
+    # context window. A doc whose text exceeds min(fraction*context, hard cap)
+    # is auto-chunked into a per-attachment Qdrant collection and retrieved on
+    # demand instead of being spliced wholesale.
+    ATTACHMENT_INLINE_FRACTION: float = 0.30
+    ATTACHMENT_INLINE_MAX_CHARS: int = 24000
+    # Long edge (px) an image is downscaled to before vision injection, to keep
+    # base64 / token cost bounded (OpenAI recommends <= 2048px).
+    VISION_IMAGE_MAX_EDGE: int = 2048
+    # Heuristic: model_names containing any token are assumed vision-capable
+    # unless the ModelConfig row explicitly sets supports_vision=False. Lets the
+    # feature work out-of-the-box for well-known vision models.
+    VISION_MODEL_KEYWORDS: str = "gpt-4o,qwen-vl,qwen2-vl,qwen2.5-vl,glm-4v,glm-4.5v,internvl,llava,minicpm-v,deepseek-vl,vision,vl"
 
     # ---- SSE ----
     # Heartbeat comment cadence to keep proxies/CDNs from dropping idle streams.

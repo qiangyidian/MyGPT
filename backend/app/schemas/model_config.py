@@ -17,6 +17,7 @@ class ModelConfigBase(BaseModel):
     embedding_model_name: str | None = None
     supports_stream: bool = True
     supports_tools: bool = False
+    supports_vision: bool = False
     max_context_tokens: int = 8192
     max_tokens: int = 1024
     temperature: float = 0.7
@@ -36,6 +37,7 @@ class ModelConfigUpdate(BaseModel):
     embedding_model_name: str | None = None
     supports_stream: bool | None = None
     supports_tools: bool | None = None
+    supports_vision: bool | None = None
     max_context_tokens: int | None = None
     max_tokens: int | None = None
     temperature: float | None = None
@@ -55,6 +57,7 @@ class ModelConfigOut(ORMModel):
     embedding_model_name: str | None
     supports_stream: bool
     supports_tools: bool
+    supports_vision: bool
     max_context_tokens: int
     max_tokens: int
     temperature: float

@@ -43,6 +43,7 @@ export interface ModelConfig {
   embedding_model_name: string | null;
   supports_stream: boolean;
   supports_tools: boolean;
+  supports_vision: boolean;
   max_context_tokens: number;
   max_tokens: number;
   temperature: number;
@@ -60,6 +61,7 @@ export interface ModelConfigInput {
   embedding_model_name?: string | null;
   supports_stream?: boolean;
   supports_tools?: boolean;
+  supports_vision?: boolean;
   max_context_tokens?: number;
   max_tokens?: number;
   temperature?: number;

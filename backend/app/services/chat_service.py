@@ -58,7 +58,11 @@ from app.providers.registry import get_provider_for_config
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
-from app.services.attachment_service import resolve_and_bind_attachments
+from app.services.attachment_service import (
+    collect_image_parts,
+    resolve_and_bind_attachments,
+    smart_attachment_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +356,22 @@ def _build_system_prompt(conversation: Conversation | None, rag_context: str) ->
     return base
 
 
-def _augment_with_attachments(user_content: str, attachment_text: str) -> str:
+def _inline_attachment_budget(cfg: ModelConfig) -> int:
+    """Model-aware char budget for inline attachment text injection.
+
+    A fraction of the model's context window (chars ≈ tokens × 4), capped by a
+    hard ceiling so a 128k-context model doesn't try to inline a whole book.
+    Docs exceeding this go through per-attachment RAG retrieval instead.
+    """
+    s = get_settings()
+    ctx_tokens = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
+    from_fraction = int(ctx_tokens * s.ATTACHMENT_INLINE_FRACTION * _CHARS_PER_TOKEN)
+    return max(2000, min(from_fraction, s.ATTACHMENT_INLINE_MAX_CHARS))
+
+
+def _augment_with_attachments(
+    user_content: str, attachment_text: str, max_chars: int = 8000
+) -> str:
     """Append parsed attachment text to the user content for this turn.
 
     The attachment bytes live in storage; only the extracted text is spliced in
@@ -364,10 +383,31 @@ def _augment_with_attachments(user_content: str, attachment_text: str) -> str:
     if not snippet:
         return user_content
     # Bound the inline injection; full text stays on the attachment row.
-    max_chars = 8000
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars] + "\n…（内容已截断，完整内容见附件）"
     return f"{user_content}\n\n[附件内容]\n{snippet}"
+
+
+def _attach_image_parts(messages: list[dict[str, Any]], image_parts: list[dict[str, Any]]) -> None:
+    """Convert the latest user message to multimodal content with image parts.
+
+    OpenAI vision format: ``content`` becomes a list of ``{type: text|image_url}``
+    parts. The text part preserves whatever the user typed + inline attachment
+    text; each image part carries a base64 data URL. We mutate the LAST user
+    message in-place (the current turn). History turns keep plain-string
+    content — old image turns are reconstructed from OCR text only, matching
+    the common pattern of not re-sending images from prior turns.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        existing = msg.get("content")
+        text = existing if isinstance(existing, str) else ""
+        parts: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
+        for ip in image_parts:
+            parts.append({"type": "image_url", "image_url": {"url": ip["data_url"]}})
+        msg["content"] = parts
+        return
 
 
 async def _delete_last_assistant_message(
@@ -510,12 +550,20 @@ class ChatService:
                 # Bind chat attachments to this user message (ownership-checked).
                 if request.attachment_ids:
                     try:
-                        summaries, attachment_text = await resolve_and_bind_attachments(
+                        summaries, _full_attachment_text = await resolve_and_bind_attachments(
                             db, user.id, conversation.id, user_msg.id, request.attachment_ids
                         )
                         user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
+                        # Smart-hybrid attachment text: small docs inlined verbatim,
+                        # oversized ones replaced by query-relevant chunks (RAG).
+                        attachment_text = await smart_attachment_text(
+                            db, user.id, conversation.id, request.attachment_ids,
+                            user_content, _inline_attachment_budget(cfg),
+                        )
                         if attachment_text:
-                            user_content = _augment_with_attachments(user_content, attachment_text)
+                            user_content = _augment_with_attachments(
+                                user_content, attachment_text, _inline_attachment_budget(cfg)
+                            )
                     except AppException:
                         raise
                     except Exception as exc:  # noqa: BLE001 — attachments are best-effort
@@ -593,6 +641,20 @@ class ChatService:
         messages = _messages_to_dicts(system_prompt, history)
         max_ctx = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
         messages = _trim_history(messages, max_ctx, cfg.model_name)
+
+        # 4b. Gather multimodal image parts (data only — do NOT mutate messages
+        # yet). The actual content-parts injection happens after intent
+        # recognition / context enrichment (those read message content as a
+        # plain string and would otherwise skip the current user turn).
+        _image_parts: list[dict[str, Any]] = []
+        if cfg.supports_vision and request.attachment_ids:
+            try:
+                _image_parts = await collect_image_parts(
+                    db, user.id, conversation.id, request.attachment_ids
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("collect_image_parts failed: %s", exc)
+                _image_parts = []
 
         # 5. Pending assistant message + meta event.
         assistant_msg = Message(
@@ -758,6 +820,13 @@ class ChatService:
                 "intent_fragments": intent_fragment_names,
             },
         )
+
+        # Apply multimodal vision parts NOW — after intent recognition and
+        # context enrichment (which read user content as a plain string). The
+        # last user message becomes an OpenAI content-parts list with the image
+        # data URLs; the provider passes it through unchanged.
+        if _image_parts:
+            _attach_image_parts(messages, _image_parts)
 
         try:
             async for evt in chat_orchestrator.stream(ctx):

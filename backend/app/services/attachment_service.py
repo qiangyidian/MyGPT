@@ -32,6 +32,9 @@ from app.core.exceptions import AppException
 from app.core.storage import get_storage
 from app.db import AsyncSessionLocal
 from app.models import ChatAttachment, KnowledgeBase, User
+from app.rag import attachment_rag
+from app.rag.base import ParsedDocument
+from app.rag.ocr import image_to_text as ocr_image_to_text
 from app.rag.parsers import default_parser
 
 logger = logging.getLogger(__name__)
@@ -213,15 +216,17 @@ async def upload(
         size_bytes=size,
         storage_key=storage_key,
         status="uploaded",
-        parse_status="skipped" if ext in _IMAGE_EXTS else "pending",
+        parse_status="pending",
         is_temporary=True,
     )
     db.add(attachment)
     await db.commit()
     await db.refresh(attachment)
 
-    if ext not in _IMAGE_EXTS:
-        _spawn(_parse_attachment_bg(attachment.id))
+    # All attachments parse in the background: documents → extracted text,
+    # images → OCR text (the multimodal fallback when the model lacks vision;
+    # a vision model still sees the real bytes via collect_image_parts at send).
+    _spawn(_parse_attachment_bg(attachment.id))
 
     return attachment
 
@@ -263,53 +268,59 @@ async def _parse_attachment_bg(attachment_id: uuid.UUID) -> None:
             att.preview_metadata = preview
             att.parse_status = "ready"
             att.status = "ready"
+            # Pre-index oversized docs into the per-attachment RAG collection so
+            # send-time retrieval is fast (smart-hybrid large-file path).
+            if attachment_rag.should_index(text):
+                preview = {**preview, "rag_indexed": await attachment_rag.ensure_index(db, attachment_id, text)}
+                att.preview_metadata = preview
             await db.commit()
     except Exception:  # noqa: BLE001 — background; never propagate
         logger.exception("attachment parse task crashed for %s", attachment_id)
 
 
 async def _extract(storage_key: str, filename: str) -> tuple[str, dict[str, Any]]:
-    """Parse text + collect preview hints, off the event loop."""
+    """Parse text + collect preview metadata, off the event loop.
+
+    Documents go through :data:`default_parser`; images are OCR'd — that text is
+    the multimodal fallback a non-vision model reads inline, while a vision
+    model still receives the raw image bytes via :func:`collect_image_parts` at
+    send time. Runs on the dedicated parse pool so a pathological file cannot
+    starve reranking/tools.
+    """
     ext = _ext_of(filename)
     storage = get_storage()
 
     def _work() -> tuple[str, dict[str, Any]]:
-        preview: dict[str, Any] = {}
-        if ext in _IMAGE_EXTS:
-            return "", preview
         with storage.open(storage_key) as fh:
             tmp_path = fh.name  # LocalStorage returns a real file handle
-        text = default_parser.parse(tmp_path, ext)
-        preview = _preview_for(tmp_path, ext, text)
-        return text, preview
+        if ext in _IMAGE_EXTS:
+            text = ocr_image_to_text(tmp_path)
+            preview: dict[str, Any] = {
+                "kind": "image",
+                "parser_used": "ocr",
+                "ocr_used": bool(text.strip()),
+                "chars": len(text),
+            }
+            return text, preview
+        parsed = default_parser.parse(tmp_path, ext)
+        return parsed.text, _preview_for_parsed(parsed, ext)
 
     loop = asyncio.get_running_loop()
-    # Run on the dedicated parse pool, NOT the shared default executor, so a
-    # pathological file that hangs the parser cannot starve reranking/tools.
     return await loop.run_in_executor(_PARSE_EXECUTOR, _work)
 
 
-def _preview_for(path: str, ext: str, text: str) -> dict[str, Any]:
-    """Best-effort structured preview (page count, rows/cols, sheet names...)."""
-    preview: dict[str, Any] = {}
-    try:
-        if ext == ".pdf":
-            import pdfplumber  # type: ignore
-            with pdfplumber.open(path) as pdf:
-                preview = {"pages": len(pdf.pages)}
-        elif ext == ".csv":
-            import pandas as pd  # type: ignore
-            df = pd.read_csv(path, nrows=0)
-            preview = {"format": "csv", "columns": list(df.columns)}
-        elif ext == ".xlsx":
-            import pandas as pd  # type: ignore
-            xl = pd.ExcelFile(path)
-            preview = {"format": "xlsx", "sheets": xl.sheet_names}
-        elif ext in {".txt", ".md", ".json"}:
-            preview = {"chars": len(text or "")}
-    except Exception:  # noqa: BLE001 — preview is best-effort
-        pass
-    return preview
+def _preview_for_parsed(parsed: ParsedDocument, ext: str) -> dict[str, Any]:
+    """Structured preview derived once from the parser result (no re-open).
+
+    The parser already reports pages/sheets/tables/ocr_used in ``metadata``;
+    we just normalize a few UI-facing fields and record the extension.
+    """
+    md = dict(parsed.metadata or {})
+    md["chars"] = parsed.chars
+    md.setdefault("kind", "document")
+    if ext and "format" not in md:
+        md["format"] = ext.lstrip(".")
+    return md
 
 
 async def resolve_and_bind_attachments(
@@ -362,6 +373,135 @@ async def resolve_and_bind_attachments(
     return summaries, "\n\n".join(text_parts)
 
 
+async def smart_attachment_text(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    attachment_ids: list[uuid.UUID],
+    query: str,
+    inline_budget: int,
+) -> str:
+    """Assemble attachment context with the smart-hybrid strategy.
+
+    Small documents are inlined verbatim; oversized ones are replaced by the
+    top-k chunks most relevant to ``query`` (per-attachment RAG, indexed at parse
+    time). Images are skipped here — a vision model receives their bytes via
+    :func:`collect_image_parts`, and the OCR fallback text is small enough to
+    inline already. Never raises: on any RAG failure it falls back to a truncated
+    head so the turn always has *something* from the file.
+    """
+    if not attachment_ids:
+        return ""
+    res = await db.execute(
+        select(ChatAttachment).where(ChatAttachment.id.in_(list(attachment_ids)))
+    )
+    rows = {r.id: r for r in res.scalars().all()}
+    parts: list[str] = []
+    for aid in attachment_ids:
+        att = rows.get(aid)
+        if att is None or att.user_id != user_id or att.conversation_id != conversation_id:
+            continue
+        if _ext_of(att.original_filename) in _IMAGE_EXTS:
+            continue
+        text = (att.extracted_text or "").strip()
+        if not text:
+            continue
+        if len(text) <= inline_budget:
+            parts.append(f"[附件: {att.original_filename}]\n{text[:inline_budget]}")
+            continue
+        # Oversized → per-attachment RAG retrieval (pre-indexed at parse time).
+        snippets = await attachment_rag.retrieve(db, att.id, query, top_k=5)
+        if not snippets:
+            # Index missing / RAG unavailable → truncated head keeps it usable.
+            snippets = [text[:inline_budget] + "\n…（内容已截断，完整内容见附件）"]
+        joined = "\n\n".join(s for s in snippets if s)
+        parts.append(
+            f"[附件: {att.original_filename}（文档较长，已按问题检索 {len(snippets)} 个相关片段）]\n{joined}"
+        )
+    return "\n\n".join(parts)
+
+
+async def collect_image_parts(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    attachment_ids: list[uuid.UUID],
+) -> list[dict[str, Any]]:
+    """Return OpenAI ``image_url`` content parts for the image attachments.
+
+    Called by the chat layer ONLY when the configured model is vision-capable.
+    Each part carries a base64 data URL; the image is downsized to
+    ``VISION_IMAGE_MAX_EDGE`` first so base64/token cost stays bounded.
+    Ownership-checked exactly like :func:`resolve_and_bind_attachments`.
+    Non-image ids are silently skipped.
+    """
+    if not attachment_ids:
+        return []
+    res = await db.execute(
+        select(ChatAttachment).where(ChatAttachment.id.in_(list(attachment_ids)))
+    )
+    rows = {r.id: r for r in res.scalars().all()}
+    parts: list[dict[str, Any]] = []
+    for aid in attachment_ids:
+        att = rows.get(aid)
+        if att is None or att.user_id != user_id or att.conversation_id != conversation_id:
+            continue
+        if _ext_of(att.original_filename) not in _IMAGE_EXTS:
+            continue
+        part = await asyncio.to_thread(_load_image_part, att)
+        if part:
+            parts.append(part)
+    return parts
+
+
+def _load_image_part(att: ChatAttachment) -> dict[str, Any] | None:
+    """Read + resize one image attachment into a base64 data-url part.
+
+    Returns ``None`` on any decode/rescale failure so one corrupt image never
+    breaks the turn (the text path's OCR fallback still carries what it can).
+    """
+    import base64
+    import io
+
+    from PIL import Image  # lazy
+
+    settings = get_settings()
+    storage = get_storage()
+    try:
+        with storage.open(att.storage_key) as fh:
+            data = fh.read()
+        img = Image.open(io.BytesIO(data))
+    except Exception:  # noqa: BLE001 — corrupt image must not break the turn
+        logger.warning("could not open image attachment %s", att.id)
+        return None
+
+    max_edge = settings.VISION_IMAGE_MAX_EDGE
+    w, h = img.size
+    scale = max_edge / float(max(w, h))
+    if scale < 1:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+    # Normalize to PNG/JPEG — the two formats every vision endpoint accepts.
+    ext = _ext_of(att.original_filename)
+    save_fmt = "PNG" if ext == ".png" else "JPEG"
+    mime = "image/png" if save_fmt == "PNG" else "image/jpeg"
+    if save_fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+
+    buf = io.BytesIO()
+    try:
+        img.save(buf, format=save_fmt)
+    except Exception:  # noqa: BLE001
+        img.convert("RGB").save(buf, format="JPEG")
+        mime = "image/jpeg"
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "filename": att.original_filename,
+        "mime_type": mime,
+        "data_url": f"data:{mime};base64,{b64}",
+    }
+
+
 async def get_owned(db: AsyncSession, attachment_id: uuid.UUID, user_id: uuid.UUID) -> ChatAttachment:
     att = await db.get(ChatAttachment, attachment_id)
     if att is None or att.user_id != user_id or att.status == "deleted":
@@ -384,6 +524,8 @@ async def delete(db: AsyncSession, attachment_id: uuid.UUID, user_id: uuid.UUID)
         await get_storage().delete(att.storage_key)
     except Exception:  # noqa: BLE001
         pass
+    # Drop any per-attachment RAG index (best-effort; no DB session needed).
+    await attachment_rag.drop(attachment_id)
     att.status = "deleted"
     await db.commit()
 

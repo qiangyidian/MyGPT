@@ -1,6 +1,7 @@
 from app.rag.base import (
     DocumentParser,
     Embedder,
+    ParsedDocument,
     Reranker,
     SearchHit,
     TextSplitter,
@@ -10,6 +11,7 @@ from app.rag.base import (
 
 __all__ = [
     "DocumentParser",
+    "ParsedDocument",
     "TextSplitter",
     "Embedder",
     "VectorStore",

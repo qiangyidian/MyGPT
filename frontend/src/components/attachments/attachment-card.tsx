@@ -1,7 +1,9 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { AlertCircle, FileText, FileSpreadsheet, Image as ImageIcon, Loader2, X } from "lucide-react";
 
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -21,13 +23,46 @@ function extOf(name: string): string {
   return i >= 0 ? name.slice(i).toLowerCase() : "";
 }
 
-function iconFor(a: AttachmentCardData) {
+function isImage(a: AttachmentCardData): boolean {
   const ext = extOf(a.filename);
-  if (a.mime_type?.startsWith("image/") || [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) {
-    return ImageIcon;
-  }
+  return !!a.mime_type?.startsWith("image/") || [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext);
+}
+
+function iconFor(a: AttachmentCardData) {
+  if (isImage(a)) return ImageIcon;
+  const ext = extOf(a.filename);
   if ([".csv", ".xlsx", ".xls"].includes(ext)) return FileSpreadsheet;
   return FileText;
+}
+
+/**
+ * Lazy thumbnail for an image attachment. Fetches the (authenticated) bytes via
+ * the content endpoint, holds a blob URL, and revokes it on unmount/id change.
+ * Renders the file icon until the bytes arrive, so there is always a fallback.
+ * Skipped for optimistic drafts (id `tmp-…`) which have no server bytes yet.
+ */
+function AttachmentThumb({ id, filename }: { id: string; filename: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let revoked = false;
+    let blobUrl: string | null = null;
+    (async () => {
+      try {
+        const blob = await api.downloadAttachment(id);
+        if (revoked) return;
+        blobUrl = URL.createObjectURL(blob);
+        setUrl(blobUrl);
+      } catch {
+        /* leave null — the icon fallback renders */
+      }
+    })();
+    return () => {
+      revoked = true;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [id]);
+  if (!url) return <ImageIcon className="h-4 w-4" />;
+  return <img src={url} alt={filename} className="h-full w-full object-cover" />;
 }
 
 export function formatSize(bytes?: number): string {
@@ -61,6 +96,8 @@ export function AttachmentCard({
   const label = statusLabel(attachment);
   const isFailed = attachment.status === "failed";
   const busy = attachment.uploading || attachment.status === "uploading" || attachment.parse_status === "parsing";
+  // Show a real thumbnail only for uploaded image attachments (drafts have no bytes yet).
+  const showThumb = isImage(attachment) && !busy && !attachment.id.startsWith("tmp-");
 
   return (
     <div
@@ -78,8 +115,19 @@ export function AttachmentCard({
         disabled={busy}
         aria-label={`附件 ${attachment.filename}`}
       >
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Icon className="h-4 w-4" />}
+        <span
+          className={cn(
+            "flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground",
+            showThumb && "overflow-hidden"
+          )}
+        >
+          {busy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : showThumb ? (
+            <AttachmentThumb id={attachment.id} filename={attachment.filename} />
+          ) : (
+            <Icon className="h-4 w-4" />
+          )}
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-xs font-medium">{attachment.filename}</span>

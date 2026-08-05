@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.security import decrypt_secret, encrypt_secret, mask_secret
 from app.db import get_db
 from app.models import ModelConfig, User
@@ -22,6 +23,13 @@ router = APIRouter(prefix="/api/models", tags=["models"])
 
 NOT_FOUND = status.HTTP_404_NOT_FOUND
 FORBID = status.HTTP_403_FORBIDDEN
+
+
+def _looks_like_vision_model(model_name: str) -> bool:
+    """Heuristic: does ``model_name`` look vision-capable (per VISION_MODEL_KEYWORDS)?"""
+    kws = (get_settings().VISION_MODEL_KEYWORDS or "").lower().split(",")
+    name = (model_name or "").lower()
+    return any(k.strip() and k.strip() in name for k in kws)
 
 
 def _to_out(cfg: ModelConfig) -> ModelConfigOut:
@@ -38,6 +46,7 @@ def _to_out(cfg: ModelConfig) -> ModelConfigOut:
         embedding_model_name=cfg.embedding_model_name,
         supports_stream=cfg.supports_stream,
         supports_tools=cfg.supports_tools,
+        supports_vision=cfg.supports_vision,
         max_context_tokens=cfg.max_context_tokens,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
@@ -94,6 +103,7 @@ async def create_model(
         embedding_model_name=payload.embedding_model_name,
         supports_stream=payload.supports_stream,
         supports_tools=payload.supports_tools,
+        supports_vision=payload.supports_vision or _looks_like_vision_model(payload.model_name),
         max_context_tokens=payload.max_context_tokens,
         max_tokens=payload.max_tokens,
         temperature=payload.temperature,
@@ -126,6 +136,11 @@ async def update_model(
             cfg.api_key_encrypted = encrypt_secret(new_key)
     for field, value in data.items():
         setattr(cfg, field, value)
+
+    # If the model name changed and vision wasn't explicitly set this request,
+    # re-run the heuristic so switching to e.g. a Qwen-VL model auto-enables it.
+    if "model_name" in data and "supports_vision" not in data:
+        cfg.supports_vision = cfg.supports_vision or _looks_like_vision_model(cfg.model_name)
 
     await db.commit()
     await db.refresh(cfg)

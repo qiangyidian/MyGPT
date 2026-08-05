@@ -53,7 +53,8 @@ class ChatAttachment(Base, TimestampMixin):
 
     # uploading | uploaded | parsing | ready | failed | deleted
     status: Mapped[str] = mapped_column(String(32), default="uploading", nullable=False)
-    # pending | parsing | ready | failed | skipped (images skip parsing)
+    # pending | parsing | ready | failed. Images are OCR'd (multimodal fallback
+    # text); a vision model still receives the raw bytes at send time.
     parse_status: Mapped[str] = mapped_column(
         String(32), default="pending", nullable=False
     )

@@ -27,6 +27,10 @@ class ModelConfig(Base, TimestampMixin):
 
     supports_stream: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     supports_tools: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Vision (multimodal): when True, image attachments are sent to the model as
+    # OpenAI image_url content parts. Defaults to False; auto-detected from the
+    # model name heuristically at create time (see VISION_MODEL_KEYWORDS).
+    supports_vision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     max_context_tokens: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
     max_tokens: Mapped[int] = mapped_column(Integer, default=1024, nullable=False)
     temperature: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)

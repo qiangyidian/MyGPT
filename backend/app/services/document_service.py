@@ -101,7 +101,8 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         doc.status = "parsing"
         doc.error_message = None
         await db.commit()
-        text = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
+        parsed = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
+        text = parsed.text
         if not text or not text.strip():
             raise ValueError("文档内容为空或无法解析")
 
