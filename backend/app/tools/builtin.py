@@ -274,7 +274,7 @@ class WebSearchTool(BaseTool):
         }
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             resp = await client.post(url, data={"q": query}, headers=headers)
-        html = resp.text or ""
+        page = resp.text or ""
 
         results: list[dict[str, str]] = []
         # DDG HTML wraps results in <a class="result__a" href="...">title</a>
@@ -287,8 +287,8 @@ class WebSearchTool(BaseTool):
         )
         tag_re = re.compile(r"<[^>]+>")
 
-        titles = title_re.findall(html)
-        snippets = snippet_re.findall(html)
+        titles = title_re.findall(page)
+        snippets = snippet_re.findall(page)
         for i, (raw_href, raw_title) in enumerate(titles):
             if i >= top_k:
                 break

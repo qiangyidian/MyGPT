@@ -210,3 +210,41 @@ async def test_no_endpoint_uses_duckduckgo(monkeypatch: pytest.MonkeyPatch):
     out = await WebSearchTool().run(query="x", top_k=5)
     assert ddg_called["v"] is True
     assert out["results"][0]["url"] == "https://only.com"
+
+
+async def test_duckduckgo_scrape_does_not_shadow_html_module(monkeypatch: pytest.MonkeyPatch):
+    """Regression: _search_duckduckgo imports stdlib `html` for entity decoding
+    but previously ALSO bound the response body to a local named ``html``. The
+    later ``html.unescape`` then hit a str, so EVERY DuckDuckGo search returned
+    ``{'ok': False, 'error': "'str' object has no attribute 'unescape'"}`` and the
+    Sources panel stayed empty. This runs the REAL scrape (mocked HTML) to guard it.
+    """
+    fake_html = (
+        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftokio.rs%2F">'
+        "Tokio&#x27;s runtime</a>"
+        '<a class="result__snippet">async runtime for Rust</a>'
+    )
+
+    class _Resp:
+        text = fake_html
+
+    class _Client:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a: Any) -> bool:
+            return False
+
+        async def post(self, url, data=None, headers=None):
+            return _Resp()
+
+    monkeypatch.setattr("app.tools.builtin.httpx.AsyncClient", _Client)
+    out = await WebSearchTool().run(query="tokio", top_k=3)
+    assert out["ok"] is True, out
+    assert out["results"], out
+    assert out["results"][0]["url"] == "https://tokio.rs/"
+    # The HTML entity was decoded (stdlib html.unescape), not left as &#x27;.
+    assert "'" in out["results"][0]["title"]

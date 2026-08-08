@@ -155,13 +155,18 @@ _DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise assistant."
 # Anti-"fake multi-agent": a single model must not claim to have launched
 # multiple agents / sub-models / roles unless the runtime actually did. Without
 # this, a native fallback answering "use multiple agents to debate X vs Y" would
-# role-play several agents in prose and look like a real multi-agent run. This
-# is a backstop; the real fix is the routing + observable runtime selection.
+# role-play several agents in prose and look like a real multi-agent run.
+#
+# Important: this only FORBIDS fabricating/role-playing multi-agent work — it
+# must NOT make the model prepend a "I didn't really run multiple agents"
+# disclaimer. That disclosure is already handled in the UI (the fallback toast
+# in useChatStream), so a prose disclaimer is redundant and noisy. The model
+# should simply answer as a single assistant without commentary on the runtime.
 _MULTI_AGENT_HONESTY = (
-    "多 Agent 诚实约束：除非上下文中明确存在真实的多 Agent 执行证据（例如结构化的 "
-    "agent_graph / agent_status 事件），否则你不得声称已启动多个 Agent、子模型、角色或"
-    "并行执行。若用户请求多 Agent 但当前运行时未能提供，请如实说明本次未启动真实多 "
-    "Agent，而不是在回答中扮演多个角色。"
+    "多 Agent 诚实约束：当你作为单一模型直接作答时（即本轮并非由多 Agent 运行时真实执行），"
+    "不要在回答中声称、扮演或模拟“多个 Agent / 子模型 / 角色 / 并行执行”在协作——"
+    "直接以单一助手身份给出回答即可，无需就运行时或 Agent 数量做任何声明、解释或免责。"
+    "真正由多 Agent 运行时执行的轮次（你会收到其它 Agent 的结构化产出作为上下文）不受此限。"
 )
 
 # Prepended when the user enables "agent / tools" mode. Drives iterative tool
