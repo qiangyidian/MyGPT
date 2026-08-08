@@ -196,6 +196,21 @@ class Settings(BaseSettings):
     S3_SECRET_KEY: str = ""
     S3_USE_PATH_STYLE: bool = False
 
+    # ---- Web search (tool: web_search) ----
+    # Reachable search backend for the web_search tool. The dependency-free
+    # DuckDuckGo HTML scrape is the default no-config fallback, but it is blocked
+    # in some networks (e.g. mainland CN), so point this at a JSON-returning
+    # search endpoint you can actually reach. Examples:
+    #   * self-hosted SearXNG (GET): http://localhost:8080/search   (no key)
+    #   * Bing v7 (GET):             https://api.bing.microsoft.com/v7.0/search  (WEB_SEARCH_API_KEY)
+    #   * Tavily (POST):             https://api.tavily.com/search   (WEB_SEARCH_API_KEY, WEB_SEARCH_METHOD=post)
+    #   * Serper (POST):             https://google.serper.dev/search (WEB_SEARCH_API_KEY, WEB_SEARCH_METHOD=post)
+    WEB_SEARCH_ENDPOINT: str = ""
+    WEB_SEARCH_API_KEY: str = ""
+    # get | post — how to call WEB_SEARCH_ENDPOINT. GET fits SearXNG/Bing;
+    # POST fits Tavily/Serper (query + key go in the JSON body / provider header).
+    WEB_SEARCH_METHOD: str = "get"
+
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
     ADMIN_USERNAME: str = "admin"

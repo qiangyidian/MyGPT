@@ -150,3 +150,6 @@ $RECYCLE.BIN/
 # ---- Brainstorming / visual companion ---------------------------------------
 # Superpowers brainstorm mockups are session-local scratch; do not commit.
 .superpowers/
+.github/commit-message-instructions.md
+docs/superpowers/plans/2026-08-03-multi-agent-panel.md
+docs/superpowers/specs/2026-08-05-sources-panel-web-citations-design.md

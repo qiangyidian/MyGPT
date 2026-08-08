@@ -14,9 +14,13 @@ function sourceIcon(c: Citation) {
 
 /**
  * Qualitative relevance band. Vector/rerank scores are debug/eval metrics and
- * are NOT shown to end users as a confidence percentage — only a label.
+ * are NOT shown to end users as a confidence percentage — only a label. Web
+ * sources carry no rerank score, so they show neutral "相关" (score=0 is the
+ * "no score" sentinel for web hits, not a low-relevance signal).
  */
-function relevanceLabel(score?: number): { label: string; tone: string } {
+function relevanceLabel(c: Citation): { label: string; tone: string } {
+  if (c.source_type === "web") return { label: "相关", tone: "secondary" };
+  const score = c.rerank_score ?? c.score;
   if (score == null) return { label: "相关", tone: "secondary" };
   if (score >= 0.75) return { label: "高相关", tone: "default" };
   if (score >= 0.5) return { label: "相关", tone: "secondary" };
@@ -33,7 +37,7 @@ function CitationChip({
   onSourceClick?: (index: number) => void;
 }) {
   const Icon = sourceIcon(citation);
-  const rel = relevanceLabel(citation.rerank_score ?? citation.score);
+  const rel = relevanceLabel(citation);
 
   return (
     <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-transparent px-2.5 py-2 transition-colors hover:border-primary/30 hover:bg-muted/50 focus-within:border-primary/30 focus-within:bg-muted/50">

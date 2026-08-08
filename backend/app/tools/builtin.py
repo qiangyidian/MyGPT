@@ -153,8 +153,10 @@ class WebSearchTool(BaseTool):
     """Lightweight web search.
 
     Strategy:
-      1. If WEB_SEARCH_ENDPOINT is configured, GET it (or a DuckDuckGo JSON endpoint)
-         and forward the `query` param — robust provider-agnostic path.
+      1. If ``WEB_SEARCH_ENDPOINT`` is configured, call it (GET or POST per
+         ``WEB_SEARCH_METHOD``), attach ``WEB_SEARCH_API_KEY`` in the common
+         provider-accepted forms, and normalize the JSON response — a
+         provider-agnostic path covering SearXNG / Bing / Tavily / Serper shapes.
       2. Otherwise fall back to scraping DuckDuckGo's HTML results and parsing the
          result links/snippets with a tolerant regex.
 
@@ -197,12 +199,16 @@ class WebSearchTool(BaseTool):
             top_k = 5
 
         settings = get_settings()
-        endpoint = getattr(settings, "WEB_SEARCH_ENDPOINT", "") or ""
+        endpoint = (getattr(settings, "WEB_SEARCH_ENDPOINT", "") or "").strip()
+        api_key = (getattr(settings, "WEB_SEARCH_API_KEY", "") or "").strip()
+        method = (getattr(settings, "WEB_SEARCH_METHOD", "get") or "get").strip().lower() or "get"
 
         results: list[dict[str, str]] = []
         try:
             if endpoint:
-                results = await self._search_via_endpoint(endpoint, query, top_k)
+                results = await self._search_via_endpoint(
+                    endpoint, query, top_k, api_key=api_key, method=method
+                )
             else:
                 results = await self._search_duckduckgo(query, top_k)
         except Exception as exc:  # noqa: BLE001 — must never raise
@@ -211,13 +217,42 @@ class WebSearchTool(BaseTool):
         return {"ok": True, "query": query, "results": results[:top_k]}
 
     async def _search_via_endpoint(
-        self, endpoint: str, query: str, top_k: int
+        self,
+        endpoint: str,
+        query: str,
+        top_k: int,
+        *,
+        api_key: str = "",
+        method: str = "get",
     ) -> list[dict[str, str]]:
         timeout = httpx.Timeout(15.0, connect=10.0)
+        headers: dict[str, str] = {"Accept": "application/json"}
+        # Send the key in every common form; each provider reads the header it
+        # expects and ignores the rest. (Bing: Ocp-Apim-Subscription-Key;
+        # generic bearer: Authorization; Serper: X-API-DB-KEY.)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["X-API-Key"] = api_key
+            headers["X-API-DB-KEY"] = api_key
+            headers["Ocp-Apim-Subscription-Key"] = api_key
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            # Try common query param names; provider decides which it reads.
-            params = {"q": query, "query": query, "format": "json", "count": top_k}
-            resp = await client.get(endpoint, params=params, headers={"Accept": "application/json"})
+            if method == "post":
+                # Tavily reads query + api_key from the JSON body; Serper reads q
+                # from the body + X-API-DB-KEY from the header. Sending all forms
+                # lets one call satisfy either provider.
+                body: dict[str, Any] = {
+                    "q": query,
+                    "query": query,
+                    "max_results": top_k,
+                    "num": top_k,
+                }
+                if api_key:
+                    body["api_key"] = api_key
+                resp = await client.post(endpoint, json=body, headers=headers)
+            else:
+                # Common query param names; the provider decides which it reads.
+                params = {"q": query, "query": query, "format": "json", "count": top_k}
+                resp = await client.get(endpoint, params=params, headers=headers)
             data: Any
             try:
                 data = resp.json()
@@ -229,6 +264,7 @@ class WebSearchTool(BaseTool):
 
     async def _search_duckduckgo(self, query: str, top_k: int) -> list[dict[str, str]]:
         """Scrape DuckDuckGo HTML results as a dependency-free fallback."""
+        import html
         import re
 
         url = "https://html.duckduckgo.com/html/"
@@ -258,10 +294,12 @@ class WebSearchTool(BaseTool):
                 break
             # DDG wraps real URLs in a redirect like //duckduckgo.com/l/?uddg=<encoded>
             href = self._unwrap_ddg_href(raw_href)
-            title = tag_re.sub("", raw_title).strip()
+            # Strip tags then decode HTML entities (DDG emits &#x27; etc.) so a
+            # source title reads "Python's" not "Python&#x27;s" in the panel.
+            title = html.unescape(tag_re.sub("", raw_title)).strip()
             snippet = ""
             if i < len(snippets):
-                snippet = tag_re.sub("", snippets[i]).strip()
+                snippet = html.unescape(tag_re.sub("", snippets[i])).strip()
             if not title and not href:
                 continue
             results.append({"title": title, "url": href, "snippet": snippet})
@@ -283,23 +321,32 @@ class WebSearchTool(BaseTool):
 
     @staticmethod
     def _normalize_search_data(data: Any, top_k: int) -> list[dict[str, str]]:
-        """Map assorted JSON search-API shapes onto {title,url,snippet}."""
+        """Map assorted JSON search-API shapes onto {title,url,snippet}.
+
+        Covers SearXNG/Google ``items``, DDG ``Results``, Tavily ``results``,
+        Serper ``organic``, and Bing ``webPages.value`` without branching on
+        provider — the first list-shaped container wins.
+        """
         out: list[dict[str, str]] = []
-        # Candidate containers: list itself, dict with Results / results / items.
         items: list[Any] = []
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            for key in ("Results", "results", "items", "data"):
-                v = data.get(key)
-                if isinstance(v, list):
-                    items = v
-                    break
-                if isinstance(v, dict):
-                    nested = v.get("results") or v.get("items")
-                    if isinstance(nested, list):
-                        items = nested
+            # Bing nests its hits under webPages.value.
+            wp = data.get("webPages")
+            if isinstance(wp, dict) and isinstance(wp.get("value"), list):
+                items = wp["value"]
+            else:
+                for key in ("Results", "results", "items", "data", "organic"):
+                    v = data.get(key)
+                    if isinstance(v, list):
+                        items = v
                         break
+                    if isinstance(v, dict):
+                        nested = v.get("results") or v.get("items") or v.get("organic")
+                        if isinstance(nested, list):
+                            items = nested
+                            break
 
         for raw in items:
             if not isinstance(raw, dict):
@@ -316,13 +363,17 @@ class WebSearchTool(BaseTool):
                 or raw.get("link")
                 or raw.get("href")
                 or raw.get("URL")
+                or raw.get("FirstURL")  # DuckDuckGo JSON
                 or raw.get("first")
+                or raw.get("displayUrl")  # Bing v7
                 or ""
             )
             snippet = str(
                 raw.get("snippet")
                 or raw.get("abstract")
                 or raw.get("description")
+                or raw.get("content")  # Tavily
+                or raw.get("Text")  # DuckDuckGo JSON
                 or raw.get("text")
                 or raw.get("body")
                 or ""

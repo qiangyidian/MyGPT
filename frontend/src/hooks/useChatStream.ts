@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api, streamChat, type ChatStreamHandlers } from "@/lib/api";
 import { buildChatBody } from "@/lib/chat-request";
+import { extractWebCitations, mergeCitations } from "@/lib/web-citations";
 import {
   CONVERSATIONS_QUERY_KEY,
   CONVERSATION_DETAIL_QUERY_KEY,
@@ -402,10 +403,12 @@ export function useChatStream(): ChatStreamState {
           setStreamingText(accumulated);
         },
         onCitations: (cits) => {
-          accumulatedCitations = cits;
-          setCitations(cits);
+          // Merge (not replace): KB document citations arrive early, web sources
+          // arrive later via onToolResult — both must coexist in the Sources tab.
+          accumulatedCitations = mergeCitations(accumulatedCitations, cits);
+          setCitations(accumulatedCitations);
           // Mirror into the Context Panel so the Sources tab can render them.
-          useContextPanelStore.getState().setSources(cits);
+          useContextPanelStore.getState().setSources(accumulatedCitations);
         },
         onToolCall: (e) => {
           stepSeq += 1;
@@ -466,6 +469,18 @@ export function useChatStream(): ChatStreamState {
               callId: e.id,
               ok: e.ok,
             });
+          }
+          // Promote real web tool output into verifiable Sources. web_search /
+          // http_get results arrive here as a stringified-JSON payload; turning
+          // them into web Citations makes the "来源" tab list the actual pages
+          // and search hits the agent used (merged with any KB citations).
+          if (e.ok && (e.name === "web_search" || e.name === "http_get")) {
+            const web = extractWebCitations(e.name, e.result);
+            if (web.length) {
+              accumulatedCitations = mergeCitations(accumulatedCitations, web);
+              setCitations(accumulatedCitations);
+              useContextPanelStore.getState().setSources(accumulatedCitations);
+            }
           }
         },
         onApprovalRequired: (ap) => {

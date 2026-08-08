@@ -9,8 +9,14 @@ import { Badge } from "@/components/ui/badge";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import type { Citation } from "@/lib/types";
 
-/** Qualitative relevance band — never a raw confidence percentage. */
-function relevance(score?: number): { label: string; tone: string } {
+/**
+ * Qualitative relevance band — never a raw confidence percentage. Web sources
+ * carry no rerank score (a search hit isn't a reranked chunk), so they render
+ * as a neutral "相关" rather than misreading score=0 as "一般".
+ */
+function relevance(c: Citation): { label: string; tone: string } {
+  if (c.source_type === "web") return { label: "相关", tone: "secondary" };
+  const score = c.rerank_score ?? c.score;
   if (score == null) return { label: "相关", tone: "secondary" };
   if (score >= 0.75) return { label: "高相关", tone: "default" };
   if (score >= 0.5) return { label: "相关", tone: "secondary" };
@@ -35,7 +41,7 @@ function domainOf(url?: string | null): string | null {
 
 function SourceRow({ c, index, focused }: { c: Citation; index: number; focused: boolean }) {
   const Icon = sourceIcon(c);
-  const rel = relevance(c.rerank_score ?? c.score);
+  const rel = relevance(c);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -89,12 +95,38 @@ export function SourcesTab() {
     );
   }
 
+  // Partition by source_type but keep the ORIGINAL global index, so the [N]
+  // label and the citation-chip focus (focusSourceIndex) stay consistent with
+  // the flat metadata.citations list the chips are indexed against.
+  const indexed = sources.map((c, i) => ({ c, i }));
+  const web = indexed.filter((x) => x.c.source_type === "web");
+  const docs = indexed.filter((x) => x.c.source_type !== "web");
+
   return (
     <ScrollArea className="h-full">
-      <div className="space-y-2 p-3">
-        {sources.map((c, i) => (
-          <SourceRow key={`${c.document_id ?? c.url}-${i}`} c={c} index={i} focused={focusIndex === i} />
-        ))}
+      <div className="space-y-3 p-3">
+        {web.length > 0 && (
+          <section className="space-y-2">
+            <div className="flex items-center gap-1.5 px-0.5 text-[11px] font-semibold text-muted-foreground">
+              <Globe className="h-3 w-3" /> 联网搜索
+              <span className="font-normal text-muted-foreground/70">({web.length})</span>
+            </div>
+            {web.map(({ c, i }) => (
+              <SourceRow key={`web-${c.url ?? c.document_id}-${i}`} c={c} index={i} focused={focusIndex === i} />
+            ))}
+          </section>
+        )}
+        {docs.length > 0 && (
+          <section className="space-y-2">
+            <div className="flex items-center gap-1.5 px-0.5 text-[11px] font-semibold text-muted-foreground">
+              <FileText className="h-3 w-3" /> 知识库
+              <span className="font-normal text-muted-foreground/70">({docs.length})</span>
+            </div>
+            {docs.map(({ c, i }) => (
+              <SourceRow key={`doc-${c.document_id ?? c.url}-${i}`} c={c} index={i} focused={focusIndex === i} />
+            ))}
+          </section>
+        )}
       </div>
     </ScrollArea>
   );
