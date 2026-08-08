@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 _controls: dict[str, "RunControl"] = {}
+# Soft cap so runs that crash/abort without reaching their drop() cleanup can't
+# leak RunControl objects (and their asyncio.Events) into the registry forever.
+_MAX_CONTROLS = 256
 
 
 @dataclass
@@ -54,6 +57,11 @@ def get_or_create(run_id: str | object) -> RunControl:
     key = str(run_id)
     ctl = _controls.get(key)
     if ctl is None:
+        # Bound the registry: evict the oldest entry when at the cap (crashed /
+        # abandoned runs never call drop(), so without this the dict grows
+        # without bound across the process lifetime).
+        while len(_controls) >= _MAX_CONTROLS:
+            _controls.pop(next(iter(_controls)), None)
         ctl = RunControl(run_id=key)
         _controls[key] = ctl
     return ctl

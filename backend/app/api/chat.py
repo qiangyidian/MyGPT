@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import Conversation, User
 from app.schemas import ChatRequest
@@ -112,7 +113,8 @@ async def _assert_owned(db: AsyncSession, conv_id: uuid.UUID, user: User) -> Non
         raise HTTPException(NOT_FOUND, "Conversation not found")
 
 
-@router.post("/stream")
+@router.post("/stream",
+             dependencies=[Depends(rate_limit_user(60, 60, "chat"))])
 async def chat_stream(
     payload: ChatRequest,
     request: Request,
@@ -135,7 +137,8 @@ async def chat_stream(
     )
 
 
-@router.post("/regenerate/{conversation_id}")
+@router.post("/regenerate/{conversation_id}",
+             dependencies=[Depends(rate_limit_user(60, 60, "chat"))])
 async def regenerate(
     conversation_id: uuid.UUID,
     request: Request,

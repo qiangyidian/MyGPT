@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AsyncSessionLocal
@@ -27,12 +27,22 @@ logger = logging.getLogger(__name__)
 # weak ref, so an unreferenced task can be GC'd before it completes
 # (see asyncio.create_task docs).
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+# Live runners keyed by BackgroundTask.id so cancel() can actually interrupt the
+# in-flight handler (not just flip the DB row). Cleaned up in the done callback.
+_RUNNERS: dict[uuid.UUID, asyncio.Task] = {}
 
 
-def _spawn(coro):
-    task = asyncio.create_task(coro)
+def _spawn_runner(task_id: uuid.UUID) -> asyncio.Task:
+    """Schedule _run(task_id) and track it by id for cancellation."""
+    task = asyncio.create_task(_run(task_id))
     _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    _RUNNERS[task_id] = task
+
+    def _done(t: asyncio.Task, tid: uuid.UUID = task_id) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        _RUNNERS.pop(tid, None)
+
+    task.add_done_callback(_done)
     return task
 
 
@@ -81,37 +91,64 @@ async def enqueue(
     await db.commit()
     await db.refresh(task)
     if scheduled_at is None:
-        _spawn(_run(task.id))
+        _spawn_runner(task.id)
     return task
 
 
 async def _run(task_id: uuid.UUID) -> None:
-    """Execute one task in its own session; never raises out."""
+    """Execute one task in its own session; never raises out.
+
+    Status transitions are guarded by conditional UPDATEs (``WHERE status=<prev>``)
+    so a concurrent ``cancel()`` that already flipped the row to ``cancelled`` on
+    another session is never clobbered back to ``completed``/``failed`` by this
+    runner finishing a moment later.
+    """
     try:
         async with AsyncSessionLocal() as db:
             t = await db.get(BackgroundTask, task_id)
             if t is None:
                 return
-            t.status = "running"
-            t.started_at = datetime.now(timezone.utc)
+            # pending -> running, but only if still pending (a pre-spawn cancel wins).
+            started = await db.execute(
+                update(BackgroundTask)
+                .where(BackgroundTask.id == task_id, BackgroundTask.status == "pending")
+                .values(status="running", started_at=datetime.now(timezone.utc))
+            )
             await db.commit()
+            if started.rowcount == 0:
+                return  # already cancelled/finished before we got the runner
             handler = _handlers.get(t.kind)
+            new_status = "completed"
+            result: dict[str, Any] | None = None
+            error_message: str | None = None
             try:
                 if handler is None:
                     result = {"echo": t.payload, "note": f"no handler for kind {t.kind!r}"}
                 else:
                     result = await handler(t, db)
-                t.result = result
-                t.status = "completed"
             except asyncio.CancelledError:
-                t.status = "cancelled"
-                raise
+                new_status = "cancelled"
             except Exception as exc:  # noqa: BLE001 — record and continue
                 logger.exception("background task %s failed", task_id)
-                t.status = "failed"
-                t.error_message = str(exc)[:500]
-            t.finished_at = datetime.now(timezone.utc)
+                new_status = "failed"
+                error_message = str(exc)[:500]
+            # Conditional finalize: only flip while still 'running', so a cancel()
+            # that already wrote 'cancelled' is never overwritten.
+            values: dict[str, Any] = {"status": new_status, "finished_at": datetime.now(timezone.utc)}
+            if result is not None:
+                values["result"] = result
+            if error_message is not None:
+                values["error_message"] = error_message
+            await db.execute(
+                update(BackgroundTask)
+                .where(BackgroundTask.id == task_id, BackgroundTask.status == "running")
+                .values(**values)
+            )
             await db.commit()
+    except asyncio.CancelledError:
+        # Cancelled mid-finalize: the conditional UPDATE above already recorded
+        # 'cancelled' (or cancel() did on its own session); nothing more to do.
+        logger.info("background task %s runner cancelled", task_id)
     except Exception:  # noqa: BLE001 — background; never propagate
         logger.exception("background task runner crashed for %s", task_id)
 
@@ -126,6 +163,12 @@ async def cancel(db: AsyncSession, task_id: uuid.UUID, user_id: uuid.UUID) -> Ba
         t.finished_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(t)
+    # Actually interrupt the live runner so a long handler stops now (not just
+    # the next status poll). Best-effort: the conditional UPDATE in _run already
+    # guarantees the 'cancelled' status survives even if the runner finishes.
+    runner = _RUNNERS.get(task_id)
+    if runner is not None and not runner.done():
+        runner.cancel()
     return t
 
 

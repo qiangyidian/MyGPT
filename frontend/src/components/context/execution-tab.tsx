@@ -51,7 +51,11 @@ function ToolCallAudit({ runId }: { runId: string }) {
   const { data: run } = useQuery({
     queryKey: ["agent-run-detail", runId],
     queryFn: () => api.getAgentRun(runId),
-    refetchInterval: 2000,
+    // Stop polling once the run reaches a terminal state (was every 2s forever).
+    refetchInterval: (query) => {
+      const st = query.state.data?.status;
+      return st && ["completed", "failed", "cancelled"].includes(st) ? false : 2000;
+    },
   });
   if (!run) return null;
   const calls = run.tool_calls ?? [];

@@ -33,7 +33,9 @@ services:
 
   # ------------------------------------------------------------------ qdrant
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned (was :latest) for reproducibility — a drifting qdrant version can
+    # silently change the API/behavior the client relies on. Bump deliberately.
+    image: qdrant/qdrant:v1.12.4
     restart: unless-stopped
     volumes:
       - qdrant_data:/qdrant/storage

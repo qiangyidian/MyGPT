@@ -24,6 +24,7 @@ from app.agents.approval_bus import approval_bus
 from app.agents.run_controls import get as get_run_control
 from app.services import audit_service
 from app.core.deps import get_current_user
+from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import AgentRun, AgentStep, ToolApproval, ToolCall, User
 from app.schemas import (
@@ -121,7 +122,8 @@ async def get_run(
     return await _build_run_out(db, run)
 
 
-@router.post("/{run_id}/approve", response_model_exclude_none=True)
+@router.post("/{run_id}/approve", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
 async def approve_run(
     run_id: uuid.UUID,
     body: ApproveRequest,
@@ -152,7 +154,8 @@ async def approve_run(
     return ActionResult(ok=True, status="approved")
 
 
-@router.post("/{run_id}/reject", response_model_exclude_none=True)
+@router.post("/{run_id}/reject", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
 async def reject_run(
     run_id: uuid.UUID,
     body: RejectRequest,
@@ -182,7 +185,8 @@ async def reject_run(
     return ActionResult(ok=True, status="rejected")
 
 
-@router.post("/{run_id}/cancel", response_model_exclude_none=True)
+@router.post("/{run_id}/cancel", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
 async def cancel_run(
     run_id: uuid.UUID,
     user: User = Depends(get_current_user),
@@ -210,7 +214,8 @@ async def cancel_run(
 # --------------------------------------------------------------------------- #
 # Phase 2: research-plan + run-control endpoints
 # --------------------------------------------------------------------------- #
-@router.post("/{run_id}/plan/confirm", response_model_exclude_none=True)
+@router.post("/{run_id}/plan/confirm", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
 async def confirm_plan(
     run_id: uuid.UUID,
     user: User = Depends(get_current_user),
@@ -223,7 +228,8 @@ async def confirm_plan(
     return ActionResult(ok=True, status="confirmed")
 
 
-@router.post("/{run_id}/plan/update", response_model_exclude_none=True)
+@router.post("/{run_id}/plan/update", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
 async def update_plan(
     run_id: uuid.UUID,
     body: PlanUpdateRequest,

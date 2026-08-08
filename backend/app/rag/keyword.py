@@ -79,7 +79,9 @@ class KeywordRetriever:
             content = (chunk.content or "").lower()
             tokens = content.split()
             denom = len(tokens) + 1
-            hits = sum(content.count(t) for t in terms)
+            # Count whole-token matches, not str.count substrings: str.count would
+            # inflate a query term like "cat" inside "catalog", biasing the score.
+            hits = sum(tokens.count(t) for t in terms)
             score = hits / denom
             if score > 0:
                 scored.append((score, chunk, doc))

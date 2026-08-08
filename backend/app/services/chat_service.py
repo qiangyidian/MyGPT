@@ -253,14 +253,25 @@ async def _get_or_create_conversation(
     return conv
 
 
-async def _load_history(db: AsyncSession, conversation_id: uuid.UUID) -> list[Message]:
-    """Return conversation messages oldest-first."""
+async def _load_history(
+    db: AsyncSession, conversation_id: uuid.UUID, *, limit: int = 500
+) -> list[Message]:
+    """Return the most recent ``limit`` conversation messages, oldest-first.
+
+    Capped so a very long conversation doesn't load every message row (with full
+    content/metadata) into memory on every turn — trimming + summarization then
+    operate within this recent window. ``limit`` defaults high enough that normal
+    conversations are unaffected; it's a backstop against pathological histories.
+    """
     result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.desc())
+        .limit(limit)
     )
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    rows.reverse()  # restore oldest-first for callers
+    return rows
 
 
 def _estimate_tokens(text: str, model_name: str) -> int:
@@ -296,21 +307,23 @@ def _trim_history(
     if not messages or len(messages) <= 1:
         return messages
 
-    def total() -> int:
-        # Count the whole serialized entry (incl. tool_calls payloads) so we
-        # don't underestimate the true prompt size.
-        import json
+    # Precompute each message's token cost ONCE. The old loop recomputed the
+    # whole-list total on every deletion (re-serializing every message each
+    # time) — O(n^2). Here we keep a running total and subtract in O(1).
+    import json
 
-        return sum(
-            _estimate_tokens(json.dumps(m, ensure_ascii=False, default=str), model_name)
-            for m in messages
-        )
-
-    if total() <= max_tokens:
+    costs = [
+        _estimate_tokens(json.dumps(m, ensure_ascii=False, default=str), model_name)
+        for m in messages
+    ]
+    total = sum(costs)
+    if total <= max_tokens:
         return messages
 
-    while len(messages) > 2 and total() > max_tokens:
+    while len(messages) > 2 and total > max_tokens:
+        total -= costs[1]
         del messages[1]
+        del costs[1]
     return messages
 
 
@@ -513,11 +526,17 @@ class ChatService:
         if cfg.user_id is not None and cfg.user_id != user.id:
             raise AppException(404, "model_not_found", "Model config not found")
         kb_names: list[str] = []
-        for _kb_id in kb_ids:
-            kb_row = await db.get(KnowledgeBase, _kb_id)
-            if kb_row is None or kb_row.user_id != user.id:
-                raise AppException(404, "knowledge_base_not_found", "Knowledge base not found")
-            kb_names.append(kb_row.name or str(_kb_id))
+        if kb_ids:
+            # Batch-load KBs in one query instead of one db.get per id (N+1).
+            kb_rows = (
+                await db.execute(select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids)))
+            ).scalars().all()
+            kb_by_id = {kb.id: kb for kb in kb_rows}
+            for _kb_id in kb_ids:
+                kb_row = kb_by_id.get(_kb_id)
+                if kb_row is None or kb_row.user_id != user.id:
+                    raise AppException(404, "knowledge_base_not_found", "Knowledge base not found")
+                kb_names.append(kb_row.name or str(_kb_id))
         route = decide_route(
             request.mode,
             has_knowledge_base=bool(kb_ids),

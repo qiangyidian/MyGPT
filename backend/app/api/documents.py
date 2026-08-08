@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.rate_limit import rate_limit_user
 from app.db import AsyncSessionLocal, get_db
 from app.models import Document, KnowledgeBase, User
 from app.schemas import DocumentOut, ReindexResult
@@ -55,6 +56,7 @@ async def _index_background(document_id: uuid.UUID) -> None:
     "/knowledge-bases/{kb_id}/documents",
     response_model=DocumentOut,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit_user(30, 60, "upload"))],
 )
 async def upload_document(
     kb_id: uuid.UUID,

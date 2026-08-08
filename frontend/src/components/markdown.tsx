@@ -53,9 +53,18 @@ function CodeCopyButton({ text }: { text: string }) {
 export const Markdown = memo(function Markdown({
   content,
   className,
+  lite = false,
 }: {
   content: string;
   className?: string;
+  /**
+   * Skip syntax highlighting (rehype-highlight is the expensive part — it
+   * re-runs highlight.js over every code block on each render). Use while a
+   * message is streaming so the growing content doesn't re-highlight O(n²);
+   * GFM formatting (bold/lists/code fences) still renders live, and full
+   * highlighting is applied once streaming completes.
+   */
+  lite?: boolean;
 }) {
   return (
     <div
@@ -97,7 +106,7 @@ export const Markdown = memo(function Markdown({
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        rehypePlugins={lite ? [] : [rehypeHighlight]}
         components={{
           pre({ children }) {
             // Extract raw text (for the copy button) and the language (for the

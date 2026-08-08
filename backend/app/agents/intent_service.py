@@ -26,9 +26,11 @@ keyword router — intent recognition is an *enhancement*, never a hard dependen
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +39,13 @@ from app.agents.schemas import IntentDecision
 from app.providers.base import ChatOptions, ProviderError
 
 logger = logging.getLogger(__name__)
+
+
+# Process-local LRU cache of recent classifications, keyed by
+# (model, user_content, context-block) hash. Re-edits and repeated prompts hit
+# the cache for free instead of making another model call on the chat hot path.
+_INTENT_CACHE: "OrderedDict[str, IntentDecision]" = OrderedDict()
+_INTENT_CACHE_MAX = 512
 
 
 # --------------------------------------------------------------------------- #
@@ -48,10 +57,13 @@ class IntentClassifierConfig:
 
     temperature: float = 0.0
     max_tokens: int = 320
-    timeout_seconds: float = 8.0
+    timeout_seconds: float = 2.0
     # Retries ON TOP OF the first attempt (0 = single attempt). Retries only fire
     # on transient provider errors or an unparseable/empty response.
-    max_retries: int = 1
+    max_retries: int = 0
+    # Master kill-switch. When False, judge() short-circuits to None so the
+    # keyword router handles routing with zero added latency / model calls.
+    enabled: bool = True
 
     @staticmethod
     def from_settings() -> "IntentClassifierConfig":
@@ -74,11 +86,23 @@ class IntentClassifierConfig:
             except (TypeError, ValueError):
                 return default
 
+        def _bool(name: str, default: bool) -> bool:
+            try:
+                v = getattr(s, name, None)
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    return v.strip().lower() in ("1", "true", "yes", "on")
+                return default
+            except Exception:  # noqa: BLE001
+                return default
+
         return IntentClassifierConfig(
             temperature=_num("INTENT_TEMPERATURE", 0.0),
             max_tokens=int(_num("INTENT_MAX_TOKENS", 320)),
-            timeout_seconds=_num("INTENT_TIMEOUT_SECONDS", 8.0),
-            max_retries=int(_num("INTENT_MAX_RETRIES", 1)),
+            timeout_seconds=_num("INTENT_TIMEOUT_SECONDS", 2.0),
+            max_retries=int(_num("INTENT_MAX_RETRIES", 0)),
+            enabled=_bool("INTENT_CLASSIFIER_ENABLED", True),
         )
 
 
@@ -168,15 +192,31 @@ class IntentService:
     ) -> IntentDecision | None:
         """Classify intent from the user message + context fragments.
 
-        Returns an :class:`IntentDecision`, or ``None`` on any failure (timeout,
-        provider error, unparseable/invalid response) so the caller falls back.
+        Returns an :class:`IntentDecision`, or ``None`` on any failure (disabled,
+        timeout, provider error, unparseable/invalid response) so the caller
+        falls back to the keyword router.
         """
+        if not self._config.enabled:
+            return None
         if provider is None:
             return None
         if not (user_content or "").strip():
             return None
 
-        messages = self._build_messages(user_content, fragments)
+        ctx_block = render_fragments(fragments)
+        # Cache lookup: repeated prompts / minor re-edits skip the model call.
+        # Bypassed in the test env so the suite's module-level cache doesn't leak
+        # between tests that reuse the same canned content/provider.
+        use_cache = _cache_active()
+        cache_key = _cache_key(user_content, ctx_block, provider) if use_cache else None
+        if cache_key is not None:
+            cached = _INTENT_CACHE.get(cache_key)
+            if cached is not None:
+                _INTENT_CACHE.move_to_end(cache_key)
+                logger.info("intent cache hit route=%s kind=%s", cached.route, cached.deliverable_kind)
+                return cached
+
+        messages = self._build_messages(user_content, ctx_block)
         options = ChatOptions(
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
@@ -220,6 +260,12 @@ class IntentService:
                     decision.route, decision.deliverable_kind, decision.confidence,
                     decision.rationale, len(fragments), attempt + 1,
                 )
+                # Populate the cache so the next identical turn is free.
+                if cache_key is not None:
+                    _INTENT_CACHE[cache_key] = decision
+                    _INTENT_CACHE.move_to_end(cache_key)
+                    if len(_INTENT_CACHE) > _INTENT_CACHE_MAX:
+                        _INTENT_CACHE.popitem(last=False)
                 return decision
             last_reason = "unparseable"
             logger.info(
@@ -236,9 +282,8 @@ class IntentService:
     # -- prompt construction ------------------------------------------------
     @staticmethod
     def _build_messages(
-        user_content: str, fragments: list[ContextFragment]
+        user_content: str, ctx_block: str
     ) -> list[dict[str, Any]]:
-        ctx_block = render_fragments(fragments)
         user_parts = ["【上下文片段】"]
         user_parts.append(ctx_block or "（无额外上下文）")
         user_parts.append("【用户消息】")
@@ -330,6 +375,46 @@ def _coerce_str_list(value: Any) -> list[str]:
         if isinstance(item, str) and item.strip():
             out.append(item.strip())
     return out
+
+
+def _cache_key(user_content: str, ctx_block: str, provider: Any) -> str:
+    """Stable hash key for a classification request.
+
+    Includes the model identity (best-effort) so a model swap invalidates the
+    cache, plus the user content + rendered context block.
+    """
+    model = ""
+    try:
+        model = str(
+            getattr(provider, "model", None)
+            or getattr(provider, "model_name", None)
+            or getattr(provider, "name", None)
+            or ""
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    h = hashlib.sha1()
+    h.update(model.encode("utf-8", "ignore"))
+    h.update(b"\x00")
+    h.update((user_content or "").encode("utf-8", "ignore"))
+    h.update(b"\x00")
+    h.update((ctx_block or "").encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def _cache_active() -> bool:
+    """Cache is active outside the test env (keeps the suite isolated)."""
+    try:
+        from app.core.config import get_settings
+
+        return get_settings().ENV != "test"
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def clear_intent_cache() -> None:
+    """Drop all cached classifications (test/ops hook)."""
+    _INTENT_CACHE.clear()
 
 
 # Module-level singleton (stateless; config read once at import).

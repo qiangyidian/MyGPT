@@ -106,6 +106,12 @@ class RagService:
             try:
                 cfg = await _resolve_embedding_config(db, kb)
                 provider = get_provider_for_config(cfg)
+                if not cfg.embedding_model_name:
+                    logger.warning(
+                        "kb %s has no embedding_model_name; falling back to chat model %r "
+                        "— set an embedding model for correct retrieval quality",
+                        kb.id, cfg.model_name,
+                    )
                 embedder = ProviderEmbedder(provider, model=cfg.embedding_model_name)
                 store = get_vector_store()
                 if settings.RAG_HYBRID:
@@ -118,8 +124,12 @@ class RagService:
                     all_v.extend(_tag_kb(v_hits, kb))
                     all_k.extend(_tag_kb(k_hits, kb))
                 else:
-                    v_hits = await Retriever(embedder, store, reranker).retrieve(
-                        question, collection_name(kb.id), top_k=fetch_k, overfetch=overfetch
+                    # Pass reranker=None + overfetch=1: top_k=fetch_k already bakes
+                    # in the overfetch multiplier, so letting Retriever re-multiply
+                    # would 4x the recall window (and rerank) for nothing. Reranking
+                    # happens once, globally, below — mirroring the hybrid branch.
+                    v_hits = await Retriever(embedder, store, None).retrieve(
+                        question, collection_name(kb.id), top_k=fetch_k, overfetch=1
                     )
                     all_v.extend(_tag_kb(v_hits, kb))
             except Exception as exc:  # noqa: BLE001 — RAG is best-effort per-KB

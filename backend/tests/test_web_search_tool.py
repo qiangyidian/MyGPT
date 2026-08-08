@@ -8,6 +8,7 @@ network.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -96,20 +97,37 @@ def test_normalize_caps_at_top_k():
 # --------------------------------------------------------------------------- #
 # Endpoint routing: GET vs POST, key propagation, DDG fallback.
 # --------------------------------------------------------------------------- #
-class _Resp:
-    def __init__(self, payload: Any, *, raise_on_json: bool = False):
-        self._payload = payload
-        self._raise = raise_on_json
+class _StreamResp:
+    """Fake streaming httpx response: yields fixed body bytes, exposes the
+    attributes ``_bounded_request`` reads (status_code, headers, url, aiter_raw)."""
 
-    def json(self):
-        if self._raise:
-            raise ValueError("not json")
-        return self._payload
+    def __init__(self, body_bytes: bytes, url: str = "https://search.example/api"):
+        self._body = body_bytes
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+        self.url = url
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a: Any) -> bool:
+        return False
+
+    async def aiter_raw(self):
+        yield self._body
 
 
 def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch, payload: Any, *, raise_on_json: bool = False):
-    """Replace httpx.AsyncClient with a recorder; return the calls list."""
+    """Replace httpx.AsyncClient with a recorder; return the calls list.
+
+    The tool now reads responses via ``client.stream(...)`` (bounded read), so the
+    fake exposes ``stream`` returning a :class:`_StreamResp` async context manager.
+    Recorded call tuples keep the historic shape: (method, url, params_or_body, headers).
+    """
     calls: list[tuple] = []
+    body_bytes = (
+        b"<html>not json</html>" if raise_on_json else json.dumps(payload).encode()
+    )
 
     class _Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -121,13 +139,12 @@ def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch, payload: Any, *, raise_
         async def __aexit__(self, *a: Any) -> bool:
             return False
 
-        async def get(self, url, params=None, headers=None):
-            calls.append(("get", url, params, headers))
-            return _Resp(payload, raise_on_json=raise_on_json)
-
-        async def post(self, url, json=None, headers=None):
-            calls.append(("post", url, json, headers))
-            return _Resp(payload, raise_on_json=raise_on_json)
+        def stream(self, method, url, **kwargs: Any):
+            if str(method).lower() == "get":
+                calls.append(("get", url, kwargs.get("params"), kwargs.get("headers")))
+            else:
+                calls.append(("post", url, kwargs.get("json"), kwargs.get("headers")))
+            return _StreamResp(body_bytes, url)
 
     monkeypatch.setattr("app.tools.builtin.httpx.AsyncClient", _Client)
     return calls
@@ -225,9 +242,6 @@ async def test_duckduckgo_scrape_does_not_shadow_html_module(monkeypatch: pytest
         '<a class="result__snippet">async runtime for Rust</a>'
     )
 
-    class _Resp:
-        text = fake_html
-
     class _Client:
         def __init__(self, *a: Any, **k: Any) -> None:
             pass
@@ -238,8 +252,8 @@ async def test_duckduckgo_scrape_does_not_shadow_html_module(monkeypatch: pytest
         async def __aexit__(self, *a: Any) -> bool:
             return False
 
-        async def post(self, url, data=None, headers=None):
-            return _Resp()
+        def stream(self, method, url, **kwargs: Any):
+            return _StreamResp(fake_html.encode(), url)
 
     monkeypatch.setattr("app.tools.builtin.httpx.AsyncClient", _Client)
     out = await WebSearchTool().run(query="tokio", top_k=3)

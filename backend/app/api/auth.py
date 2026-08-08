@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.rate_limit import rate_limit_ip
 from app.core.security import (
     ACCESS_TOKEN_TYPE,
     REFRESH_TOKEN_TYPE,
@@ -43,7 +44,8 @@ CRED = status.HTTP_401_UNAUTHORIZED
 CONF = status.HTTP_409_CONFLICT
 
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(rate_limit_ip(5, 60, "register"))])
 async def register(
     payload: RegisterRequest,
     response: Response,
@@ -74,7 +76,8 @@ async def register(
     return _issue_tokens(user, response)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse,
+             dependencies=[Depends(rate_limit_ip(10, 60, "login"))])
 async def login(
     payload: LoginRequest,
     response: Response,

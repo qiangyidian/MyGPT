@@ -52,6 +52,10 @@ class QdrantVectorStore(VectorStore):
     async def ensure_collection(self, collection: str, dim: int) -> None:
         _, models = _import_qdrant()
         try:
+            from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+        except Exception:  # noqa: BLE001 — qdrant not importable here
+            UnexpectedResponse = ()  # type: ignore
+        try:
             info = await self._client.get_collection(collection_name=collection)
             # If the collection exists with a different dim, recreate it.
             existing_dim = (
@@ -64,15 +68,21 @@ class QdrantVectorStore(VectorStore):
                     "Collection %s dim %s != required %s; recreating",
                     collection, existing_dim, dim,
                 )
-                await self._client.recreate_collection(
+                # delete + create: recreate_collection is deprecated in
+                # qdrant-client >=1.12 and will be removed.
+                await self._client.delete_collection(collection_name=collection)
+                await self._client.create_collection(
                     collection_name=collection,
                     vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
                 )
             self._known.add(collection)
             return
-        except Exception:
-            # Collection does not exist (or any other transient) — create it.
-            pass
+        except UnexpectedResponse as exc:
+            # Only a 404 means "collection missing" → fall through to create.
+            # Other status codes (auth, 5xx, …) must NOT be masked as "missing".
+            if getattr(exc, "status_code", None) != 404:
+                logger.warning("qdrant get_collection failed for %s: %s", collection, exc)
+                raise
         await self._client.create_collection(
             collection_name=collection,
             vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
@@ -129,3 +139,18 @@ def get_vector_store() -> QdrantVectorStore:
     if _store is None:
         _store = QdrantVectorStore()
     return _store
+
+
+async def close_vector_store() -> None:
+    """Close + drop the cached client (called on app shutdown).
+
+    Without this the AsyncQdrantClient's underlying httpx connection pool leaks
+    on every worker reload / graceful shutdown.
+    """
+    global _store
+    if _store is not None:
+        try:
+            await _store._client.close()
+        except Exception:  # noqa: BLE001 — shutdown must always succeed
+            pass
+        _store = None

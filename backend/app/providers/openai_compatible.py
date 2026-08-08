@@ -213,33 +213,47 @@ class OpenAICompatibleProvider(ModelProvider):
         payload = self._build_chat_payload(self.model, messages, options, stream=True)
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                # Retry the INITIAL response on transient errors (502/503/429/...).
-                # Safe because no tokens have been emitted yet. Once the stream
-                # starts, we do NOT retry (would duplicate tokens).
+                # Retry the INITIAL response on transient errors (502/503/429/...)
+                # AND transient transport errors (connect/read timeout) — both are
+                # safe because no tokens have been emitted yet. Once the stream
+                # starts iterating, we do NOT retry (would duplicate tokens).
                 for attempt in range(1, 6):
-                    async with client.stream(
-                        "POST", self._chat_url(), json=payload, headers=self._headers()
-                    ) as resp:
-                        if resp.status_code in _RETRYABLE_STATUS:
-                            await resp.aread()  # drain the error body before retrying
-                            if attempt < 5:
-                                await asyncio.sleep(min(2 ** attempt, 10))
-                                continue
-                            raise ProviderError(
-                                f"transient HTTP {resp.status_code} from {self._chat_url()} after retries"
-                            )
-                        if resp.status_code >= 400:
-                            body = (await resp.aread()).decode(errors="replace")[:500]
-                            if resp.status_code in (401, 403):
+                    started_iter = False
+                    try:
+                        async with client.stream(
+                            "POST", self._chat_url(), json=payload, headers=self._headers()
+                        ) as resp:
+                            if resp.status_code in _RETRYABLE_STATUS:
+                                await resp.aread()  # drain the error body before retrying
+                                if attempt < 5:
+                                    await asyncio.sleep(min(2 ** attempt, 10))
+                                    continue
                                 raise ProviderError(
-                                    f"auth error {resp.status_code} from {self._chat_url()}: {body}"
+                                    f"transient HTTP {resp.status_code} from {self._chat_url()} after retries"
                                 )
-                            raise ProviderError(
-                                f"HTTP {resp.status_code} from {self._chat_url()}: {body}"
-                            )
-                        async for chunk in self._iter_sse(resp):
-                            yield chunk
-                        return
+                            if resp.status_code >= 400:
+                                body = (await resp.aread()).decode(errors="replace")[:500]
+                                if resp.status_code in (401, 403):
+                                    raise ProviderError(
+                                        f"auth error {resp.status_code} from {self._chat_url()}: {body}"
+                                    )
+                                raise ProviderError(
+                                    f"HTTP {resp.status_code} from {self._chat_url()}: {body}"
+                                )
+                            started_iter = True
+                            async for chunk in self._iter_sse(resp):
+                                yield chunk
+                            return
+                    except _RETRYABLE_EXC as exc:
+                        # Transport error before the first token → retry (matches
+                        # the comment). A mid-stream error (started_iter) is NOT
+                        # retried — resending would duplicate emitted tokens.
+                        if not started_iter and attempt < 5:
+                            await asyncio.sleep(min(2 ** attempt, 10))
+                            continue
+                        raise _to_provider_error(exc, where="stream") from exc
+        except ProviderError:
+            raise
         except _RETRYABLE_EXC as exc:
             raise _to_provider_error(exc, where="stream") from exc
 

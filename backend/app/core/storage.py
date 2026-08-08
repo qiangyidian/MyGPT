@@ -80,8 +80,14 @@ class LocalStorage(StorageBackend):
 
         stored_name = f"{uuid.uuid4().hex}{ext}"
         dest = (user_dir / stored_name).resolve()
-        # Defence in depth: ensure the resolved target stays under base_dir.
-        if not str(dest).startswith(str(self.base_dir.resolve())):
+        # Defence in depth: ensure the resolved target stays under base_dir. Use
+        # Path.relative_to (not str.startswith) so a prefix collision like
+        # base_dir "uploads" vs a sibling "uploads-x" can't slip through, and
+        # path-separator differences are handled correctly.
+        base_resolved = self.base_dir.resolve()
+        try:
+            dest.relative_to(base_resolved)
+        except ValueError:
             raise ValueError("Invalid storage path")
 
         # Stream the upload to disk so large files don't get fully buffered.
@@ -94,10 +100,12 @@ class LocalStorage(StorageBackend):
         return str(dest)
 
     def open(self, path: str) -> IO[bytes]:
-        # Resolve against base and refuse to escape it.
+        # Resolve against base and refuse to escape it (relative_to, not startswith).
         target = (self.base_dir / path).resolve() if not os.path.isabs(path) else Path(path).resolve()
         base_resolved = self.base_dir.resolve()
-        if not str(target).startswith(str(base_resolved)):
+        try:
+            target.relative_to(base_resolved)
+        except ValueError:
             raise ValueError("Invalid storage path")
         return open(target, "rb")
 

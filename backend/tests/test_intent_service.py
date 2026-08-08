@@ -123,3 +123,30 @@ async def test_judge_returns_none_when_no_provider():
 async def test_judge_returns_none_for_empty_content():
     d = await _service().judge(user_content="   ", fragments=_fragments(), provider=_ScriptedProvider())
     assert d is None
+
+
+async def test_judge_disabled_short_circuits_without_provider_call():
+    # Kill switch: when disabled, judge returns None and never calls the provider.
+    p = _ScriptedProvider(script=['{"route":"native","deliverable_kind":"code","confidence":0.9}'])
+    cfg = IntentClassifierConfig(enabled=False, max_retries=0)
+    d = await IntentService(cfg).judge(user_content="写贪吃蛇", fragments=_fragments(), provider=p)
+    assert d is None
+    assert p.calls == 0
+
+
+async def test_judge_caches_identical_request(monkeypatch):
+    # An identical second call must hit the cache (no second provider call).
+    import app.agents.intent_service as svc
+
+    monkeypatch.setattr(svc, "_cache_active", lambda: True)
+    svc.clear_intent_cache()
+    try:
+        p = _ScriptedProvider(script=['{"route":"native","deliverable_kind":"code","confidence":0.9}'])
+        srv = _service()
+        d1 = await srv.judge(user_content="写贪吃蛇", fragments=_fragments(), provider=p)
+        d2 = await srv.judge(user_content="写贪吃蛇", fragments=_fragments(), provider=p)
+        assert d1 is not None and d2 is not None
+        assert d1.route == d2.route == "native"
+        assert p.calls == 1  # second call served from cache
+    finally:
+        svc.clear_intent_cache()

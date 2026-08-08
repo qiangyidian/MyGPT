@@ -18,9 +18,9 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ai_chat
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_chat}
     ports:
       - "5432:5432"
     volumes:
@@ -32,7 +32,8 @@ services:
       retries: 10
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned (was :latest) for reproducibility. Bump deliberately.
+    image: qdrant/qdrant:v1.12.4
     restart: unless-stopped
     ports:
       - "6333:6333"

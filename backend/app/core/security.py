@@ -5,6 +5,7 @@ Kept free of FastAPI/DB deps so it is unit-testable in isolation.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -14,6 +15,8 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -70,12 +73,31 @@ def decode_token(token: str) -> dict[str, Any]:
 
 
 # ---- API key encryption (Fernet) ------------------------------------------
+# Module-level cache for the dev-fallback Fernet. Without it, _fernet() used to
+# generate a FRESH random key on every call, so ciphertext encrypted in one call
+# was immediately undecryptable by the next. Caching makes dev at least
+# consistent within a single process. Production must set FERNET_KEY (enforced
+# at startup by config._guard_default_secrets) and never hits this fallback.
+_FALLBACK_FERNET: Fernet | None = None
+
+
 def _fernet() -> Fernet:
+    global _FALLBACK_FERNET
     key = settings.FERNET_KEY
-    if not key:
-        # Dev fallback: deterministic per-process key. NOT safe for prod — set FERNET_KEY.
-        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
-    return Fernet(key.encode() if isinstance(key, str) else key)
+    if key:
+        return Fernet(key.encode() if isinstance(key, str) else key)
+    # Dev-only fallback: stable per-process random key. NOT safe for prod —
+    # config._guard_default_secrets refuses to boot non-dev without FERNET_KEY.
+    if _FALLBACK_FERNET is None:
+        logger.warning(
+            "FERNET_KEY is empty — generating a random per-process key. Any API "
+            "key encrypted now will be UNDECRYPTABLE after a process restart. "
+            "Set FERNET_KEY to a stable value: python -c \"from cryptography.fernet "
+            "import Fernet; print(Fernet.generate_key().decode())\""
+        )
+        rand_key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        _FALLBACK_FERNET = Fernet(rand_key.encode())
+    return _FALLBACK_FERNET
 
 
 def encrypt_secret(plaintext: str) -> str:
@@ -90,6 +112,13 @@ def decrypt_secret(ciphertext: str) -> str:
     try:
         return _fernet().decrypt(ciphertext.encode()).decode()
     except InvalidToken:
+        # A non-empty ciphertext that won't decrypt means the Fernet key changed
+        # (rotation / restart on the random fallback) or the row was tampered
+        # with. Log so it isn't silently misread as "the user stored an empty key".
+        logger.warning(
+            "decrypt_secret: Fernet InvalidToken — key mismatch or tampered "
+            "ciphertext; returning empty string"
+        )
         return ""
 
 

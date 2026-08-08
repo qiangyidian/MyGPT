@@ -114,12 +114,6 @@ class AgentLifecycleEmitter:
             logger.info("agent_started: drop (terminal) node=%s status=%s", agent_id, node.status)
             return False
         # Join guard: every inbound edge must be completed.
-        preds = self.graph.predecessors(agent_id)
-        blocked = [
-            p for p in preds
-            if self.graph.node(p) and self.graph.node(p).status not in  # type: ignore[union-attr]
-               (AgentNodeStatus.completed,)
-        ]
         # An edge from a not-yet-completed predecessor means we must wait.
         inbound_edges = [e for e in self.graph.edges if e.target == agent_id]
         if inbound_edges and any(e.status != AgentEdgeStatus.completed for e in inbound_edges):

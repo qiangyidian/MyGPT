@@ -111,10 +111,28 @@ class Settings(BaseSettings):
     # it stays disabled unless one of these opts it in AND a sandbox is configured.
     ALLOW_PYTHON_EXEC: bool = False
     PYTHON_SANDBOX: str = ""  # e.g. "docker" | "e2b" | "gvisor" — reserved for Phase 5
+    # Optional JSON file of network-egress allow/forbid rules consulted by the
+    # http_get / web_search tools (Codex-style NetworkPolicy, see
+    # app.agents.network_policy.NetworkRuleStore). Empty = no policy (allow-all,
+    # the historic behaviour). Lets an operator forbid egress to specific hosts
+    # without code changes.
+    NETWORK_POLICY_FILE: str = ""
     # Agent hard-stop budgets (see app.agents.policies.budget_policy).
     AGENT_MAX_STEPS: int = 8
     AGENT_MAX_TOOL_CALLS: int = 12
     AGENT_MAX_RUNTIME_SECONDS: int = 120
+    # Intent classifier (runs on the chat hot path before the first token).
+    # Master switch: when False, intent recognition is skipped entirely and the
+    # keyword router handles routing (zero model calls, zero added latency).
+    INTENT_CLASSIFIER_ENABLED: bool = True
+    # Per-attempt timeout. A 320-token classification finishes in well under a
+    # second on any reasonable endpoint; the old 8s ceiling (x2 with retry) could
+    # block the first token for ~16s. Lowered to 2s; tune up only if needed.
+    INTENT_TIMEOUT_SECONDS: float = 2.0
+    # Retries ON TOP OF the first attempt. 0 = one attempt on the hot path: a
+    # transient failure falls back to the keyword router immediately rather than
+    # doubling the worst-case latency.
+    INTENT_MAX_RETRIES: int = 0
     # Demo mode: the CrewAI multi-agent runtime MAY use a deterministic fake
     # executor (no external LLM) so the full multi-agent panel — real SSE,
     # graph, tool attribution, sequential/parallel lifecycle — can be exercised
@@ -247,6 +265,18 @@ class Settings(BaseSettings):
             if self.ADMIN_PASSWORD in ("", "changeme123"):
                 raise ValueError(
                     "ADMIN_PASSWORD must be changed from the default in non-dev environments"
+                )
+            # Without a stable FERNET_KEY, stored API keys are encrypted with an
+            # ephemeral per-process random key and become undecryptable on any
+            # restart/redeploy — a silent data-loss/availability bug. Fail startup
+            # in real deployments so this can't ship unnoticed.
+            if not self.FERNET_KEY:
+                raise ValueError(
+                    "FERNET_KEY must be set in non-dev environments — otherwise "
+                    "stored API keys are encrypted with an ephemeral random key "
+                    "and become undecryptable on restart. Generate one with: "
+                    "python -c \"from cryptography.fernet import Fernet; "
+                    "print(Fernet.generate_key().decode())\""
                 )
             # Demo mode emits CANNED, non-real answers from a fake executor.
             # It must never run in production — a real user would receive

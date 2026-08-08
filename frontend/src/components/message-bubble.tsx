@@ -334,6 +334,7 @@ export const MessageBubble = memo(function MessageBubble({
               <Markdown
                 content={safeContent}
                 className={cn("text-[0.95rem] leading-[1.7]", isStreaming && "msg-streaming")}
+                lite={isStreaming}
               />
               {citationFlagged && (
                 <p className="mt-1 text-[11px] text-muted-foreground">

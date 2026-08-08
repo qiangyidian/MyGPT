@@ -28,6 +28,11 @@ from app.services.conversation_service import branch_from_message, list_for_user
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 NOT_FOUND = status.HTTP_404_NOT_FOUND
+# Cap on how many recent messages the detail endpoint returns in one response.
+# selectinload would pull the ENTIRE history; an explicit capped query bounds
+# memory + serialization for very long conversations. High enough that normal
+# conversations are unaffected.
+_DETAIL_MESSAGE_WINDOW = 1000
 
 
 async def _load_owned(
@@ -109,9 +114,20 @@ async def get_conversation(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationDetail:
-    conv = await _load_owned(db, conv_id, user, with_messages=True)
+    conv = await _load_owned(db, conv_id, user)
+    # Load a bounded window of recent messages (oldest-first) rather than
+    # selectinload-ing the entire history, which could serialize thousands of
+    # rows for a long conversation.
+    msg_rows = (
+        await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.desc())
+            .limit(_DETAIL_MESSAGE_WINDOW)
+        )
+    ).scalars().all()
     detail = ConversationDetail.model_validate(conv)
-    detail.messages = [MessageOut.model_validate(m) for m in sorted(conv.messages, key=lambda m: m.created_at)]
+    detail.messages = [MessageOut.model_validate(m) for m in reversed(msg_rows)]
     return detail
 
 
@@ -212,5 +228,11 @@ async def delete_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     conv = await _load_owned(db, conv_id, user)
+    # Clean up attachment file bytes + per-attachment RAG vectors BEFORE the FK
+    # CASCADE removes the rows — otherwise deleting a conversation leaks every
+    # attachment's file on disk forever (cascade only deletes DB rows).
+    from app.services import attachment_service
+
+    await attachment_service.delete_for_conversation(db, conv.id)
     await db.delete(conv)
     await db.commit()

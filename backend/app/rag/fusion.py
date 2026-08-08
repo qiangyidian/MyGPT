@@ -27,10 +27,16 @@ def rrf_fuse(
         for rank, h in enumerate(hits):
             scores[h.id] = scores.get(h.id, 0.0) + 1.0 / (k + rank)
             payload.setdefault(h.id, dict(h.payload))
-            # Carry the originating retriever + raw scores for debugging.
+            # Carry the originating retriever + raw scores for debugging. Collect
+            # every distinct retriever that surfaced this hit (the old
+            # ``"retrievers" not in p`` guard stopped after the first, so a hit
+            # found by both vector AND keyword only ever recorded one tag).
             p = payload[h.id]
-            if "retriever" in h.payload and "retrievers" not in p:
-                p.setdefault("retrievers", []).append(h.payload["retriever"])
+            if "retriever" in h.payload:
+                tag = h.payload["retriever"]
+                cur = p.setdefault("retrievers", [])
+                if tag not in cur:
+                    cur.append(tag)
     merged = [
         SearchHit(id=i, score=s, payload=payload[i]) for i, s in scores.items()
     ]
@@ -49,14 +55,17 @@ def compress_context(hits: list[SearchHit], *, jaccard_threshold: float = 0.85) 
     for h in hits:
         text = h.payload.get("text") or h.payload.get("content") or ""
         ws = _word_set(text)
+        if not ws:
+            # Empty/whitespace chunk carries no signal — drop it (the old code
+            # skipped dedup for these, so every empty chunk survived).
+            continue
         duplicate = False
-        if ws:
-            for ks in kept_sets:
-                inter = len(ws & ks)
-                union = len(ws | ks) or 1
-                if inter / union >= jaccard_threshold:
-                    duplicate = True
-                    break
+        for ks in kept_sets:
+            inter = len(ws & ks)
+            union = len(ws | ks) or 1
+            if inter / union >= jaccard_threshold:
+                duplicate = True
+                break
         if not duplicate:
             kept.append(h)
             kept_sets.append(ws)

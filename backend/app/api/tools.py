@@ -26,4 +26,4 @@ async def test_tool(
     payload: ToolTestRequest,
     user: User = Depends(get_current_user),
 ) -> ToolTestResult:
-    return await tool_service.test_tool(payload.name, payload.arguments)
+    return await tool_service.test_tool(payload.name, payload.arguments, user=user)

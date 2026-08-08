@@ -530,6 +530,30 @@ async def delete(db: AsyncSession, attachment_id: uuid.UUID, user_id: uuid.UUID)
     await db.commit()
 
 
+async def delete_for_conversation(db: AsyncSession, conversation_id: uuid.UUID) -> None:
+    """Delete every attachment's file + RAG index for a conversation.
+
+    Called by ``delete_conversation`` BEFORE the FK ondelete=CASCADE removes the
+    ChatAttachment rows — the cascade only handles DB rows, so without this the
+    on-disk bytes (uploads/) and per-attachment Qdrant collections leak forever
+    on every conversation delete. Best-effort throughout: a missing file or a
+    failed vector drop never blocks the conversation delete.
+    """
+    storage = get_storage()
+    res = await db.execute(
+        select(ChatAttachment).where(ChatAttachment.conversation_id == conversation_id)
+    )
+    for att in res.scalars().all():
+        try:
+            await storage.delete(att.storage_key)
+        except Exception:  # noqa: BLE001 — file may already be gone
+            pass
+        try:
+            await attachment_rag.drop(att.id)
+        except Exception:  # noqa: BLE001 — vector store may be unavailable
+            pass
+
+
 async def list_for_conversation(
     db: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID
 ) -> list[ChatAttachment]:

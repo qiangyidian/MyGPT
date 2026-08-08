@@ -47,7 +47,9 @@ export function MultiAgentPanel() {
   const active = useAgentRunStore((s) => s.active);
   const clock = useAgentRunStore((s) => s.clock); // re-render each second for live durations
   const dismissActive = useAgentRunStore((s) => s.dismissActive);
-  const show = selectShouldShowPanel(useAgentRunStore.getState());
+  // Subscribe reactively (not getState()) so the panel re-renders when
+  // dismissedRunIds changes — otherwise dismissActive() would never hide it.
+  const show = useAgentRunStore(selectShouldShowPanel);
   const [tab, setTab] = useState<"flow" | "activity">("flow");
   const isDesktop = useIsDesktop();
   // Drive the shared clock + poll fallback while mounted.

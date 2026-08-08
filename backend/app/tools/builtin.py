@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
 import tempfile
 from datetime import datetime, timezone
@@ -30,32 +31,88 @@ from app.tools.base import BaseTool, ToolError, ToolParameter
 
 # How much of an HTTP body we keep — payloads can be huge and bust the LLM context.
 _HTTP_MAX_CHARS = 4000
+# Hard cap on how many bytes we will ever buffer from a single HTTP response
+# before truncating. Stops a hostile/misconfigured endpoint from exhausting
+# memory by serving a multi-hundred-MB body (the [:max_chars] slice used to run
+# only AFTER the whole body was already decoded into memory).
+_HTTP_MAX_BYTES = 4 * 1024 * 1024
 # Sync DB query safety cap — read-only-ish, bounded row count.
 _DB_ROW_LIMIT = 50
 
 
-def _is_public_host(host: str) -> bool:
-    """True only if every resolved address for ``host`` is a public IP.
+def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
+    """True for any address an SSRF-safe tool must never reach.
 
-    Blocks the SSRF vector of pointing http_get at internal/metadata hosts
-    (e.g. 169.254.169.254, 127.0.0.1, 10.x, 192.168.x, ::1)."""
+    Covers private/loopback/link-local/reserved/multicast/unspecified ranges, and
+    also reduces IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) to its embedded
+    IPv4 and re-tests — some stdlib versions do NOT flag the mapped form as
+    private, which would otherwise bypass the check.
+    """
+    if (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    ):
+        return True
+    if ip.version == 6:
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and _is_private_ip(mapped):
+            return True
+    return False
+
+
+def _resolve_public_ip(host: str) -> str | None:
+    """Resolve ``host`` once and return one validated public IP to pin to.
+
+    Returns None if the host is unset, unresolvable, or resolves to ANY
+    private/loopback/link-local address. The caller connects directly to the
+    returned IP (keeping the original Host header + TLS SNI), which eliminates the
+    DNS-rebinding TOCTOU window where httpx's own second resolution could flip the
+    record to an internal address between our check and the connect. Prefers IPv4
+    for reachability when both families are available.
+    """
     if not host:
-        return False
+        return None
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return False
+        return None
+    chosen: str | None = None
     for info in infos:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except (ValueError, IndexError):
-            return False
-        if (
-            ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-        ):
-            return False
-    return True
+            return None
+        if _is_private_ip(ip):
+            return None
+        candidate = str(ip) if ip.version == 4 else f"[{ip}]"
+        if chosen is None or (ip.version == 4 and ":" in chosen):
+            # First valid address, or upgrade from an IPv6 choice to IPv4.
+            chosen = candidate
+    return chosen
+
+
+async def _bounded_request(
+    client: httpx.AsyncClient, method: str, url: str, *, max_bytes: int = _HTTP_MAX_BYTES, **kwargs: Any
+) -> tuple[int, bytes, str, str]:
+    """Stream a request and read at most ``max_bytes`` of the body.
+
+    Returns (status_code, body_bytes, content_type, final_url). The body is never
+    fully buffered past max_bytes, so a huge response cannot exhaust memory. Any
+    extra bytes are simply dropped (callers signal truncation via [:max_chars]).
+    """
+    async with client.stream(method, url, **kwargs) as resp:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_raw():
+            remaining = max_bytes - total
+            if remaining <= 0:
+                break
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return resp.status_code, b"".join(chunks), resp.headers.get("content-type", ""), str(resp.url)
 
 
 class DateTimeNowTool(BaseTool):
@@ -110,40 +167,64 @@ class HttpGetTool(BaseTool):
         if max_chars <= 0:
             max_chars = _HTTP_MAX_CHARS
 
-        # SSRF guard: only http/https, and the host must resolve to public IPs
-        # (blocks metadata/loopback/private/link-local addresses).
+        # SSRF guard, in order:
+        #   * scheme allow-list (http/https only);
+        #   * operator network-egress policy (NetworkPolicy) — allow-all by default;
+        #   * resolve ONCE and connect to a validated public IP, so httpx's own
+        #     second resolution cannot DNS-rebind us to an internal host (TOCTOU).
         try:
             parsed = httpx.URL(url)
         except Exception as exc:  # noqa: BLE001
             raise ToolError(f"invalid url: {exc}")
         if parsed.scheme not in ("http", "https"):
             raise ToolError("only http/https URLs are allowed")
-        if not _is_public_host(parsed.host):
-            raise ToolError("URL host resolves to a blocked (internal/private) address")
+
+        from app.agents.network_policy import load_active_policy
+
+        if load_active_policy().decide(parsed.host, parsed.scheme) == "forbidden":
+            raise ToolError(f"network policy forbids egress to {parsed.host!r}")
+
+        pinned_ip = _resolve_public_ip(parsed.host)
+        if pinned_ip is None:
+            raise ToolError(
+                "URL host is unresolvable or resolves to a blocked (internal/private) address"
+            )
 
         timeout = httpx.Timeout(15.0, connect=10.0)
         headers = {
             "User-Agent": "MyGPT-Tool/1.0 (+https://example.com/bot)",
             "Accept": "text/html,application/json,text/plain,*/*",
+            # Pin the connection to the validated IP but keep the original Host
+            # header so virtual-hosted servers still route correctly.
+            "Host": parsed.host,
         }
-        # follow_redirects=False: don't let an external server redirect us to an
-        # internal host (DNS-rebind). status_code is returned so the caller can
-        # follow a redirect explicitly if it chooses.
+        # follow_redirects=False: don't let a server redirect us to an internal
+        # host. status_code is returned so the caller can follow a redirect
+        # explicitly if it chooses.
+        ip_url = parsed.copy_with(host=pinned_ip)
+        # For HTTPS, drive TLS SNI + cert verification with the ORIGINAL hostname
+        # (the URL host is now the IP), so the cert still validates and the right
+        # vhost is selected on the server.
+        req_kwargs: dict[str, Any] = {"headers": headers}
+        if parsed.scheme == "https":
+            req_kwargs["extensions"] = {"sni_hostname": parsed.host}
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                resp = await client.get(url, headers=headers)
+                status_code, raw, content_type, final_url = await _bounded_request(
+                    client, "GET", str(ip_url), **req_kwargs
+                )
         except httpx.TimeoutException as exc:
             return {"ok": False, "error": f"timeout: {exc}", "status_code": None, "body": ""}
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"http error: {exc}", "status_code": None, "body": ""}
 
-        body = resp.text or ""
+        body = raw.decode("utf-8", errors="replace")
         truncated = len(body) > max_chars
         return {
             "ok": True,
-            "status_code": resp.status_code,
-            "url": str(resp.url),
-            "content_type": resp.headers.get("content-type", ""),
+            "status_code": status_code,
+            "url": final_url,
+            "content_type": content_type,
             "truncated": truncated,
             "body": body[:max_chars],
         }
@@ -248,16 +329,24 @@ class WebSearchTool(BaseTool):
                 }
                 if api_key:
                     body["api_key"] = api_key
-                resp = await client.post(endpoint, json=body, headers=headers)
+                _status, raw, _ct, _url = await _bounded_request(
+                    client, "POST", endpoint, json=body, headers=headers
+                )
             else:
                 # Common query param names; the provider decides which it reads.
                 params = {"q": query, "query": query, "format": "json", "count": top_k}
-                resp = await client.get(endpoint, params=params, headers=headers)
+                _status, raw, _ct, _url = await _bounded_request(
+                    client, "GET", endpoint, params=params, headers=headers
+                )
             data: Any
             try:
-                data = resp.json()
+                # Bounded read above caps memory; parse the (possibly truncated)
+                # JSON. A truncation-induced parse failure hands off to the DDG
+                # HTML scraper, preserving the historic fallback behaviour.
+                data = json.loads(raw.decode("utf-8", errors="replace"))
             except Exception:
-                # If the endpoint returns HTML, hand off to the DDG HTML scraper instead.
+                # If the endpoint returns HTML (or non-JSON), hand off to the DDG
+                # HTML scraper instead.
                 return await self._search_duckduckgo(query, top_k)
 
         return self._normalize_search_data(data, top_k)
@@ -273,8 +362,10 @@ class WebSearchTool(BaseTool):
             "User-Agent": "Mozilla/5.0 (compatible; MyGPT-Tool/1.0)",
         }
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.post(url, data={"q": query}, headers=headers)
-        page = resp.text or ""
+            _status, raw, _ct, _url = await _bounded_request(
+                client, "POST", url, data={"q": query}, headers=headers
+            )
+        page = raw.decode("utf-8", errors="replace")
 
         results: list[dict[str, str]] = []
         # DDG HTML wraps results in <a class="result__a" href="...">title</a>
@@ -427,6 +518,28 @@ class PythonExecTool(BaseTool):
         except (TypeError, ValueError):
             timeout = 10
         timeout = max(1, min(timeout, 10))
+
+        # Defense in depth: the ToolGateway also gates this, but this run() is
+        # reached directly by /api/tools/test (and any other caller that bypasses
+        # the gateway), so enforce the same environment gate HERE. python_exec is
+        # fail-closed outside dev unless explicitly opted in (ALLOW_PYTHON_EXEC)
+        # or a real sandbox backend is configured (PYTHON_SANDBOX). Without this
+        # guard, POST /api/tools/test {name:python_exec} is arbitrary code
+        # execution with the backend process's privileges.
+        from app.agents.policies.tool_policy import is_tool_allowed
+
+        if not is_tool_allowed("python_exec", None):
+            return {
+                "ok": False,
+                "error": (
+                    "python_exec is disabled in this environment (allow only in dev, "
+                    "or set ALLOW_PYTHON_EXEC=true / PYTHON_SANDBOX)"
+                ),
+                "stdout": "",
+                "stderr": "",
+                "returncode": None,
+                "blocked": True,
+            }
 
         with tempfile.TemporaryDirectory(prefix="pyexec_") as workdir:
             script_path = f"{workdir}/snippet.py"

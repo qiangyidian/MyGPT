@@ -57,6 +57,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await approval_bus.stop()
+        # Close shared clients so their connection pools don't leak on reload /
+        # graceful shutdown (each used to live for the process with no close).
+        from app.rag.qdrant_store import close_vector_store
+        await close_vector_store()
+        from app.core.redis import close_redis
+        await close_redis()
 
 
 def create_app() -> FastAPI:

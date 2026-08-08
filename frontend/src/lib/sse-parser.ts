@@ -146,6 +146,13 @@ export async function* parseSSEStream(
       for (const frame of framer.push(text)) yield frame;
     }
   } finally {
+    // Cancel the underlying stream so the server/connection is torn down on
+    // abort (releaseLock alone detaches the reader but leaves the stream open).
+    try {
+      await reader.cancel();
+    } catch {
+      // Already closed / cancelled; ignore.
+    }
     try {
       reader.releaseLock();
     } catch {

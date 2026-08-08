@@ -151,5 +151,7 @@ def _walk(base: Any, path: str) -> Any:
             raise ValueError(f"cannot index into {type(cur).__name__} at {part}")
         if m.group(2):  # trailing [n]
             idx = int(m.group(2)[1:-1])
-            cur = cur[idx] if isinstance(cur, list) else (_ for _ in ()).throw(ValueError("not a list"))
+            if not isinstance(cur, list):
+                raise ValueError("not a list")
+            cur = cur[idx]
     return cur

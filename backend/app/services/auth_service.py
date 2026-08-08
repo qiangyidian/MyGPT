@@ -43,8 +43,30 @@ REFRESH_BLACKLIST_KEY = "refresh:blacklist"
 # ---------------------------------------------------------------------------
 _redis_client: Any = None
 _redis_checked = False
+_redis_warned_multiworker = False
 # Fallback in-memory blacklist for single-process / test environments.
 _mem_blacklist: set[str] = set()
+
+
+def _warn_multiworker_revocation() -> None:
+    """Once-only WARNING when refresh revocation degrades to in-memory in prod.
+
+    In a multi-worker deployment each worker keeps its own in-memory set, so a
+    refresh token revoked on one worker stays valid on the others until that
+    worker restarts. The historic code logged a generic line per call; this makes
+    the security implication explicit once at the first occurrence.
+    """
+    global _redis_warned_multiworker
+    if _redis_warned_multiworker:
+        return
+    if settings.ENV not in ("dev", "test"):
+        _redis_warned_multiworker = True
+        logger.warning(
+            "Refresh-token revocation is in-memory (no Redis reachable). In a "
+            "multi-worker deployment (e.g. uvicorn --workers N>1) a refresh token "
+            "revoked on one worker remains valid on the others until they restart. "
+            "Set REDIS_URL for correct cross-process revocation."
+        )
 
 
 async def _get_redis() -> Any:
@@ -65,6 +87,7 @@ async def _get_redis() -> Any:
     except Exception:  # pragma: no cover - optional dep
         _redis_checked = True  # no package → don't keep retrying the import
         logger.warning("redis package not installed; using in-memory refresh blacklist")
+        _warn_multiworker_revocation()
         return None
     try:
         client = Redis.from_url(
@@ -77,6 +100,7 @@ async def _get_redis() -> Any:
     except Exception as exc:  # pragma: no cover - environment dependent
         # Transient (Redis briefly down): do NOT cache so the next call retries.
         logger.warning("Redis unavailable (%s); using in-memory refresh blacklist", exc)
+        _warn_multiworker_revocation()
         return None
     return _redis_client
 

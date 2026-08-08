@@ -114,3 +114,21 @@ class NetworkRuleStore:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
+
+
+def load_active_policy() -> NetworkPolicy:
+    """Load the operator-configured egress policy, or default-allow when unset.
+
+    Reads ``NETWORK_POLICY_FILE`` (a JSON file managed by :class:`NetworkRuleStore`).
+    Empty/unset path => allow-all (the historic behaviour), so this is opt-in.
+    A missing/corrupt file degrades to allow-all rather than breaking tool calls.
+    """
+    from app.core.config import get_settings
+
+    path = getattr(get_settings(), "NETWORK_POLICY_FILE", "") or ""
+    if not path:
+        return NetworkPolicy(default="allow")
+    try:
+        return NetworkRuleStore(Path(path)).load()
+    except Exception:  # noqa: BLE001 — a bad policy file must not block egress
+        return NetworkPolicy(default="allow")
