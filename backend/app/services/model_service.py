@@ -70,6 +70,14 @@ async def create(
         embedding_model_name=data.embedding_model_name,
         supports_stream=data.supports_stream,
         supports_tools=data.supports_tools,
+        supports_parallel_tools=data.supports_parallel_tools,
+        supports_vision=data.supports_vision,
+        supports_audio_input=data.supports_audio_input,
+        supports_audio_output=data.supports_audio_output,
+        supports_image_generation=data.supports_image_generation,
+        supports_structured_output=data.supports_structured_output,
+        supports_reasoning_effort=data.supports_reasoning_effort,
+        output_token_parameter=data.output_token_parameter,
         max_context_tokens=data.max_context_tokens,
         max_tokens=data.max_tokens,
         temperature=data.temperature,
@@ -134,6 +142,14 @@ def to_out(cfg: ModelConfig) -> ModelConfigOut:
         embedding_model_name=cfg.embedding_model_name,
         supports_stream=cfg.supports_stream,
         supports_tools=cfg.supports_tools,
+        supports_parallel_tools=cfg.supports_parallel_tools,
+        supports_vision=cfg.supports_vision,
+        supports_audio_input=cfg.supports_audio_input,
+        supports_audio_output=cfg.supports_audio_output,
+        supports_image_generation=cfg.supports_image_generation,
+        supports_structured_output=cfg.supports_structured_output,
+        supports_reasoning_effort=cfg.supports_reasoning_effort,
+        output_token_parameter=cfg.output_token_parameter,
         max_context_tokens=cfg.max_context_tokens,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
@@ -154,7 +170,11 @@ async def test(cfg: ModelConfig) -> ModelTestResult:
         provider = get_provider_for_config(cfg)
         result = await provider.chat(
             messages=[{"role": "user", "content": "ping"}],
-            options=ChatOptions(max_tokens=1, temperature=0.0),
+            options=ChatOptions(
+                max_tokens=1,
+                temperature=0.0,
+                output_token_parameter=cfg.output_token_parameter,
+            ),
         )
         latency_ms = int((time.perf_counter() - start) * 1000)
         sample = (result.content or "").strip()[:200] or None

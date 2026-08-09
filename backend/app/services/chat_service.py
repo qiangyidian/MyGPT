@@ -52,9 +52,11 @@ from app.agents.schemas import (
     ExecutionMode,
 )
 from app.agents.state_store import load_state, save_summary, upsert_goal
+from app.agents.token_budget import admit_latest_turn, calculate_prompt_budget
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.models import Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
+from app.model_capabilities import capabilities_from_config
 from app.providers.registry import get_provider_for_config
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
@@ -322,10 +324,77 @@ def _trim_history(
         return messages
 
     while len(messages) > 2 and total > max_tokens:
-        total -= costs[1]
-        del messages[1]
-        del costs[1]
+        # Remove a complete oldest turn where possible, rather than leaving an
+        # orphaned assistant/tool response after its user prompt was trimmed.
+        cutoff = 2
+        if messages[1].get("role") == "user":
+            while cutoff < len(messages) and messages[cutoff].get("role") != "user":
+                cutoff += 1
+        total -= sum(costs[1:cutoff])
+        del messages[1:cutoff]
+        del costs[1:cutoff]
     return messages
+
+
+def _latest_user_turn_tokens(messages: list[dict[str, Any]], model_name: str) -> int:
+    """Return the serialized cost of the newest user turn only."""
+    import json
+
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return _estimate_tokens(
+                json.dumps(message, ensure_ascii=False, default=str), model_name
+            )
+    return 0
+
+
+def _admit_and_trim_history(
+    messages: list[dict[str, Any]],
+    cfg: ModelConfig,
+    *,
+    model_name: str | None = None,
+    tool_schema_tokens: int = 0,
+) -> list[dict[str, Any]]:
+    """Apply capability-aware admission, then trim only older history."""
+
+    caps = capabilities_from_config(cfg)
+    budget = calculate_prompt_budget(
+        caps,
+        requested_output=caps.max_output_tokens,
+        tool_schema_tokens=tool_schema_tokens,
+    )
+    effective_model = model_name or getattr(cfg, "model_name", "")
+    admit_latest_turn(
+        _latest_user_turn_tokens(messages, effective_model), budget.input_tokens
+    )
+    return _trim_history(list(messages), budget.input_tokens, effective_model)
+
+
+def _estimate_available_tool_schema_tokens(
+    cfg: ModelConfig, *, enable_tools: bool, route: Any, model_name: str
+) -> int:
+    """Estimate advertised tool schemas when this turn can expose them."""
+    caps = capabilities_from_config(cfg)
+    if not enable_tools or not (
+        caps.supports_tools or (getattr(cfg, "provider", "") or "") == "mock"
+    ):
+        return 0
+    try:
+        import json
+
+        from app.agents.intent_router import filter_tool_names
+        from app.tools.registry_init import get_default_registry
+
+        registry = get_default_registry()
+        names = [tool.name for tool in registry.list()]
+        names = list(filter_tool_names(names, route))
+        schemas = registry.openai_schemas(only=names)
+        return _estimate_tokens(
+            json.dumps(schemas, ensure_ascii=False, default=str), model_name
+        )
+    except Exception:  # noqa: BLE001 - estimation is best-effort
+        logger.warning("tool schema token estimation failed", exc_info=True)
+        return 0
 
 
 def _messages_to_dicts(
@@ -662,11 +731,21 @@ class ChatService:
                 source_message_id=None,
             )
 
-        # 4. Load + trim history.
+        # 4. Load + capability-aware admission and history trimming.
         history = await _load_history(db, conversation.id)
         messages = _messages_to_dicts(system_prompt, history)
-        max_ctx = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
-        messages = _trim_history(messages, max_ctx, cfg.model_name)
+        tool_schema_tokens = _estimate_available_tool_schema_tokens(
+            cfg,
+            enable_tools=enable_tools,
+            route=route,
+            model_name=cfg.model_name,
+        )
+        messages = _admit_and_trim_history(
+            messages,
+            cfg,
+            model_name=cfg.model_name,
+            tool_schema_tokens=tool_schema_tokens,
+        )
 
         # 4b. Gather multimodal image parts (data only — do NOT mutate messages
         # yet). The actual content-parts injection happens after intent

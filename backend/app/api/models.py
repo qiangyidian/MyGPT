@@ -46,7 +46,14 @@ def _to_out(cfg: ModelConfig) -> ModelConfigOut:
         embedding_model_name=cfg.embedding_model_name,
         supports_stream=cfg.supports_stream,
         supports_tools=cfg.supports_tools,
+        supports_parallel_tools=cfg.supports_parallel_tools,
         supports_vision=cfg.supports_vision,
+        supports_audio_input=cfg.supports_audio_input,
+        supports_audio_output=cfg.supports_audio_output,
+        supports_image_generation=cfg.supports_image_generation,
+        supports_structured_output=cfg.supports_structured_output,
+        supports_reasoning_effort=cfg.supports_reasoning_effort,
+        output_token_parameter=cfg.output_token_parameter,
         max_context_tokens=cfg.max_context_tokens,
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
@@ -103,7 +110,14 @@ async def create_model(
         embedding_model_name=payload.embedding_model_name,
         supports_stream=payload.supports_stream,
         supports_tools=payload.supports_tools,
+        supports_parallel_tools=payload.supports_parallel_tools,
         supports_vision=payload.supports_vision or _looks_like_vision_model(payload.model_name),
+        supports_audio_input=payload.supports_audio_input,
+        supports_audio_output=payload.supports_audio_output,
+        supports_image_generation=payload.supports_image_generation,
+        supports_structured_output=payload.supports_structured_output,
+        supports_reasoning_effort=payload.supports_reasoning_effort,
+        output_token_parameter=payload.output_token_parameter,
         max_context_tokens=payload.max_context_tokens,
         max_tokens=payload.max_tokens,
         temperature=payload.temperature,
@@ -178,7 +192,11 @@ async def test_model(
         provider = get_provider_for_config(cfg)
         result = await provider.chat(
             [{"role": "user", "content": "ping"}],
-            ChatOptions(max_tokens=8, temperature=0.0),
+            ChatOptions(
+                max_tokens=8,
+                temperature=0.0,
+                output_token_parameter=cfg.output_token_parameter,
+            ),
         )
         latency = int((time.perf_counter() - start) * 1000)
         return ModelTestResult(ok=True, latency_ms=latency, sample=(result.content or "")[:200])

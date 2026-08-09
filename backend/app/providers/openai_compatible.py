@@ -141,9 +141,6 @@ class OpenAICompatibleProvider(ModelProvider):
             # Ask OpenAI-compatible endpoints to emit a final usage-only chunk so
             # we can persist per-message token accounting (cost/budget).
             payload["stream_options"] = {"include_usage": True}
-        # Omit max_tokens when None → endpoint uses its own maximum (no truncation).
-        if opts.max_tokens is not None:
-            payload["max_tokens"] = opts.max_tokens
         if opts.tools:
             payload["tools"] = opts.tools
             payload["tool_choice"] = opts.tool_choice
@@ -151,6 +148,13 @@ class OpenAICompatibleProvider(ModelProvider):
             payload["stop"] = opts.stop
         if opts.extra:
             payload.update(opts.extra)
+        # Generic output budgeting maps to exactly one provider parameter.
+        # Remove either spelling supplied through ``extra`` so callers can
+        # never accidentally emit both and trigger an upstream 400.
+        payload.pop("max_tokens", None)
+        payload.pop("max_completion_tokens", None)
+        if opts.max_tokens is not None:
+            payload[opts.output_token_parameter] = opts.max_tokens
         return payload
 
     @staticmethod

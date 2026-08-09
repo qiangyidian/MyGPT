@@ -39,7 +39,14 @@ const EMPTY: ModelConfigInput = {
   embedding_model_name: "",
   supports_stream: true,
   supports_tools: false,
+  supports_parallel_tools: false,
   supports_vision: false,
+  supports_audio_input: false,
+  supports_audio_output: false,
+  supports_image_generation: false,
+  supports_structured_output: false,
+  supports_reasoning_effort: false,
+  output_token_parameter: "max_tokens",
   is_embedding: false,
   temperature: 0.7,
   top_p: 1,
@@ -118,7 +125,14 @@ export default function ModelsPage() {
       embedding_model_name: m.embedding_model_name ?? "",
       supports_stream: m.supports_stream,
       supports_tools: m.supports_tools,
+      supports_parallel_tools: m.supports_parallel_tools,
       supports_vision: m.supports_vision,
+      supports_audio_input: m.supports_audio_input,
+      supports_audio_output: m.supports_audio_output,
+      supports_image_generation: m.supports_image_generation,
+      supports_structured_output: m.supports_structured_output,
+      supports_reasoning_effort: m.supports_reasoning_effort,
+      output_token_parameter: m.output_token_parameter,
       is_embedding: m.is_embedding,
       temperature: m.temperature,
       top_p: m.top_p,
@@ -181,6 +195,7 @@ export default function ModelsPage() {
                   )}
                   {m.supports_tools && <Badge variant="outline">工具</Badge>}
                   {m.supports_vision && <Badge variant="outline">视觉</Badge>}
+                  {m.supports_structured_output && <Badge variant="outline">结构化输出</Badge>}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-muted-foreground">
                   {m.provider} · {m.model_name} · {m.api_base_url}
@@ -284,7 +299,7 @@ export default function ModelsPage() {
                 placeholder="例如：text-embedding-3-small"
               />
             </Field>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-2 gap-4">
               <Field label="temperature">
                 <Input
                   type="number"
@@ -305,9 +320,20 @@ export default function ModelsPage() {
                   }
                 />
               </Field>
+              <Field label="上下文 Token 上限">
+                <Input
+                  type="number"
+                  min={1}
+                  value={form.max_context_tokens ?? 8192}
+                  onChange={(e) =>
+                    setForm({ ...form, max_context_tokens: parseInt(e.target.value) })
+                  }
+                />
+              </Field>
               <Field label="max_tokens">
                 <Input
                   type="number"
+                  min={1}
                   value={form.max_tokens ?? 1024}
                   onChange={(e) =>
                     setForm({ ...form, max_tokens: parseInt(e.target.value) })
@@ -315,6 +341,24 @@ export default function ModelsPage() {
                 />
               </Field>
             </div>
+            <Field label="输出 Token 参数">
+              <Select
+                value={form.output_token_parameter ?? "max_tokens"}
+                onValueChange={(v: "max_tokens" | "max_completion_tokens") =>
+                  setForm({ ...form, output_token_parameter: v })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="max_tokens">max_tokens</SelectItem>
+                  <SelectItem value="max_completion_tokens">
+                    max_completion_tokens
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
             <div className="flex flex-wrap gap-6 pt-1">
               <Toggle
                 label="流式输出"
@@ -327,9 +371,39 @@ export default function ModelsPage() {
                 onChange={(v) => setForm({ ...form, supports_tools: v })}
               />
               <Toggle
+                label="支持并行工具"
+                checked={!!form.supports_parallel_tools}
+                onChange={(v) => setForm({ ...form, supports_parallel_tools: v })}
+              />
+              <Toggle
                 label="支持视觉（图片输入）"
                 checked={!!form.supports_vision}
                 onChange={(v) => setForm({ ...form, supports_vision: v })}
+              />
+              <Toggle
+                label="支持音频输入"
+                checked={!!form.supports_audio_input}
+                onChange={(v) => setForm({ ...form, supports_audio_input: v })}
+              />
+              <Toggle
+                label="支持音频输出"
+                checked={!!form.supports_audio_output}
+                onChange={(v) => setForm({ ...form, supports_audio_output: v })}
+              />
+              <Toggle
+                label="支持图像生成"
+                checked={!!form.supports_image_generation}
+                onChange={(v) => setForm({ ...form, supports_image_generation: v })}
+              />
+              <Toggle
+                label="支持结构化输出"
+                checked={!!form.supports_structured_output}
+                onChange={(v) => setForm({ ...form, supports_structured_output: v })}
+              />
+              <Toggle
+                label="支持推理强度"
+                checked={!!form.supports_reasoning_effort}
+                onChange={(v) => setForm({ ...form, supports_reasoning_effort: v })}
               />
               <Toggle
                 label="作为向量模型"

@@ -33,6 +33,47 @@ async def test_create_list_model_and_key_is_masked(client):
     assert any(m["id"] == mid for m in listed.json())
 
 
+async def test_model_capabilities_round_trip_through_api(client):
+    h = auth_headers()
+    created = await client.post(
+        "/api/models",
+        json={
+            "name": "Reasoner",
+            "provider": "mock",
+            "api_base_url": "http://localhost/v1",
+            "model_name": "reasoner",
+            "supports_tools": True,
+            "supports_parallel_tools": True,
+            "supports_audio_input": True,
+            "supports_audio_output": True,
+            "supports_image_generation": True,
+            "supports_structured_output": True,
+            "supports_reasoning_effort": True,
+            "output_token_parameter": "max_completion_tokens",
+        },
+        headers=h,
+    )
+
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["supports_parallel_tools"] is True
+    assert body["supports_audio_input"] is True
+    assert body["supports_audio_output"] is True
+    assert body["supports_image_generation"] is True
+    assert body["supports_structured_output"] is True
+    assert body["supports_reasoning_effort"] is True
+    assert body["output_token_parameter"] == "max_completion_tokens"
+
+    updated = await client.put(
+        f"/api/models/{body['id']}",
+        json={"supports_parallel_tools": False, "output_token_parameter": "max_tokens"},
+        headers=h,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["supports_parallel_tools"] is False
+    assert updated.json()["output_token_parameter"] == "max_tokens"
+
+
 async def test_model_test_endpoint_ok(client):
     h = auth_headers()
     created = await client.post(

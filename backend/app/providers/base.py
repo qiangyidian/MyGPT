@@ -52,10 +52,15 @@ class ChatOptions:
     # (no output truncation). The multi-agent streaming Writer uses this so long
     # code answers are never cut off at finish_reason=length.
     max_tokens: int | None = 1024
+    output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     tools: list[dict[str, Any]] | None = None        # OpenAI tool schemas
     tool_choice: Any = "auto"
     stop: list[str] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.output_token_parameter not in ("max_tokens", "max_completion_tokens"):
+            raise ValueError("unsupported output token parameter")
 
 
 @dataclass

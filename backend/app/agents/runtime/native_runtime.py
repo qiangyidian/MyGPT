@@ -98,6 +98,7 @@ class NativeChatRuntime:
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=safe_positive_int(cfg.max_tokens, 1024),
+            output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
             tools=tool_schemas,
             tool_choice="auto",
         )
