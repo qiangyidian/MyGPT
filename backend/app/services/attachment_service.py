@@ -68,9 +68,21 @@ _EXT_RULES: dict[str, tuple[tuple[str, ...], tuple[bytes, ...]]] = {
     ".jpg":  (("image/jpeg",), (b"\xff\xd8\xff",)),
     ".jpeg": (("image/jpeg",), (b"\xff\xd8\xff",)),
     ".webp": (("image/webp", "image/riff"), (b"RIFF",)),
+    ".gif":  (("image/gif",), (b"GIF87a", b"GIF89a")),
+    ".bmp":  (("image/bmp", "image/x-ms-bmp"), (b"BM",)),
+    ".tif":  (("image/tiff",), (b"II*\x00", b"MM\x00*")),
+    ".tiff": (("image/tiff",), (b"II*\x00", b"MM\x00*")),
     ".docx": (("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
     ".xlsx": (("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
+    ".odt":  (("application/vnd.oasis.opendocument.text",
+               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
+    ".ods":  (("application/vnd.oasis.opendocument.spreadsheet",
+               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
+    ".odp":  (("application/vnd.oasis.opendocument.presentation",
+               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
+    ".pptx": (("application/vnd.openxmlformats-officedocument.presentationml.presentation",
                "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
     ".txt":  (("text/plain", "text/markdown", "application/octet-stream"), ()),
     ".md":   (("text/markdown", "text/plain", "application/octet-stream"), ()),
@@ -78,7 +90,7 @@ _EXT_RULES: dict[str, tuple[tuple[str, ...], tuple[bytes, ...]]] = {
     ".json": (("application/json", "text/plain", "application/octet-stream"), ()),
 }
 
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 _TABLE_EXTS = {".csv", ".xlsx"}
 
 

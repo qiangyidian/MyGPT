@@ -373,6 +373,50 @@ def _parse_doc(path: str, _ext: str) -> ParsedDocument:
     return result
 
 
+def _parse_via_libreoffice(path: str, src_ext: str, target_ext: str, parse_fn):
+    """Parse a mainstream-but-unsupported format by converting it via LibreOffice
+    to an OOXML equivalent, then reusing the first-class parser.
+
+    Covers OpenDocument (.odt/.ods/.odp) and legacy PowerPoint (.ppt). Requires
+    LibreOffice (soffice) on PATH — same constraint as legacy .doc/.xls.
+    """
+    converted = _convert_via_libreoffice(path, target_ext)
+    if not converted:
+        raise ValueError(
+            f"{src_ext} 需要 LibreOffice (soffice) 才能解析；"
+            f"请将文件另存为 {target_ext} 后重新上传，或安装 LibreOffice 并确保 soffice 在 PATH。"
+        )
+    result = parse_fn(converted, target_ext)
+    inner = result.metadata.get("parser_used", "?")
+    result.metadata["parser_used"] = f"libreoffice->{inner}"
+    result.metadata["converted_from"] = src_ext
+    try:
+        os.remove(converted)
+    except OSError:
+        pass
+    return result
+
+
+def _parse_odt(path: str, _ext: str) -> ParsedDocument:
+    """OpenDocument Text (.odt) -> .docx via LibreOffice."""
+    return _parse_via_libreoffice(path, ".odt", ".docx", _parse_docx)
+
+
+def _parse_ods(path: str, _ext: str) -> ParsedDocument:
+    """OpenDocument Spreadsheet (.ods) -> .xlsx via LibreOffice."""
+    return _parse_via_libreoffice(path, ".ods", ".xlsx", _parse_table)
+
+
+def _parse_odp(path: str, _ext: str) -> ParsedDocument:
+    """OpenDocument Presentation (.odp) -> .pptx via LibreOffice."""
+    return _parse_via_libreoffice(path, ".odp", ".pptx", _parse_pptx)
+
+
+def _parse_ppt(path: str, _ext: str) -> ParsedDocument:
+    """Legacy PowerPoint (.ppt) -> .pptx via LibreOffice."""
+    return _parse_via_libreoffice(path, ".ppt", ".pptx", _parse_pptx)
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -393,6 +437,11 @@ _EXT_TO_PARSER: dict[str, Callable[[str, str], ParsedDocument]] = {
     ".htm": _parse_html,
     ".epub": _parse_epub,
     ".rtf": _parse_rtf,
+    # OpenDocument + legacy PowerPoint via LibreOffice conversion.
+    ".odt": _parse_odt,
+    ".ods": _parse_ods,
+    ".odp": _parse_odp,
+    ".ppt": _parse_ppt,
 }
 
 

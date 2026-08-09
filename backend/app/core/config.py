@@ -150,8 +150,10 @@ class Settings(BaseSettings):
     # ---- Chat attachments (Phase 1) ----
     # Broader than KB uploads: includes images for multimodal chat.
     ATTACHMENT_ALLOWED_EXT: str = (
-        ".pdf,.docx,.txt,.md,.csv,.xlsx,.json,.png,.jpg,.jpeg,.webp,"
-        ".pptx,.html,.htm,.epub,.rtf,.doc,.xls"
+        ".pdf,.docx,.txt,.md,.markdown,.csv,.xlsx,.xls,.json,"
+        ".png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,"
+        ".pptx,.ppt,.html,.htm,.epub,.rtf,.doc,"
+        ".odt,.ods,.odp"
     )
     ATTACHMENT_MAX_MB: int = 20
     MAX_ATTACHMENTS_PER_MESSAGE: int = 10
