@@ -259,6 +259,10 @@ class CrewAIRuntime:
 
         try:
             result = await crew.kickoff_async()
+        except PromptAdmissionError as exc:
+            ctx.extra["finish_reason"] = "budget"
+            yield ev_error(code=exc.code, message=str(exc))
+            return
         except Exception as exc:  # noqa: BLE001
             logger.exception("crewai kickoff failed: %s", exc)
             yield ev_error(code="crewai_run_error", message=str(exc))

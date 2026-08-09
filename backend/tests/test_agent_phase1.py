@@ -116,9 +116,16 @@ def test_crewai_llm_factory_uses_exact_output_parameter(
 ):
     captured = {}
 
+    class FakeLLM(types.SimpleNamespace):
+        def call(self, *args, **kwargs):
+            return "ok"
+
+        async def acall(self, *args, **kwargs):
+            return "ok"
+
     def fake_llm(**kwargs):
         captured.update(kwargs)
-        return types.SimpleNamespace(**kwargs)
+        return FakeLLM(**kwargs)
 
     import crewai
 
