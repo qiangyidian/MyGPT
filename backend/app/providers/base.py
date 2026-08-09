@@ -71,6 +71,9 @@ class ChatDelta:
     content: str = ""
     tool_calls: list[ToolCallDef] | None = None
     finish_reason: FinishReason | None = None
+    # Token usage — populated on the final usage-only chunk when streaming with
+    # include_usage (OpenAI-compatible), or on ChatResult for non-streaming.
+    usage: dict[str, int] | None = None
 
 
 @dataclass

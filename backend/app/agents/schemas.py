@@ -312,8 +312,16 @@ def ev_citations(*, citations: list[Citation]) -> AgentEvent:
     return AgentEvent(kind="citations", data={"citations": [c.model_dump(mode="json") for c in citations]})
 
 
-def ev_done(*, message_id: uuid.UUID | str, finish_reason: FinishReason = "stop") -> AgentEvent:
-    return AgentEvent(kind="done", data={"message_id": str(message_id), "finish_reason": finish_reason})
+def ev_done(
+    *,
+    message_id: uuid.UUID | str,
+    finish_reason: FinishReason = "stop",
+    usage: dict[str, int] | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {"message_id": str(message_id), "finish_reason": finish_reason}
+    if usage is not None:
+        data["usage"] = usage
+    return AgentEvent(kind="done", data=data)
 
 
 def ev_error(*, code: str, message: str) -> AgentEvent:

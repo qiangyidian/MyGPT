@@ -35,6 +35,24 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
+def validate_password_strength(password: str) -> None:
+    """Enforce the configured password policy. Raises ValueError on violation.
+
+    Replaces the implicit "any non-empty string" policy. Min length + (when
+    enabled) a basic complexity rule covering upper/lower/digit to resist
+    brute-force / credential-stuffing on the login + register endpoints.
+    """
+    from app.core.exceptions import AppException
+
+    s = get_settings()
+    pwd = password or ""
+    if len(pwd) < int(getattr(s, "PASSWORD_MIN_LENGTH", 8)):
+        raise AppException(400, "password_too_short", f"密码至少需要 {s.PASSWORD_MIN_LENGTH} 个字符")
+    if getattr(s, "PASSWORD_REQUIRE_COMPLEXITY", True):
+        if not (any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd)):
+            raise AppException(400, "password_too_weak", "密码需包含大写字母、小写字母和数字")
+
+
 # ---- JWT -------------------------------------------------------------------
 ACCESS_TOKEN_TYPE = "access"
 REFRESH_TOKEN_TYPE = "refresh"

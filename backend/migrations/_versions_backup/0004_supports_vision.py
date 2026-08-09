@@ -23,9 +23,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Baseline (0000_initial) already created the full schema incl. this column.
-    if "supports_vision" in {c["name"] for c in sa.inspect(op.get_bind()).get_columns("model_configs")}:
-        return
     with op.batch_alter_table("model_configs") as batch:
         batch.add_column(
             sa.Column(

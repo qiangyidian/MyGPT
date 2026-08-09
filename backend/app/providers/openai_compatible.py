@@ -137,6 +137,10 @@ class OpenAICompatibleProvider(ModelProvider):
             "top_p": opts.top_p,
             "stream": stream,
         }
+        if stream:
+            # Ask OpenAI-compatible endpoints to emit a final usage-only chunk so
+            # we can persist per-message token accounting (cost/budget).
+            payload["stream_options"] = {"include_usage": True}
         # Omit max_tokens when None → endpoint uses its own maximum (no truncation).
         if opts.max_tokens is not None:
             payload["max_tokens"] = opts.max_tokens
@@ -268,6 +272,7 @@ class OpenAICompatibleProvider(ModelProvider):
         # Accumulate per-tool-call deltas (id/function.name/arguments stream in pieces).
         tool_accum: dict[int, dict[str, Any]] = {}
         seen_real_finish: FinishReason | None = None
+        final_usage: dict[str, int] | None = None
         async for raw_line in resp.aiter_lines():
             if not raw_line:
                 continue
@@ -289,6 +294,10 @@ class OpenAICompatibleProvider(ModelProvider):
                 # finish_reason; otherwise the real reason already went out.
                 if seen_real_finish is None:
                     yield ChatDelta(content="", tool_calls=None, finish_reason="stop")
+                # Emit the captured usage (if any) as a final out-of-band delta so
+                # callers can persist per-message token accounting.
+                if final_usage is not None:
+                    yield ChatDelta(content="", tool_calls=None, finish_reason=None, usage=final_usage)
                 return
             try:
                 obj = json.loads(data_str)
@@ -297,7 +306,10 @@ class OpenAICompatibleProvider(ModelProvider):
                 continue
             choices = obj.get("choices") or []
             if not choices:
-                # usage-only / routing chunk — must not end generation.
+                # usage-only / routing chunk — capture usage (for token accounting)
+                # but never end generation on it.
+                if obj.get("usage"):
+                    final_usage = obj["usage"]
                 continue
             choice = choices[0]
             delta = choice.get("delta") or {}

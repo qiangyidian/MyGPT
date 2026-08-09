@@ -20,6 +20,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.responses import JSONResponse
 
 from app.api import (
     admin,
@@ -37,6 +39,7 @@ from app.api import (
     projects,
     retrieval,
     tools,
+    usage,
 )
 from app.core.bootstrap import init_db
 from app.core.config import get_settings
@@ -83,6 +86,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # GZip compress large JSON / SSE-adjacent payloads (bounded bandwidth).
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Baseline security response headers (CSP/HSTS/X-Frame-Options/…).
+    from app.core.middleware import SecurityHeadersMiddleware
+    app.add_middleware(SecurityHeadersMiddleware)
 
     register_exception_handlers(app)
 
@@ -102,10 +110,17 @@ def create_app() -> FastAPI:
     app.include_router(projects.router)
     app.include_router(memories.router)
     app.include_router(background_tasks.router)
+    app.include_router(usage.router)
 
     @app.get("/health", tags=["health"])
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> JSONResponse:
+        # Real readiness probe: pings DB (hard dep) + Redis + Qdrant concurrently.
+        # 200 when healthy, 503 when the DB (or all deps) are down so a
+        # load-balancer / k8s readiness gate can pull the instance out.
+        from app.core.health import check_health
+        result = await check_health()
+        status_code = 200 if result["status"] == "ok" else 503
+        return JSONResponse(result, status_code=status_code)
 
     return app
 

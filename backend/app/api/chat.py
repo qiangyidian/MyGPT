@@ -121,6 +121,10 @@ async def chat_stream(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
+    # Idempotency: a client-supplied Idempotency-Key dedupes retried sends
+    # (prevents duplicate assistant turns + duplicate model spend).
+    from app.core.idempotency import check as idempotency_check
+    await idempotency_check(request, user.id)
     if payload.conversation_id is not None:
         await _assert_owned(db, payload.conversation_id, user)
 

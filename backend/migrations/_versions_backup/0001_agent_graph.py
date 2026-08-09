@@ -24,7 +24,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0001_agent_graph"
-down_revision: Union[str, None] = "0000_initial"
+down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -48,10 +48,6 @@ def _uuid_type() -> sa.types.TypeEngine:
 
 
 def upgrade() -> None:
-    # Baseline (0000_initial) already created the full schema including these
-    # columns — no-op on a fresh DB; run normally on a legacy DB upgrading through.
-    if "graph_definition" in {c["name"] for c in sa.inspect(op.get_bind()).get_columns("agent_runs")}:
-        return
     # agent_runs: graph columns
     with op.batch_alter_table("agent_runs") as batch:
         batch.add_column(sa.Column("graph_definition", _json_type(), nullable=True))

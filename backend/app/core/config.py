@@ -234,6 +234,31 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "admin"
     ADMIN_PASSWORD: str = "changeme123"
 
+    # ---- Token / cost accounting + security policy ----
+    # Per-message token usage is persisted (Message.prompt/completion/total_tokens).
+    # Cost is computed from this price table: a JSON map of model-substring ->
+    # {"prompt": <USD per 1M prompt tokens>, "completion": <USD per 1M completion>}.
+    # First matching substring (longest-first) wins. Empty => cost left null.
+    # Example: {"gpt-4o": {"prompt": 2.5, "completion": 10}, "gpt-4o-mini": {"prompt": 0.15, "completion": 0.6}}
+    MODEL_PRICING_JSON: str = ""
+    # Password policy (applied at register/change). min length + complexity toggle.
+    PASSWORD_MIN_LENGTH: int = 8
+    PASSWORD_REQUIRE_COMPLEXITY: bool = True
+    # Idempotency window for chat sends: a client-supplied Idempotency-Key within
+    # this TTL dedupes a retried send (avoids double model spend on flaky networks).
+    IDEMPOTENCY_TTL_SECONDS: int = 600
+    # Backpressure: cap on concurrent in-flight model calls across the process.
+    # Bounds DB-pool + provider-connection exhaustion under burst load.
+    MAX_CONCURRENT_MODEL_CALLS: int = 16
+    # Circuit breaker: open a provider's circuit after this many consecutive
+    # failures, then fast-fail for the cooldown before a half-open probe.
+    MODEL_CIRCUIT_FAILURE_THRESHOLD: int = 5
+    MODEL_CIRCUIT_COOLDOWN_SECONDS: float = 30.0
+    # Semantic cache (W2): cache exact (model+messages) completions for this TTL
+    # so identical prompts skip the model entirely. 0 disables.
+    SEMANTIC_CACHE_TTL_SECONDS: int = 0
+    SEMANTIC_CACHE_ENABLED: bool = False
+
     # ---- Derived ----
     @property
     def cors_origins(self) -> List[str]:

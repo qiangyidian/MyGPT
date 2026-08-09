@@ -161,3 +161,4 @@ bash.exe.stackdump
 # third-party code under a different license. Keep such clones OUTSIDE the repo.
 codex/
 
+.github/workflows/ci.yml

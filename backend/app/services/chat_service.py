@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import replace
 from typing import Any, AsyncIterator
@@ -499,6 +500,7 @@ class ChatService:
     async def _run(
         self, db: AsyncSession, user: User, request: ChatRequest
     ) -> AsyncIterator[dict[str, Any]]:
+        turn_started = time.monotonic()  # for per-message latency accounting
         # 1. Resolve conversation + model.
         conversation = await _get_or_create_conversation(db, user, request)
         cfg = await _resolve_model_config(db, request, conversation)
@@ -922,6 +924,18 @@ class ChatService:
                     if rag_skipped_reason:
                         assistant_msg.metadata_["rag_skipped_reason"] = rag_skipped_reason
                     assistant_msg.metadata_["citation_count"] = len(citations)
+                    # Token / cost accounting: persist usage from the provider
+                    # (propagated through the runtime's done event). The provider
+                    # parses usage; it used to be discarded — now it answers
+                    # "who spent what" and enables per-user budgets.
+                    from app.core.pricing import compute_cost, normalize_usage
+                    _usage = normalize_usage(evt.data.get("usage"))
+                    if _usage is not None:
+                        assistant_msg.prompt_tokens = _usage["prompt_tokens"]
+                        assistant_msg.completion_tokens = _usage["completion_tokens"]
+                        assistant_msg.total_tokens = _usage["total_tokens"]
+                        assistant_msg.cost_usd = compute_cost(cfg.model_name, evt.data.get("usage"))
+                    assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                     _log_turn_outcome(
                         "complete",
                         sel=sel,

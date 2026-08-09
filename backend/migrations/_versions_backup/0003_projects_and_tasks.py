@@ -44,9 +44,6 @@ def _uuid_type() -> sa.types.TypeEngine:
 
 
 def upgrade() -> None:
-    # Baseline (0000_initial) already created the full schema incl. these tables.
-    if "projects" in sa.inspect(op.get_bind()).get_table_names():
-        return
     op.create_table(
         "projects",
         sa.Column("id", _uuid_type(), primary_key=True),

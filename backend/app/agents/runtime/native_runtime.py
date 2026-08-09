@@ -131,6 +131,7 @@ class NativeChatRuntime:
 
         working: list[dict[str, Any]] = list(ctx.messages)
         finish_reason = "stop"
+        turn_usage: dict[str, int] | None = None  # accumulated token usage (final chunk)
 
         yield ev_step_started(
             step_id="answer", title="生成回答", step_type="llm", agent="assistant",
@@ -153,6 +154,12 @@ class NativeChatRuntime:
                 accumulated: list[str] = []
                 pending_tool_calls: list[ToolCallDef] = []
 
+                # Backpressure (bound concurrent in-flight model calls) + circuit
+                # breaker (fast-fail when this provider endpoint is down).
+                from app.core.concurrency import model_breaker, model_limiter
+                _breaker_key = f"{getattr(provider, 'base_url', '')}|{getattr(provider, 'model', '')}"
+                model_breaker().before(_breaker_key)
+                await model_limiter().acquire()
                 try:
                     async for delta in provider.stream_chat(working, options):
                         ctl = ctx.extra.get("run_control")
@@ -167,7 +174,11 @@ class NativeChatRuntime:
                             pending_tool_calls.extend(delta.tool_calls)
                         if delta.finish_reason:
                             finish_reason = delta.finish_reason
+                        if delta.usage:
+                            turn_usage = delta.usage
+                    model_breaker().record_success(_breaker_key)
                 except ProviderError as exc:
+                    model_breaker().record_failure(_breaker_key)
                     # Fold this round's partial text before surfacing the error,
                     # so a mid-stream timeout/network failure still preserves
                     # everything generated so far.
@@ -180,6 +191,8 @@ class NativeChatRuntime:
                     for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
                         yield _evt
                     return
+                finally:
+                    model_limiter().release()
 
                 # Fold this round's streamed text into the assistant message so a
                 # mid-loop disconnect still leaves recoverable content.
@@ -346,7 +359,7 @@ class NativeChatRuntime:
         ctx.extra["budget"] = guard.snapshot()
         for _evt in _native_terminal_events(ctx, _node_terminal, _assistant_started):
             yield _evt
-        yield ev_done(message_id=assistant_msg.id, finish_reason=finish_reason)
+        yield ev_done(message_id=assistant_msg.id, finish_reason=finish_reason, usage=turn_usage)
 
     @staticmethod
     async def _set_run_status(ctx: AgentTurnContext, status: str) -> None:

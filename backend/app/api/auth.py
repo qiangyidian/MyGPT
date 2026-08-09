@@ -52,6 +52,9 @@ async def register(
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     """Create a new user account and issue tokens immediately."""
+    # Password policy (replaces implicit "any non-empty string").
+    from app.core.security import validate_password_strength
+    validate_password_strength(payload.password)
     # Uniqueness checks.
     existing = await db.execute(
         select(User).where((User.email == payload.email) | (User.username == payload.username))

@@ -48,10 +48,6 @@ def _uuid_type() -> sa.types.TypeEngine:
 
 
 def upgrade() -> None:
-    # Baseline (0000_initial) already created the full schema incl. these — no-op
-    # on a fresh DB; run normally on a legacy DB upgrading through the chain.
-    if "chat_attachments" in sa.inspect(op.get_bind()).get_table_names():
-        return
     # ---- conversations: management columns ----
     with op.batch_alter_table("conversations") as batch:
         batch.add_column(

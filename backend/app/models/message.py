@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import BigInteger, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -21,6 +21,14 @@ class Message(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Per-message token/cost accounting. Populated for assistant messages from
+    # the provider usage payload (the provider already parses usage; it used to
+    # be discarded). Lets ops answer "who spent what" and enforce budgets.
+    prompt_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     conversation = relationship(
         "Conversation",
