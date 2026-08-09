@@ -10,6 +10,7 @@ import type { ModelConfig, ModelConfigInput } from "@/lib/types";
 import {
   parseOptionalNumber,
   parseOptionalPositiveInteger,
+  normalizeParallelTools,
   validateModelConfigNumbers,
 } from "@/lib/model-config-validation";
 import { Button } from "@/components/ui/button";
@@ -130,7 +131,10 @@ export default function ModelsPage() {
       embedding_model_name: m.embedding_model_name ?? "",
       supports_stream: m.supports_stream,
       supports_tools: m.supports_tools,
-      supports_parallel_tools: m.supports_parallel_tools,
+      supports_parallel_tools: normalizeParallelTools(
+        m.supports_tools,
+        m.supports_parallel_tools,
+      ),
       supports_vision: m.supports_vision,
       supports_audio_input: m.supports_audio_input,
       supports_audio_output: m.supports_audio_output,
@@ -157,8 +161,15 @@ export default function ModelsPage() {
       toast.error(numericError);
       return;
     }
-    if (editing) updateMut.mutate({ id: editing.id, body: form });
-    else createMut.mutate(form);
+    const normalized = {
+      ...form,
+      supports_parallel_tools: normalizeParallelTools(
+        !!form.supports_tools,
+        !!form.supports_parallel_tools,
+      ),
+    };
+    if (editing) updateMut.mutate({ id: editing.id, body: normalized });
+    else createMut.mutate(normalized);
   }
 
   return (
@@ -384,12 +395,20 @@ export default function ModelsPage() {
               <Toggle
                 label="支持工具调用"
                 checked={!!form.supports_tools}
-                onChange={(v) => setForm({ ...form, supports_tools: v })}
+                onChange={(v) => setForm({
+                  ...form,
+                  supports_tools: v,
+                  supports_parallel_tools: normalizeParallelTools(
+                    v,
+                    !!form.supports_parallel_tools,
+                  ),
+                })}
               />
               <Toggle
                 label="支持并行工具"
                 checked={!!form.supports_parallel_tools}
                 onChange={(v) => setForm({ ...form, supports_parallel_tools: v })}
+                disabled={!form.supports_tools}
               />
               <Toggle
                 label="支持视觉（图片输入）"
@@ -458,14 +477,20 @@ function Toggle({
   label,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <label className="flex cursor-pointer items-center gap-2 text-sm">
-      <Switch checked={checked} onCheckedChange={onChange} />
+    <label
+      className={`flex items-center gap-2 text-sm ${
+        disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+      }`}
+    >
+      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
       {label}
     </label>
   );

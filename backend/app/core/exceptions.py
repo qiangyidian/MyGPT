@@ -47,6 +47,17 @@ def _envelope(code: str, message: str, status_code: int, extra: dict[str, Any] |
     return JSONResponse(status_code=status_code, content=body)
 
 
+def _sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep useful field diagnostics without reflecting the submitted body.
+
+    Pydantic's error dictionaries can contain the complete request in ``input``
+    and arbitrary validator state in ``ctx``. Validation responses are public,
+    so allow-list only the stable, non-secret diagnostic fields.
+    """
+    allowed = ("loc", "msg", "type", "url")
+    return [{key: error[key] for key in allowed if key in error} for error in errors]
+
+
 async def _app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
     return _envelope(exc.code, exc.message, exc.status_code, exc.extra)
 
@@ -54,11 +65,12 @@ async def _app_exception_handler(request: Request, exc: AppException) -> JSONRes
 async def _validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    # Collapse pydantic validation errors into a readable message; full detail
-    # list is preserved under "details" for clients that want field-level info.
-    # Pydantic model validators may put the originating ValueError object in
-    # ``ctx.error``; normalize it so the uniform 422 envelope is always JSON-safe.
-    errors = json.loads(json.dumps(exc.errors(), default=str))
+    # Collapse pydantic validation errors into a readable message. Safe
+    # field-level diagnostics remain under ``details``; submitted input and
+    # validator context are intentionally excluded because either can contain
+    # credentials.
+    errors = _sanitize_validation_errors(exc.errors())
+    errors = json.loads(json.dumps(errors, default=str))
     first = errors[0] if errors else {}
     loc = ".".join(str(p) for p in first.get("loc", []) if p not in ("body",))
     msg = first.get("msg", "Validation failed")

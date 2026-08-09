@@ -4,6 +4,7 @@ import {
   parseOptionalNumber,
   parseOptionalPositiveInteger,
   validateModelConfigNumbers,
+  normalizeParallelTools,
 } from "../model-config-validation";
 
 
@@ -37,5 +38,10 @@ describe("model config numeric validation", () => {
         top_p: 1,
       }),
     ).not.toBeNull();
+  });
+
+  it("clears parallel tools whenever tool support is disabled", () => {
+    expect(normalizeParallelTools(false, true)).toBe(false);
+    expect(normalizeParallelTools(true, true)).toBe(true);
   });
 });

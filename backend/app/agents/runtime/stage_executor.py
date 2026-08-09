@@ -23,8 +23,18 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from app.agents.stage_context import StageContext
+from app.agents.token_budget import (
+    MESSAGE_TOO_LARGE,
+    PromptAdmissionError,
+    calculate_prompt_budget,
+)
+from app.model_capabilities import capabilities_from_config
 
 logger = logging.getLogger(__name__)
+
+_STAGE_SYSTEM_TOKEN_RESERVE = 512
+_STAGE_TOOL_TOKEN_RESERVE = 256
+_TRUNCATION_MARKER = "[Earlier dependency context truncated]\n"
 
 
 def safe_positive_int(value: Any, default: int) -> int:
@@ -93,8 +103,11 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
+        admitted_context = _admit_stage_dispatch(
+            agent=agent, task=task, context=context, stage_ctx=stage_ctx
+        )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
-        output = await agent.aexecute_task(task, context=context)
+        output = await agent.aexecute_task(task, context=admitted_context)
         raw = _extract_raw(output)
         return StageResult(
             agent_id=agent_id,
@@ -102,6 +115,45 @@ class CrewAIStageExecutor:
             output_summary=_summarize(raw, self._summarize_chars),
             structured=output,
         )
+
+
+def _admit_stage_dispatch(
+    *, agent: Any, task: Any, context: str | None, stage_ctx: StageContext
+) -> str | None:
+    """Bound the exact task/context immediately before CrewAI dispatch."""
+    cfg = stage_ctx.model_config
+    if cfg is None:
+        return context
+
+    caps = capabilities_from_config(cfg)
+    tool_count = len(getattr(agent, "tools", None) or [])
+    budget = calculate_prompt_budget(
+        caps,
+        requested_output=caps.max_output_tokens,
+        tool_schema_tokens=(
+            _STAGE_SYSTEM_TOKEN_RESERVE + tool_count * _STAGE_TOOL_TOKEN_RESERVE
+        ),
+    )
+    # One character per token is deliberately conservative for mixed CJK,
+    # source code, and serialized dependency payloads.
+    description = str(getattr(task, "description", "") or "")
+    if len(description) > budget.input_tokens:
+        raise PromptAdmissionError(
+            MESSAGE_TOO_LARGE,
+            "The stage task is too large for this model's prompt budget",
+        )
+
+    if context is None:
+        return None
+    remaining = budget.input_tokens - len(description)
+    if len(context) <= remaining:
+        return context
+    if remaining <= len(_TRUNCATION_MARKER):
+        raise PromptAdmissionError(
+            MESSAGE_TOO_LARGE,
+            "The stage task leaves no room for dependency context",
+        )
+    return _TRUNCATION_MARKER + context[-(remaining - len(_TRUNCATION_MARKER)) :]
 
 
 # --------------------------------------------------------------------------- #

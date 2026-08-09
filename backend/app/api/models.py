@@ -143,6 +143,8 @@ async def update_model(
         raise HTTPException(FORBID, "Only admins can edit system-wide configs")
 
     data = payload.model_dump(exclude_unset=True)
+    if data.get("supports_tools") is False:
+        data["supports_parallel_tools"] = False
     # api_key is write-only and never echoed; empty string means "leave unchanged".
     if "api_key" in data:
         new_key = data.pop("api_key")

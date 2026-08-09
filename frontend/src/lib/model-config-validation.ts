@@ -16,6 +16,14 @@ export function parseOptionalPositiveInteger(raw: string): number | undefined {
 }
 
 
+export function normalizeParallelTools(
+  supportsTools: boolean,
+  supportsParallelTools: boolean,
+): boolean {
+  return supportsTools && supportsParallelTools;
+}
+
+
 export function validateModelConfigNumbers(
   input: Pick<
     ModelConfigInput,

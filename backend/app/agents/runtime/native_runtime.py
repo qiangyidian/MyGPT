@@ -32,6 +32,7 @@ from app.agents.policies import BudgetExceeded, BudgetGuard
 from app.agents.graph import build_single_agent_graph
 from app.agents.planning import build_plan, classify_intent
 from app.agents.runtime.stage_executor import safe_positive_int
+from app.agents.token_budget import PromptAdmissionError
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -159,6 +160,34 @@ class NativeChatRuntime:
 
                 accumulated: list[str] = []
                 pending_tool_calls: list[ToolCallDef] = []
+
+                # Tool results expand ``working`` between rounds. Re-admit the
+                # exact payload immediately before every provider dispatch so
+                # a large result can never bypass the model context limit.
+                from app.services.chat_service import (
+                    _admit_and_trim_history,
+                    _estimate_tokens,
+                )
+                tool_schema_tokens = (
+                    _estimate_tokens(
+                        json.dumps(options.tools, ensure_ascii=False, default=str),
+                        cfg.model_name,
+                    )
+                    if options.tools
+                    else 0
+                )
+                try:
+                    working = _admit_and_trim_history(
+                        working,
+                        cfg,
+                        model_name=cfg.model_name,
+                        tool_schema_tokens=tool_schema_tokens,
+                    )
+                except PromptAdmissionError as exc:
+                    finish_reason = "budget"
+                    ctx.extra["admission_error_code"] = exc.code
+                    logger.info("native provider dispatch rejected: %s", exc.code)
+                    break
 
                 # Backpressure (bound concurrent in-flight model calls) + circuit
                 # breaker (fast-fail when this provider endpoint is down).

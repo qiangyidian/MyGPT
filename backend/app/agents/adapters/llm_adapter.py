@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.security import decrypt_secret
+from app.model_capabilities import capabilities_from_config
 from app.models import ModelConfig
 
 
@@ -32,12 +33,13 @@ class CrewAILLMFactory:
             base_url=cfg.api_base_url,
             api_key=api_key,
             temperature=cfg.temperature,
-            max_tokens=cfg.max_tokens,
             # Stream so the gateway's per-request actor (30s on the GLM proxy)
             # stays alive while tokens flow. Non-stream, a single 2048-token
             # reasoning call takes ~70s and 500s ("Actor timed out").
             stream=True,
         )
+        output_parameter = capabilities_from_config(cfg).output_token_parameter
+        kwargs[output_parameter] = cfg.max_tokens
         if cfg.top_p is not None:
             kwargs["top_p"] = cfg.top_p
 

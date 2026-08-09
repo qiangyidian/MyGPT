@@ -328,16 +328,28 @@ def _trim_history(
     if total <= max_tokens:
         return messages
 
-    while len(messages) > 2 and total > max_tokens:
+    latest_user_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, 0, -1)
+            if messages[index].get("role") == "user"
+        ),
+        1,
+    )
+    while latest_user_index > 1 and total > max_tokens:
         # Remove a complete oldest turn where possible, rather than leaving an
         # orphaned assistant/tool response after its user prompt was trimmed.
         cutoff = 2
         if messages[1].get("role") == "user":
-            while cutoff < len(messages) and messages[cutoff].get("role") != "user":
+            while (
+                cutoff < latest_user_index
+                and messages[cutoff].get("role") != "user"
+            ):
                 cutoff += 1
         total -= sum(costs[1:cutoff])
         del messages[1:cutoff]
         del costs[1:cutoff]
+        latest_user_index -= cutoff - 1
     return messages
 
 

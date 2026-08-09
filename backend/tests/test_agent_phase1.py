@@ -104,6 +104,45 @@ def test_crewai_llm_factory_from_model_config():
     assert llm.api_key == "sk-test"  # decrypted, not the ciphertext
 
 
+@pytest.mark.parametrize(
+    ("parameter", "expected_key"),
+    [
+        ("max_tokens", "max_tokens"),
+        ("max_completion_tokens", "max_completion_tokens"),
+    ],
+)
+def test_crewai_llm_factory_uses_exact_output_parameter(
+    monkeypatch, parameter: str, expected_key: str
+):
+    captured = {}
+
+    def fake_llm(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(**kwargs)
+
+    import crewai
+
+    monkeypatch.setattr(crewai, "LLM", fake_llm)
+    cfg = ModelConfig(
+        name="reasoner",
+        provider="openai-compatible",
+        api_base_url="http://localhost:8000/v1",
+        api_key_encrypted=encrypt_secret("sk-test"),
+        model_name="reasoner",
+        temperature=0.3,
+        max_tokens=321,
+        output_token_parameter=parameter,
+    )
+
+    CrewAILLMFactory.from_model_config(cfg)
+
+    assert captured[expected_key] == 321
+    other_key = (
+        "max_completion_tokens" if expected_key == "max_tokens" else "max_tokens"
+    )
+    assert other_key not in captured
+
+
 # --------------------------------------------------------------------------- #
 # Tool adapter
 # --------------------------------------------------------------------------- #

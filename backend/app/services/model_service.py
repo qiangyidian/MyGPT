@@ -101,6 +101,8 @@ async def update(
     if cfg is None:
         return None
     updates = data.model_dump(exclude_unset=True)
+    if updates.get("supports_tools") is False:
+        updates["supports_parallel_tools"] = False
 
     api_key = updates.pop("api_key", None)
     if api_key:  # only overwrite when a non-empty key is supplied

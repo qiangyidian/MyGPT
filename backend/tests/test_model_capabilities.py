@@ -96,6 +96,21 @@ def test_model_config_schemas_validate_limits_and_output_parameter():
         ModelConfigUpdate(output_token_parameter="both")
 
 
+def test_parallel_tools_require_tool_support_in_create_and_update():
+    common = {
+        "name": "parallel",
+        "api_base_url": "https://example.test/v1",
+        "model_name": "parallel-model",
+    }
+    with pytest.raises(ValidationError):
+        ModelConfigCreate(**common, supports_tools=False, supports_parallel_tools=True)
+    with pytest.raises(ValidationError):
+        ModelConfigUpdate(supports_parallel_tools=True)
+
+    update = ModelConfigUpdate(supports_tools=True, supports_parallel_tools=True)
+    assert update.supports_parallel_tools is True
+
+
 @pytest.mark.parametrize(
     "field",
     [

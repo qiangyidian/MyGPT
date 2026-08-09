@@ -97,6 +97,55 @@ async def test_model_update_rejects_null_non_nullable_capability(client):
     assert updated.status_code == 422
 
 
+async def test_model_validation_error_never_echoes_api_key_or_raw_input(client):
+    secret = "sk-plaintext-must-never-echo"
+    response = await client.post(
+        "/api/models",
+        json={
+            "name": "Secret validation",
+            "provider": "mock",
+            "api_base_url": "http://localhost/v1",
+            "api_key": secret,
+            "model_name": "mock-model",
+            "supports_parallel_tools": True,
+            "supports_tools": False,
+        },
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 422
+    assert secret not in response.text
+    errors = response.json()["details"]["errors"]
+    assert all("input" not in error for error in errors)
+
+
+async def test_disabling_tools_also_disables_parallel_tools(client):
+    h = auth_headers()
+    created = await client.post(
+        "/api/models",
+        json={
+            "name": "Parallel model",
+            "provider": "mock",
+            "api_base_url": "http://localhost/v1",
+            "model_name": "mock-model",
+            "supports_tools": True,
+            "supports_parallel_tools": True,
+        },
+        headers=h,
+    )
+    assert created.status_code == 201, created.text
+
+    updated = await client.put(
+        f"/api/models/{created.json()['id']}",
+        json={"supports_tools": False},
+        headers=h,
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["supports_tools"] is False
+    assert updated.json()["supports_parallel_tools"] is False
+
+
 async def test_model_test_endpoint_ok(client):
     h = auth_headers()
     created = await client.post(

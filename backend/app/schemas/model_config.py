@@ -32,6 +32,12 @@ class ModelConfigBase(BaseModel):
     top_p: float = 1.0
     is_embedding: bool = False
 
+    @model_validator(mode="after")
+    def parallel_tools_require_tools(self) -> "ModelConfigBase":
+        if self.supports_parallel_tools and not self.supports_tools:
+            raise ValueError("parallel tool support requires tool support")
+        return self
+
 
 class ModelConfigCreate(ModelConfigBase):
     pass
@@ -70,6 +76,10 @@ class ModelConfigUpdate(BaseModel):
         if explicit_nulls:
             raise ValueError(
                 "fields cannot be null: " + ", ".join(sorted(explicit_nulls))
+            )
+        if self.supports_parallel_tools is True and self.supports_tools is not True:
+            raise ValueError(
+                "supports_parallel_tools requires supports_tools=true in the same update"
             )
         return self
 

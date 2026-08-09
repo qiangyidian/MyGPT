@@ -40,19 +40,23 @@ class _FakeProvider:
 
     def __init__(self, rounds):
         self._rounds = list(rounds)
+        self.calls = []
 
     async def stream_chat(self, messages, options=None):
+        self.calls.append(list(messages))
         for delta in self._rounds.pop(0):
             yield delta
 
 
 class _FakeExecution(SimpleNamespace):
+    full_result = None
+
     def to_openai_tool_message(self):
         return {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
             "name": self.name,
-            "content": '{"content": "search hits"}',
+            "content": getattr(self, "content", '{"content": "search hits"}'),
         }
 
 
@@ -173,3 +177,55 @@ async def test_native_tool_events_attributed_to_assistant(db_session, monkeypatc
 
     starts = {d["step_id"] for d in _find_all(events, "step_started")}
     assert "plan" in starts and "answer" in starts
+
+
+async def test_native_rejects_oversized_tool_result_before_second_model_round(
+    db_session, monkeypatch
+):
+    huge_content = "tool-result-item " * 10_000
+    ctx = await _seed_native_ctx(db_session, enable_tools=True)
+    ctx.model_config.max_context_tokens = 4_000
+    ctx.model_config.max_tokens = 200
+    ctx.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "current request"},
+    ]
+
+    class HugeResultGateway(_FakeGateway):
+        async def execute(self, *, tool_call_id, tool_name, arguments):
+            return _FakeExecution(
+                status="success",
+                ok=True,
+                approval_id=None,
+                result={"content": huge_content},
+                error=None,
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                content=huge_content,
+            )
+
+    provider = _FakeProvider(
+        [
+            [
+                ChatDelta(
+                    tool_calls=[
+                        ToolCallDef(
+                            id="c1", name="web_search", arguments='{"query":"x"}'
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [ChatDelta(content="must not run"), ChatDelta(finish_reason="stop")],
+        ]
+    )
+    monkeypatch.setattr("app.agents.runtime.native_runtime.ToolGateway", HugeResultGateway)
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+
+    events = await _collect(ctx)
+
+    assert len(provider.calls) == 1
+    done = _find_all(events, "done")
+    assert done[-1]["finish_reason"] == "budget"
