@@ -145,6 +145,12 @@ def _blocked_execution(orig: ToolExecution, reason: str) -> ToolExecution:
 
 
 def _result_preview(exec_: ToolExecution) -> Any:
+    # Prefer the UNTRUNCATED result so the SSE tool_result → UI can parse the
+    # full web_search/http_get JSON into 「来源」. The truncated 'content'
+    # (capped at 8000 for the model context) used to be sent here, which cut the
+    # JSON mid-array and broke frontend source extraction in 专家 (CrewAI) mode.
+    if exec_.full_result is not None:
+        return exec_.full_result
     if exec_.ok and isinstance(exec_.result, dict):
         return exec_.result.get("content")
     return None

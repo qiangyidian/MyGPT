@@ -2,6 +2,7 @@
 
 Single entrypoint: ``create_app()`` builds the configured app. ``app`` is created
 at import time so ``uvicorn app.main:app`` works without ceremony.
+(nudge: reload to re-read .env)
 
 Responsibilities (in order):
   1. configure structured logging;

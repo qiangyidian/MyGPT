@@ -76,10 +76,22 @@ echo   Backend :  http://localhost:%BACKEND_PORT%   docs at /docs
 echo   Frontend:  http://localhost:%FRONTEND_PORT%
 echo   Login   :  admin@example.com / changeme123
 echo.
+echo   *** HOT RELOAD is ON ***
+echo   - Edit any backend .py under backend\app  -> uvicorn auto-reloads (~1s)
+echo   - Edit any frontend .tsx/.ts              -> browser Fast-Refresh instantly
+echo   - (changed backend\requirements.txt or frontend\package.json? stop & rerun)
+echo.
 echo   --- logs from both services appear below, interleaved ---
 echo.
 
-start "ai-backend" /b cmd /c "cd /d %~dp0backend && uvicorn app.main:app --reload --host 0.0.0.0 --port %BACKEND_PORT%"
+REM ---- Both services run in HOT-RELOAD mode: ----
+REM   * backend  : uvicorn --reload --reload-dir app  (watcher scoped to backend\app
+REM                only; this avoids the watchfiles-on-Windows stall that happens
+REM                when it also tries to watch .venv\data\tests. Edit any .py under
+REM                backend\app and the server reloads within ~1s.)
+REM   * frontend : next dev  (Fast Refresh; edit any .tsx/.ts and the browser
+REM                updates instantly without a full reload).
+start "ai-backend" /b cmd /c "cd /d %~dp0backend && uvicorn app.main:app --reload --reload-dir app --host 0.0.0.0 --port %BACKEND_PORT%"
 start "ai-frontend" /b cmd /c "cd /d %~dp0frontend && npx next dev -p %FRONTEND_PORT%"
 
 REM ---- Wait for both to come up ----

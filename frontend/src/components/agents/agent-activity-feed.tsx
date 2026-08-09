@@ -86,12 +86,22 @@ function buildFeed(graph: AgentGraphState): FeedItem[] {
   for (const n of ordered) {
     if (n.status === "pending" || n.status === "queued") continue;
     if (n.startedAt) {
+      // One status line per node, reflecting its CURRENT state:
+      //   running → spinner + "执行中"; completed → ✓ + "执行完毕";
+      //   failed → ⚠ + "执行失败". (Previously this line always used a Loader2
+      //   icon, so a finished step still looked like a stalled spinner.)
+      const done = n.status === "completed";
+      const failed = n.status === "failed";
       out.push({
         key: `${n.id}-start`,
-        icon: Loader2,
+        icon: done ? Check : failed ? AlertCircle : Loader2,
         spin: n.status === "running",
-        tone: "primary",
-        text: `${n.name} 开始执行：${n.taskTitle ?? n.role ?? ""}`,
+        tone: done ? "emerald" : failed ? "destructive" : "primary",
+        text: done
+          ? `${n.name} 执行完毕`
+          : failed
+            ? `${n.name} 执行失败`
+            : `${n.name} 执行中${n.taskTitle ? `：${n.taskTitle}` : ""}`,
       });
     }
     if (n.currentTool) {
@@ -127,27 +137,29 @@ function buildFeed(graph: AgentGraphState): FeedItem[] {
       });
     }
     if (n.status === "completed") {
-      // Handoff to downstream.
+      // The ✓ "执行完毕" status line above already marks completion; here we only
+      // surface a multi-agent handoff (→ 移交给 …) when there's a downstream node.
       const downstream = graph.edges
         .filter((e) => e.source === n.id && e.status === "completed")
         .map((e) => nodeOf(e.target)?.name)
         .filter(Boolean);
-      out.push({
-        key: `${n.id}-done`,
-        icon: Check,
-        tone: "emerald",
-        text:
-          downstream.length > 0
-            ? `${n.name} 完成 → 移交给 ${downstream.join("、")}`
-            : `${n.name} 完成`,
-      });
+      if (downstream.length > 0) {
+        out.push({
+          key: `${n.id}-done`,
+          icon: ArrowRight,
+          tone: "muted",
+          text: `${n.name} → 移交给 ${downstream.join("、")}`,
+        });
+      }
     }
-    if (n.status === "failed") {
+    if (n.status === "failed" && n.error) {
+      // The status line shows ⚠ "执行失败"; this adds the error detail only when
+      // there is one (no redundant bare "失败" line).
       out.push({
         key: `${n.id}-fail`,
         icon: AlertCircle,
         tone: "destructive",
-        text: `${n.name} 失败${n.error ? `：${n.error}` : ""}`,
+        text: `${n.name} 失败：${n.error}`,
       });
     }
     if (n.status === "cancelled") {

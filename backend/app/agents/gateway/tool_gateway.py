@@ -262,12 +262,17 @@ class ToolGateway:
             )
 
         # 6 + 7. Truncate + finalize (persists rows).
-        content, truncated = _stringify_and_truncate(result)
+        full_text, content, truncated = _stringify_and_truncate(result)
         return await self._finalize(
             tool_call_id, tool_name, args, started,
             ok=True, status="success",
             result={"content": content, "truncated": truncated},
             truncated=truncated,
+            # The UNTRUNCATED stringified result, so the SSE tool_result event can
+            # carry the full web_search/http_get payload to the UI — which needs the
+            # complete JSON to extract 来源 (the 8000-char cap for the model context
+            # used to cut the JSON mid-array and break source extraction).
+            full_result=full_text,
         )
 
     # ------------------------------------------------------------------ #
@@ -322,6 +327,7 @@ class ToolGateway:
         error: str | None = None,
         approval_id: uuid.UUID | None = None,
         truncated: bool = False,
+        full_result: str | None = None,
         step_type: str = "tool",
         step_status: str | None = None,
     ) -> ToolExecution:
@@ -396,17 +402,25 @@ class ToolGateway:
             error=error,
             approval_id=approval_id,
             truncated=truncated,
+            full_result=full_result,
             latency_ms=latency_ms,
         )
 
 
-def _stringify_and_truncate(result: Any) -> tuple[str, bool]:
-    """Return (text, truncated) for a tool result, capped at _MAX_RESULT_CHARS."""
+def _stringify_and_truncate(result: Any) -> tuple[str, str, bool]:
+    """Return (full_text, truncated_text, truncated) for a tool result.
+
+    ``truncated_text`` is capped at ``_MAX_RESULT_CHARS`` (for the model context +
+    the persisted audit row); ``full_text`` is the UNTRUNCATED stringified result,
+    surfaced via ``ToolExecution.full_result`` so the SSE event can carry the
+    complete payload to the UI (which needs the full web_search JSON to extract
+    「来源」 without a mid-array truncation breaking JSON.parse).
+    """
     if isinstance(result, str):
-        text = result
+        full = result
     else:
         try:
-            text = json.dumps(result, ensure_ascii=False, default=str)
+            full = json.dumps(result, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
-            text = str(result)
-    return text[:_MAX_RESULT_CHARS], len(text) > _MAX_RESULT_CHARS
+            full = str(result)
+    return full, full[:_MAX_RESULT_CHARS], len(full) > _MAX_RESULT_CHARS

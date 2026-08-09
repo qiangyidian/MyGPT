@@ -32,10 +32,12 @@ def test_settings_loads_web_search_config(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_settings_defaults_are_safe():
-    s = Settings()
-    # Constructed without env -> empty/GET (DDG fallback path).
+    # _env_file=None isolates from the dev .env (which may configure a real
+    # provider) so this asserts the PURE defaults: empty endpoint → DDG fallback.
+    s = Settings(_env_file=None)
     assert getattr(s, "WEB_SEARCH_ENDPOINT", "") == ""
     assert getattr(s, "WEB_SEARCH_METHOD", "get") == "get"
+    assert getattr(s, "WEB_SEARCH_DEPTH", "advanced") == "advanced"
 
 
 # --------------------------------------------------------------------------- #

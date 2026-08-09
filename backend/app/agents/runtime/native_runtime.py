@@ -331,7 +331,20 @@ class NativeChatRuntime:
                             id=tc.id,
                             name=tc.name,
                             ok=execution.ok,
-                            result=execution.result.get("content") if execution.ok and isinstance(execution.result, dict) else execution.result,
+                            # SSE/UI gets the UNTRUNCATED result so the frontend can
+                            # parse the full web_search JSON into 「来源」(the model
+                            # context still gets the truncated content via
+                            # to_openai_tool_message). Falls back to the (truncated)
+                            # content when full_result isn't present.
+                            result=(
+                                execution.full_result
+                                if execution.ok and execution.full_result is not None
+                                else (
+                                    execution.result.get("content")
+                                    if execution.ok and isinstance(execution.result, dict)
+                                    else execution.result
+                                )
+                            ),
                             error=execution.error,
                             agent_id="assistant",
                         )

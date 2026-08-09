@@ -76,14 +76,15 @@ def decide_route(
         m = "speed"
 
     if m == "speed":
-        # 极速模式：强制单 Agent 原生直答。不启动多 Agent、不联网、不跑意图分类
-        # （首 token 最快）。就是"普通快速聊天"。
+        # 极速模式：单 Agent 原生直答，不启动多 Agent、不跑意图分类（首 token 最快）。
+        # 允许联网搜索（web_search / http_get）——这样极速提问也能有「来源」，
+        # 但只走原生工具循环，绝不拉起多 Agent crew。
         return RouteDecision(
             execution_mode=ExecutionMode.auto,
             agent_profile="general",
-            enable_tools=False,
+            enable_tools=True,
             use_multi_agent=False,
-            disable_web=True,
+            tool_allowlist=["web_search", "http_get"],
             mode="speed",
             requested_mode="speed",
         )

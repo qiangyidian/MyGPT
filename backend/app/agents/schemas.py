@@ -495,6 +495,9 @@ class ToolExecution:
     error: str | None = None
     approval_id: Optional[uuid.UUID] = None
     truncated: bool = False
+    # UNTRUNCATED stringified result (for the SSE tool_result → UI source
+    # extraction). The model-facing content stays truncated (see to_openai_tool_message).
+    full_result: str | None = None
     latency_ms: int | None = None
 
     def to_openai_tool_message(self) -> dict[str, Any]:

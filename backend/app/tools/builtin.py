@@ -283,12 +283,15 @@ class WebSearchTool(BaseTool):
         endpoint = (getattr(settings, "WEB_SEARCH_ENDPOINT", "") or "").strip()
         api_key = (getattr(settings, "WEB_SEARCH_API_KEY", "") or "").strip()
         method = (getattr(settings, "WEB_SEARCH_METHOD", "get") or "get").strip().lower() or "get"
+        # Tavily search_depth ("basic" | "advanced"). Advanced runs a deeper,
+        # higher-quality pass. Harmless to non-Tavily providers (ignored).
+        depth = (getattr(settings, "WEB_SEARCH_DEPTH", "") or "").strip()
 
         results: list[dict[str, str]] = []
         try:
             if endpoint:
                 results = await self._search_via_endpoint(
-                    endpoint, query, top_k, api_key=api_key, method=method
+                    endpoint, query, top_k, api_key=api_key, method=method, depth=depth
                 )
             else:
                 results = await self._search_duckduckgo(query, top_k)
@@ -305,6 +308,7 @@ class WebSearchTool(BaseTool):
         *,
         api_key: str = "",
         method: str = "get",
+        depth: str = "",
     ) -> list[dict[str, str]]:
         timeout = httpx.Timeout(15.0, connect=10.0)
         headers: dict[str, str] = {"Accept": "application/json"}
@@ -329,6 +333,9 @@ class WebSearchTool(BaseTool):
                 }
                 if api_key:
                     body["api_key"] = api_key
+                if depth:
+                    # Tavily: "basic" | "advanced" (advanced = deeper, higher quality).
+                    body["search_depth"] = depth
                 _status, raw, _ct, _url = await _bounded_request(
                     client, "POST", endpoint, json=body, headers=headers
                 )

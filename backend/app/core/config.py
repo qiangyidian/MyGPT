@@ -230,6 +230,9 @@ class Settings(BaseSettings):
     # get | post — how to call WEB_SEARCH_ENDPOINT. GET fits SearXNG/Bing;
     # POST fits Tavily/Serper (query + key go in the JSON body / provider header).
     WEB_SEARCH_METHOD: str = "get"
+    # Tavily search_depth: "basic" | "advanced". Advanced = deeper, higher-quality
+    # pass (slightly slower / more credits). Only read by Tavily; ignored elsewhere.
+    WEB_SEARCH_DEPTH: str = "advanced"
 
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"

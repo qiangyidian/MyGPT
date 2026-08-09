@@ -63,11 +63,13 @@ def test_valid_modes_set():
     }
 
 
-def test_speed_mode_is_native_no_multi_agent():
+def test_speed_mode_is_native_no_multi_agent_but_can_search():
     r = decide_route("speed")
+    # 极速：不多 Agent，但允许联网搜索（web_search / http_get）→ 能有「来源」。
     assert r.use_multi_agent is False
-    assert r.enable_tools is False
     assert r.execution_mode == ExecutionMode.auto
+    assert r.enable_tools is True
+    assert r.tool_allowlist == ["web_search", "http_get"]
 
 
 def test_expert_mode_uses_multi_agent():
