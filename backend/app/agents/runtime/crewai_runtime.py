@@ -66,6 +66,7 @@ from app.agents.schemas import (
 from app.agents.run_controls import get as get_run_control
 from app.agents.stage_context import StageContext, make_stage_context
 from app.agents.streaming_writer import StreamingWriterExecutor
+from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
 from app.models import AgentRun
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
@@ -116,6 +117,8 @@ def _writer_finish_reason(stages: list[StageSpec], outputs: dict[str, StageResul
 
 def _map_run_error(exc: Exception) -> tuple[str, str]:
     """Map a multi-agent flow exception to (finish_reason, ev_error code)."""
+    if isinstance(exc, PromptAdmissionError):
+        return "budget", exc.code
     if isinstance(exc, ProviderError):
         if getattr(exc, "code", "") == PROVIDER_ERR_TIMEOUT:
             return "timeout", "provider_timeout"

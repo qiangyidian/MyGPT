@@ -17,7 +17,9 @@ from app.agents.runtime.crewai_runtime import CrewAIRuntime
 from app.agents.runtime.stage_executor import FakeStageExecutor
 from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.stage_context import make_stage_context
+from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.agents.streaming_writer import StreamingWriterExecutor
+from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta
 from app.providers.mock import MockProvider
@@ -109,8 +111,7 @@ class _RecordingProvider(MockProvider):
     async def stream_chat(self, messages, options=None):
         self.last_options = options
         self.last_messages = messages
-        async for d in super().stream_chat(messages, options):
-            yield d
+        yield ChatDelta(content="ok", finish_reason="stop")
 
 
 class _LengthProvider(MockProvider):
@@ -121,17 +122,8 @@ class _LengthProvider(MockProvider):
         yield ChatDelta(content="", finish_reason="length")
 
 
-async def test_writer_does_not_cap_output_max_tokens(db_session):
-    """The Writer must NOT impose a max_tokens cap on its own answer.
-
-    Regression: the Writer derived its output budget from ModelConfig.max_tokens
-    (default 1024). A multi-agent code request (e.g. "编写贪吃蛇游戏") spent that
-    budget on the architecture preamble the Analyst handed it, then hit
-    finish_reason=length mid-code — the user saw only the architecture, never the
-    game. The fix is to not limit the Writer at all: max_tokens=None omits it
-    from the request so the endpoint streams until the model naturally stops.
-    ModelConfig.max_tokens must NOT re-cap it, even when configured small.
-    """
+async def test_writer_uses_configured_output_limit_and_parameter(db_session):
+    """The direct writer dispatch obeys the canonical model contract."""
     conv = Conversation(user_id=_SEEDED, title="mt")
     db_session.add(conv)
     await db_session.flush()
@@ -144,8 +136,11 @@ async def test_writer_does_not_cap_output_max_tokens(db_session):
     stage_ctx.provider = rec
     stage_ctx.assistant_msg = msg
     stage_ctx.user_content = "write a snake game in python"
-    # A small configured budget must NOT cap the Writer — it would truncate code.
-    stage_ctx.model_config = SimpleNamespace(max_tokens=1024)
+    stage_ctx.model_config = SimpleNamespace(
+        max_context_tokens=8_192,
+        max_tokens=1_024,
+        output_token_parameter="max_completion_tokens",
+    )
 
     executor = StreamingWriterExecutor(FakeStageExecutor())
     await executor.execute(
@@ -155,10 +150,88 @@ async def test_writer_does_not_cap_output_max_tokens(db_session):
     await asyncio.sleep(0.05)
 
     assert rec.last_options is not None, "writer did not call stream_chat"
-    assert rec.last_options.max_tokens is None, (
-        f"writer must NOT cap output (max_tokens=None); a capped budget truncated "
-        f"long code answers. got {rec.last_options.max_tokens!r}"
+    assert rec.last_options.max_tokens == 1_024
+    assert rec.last_options.output_token_parameter == "max_completion_tokens"
+
+
+async def test_writer_compacts_oversized_dependency_context_before_dispatch(db_session):
+    conv = Conversation(user_id=_SEEDED, title="writer admission")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    rec = _RecordingProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.provider = rec
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "Summarize the evidence"
+    stage_ctx.model_config = SimpleNamespace(
+        max_context_tokens=2_000,
+        max_tokens=200,
+        output_token_parameter="max_tokens",
     )
+    original = "dependency-evidence " * 2_000
+
+    await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="write final answer", id="t"),
+        context=original,
+        stage_ctx=stage_ctx,
+    )
+
+    assert rec.last_messages is not None
+    user_prompt = next(
+        message["content"] for message in rec.last_messages if message["role"] == "user"
+    )
+    assert len(user_prompt) < len(original)
+    assert "truncated" in user_prompt.lower()
+    budget = calculate_prompt_budget(
+        capabilities_from_config(stage_ctx.model_config),
+        requested_output=200,
+        tool_schema_tokens=512,
+    )
+    dispatched_chars = sum(
+        len(message["content"]) for message in rec.last_messages
+    ) + len("write final answer")
+    assert dispatched_chars <= budget.input_tokens
+
+
+async def test_writer_rejects_oversized_fixed_prompt_before_provider_dispatch(
+    db_session, monkeypatch
+):
+    conv = Conversation(user_id=_SEEDED, title="writer rejection")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    rec = _RecordingProvider(base_url="http://x/v1", model="mock")
+    stage_ctx.provider = rec
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "question"
+    stage_ctx.model_config = SimpleNamespace(
+        max_context_tokens=1_000,
+        max_tokens=200,
+        output_token_parameter="max_tokens",
+    )
+    monkeypatch.setattr("app.agents.streaming_writer._SYSTEM", "system " * 2_000)
+
+    with pytest.raises(PromptAdmissionError) as exc_info:
+        await StreamingWriterExecutor(FakeStageExecutor()).execute(
+            agent_id="writer",
+            agent=None,
+            task=SimpleNamespace(description="write final answer", id="t"),
+            context="verified evidence",
+            stage_ctx=stage_ctx,
+        )
+
+    assert exc_info.value.code == "message_too_large"
+    assert rec.last_options is None
 
 
 async def test_writer_prompt_follows_code_intent(db_session):
@@ -307,3 +380,33 @@ async def test_multi_agent_writer_streams_without_duplicate(db_session):
     # bulk re-emission duplicated it.
     assert ctx.assistant_msg.content == "".join(token_deltas)
     assert ctx.assistant_msg.content.strip()
+
+
+async def test_writer_admission_error_becomes_controlled_runtime_failure(
+    db_session, monkeypatch
+):
+    ctx = await _seed_ctx(db_session)
+    ctx.model_config.max_context_tokens = 1_000
+    ctx.extra["stage_executor"] = StreamingWriterExecutor(
+        FakeStageExecutor(
+            behaviors={
+                "researcher": FakeStageExecutor.Behavior(output="evidence"),
+                "analyst": FakeStageExecutor.Behavior(output="verified findings"),
+            }
+        )
+    )
+    monkeypatch.setattr("app.agents.streaming_writer._SYSTEM", "system " * 2_000)
+
+    events: list[tuple[str, dict]] = []
+    async for evt in CrewAIRuntime().stream_turn(ctx):
+        events.append((evt.kind, evt.data))
+
+    errors = [data for kind, data in events if kind == "error"]
+    assert errors[-1]["code"] == "message_too_large"
+    assert "fixed prompt" in errors[-1]["message"]
+    assert ctx.extra["finish_reason"] == "budget"
+    assert any(
+        kind == "run_status" and data["status"] == "failed"
+        for kind, data in events
+    )
+    assert not any(kind == "done" for kind, _data in events)

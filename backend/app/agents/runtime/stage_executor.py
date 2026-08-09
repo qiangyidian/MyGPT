@@ -103,7 +103,7 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
-        admitted_context = _admit_stage_dispatch(
+        admitted_context = admit_stage_dispatch(
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
@@ -117,10 +117,19 @@ class CrewAIStageExecutor:
         )
 
 
-def _admit_stage_dispatch(
-    *, agent: Any, task: Any, context: str | None, stage_ctx: StageContext
+def admit_stage_dispatch(
+    *,
+    agent: Any,
+    task: Any,
+    context: str | None,
+    stage_ctx: StageContext,
+    fixed_prompt_tokens: int = 0,
 ) -> str | None:
-    """Bound the exact task/context immediately before CrewAI dispatch."""
+    """Bound a stage's exact task/context immediately before model dispatch.
+
+    ``fixed_prompt_tokens`` reserves caller-owned system/user scaffolding that
+    is not represented by the CrewAI task description.
+    """
     cfg = stage_ctx.model_config
     if cfg is None:
         return context
@@ -137,15 +146,19 @@ def _admit_stage_dispatch(
     # One character per token is deliberately conservative for mixed CJK,
     # source code, and serialized dependency payloads.
     description = str(getattr(task, "description", "") or "")
-    if len(description) > budget.input_tokens:
+    fixed_tokens = len(description) + max(0, fixed_prompt_tokens)
+    if fixed_tokens > budget.input_tokens:
         raise PromptAdmissionError(
             MESSAGE_TOO_LARGE,
-            "The stage task is too large for this model's prompt budget",
+            (
+                "The stage task or fixed prompt is too large for this model's "
+                "prompt budget"
+            ),
         )
 
     if context is None:
         return None
-    remaining = budget.input_tokens - len(description)
+    remaining = budget.input_tokens - fixed_tokens
     if len(context) <= remaining:
         return context
     if remaining <= len(_TRUNCATION_MARKER):

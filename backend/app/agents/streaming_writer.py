@@ -27,10 +27,15 @@ import asyncio
 import logging
 from typing import Any
 
-from app.agents.runtime.stage_executor import StageExecutor, StageResult
+from app.agents.runtime.stage_executor import (
+    StageExecutor,
+    StageResult,
+    admit_stage_dispatch,
+)
 from app.agents.run_controls import get as get_run_control
 from app.agents.schemas import ev_token
 from app.agents.stage_context import StageContext
+from app.model_capabilities import capabilities_from_config
 from app.providers.base import ChatOptions, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -125,34 +130,25 @@ class StreamingWriterExecutor:
 
         kind = deliverable_kind(getattr(stage_ctx, "user_content", "") or question)
         system_prompt = _CODE_SYSTEM if kind == "code" else _SYSTEM
-        if kind == "code":
-            # Code intent: write the program. The Analyst's research is reference
-            # only — never restate it as prose (that is what produced
-            # "architecture-only" answers).
-            user_prompt = (
-                f"用户问题：\n{question}\n\n"
-                f"（可选参考）研究结论：\n{verified or '（无）'}\n\n"
-                "请针对用户问题直接产出完整、可运行的代码交付物；"
-                "上面的研究结论仅作参考，不要复述，除非涉及外部事实或第三方 API 约束。"
-            )
-        else:
-            # Research / document intent: answer from verified evidence, cite it.
-            user_prompt = (
-                f"用户问题：\n{question}\n\n"
-                f"已验证内容：\n{verified or '（无已验证内容，请如实说明缺口）'}\n\n"
-                "请基于以上已验证内容生成最终回答，并保留来源编号。"
-            )
+        fixed_user_prompt = _build_user_prompt(kind, question, "")
+        admitted_context = admit_stage_dispatch(
+            agent=None,
+            task=task,
+            context=verified,
+            stage_ctx=stage_ctx,
+            fixed_prompt_tokens=len(system_prompt) + len(fixed_user_prompt),
+        )
+        user_prompt = _build_user_prompt(kind, question, admitted_context or "")
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        # Do NOT cap the Writer's output (max_tokens=None). A capped budget — even
-        # the user's ModelConfig.max_tokens — truncated long code answers
-        # mid-stream (finish_reason=length): a multi-agent "编写贪吃蛇游戏" request
-        # spent the budget on the Analyst's architecture preamble and the game
-        # code never reached the user. None omits max_tokens so the endpoint
-        # streams until the model naturally stops.
-        options = ChatOptions(temperature=0.5, max_tokens=None)
+        capabilities = capabilities_from_config(stage_ctx.model_config)
+        options = ChatOptions(
+            temperature=0.5,
+            max_tokens=capabilities.max_output_tokens,
+            output_token_parameter=capabilities.output_token_parameter,
+        )
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
 
@@ -219,3 +215,22 @@ class StreamingWriterExecutor:
             output_summary=(full.strip().replace("\n", " ")[:160] or "（空回答）"),
             structured={"finish_reason": finish_reason, "streamed": True},
         )
+
+
+def _build_user_prompt(kind: str, question: str, verified: str) -> str:
+    if kind == "code":
+        # Code intent: write the program. The Analyst's research is reference
+        # only — never restate it as prose (that is what produced
+        # "architecture-only" answers).
+        return (
+            f"用户问题：\n{question}\n\n"
+            f"（可选参考）研究结论：\n{verified or '（无）'}\n\n"
+            "请针对用户问题直接产出完整、可运行的代码交付物；"
+            "上面的研究结论仅作参考，不要复述，除非涉及外部事实或第三方 API 约束。"
+        )
+    # Research / document intent: answer from verified evidence, cite it.
+    return (
+        f"用户问题：\n{question}\n\n"
+        f"已验证内容：\n{verified or '（无已验证内容，请如实说明缺口）'}\n\n"
+        "请基于以上已验证内容生成最终回答，并保留来源编号。"
+    )
