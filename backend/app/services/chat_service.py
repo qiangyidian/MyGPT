@@ -40,10 +40,10 @@ from sqlalchemy.orm import selectinload
 from app.agents.db_mutation import (
     commit_with_rollback,
     db_mutation_scope,
-    rollback_safely,
 )
 from app.agents.intent_router import decide_route, decide_route_with_intent
 from app.agents.orchestrator import chat_orchestrator
+from app.agents.persistence import persist_continuation_checkpoint
 from app.agents.planning import (
     extract_goal,
     is_casual_question,
@@ -65,6 +65,7 @@ from app.agents.token_budget import (
 )
 from app.core.config import get_settings
 from app.core.exceptions import AppException
+from app.db import AsyncSessionLocal
 from app.models import AgentRun, Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.model_capabilities import capabilities_from_config
 from app.providers.registry import get_provider_for_config
@@ -642,38 +643,31 @@ async def _persist_partial(db: AsyncSession, assistant_msg: Message) -> None:
 
 
 async def _persist_continuation_checkpoint(
-    db: AsyncSession,
+    session_factory: Any,
     assistant_msg: Message,
     run_id: uuid.UUID | str,
     checkpoint: dict[str, Any],
 ) -> None:
-    """Durably checkpoint a continuation before its next provider dispatch."""
+    """Durably checkpoint without attaching request-session ORM objects."""
     try:
-        snapshot = dict(checkpoint)
-        assistant_msg.metadata_ = {
-            **(assistant_msg.metadata_ or {}),
-            "continuation": snapshot,
-        }
-        try:
-            run_uuid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
-        except (TypeError, ValueError):
-            run_uuid = None
-        if run_uuid is not None:
-            run = await db.get(AgentRun, run_uuid)
-            if run is not None:
-                run.output = {**(run.output or {}), "continuation": snapshot}
-                round_number = int(snapshot.get("round") or 0)
-                resume_marker = f"continuation:{round_number}"
-                run.current_step = resume_marker
-                run.resume_token = resume_marker
-        await db.commit()
-    except BaseException:
-        await rollback_safely(db)
-        raise
+        run_uuid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
+    except (TypeError, ValueError):
+        run_uuid = None
+    await persist_continuation_checkpoint(
+        session_factory,
+        message_id=assistant_msg.id,
+        run_id=run_uuid,
+        content=assistant_msg.content or "",
+        metadata=dict(assistant_msg.metadata_ or {}),
+        checkpoint=checkpoint,
+    )
 
 
 class ChatService:
     """Orchestrates a single chat turn end to end."""
+
+    def __init__(self, persistence_session_factory: Any = AsyncSessionLocal) -> None:
+        self._persistence_session_factory = persistence_session_factory
 
     async def stream(
         self, db: AsyncSession, user: User, request: ChatRequest
@@ -1043,6 +1037,7 @@ class ChatService:
 
         # 8. Build turn context and delegate to the orchestrator/runtime.
         db_mutation_lock = asyncio.Lock()
+        persistence_lock = asyncio.Lock()
         ctx = AgentTurnContext(
             db=db,
             user=user,
@@ -1067,13 +1062,18 @@ class ChatService:
                 "intent_decision": intent_decision,
                 "intent_fragments": intent_fragment_names,
                 "db_mutation_lock": db_mutation_lock,
+                "persistence_session_factory": self._persistence_session_factory,
+                "persistence_lock": persistence_lock,
             },
         )
 
         async def persist_continuation(checkpoint: dict[str, Any]) -> None:
-            async with db_mutation_scope(db_mutation_lock):
+            async with db_mutation_scope(persistence_lock):
                 await _persist_continuation_checkpoint(
-                    db, assistant_msg, ctx.run_id, checkpoint
+                    self._persistence_session_factory,
+                    assistant_msg,
+                    ctx.run_id,
+                    checkpoint,
                 )
 
         ctx.extra["persist_continuation_checkpoint"] = persist_continuation

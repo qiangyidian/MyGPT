@@ -19,7 +19,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from app.agents.db_mutation import (
     db_mutation_scope,
     rollback_safely,
 )
+from app.agents.persistence import persist_terminal_run
 from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.run_controls import drop as drop_run_control, get_or_create as get_run_control
 from app.agents.schemas import (
@@ -83,6 +84,7 @@ class ChatOrchestrator:
     # ------------------------------------------------------------------ #
     async def stream(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
         db_lock = ctx.extra.get("db_mutation_lock")
+        persistence_session_factory = ctx.extra.get("persistence_session_factory")
         async with db_mutation_scope(db_lock):
             try:
                 run = await self._create_run(ctx)
@@ -141,7 +143,13 @@ class ChatOrchestrator:
         try:
             async for evt in runtime.stream_turn(ctx):
                 if evt.kind in ("done", "error"):
-                    await self._finalize_run(ctx.db, run, evt, lock=db_lock)
+                    await self._finalize_run(
+                        ctx.db,
+                        run,
+                        evt,
+                        lock=db_lock,
+                        session_factory=persistence_session_factory,
+                    )
                 yield evt
                 if evt.kind in ("done", "error"):
                     return
@@ -155,11 +163,18 @@ class ChatOrchestrator:
                     usage=ctx.extra.get("usage"),
                 ),
                 lock=db_lock,
+                session_factory=persistence_session_factory,
             )
             raise
         except Exception as exc:  # noqa: BLE001 — runtime should self-handle, but be safe
             logger.exception("runtime %s crashed: %s", runtime.name, exc)
-            await self._fail_run(ctx.db, run, str(exc), lock=db_lock)
+            await self._fail_run(
+                ctx.db,
+                run,
+                str(exc),
+                lock=db_lock,
+                session_factory=persistence_session_factory,
+            )
             yield ev_error(code="internal", message=str(exc))
             return
         finally:
@@ -329,7 +344,19 @@ class ChatOrchestrator:
         evt: AgentEvent,
         *,
         lock: asyncio.Lock | None = None,
+        session_factory: Any = None,
     ) -> None:
+        if session_factory is not None:
+            try:
+                await persist_terminal_run(
+                    session_factory,
+                    run_id=run.id,
+                    event_kind=evt.kind,
+                    event_data=dict(evt.data),
+                )
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("failed to finalize agent_run %s", run.id)
+            return
         run.finished_at = datetime.now(timezone.utc)
         run.output = {**(run.output or {}), **dict(evt.data)}
         if evt.kind == "done":
@@ -355,7 +382,19 @@ class ChatOrchestrator:
         message: str,
         *,
         lock: asyncio.Lock | None = None,
+        session_factory: Any = None,
     ) -> None:
+        if session_factory is not None:
+            try:
+                await persist_terminal_run(
+                    session_factory,
+                    run_id=run.id,
+                    event_kind="error",
+                    event_data={"message": message},
+                )
+            except Exception:  # pragma: no cover
+                pass
+            return
         run.finished_at = datetime.now(timezone.utc)
         run.status = "failed"
         run.error_message = message

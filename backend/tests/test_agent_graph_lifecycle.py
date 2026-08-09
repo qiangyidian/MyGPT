@@ -34,6 +34,7 @@ from app.agents.runtime.stage_executor import FakeStageExecutor
 from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.stage_context import make_stage_context
 from app.models import AgentRun, AgentStep, Conversation, Message
+from tests.conftest import TestSessionLocal
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -53,7 +54,7 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
         runtime="crewai", flow_name="deep_research", status="running",
     )
     db_session.add(run)
-    await db_session.flush()
+    await db_session.commit()
     cfg = SimpleNamespace(
         provider="mock", api_base_url="http://x/v1", api_key_encrypted="",
         model_name="mock", temperature=0.3, top_p=1.0, max_tokens=64,
@@ -67,6 +68,8 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
         assistant_msg=msg, run_id=run.id, execution_mode=ExecutionMode.agent,
         agent_profile="deep_research", enable_tools=True,
     )
+    ctx.extra["persistence_session_factory"] = TestSessionLocal
+    ctx.extra["persistence_lock"] = asyncio.Lock()
     return ctx
 
 

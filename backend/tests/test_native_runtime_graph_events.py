@@ -22,6 +22,7 @@ from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError, ToolCallDef
 from app.services.chat_service import _persist_continuation_checkpoint
 from app.tools.base import BaseTool, ToolRegistry
+from tests.conftest import TestSessionLocal
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -150,7 +151,7 @@ async def _seed_native_ctx(db_session, *, enable_tools: bool) -> AgentTurnContex
         runtime="native", flow_name="single_agent", status="running",
     )
     db_session.add(run)
-    await db_session.flush()
+    await db_session.commit()
     cfg = SimpleNamespace(
         provider="mock", api_base_url="http://x/v1", api_key_encrypted="",
         model_name="mock", temperature=0.3, top_p=1.0, max_tokens=64,
@@ -164,6 +165,8 @@ async def _seed_native_ctx(db_session, *, enable_tools: bool) -> AgentTurnContex
         assistant_msg=msg, run_id=run.id, execution_mode=ExecutionMode.auto,
         agent_profile="general", enable_tools=enable_tools,
     )
+    ctx.extra["persistence_session_factory"] = TestSessionLocal
+    ctx.extra["persistence_lock"] = asyncio.Lock()
     return ctx
 
 
@@ -172,6 +175,11 @@ async def _collect(ctx) -> list[tuple[str, dict]]:
     async for evt in NativeChatRuntime().stream_turn(ctx):
         out.append((evt.kind, evt.data))
     return out
+
+
+async def _durable_run(run_id):
+    async with TestSessionLocal() as session:
+        return await session.get(AgentRun, run_id)
 
 
 def _find_all(events, kind):
@@ -314,7 +322,7 @@ async def test_native_cancel_during_continuing_checkpoint_replaces_db_before_dis
         if checkpoint["status"] == "continuing":
             control.cancel.set()
         await _persist_continuation_checkpoint(
-            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+            TestSessionLocal, ctx.assistant_msg, ctx.run_id, checkpoint
         )
 
     ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
@@ -333,7 +341,7 @@ async def test_native_cancel_during_continuing_checkpoint_replaces_db_before_dis
     assert len(provider.calls) == 1
     assert order == [("persist", "continuing"), ("persist", "cancelled")]
     assert _find_all(events, "done")[-1]["finish_reason"] == "cancelled"
-    run = await db_session.get(AgentRun, ctx.run_id)
+    run = await _durable_run(ctx.run_id)
     assert run.output["continuation"]["status"] == "cancelled"
 
 
@@ -346,7 +354,7 @@ async def test_native_task_cancelled_during_checkpoint_replaces_stale_continuing
     async def persist_checkpoint(checkpoint):
         order.append(checkpoint["status"])
         await _persist_continuation_checkpoint(
-            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+            TestSessionLocal, ctx.assistant_msg, ctx.run_id, checkpoint
         )
         if checkpoint["status"] == "continuing":
             raise asyncio.CancelledError()
@@ -364,7 +372,7 @@ async def test_native_task_cancelled_during_checkpoint_replaces_stale_continuing
 
     assert len(provider.calls) == 1
     assert order == ["continuing", "cancelled"]
-    run = await db_session.get(AgentRun, ctx.run_id)
+    run = await _durable_run(ctx.run_id)
     assert run.output["continuation"]["status"] == "cancelled"
 
 
@@ -384,7 +392,7 @@ async def test_native_checkpoint_failure_preserves_completed_round_usage(
         if checkpoint["status"] == "continuing":
             raise raised
         await _persist_continuation_checkpoint(
-            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+            TestSessionLocal, ctx.assistant_msg, ctx.run_id, checkpoint
         )
 
     ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
@@ -404,7 +412,7 @@ async def test_native_checkpoint_failure_preserves_completed_round_usage(
     if isinstance(raised, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
             await _collect(ctx)
-        run = await db_session.get(AgentRun, ctx.run_id)
+        run = await _durable_run(ctx.run_id)
         assert run.output["continuation"]["status"] == "cancelled"
     else:
         events = await _collect(ctx)
@@ -450,7 +458,7 @@ async def test_native_stops_at_max_continuation_rounds_with_length(
         "max_rounds": 2,
         "status": "maxed",
     }
-    run = await db_session.get(AgentRun, ctx.run_id)
+    run = await _durable_run(ctx.run_id)
     assert run.output["continuation"] == ctx.extra["continuation"]
     assert run.current_step == "continuation:2"
     assert run.resume_token == "continuation:2"
@@ -516,7 +524,7 @@ async def test_native_cancellation_before_continuation_dispatch_updates_checkpoi
     assert _find_all(events, "done")[-1]["finish_reason"] == "cancelled"
     assert ctx.extra["continuation"]["status"] == "cancelled"
     assert ctx.extra["continuation"]["round"] == 0
-    run = await db_session.get(AgentRun, ctx.run_id)
+    run = await _durable_run(ctx.run_id)
     assert run.output["continuation"] == ctx.extra["continuation"]
 
 
@@ -718,7 +726,7 @@ async def test_native_async_cancellation_after_tokens_flushes_partial_and_usage(
         "total_tokens": 25,
     }
     assert ctx.extra["continuation"]["status"] == "cancelled"
-    run = await db_session.get(AgentRun, ctx.run_id)
+    run = await _durable_run(ctx.run_id)
     assert run.output["continuation"] == ctx.extra["continuation"]
 
 

@@ -229,6 +229,10 @@ async def client(seeded_db):
     import httpx
 
     app = _get_app()
+    from app.services.chat_service import chat_service
+
+    previous_persistence_factory = chat_service._persistence_session_factory
+    chat_service._persistence_session_factory = TestSessionLocal
     app.dependency_overrides[production_get_db] = _override_get_db
     try:
         transport = httpx.ASGITransport(app=app)
@@ -237,6 +241,7 @@ async def client(seeded_db):
         ) as ac:
             yield ac
     finally:
+        chat_service._persistence_session_factory = previous_persistence_factory
         app.dependency_overrides.pop(production_get_db, None)
 
 

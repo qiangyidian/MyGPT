@@ -12,9 +12,12 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.adapters.tool_adapter import _execution_usage, build_crewai_tool
 from app.agents.continuation import aggregate_usage
+from app.agents.orchestrator import ChatOrchestrator
 from app.agents.runtime.crewai_runtime import (
     CrewAIRuntime,
     _aggregate_crewai_usage,
@@ -26,6 +29,7 @@ from app.agents.schemas import (
     AgentTurnContext,
     ExecutionMode,
     ToolExecution,
+    ev_done,
     ev_tool_result,
 )
 from app.agents.stage_context import make_stage_context
@@ -35,7 +39,8 @@ from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError
 from app.providers.mock import MockProvider
-from app.services.chat_service import _persist_continuation_checkpoint
+from app.services.chat_service import ChatService, _persist_continuation_checkpoint
+from tests.conftest import TestSessionLocal
 
 _SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -606,10 +611,17 @@ async def _writer_ctx(db_session, provider):
     await db_session.commit()
     stage_ctx.provider = provider
     stage_ctx.db = db_session
+    stage_ctx.persistence_session_factory = TestSessionLocal
+    stage_ctx.persistence_lock = asyncio.Lock()
     stage_ctx.assistant_msg = msg
     stage_ctx.user_content = "write a complete answer"
     stage_ctx.model_config = SimpleNamespace(max_tokens=4096)
     return stage_ctx, msg
+
+
+async def _durable_run(run_id):
+    async with TestSessionLocal() as session:
+        return await session.get(AgentRun, run_id)
 
 
 async def _writer_tokens(stage_ctx):
@@ -658,7 +670,7 @@ async def test_writer_auto_continues_length_and_emits_only_novel_tail(db_session
         "total_tokens": 27,
     }
     assert msg.metadata_["continuation"]["status"] == "completed"
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     assert run.output["continuation"] == result.structured["continuation"]
 
 
@@ -721,7 +733,7 @@ async def test_writer_cancel_during_continuing_checkpoint_avoids_followup_dispat
         if checkpoint["status"] == "continuing":
             stage_ctx.cancel_event.set()
         await _persist_continuation_checkpoint(
-            db_session, msg, stage_ctx.run_id, checkpoint
+            TestSessionLocal, msg, stage_ctx.run_id, checkpoint
         )
 
     stage_ctx.persist_continuation_checkpoint = persist_checkpoint
@@ -737,7 +749,7 @@ async def test_writer_cancel_during_continuing_checkpoint_avoids_followup_dispat
     assert len(provider.calls) == 1
     assert order == ["continuing", "cancelled"]
     assert result.structured["finish_reason"] == "cancelled"
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     assert run.output["continuation"]["status"] == "cancelled"
 
 
@@ -753,7 +765,7 @@ async def test_writer_task_cancelled_during_checkpoint_replaces_stale_continuing
     async def persist_checkpoint(checkpoint):
         order.append(checkpoint["status"])
         await _persist_continuation_checkpoint(
-            db_session, msg, stage_ctx.run_id, checkpoint
+            TestSessionLocal, msg, stage_ctx.run_id, checkpoint
         )
         if checkpoint["status"] == "continuing":
             raise asyncio.CancelledError()
@@ -771,7 +783,7 @@ async def test_writer_task_cancelled_during_checkpoint_replaces_stale_continuing
 
     assert len(provider.calls) == 1
     assert order == ["continuing", "cancelled"]
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     assert run.output["continuation"]["status"] == "cancelled"
 
 
@@ -797,7 +809,7 @@ async def test_writer_checkpoint_failure_records_completed_round_usage_once(
         if checkpoint["status"] == "continuing":
             raise raised
         await _persist_continuation_checkpoint(
-            db_session, msg, stage_ctx.run_id, checkpoint
+            TestSessionLocal, msg, stage_ctx.run_id, checkpoint
         )
 
     stage_ctx.persist_continuation_checkpoint = persist_checkpoint
@@ -819,7 +831,7 @@ async def test_writer_checkpoint_failure_records_completed_round_usage_once(
         "total_tokens": 12,
     }
     assert len(stage_ctx.usage_records) == 1
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     if isinstance(raised, asyncio.CancelledError):
         assert run.output["continuation"]["status"] == "cancelled"
     else:
@@ -848,7 +860,7 @@ async def test_writer_stops_at_max_continuation_rounds(db_session):
     assert msg.content == "A B C"
     assert result.structured["finish_reason"] == "length"
     assert result.structured["continuation"]["status"] == "maxed"
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     assert run.output["continuation"] == result.structured["continuation"]
 
 
@@ -990,7 +1002,7 @@ async def test_writer_failed_continuation_preserves_partial_and_all_usage(
         "total_tokens": 25,
     }
     if isinstance(raised, asyncio.CancelledError):
-        run = await db_session.get(AgentRun, stage_ctx.run_id)
+        run = await _durable_run(stage_ctx.run_id)
         assert msg.metadata_["continuation"]["status"] == "cancelled"
         assert run.output["continuation"] == msg.metadata_["continuation"]
 
@@ -1025,7 +1037,7 @@ async def test_writer_cancel_before_continuation_avoids_followup_dispatch(db_ses
     assert msg.content == "partial"
     assert result.structured["finish_reason"] == "cancelled"
     assert result.structured["continuation"]["status"] == "cancelled"
-    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    run = await _durable_run(stage_ctx.run_id)
     assert run.output["continuation"] == result.structured["continuation"]
 
 
@@ -1242,6 +1254,8 @@ async def test_writer_records_real_finish_reason_length(db_session):
     stage_ctx = make_stage_context(uuid.uuid4())
     stage_ctx.provider = _LengthProvider(base_url="http://x/v1", model="mock")
     stage_ctx.db = db_session
+    stage_ctx.persistence_session_factory = TestSessionLocal
+    stage_ctx.persistence_lock = asyncio.Lock()
     stage_ctx.assistant_msg = msg
     stage_ctx.user_content = "write code"
     stage_ctx.model_config = SimpleNamespace(max_tokens=4096)
@@ -1266,7 +1280,7 @@ async def test_writer_records_real_finish_reason_length(db_session):
 async def _seed_ctx(db_session) -> AgentTurnContext:
     conv = Conversation(user_id=_SEEDED, title="stream e2e")
     db_session.add(conv)
-    await db_session.flush()
+    await db_session.commit()
     msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
     db_session.add(msg)
     await db_session.flush()
@@ -1275,136 +1289,69 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
         runtime="crewai", flow_name="deep_research", status="running",
     )
     db_session.add(run)
-    await db_session.flush()
+    await db_session.commit()
     cfg = SimpleNamespace(
         provider="mock", api_base_url="http://x/v1", api_key_encrypted="",
         model_name="mock", temperature=0.3, top_p=1.0, max_tokens=64, supports_tools=True,
     )
     user = SimpleNamespace(id=_SEEDED, role="user")
-    return AgentTurnContext(
+    ctx = AgentTurnContext(
         db=db_session, user=user, conversation=conv, model_config=cfg,
         request=SimpleNamespace(), user_content="compare A and B in depth",
         system_prompt="", messages=[], rag_context="", citations=[],
         assistant_msg=msg, run_id=run.id, execution_mode=ExecutionMode.agent,
         agent_profile="deep_research", enable_tools=True,
     )
+    ctx.extra["persistence_session_factory"] = TestSessionLocal
+    ctx.extra["persistence_lock"] = asyncio.Lock()
+    return ctx
 
 
-async def test_graph_persistence_shares_checkpoint_db_lock_without_overlap():
-    """The background writer and graph drainer must serialize one AsyncSession."""
-
-    class OverlapDetectingSession:
-        def __init__(self):
-            self.run = SimpleNamespace(
-                output=None,
-                current_step="",
-                resume_token="",
-                graph_definition=None,
-                graph_state=None,
-            )
-            self.active = False
-            self.overlaps = 0
-            self.first_get_started = asyncio.Event()
-            self.release_first_get = asyncio.Event()
-            self.get_calls = 0
-
-        async def get(self, model, identity):
-            if self.active:
-                self.overlaps += 1
-                raise RuntimeError("concurrent AsyncSession use")
-            self.active = True
-            self.get_calls += 1
-            try:
-                if self.get_calls == 1:
-                    self.first_get_started.set()
-                    await self.release_first_get.wait()
-                else:
-                    await asyncio.sleep(0)
-                return self.run
-            finally:
-                self.active = False
+async def test_graph_failure_rolls_back_only_independent_session(db_session):
+    class FailFirstGraphCommitSession(AsyncSession):
+        fail_next_commit = True
+        commit_calls = 0
+        rollback_calls = 0
 
         async def commit(self):
-            if self.active:
-                self.overlaps += 1
-                raise RuntimeError("concurrent AsyncSession use")
-            self.active = True
-            try:
-                await asyncio.sleep(0)
-            finally:
-                self.active = False
+            type(self).commit_calls += 1
+            assert self.in_transaction()
+            await self.flush()
+            if type(self).fail_next_commit:
+                type(self).fail_next_commit = False
+                raise SQLAlchemyError("graph commit failed")
+            await super().commit()
 
         async def rollback(self):
-            await asyncio.sleep(0)
+            type(self).rollback_calls += 1
+            await super().rollback()
 
-    session = OverlapDetectingSession()
-    lock = asyncio.Lock()
-    run_id = uuid.uuid4()
-    message = SimpleNamespace(metadata_={})
-    ctx = SimpleNamespace(
-        db=session,
-        run_id=run_id,
-        extra={"db_mutation_lock": lock},
+    ctx = await _seed_ctx(db_session)
+    await db_session.commit()
+    run = await db_session.get(AgentRun, ctx.run_id)
+    graph_sessions = async_sessionmaker(
+        bind=db_session.bind,
+        class_=FailFirstGraphCommitSession,
+        expire_on_commit=False,
+        autoflush=False,
     )
-    emitter = SimpleNamespace(snapshot=lambda: {"nodes": [], "edges": []})
+    ctx.extra["persistence_session_factory"] = graph_sessions
+    snapshot = {"nodes": [{"id": "writer", "status": "running"}], "edges": []}
+    emitter = SimpleNamespace(snapshot=lambda: snapshot)
 
-    async def persist_checkpoint():
-        async with lock:
-            await _persist_continuation_checkpoint(
-                session,
-                message,
-                run_id,
-                {"round": 1, "max_rounds": 2, "status": "continuing"},
-            )
+    # Graph persistence is best-effort for ordinary SQLAlchemy failures.
+    await CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
 
-    checkpoint_task = asyncio.create_task(persist_checkpoint())
-    await asyncio.wait_for(session.first_get_started.wait(), timeout=1)
-    graph_task = asyncio.create_task(
-        CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
-    )
-    await asyncio.sleep(0)
-    session.release_first_get.set()
-    await asyncio.wait_for(
-        asyncio.gather(checkpoint_task, graph_task), timeout=1
-    )
+    assert FailFirstGraphCommitSession.rollback_calls == 1
+    # A rollback on ctx.db would expire both and raise MissingGreenlet here.
+    assert ctx.assistant_msg.content == ""
+    assert run.output is None
 
-    assert session.overlaps == 0
-    assert session.run.graph_definition == {"nodes": [], "edges": []}
-
-
-async def test_cancelled_graph_commit_rolls_back_and_releases_request_lock():
-    class PoisonedGraphSession:
-        def __init__(self):
-            self.run = SimpleNamespace(graph_definition=None, graph_state=None)
-            self.poisoned = False
-            self.rollback_calls = 0
-
-        async def get(self, model, identity):
-            return self.run
-
-        async def commit(self):
-            self.poisoned = True
-            raise asyncio.CancelledError()
-
-        async def rollback(self):
-            self.rollback_calls += 1
-            self.poisoned = False
-
-    session = PoisonedGraphSession()
-    lock = asyncio.Lock()
-    ctx = SimpleNamespace(
-        db=session,
-        run_id=uuid.uuid4(),
-        extra={"db_mutation_lock": lock},
-    )
-    emitter = SimpleNamespace(snapshot=lambda: {"nodes": ["writer"]})
-
-    with pytest.raises(asyncio.CancelledError):
-        await CrewAIRuntime()._persist_graph(ctx, emitter, definition=False)
-
-    assert session.rollback_calls == 1
-    assert session.poisoned is False
-    assert lock.locked() is False
+    await CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
+    async with graph_sessions() as verify:
+        durable_run = await verify.get(AgentRun, ctx.run_id)
+        assert durable_run.graph_definition == snapshot
+        assert durable_run.graph_state == snapshot
 
 
 async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
@@ -1430,15 +1377,13 @@ async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
             }
         )
     )
-    db_lock = asyncio.Lock()
-    ctx.extra["db_mutation_lock"] = db_lock
     checkpoint_statuses = []
 
     async def persist_checkpoint(checkpoint):
         checkpoint_statuses.append(checkpoint["status"])
-        async with db_lock:
+        async with ctx.extra["persistence_lock"]:
             await _persist_continuation_checkpoint(
-                db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+                TestSessionLocal, ctx.assistant_msg, ctx.run_id, checkpoint
             )
         if checkpoint["status"] == "continuing":
             raise asyncio.CancelledError()
@@ -1466,8 +1411,33 @@ async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
         event.kind == "run_status" and event.data.get("status") == "cancelled"
         for event in events
     )
-    run = await db_session.get(AgentRun, ctx.run_id)
-    assert run.output["continuation"]["status"] == "cancelled"
+    request_run = await db_session.get(AgentRun, ctx.run_id)
+    await ChatOrchestrator()._finalize_run(
+        db_session,
+        request_run,
+        ev_done(
+            message_id=ctx.assistant_msg.id,
+            finish_reason="cancelled",
+            usage=ctx.extra["usage"],
+        ),
+        session_factory=TestSessionLocal,
+    )
+    await ChatService()._finalize_interrupted(
+        db_session,
+        ctx.assistant_msg,
+        finish_reason="cancelled",
+        usage=ctx.extra["usage"],
+        model_name="mock",
+    )
+    async with TestSessionLocal() as verify:
+        durable_run = await verify.get(AgentRun, ctx.run_id)
+        durable_message = await verify.get(Message, ctx.assistant_msg.id)
+        assert durable_run.status == "cancelled"
+        assert durable_run.output["continuation"]["status"] == "cancelled"
+        assert durable_run.output["usage"] == ctx.extra["usage"]
+        assert durable_message.content == "partial answer"
+        assert durable_message.metadata_["status"] == "cancelled"
+        assert durable_message.total_tokens == 12
 
 
 async def test_multi_agent_writer_streams_without_duplicate(db_session):

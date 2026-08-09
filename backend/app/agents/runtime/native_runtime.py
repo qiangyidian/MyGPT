@@ -57,6 +57,7 @@ from app.agents.schemas import (
 )
 from app.models import AgentRun
 from app.core.config import get_settings
+from app.db import AsyncSessionLocal
 from app.providers.base import (
     ChatOptions,
     ProviderError,
@@ -163,9 +164,10 @@ class NativeChatRuntime:
                 return
             from app.services.chat_service import _persist_continuation_checkpoint
 
-            async with db_mutation_scope(ctx.extra.get("db_mutation_lock")):
+            session_factory = ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
+            async with db_mutation_scope(ctx.extra.get("persistence_lock")):
                 await _persist_continuation_checkpoint(
-                    db, assistant_msg, ctx.run_id, checkpoint
+                    session_factory, assistant_msg, ctx.run_id, checkpoint
                 )
 
         async def persist_cancelled_continuation() -> dict[str, Any]:

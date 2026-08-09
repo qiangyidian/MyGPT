@@ -184,21 +184,20 @@ class StreamingWriterExecutor:
             if callable(persist_checkpoint):
                 await persist_checkpoint(checkpoint)
                 return
-            if stage_ctx.db is not None:
-                from app.agents.db_mutation import db_mutation_scope
-                from app.services.chat_service import (
-                    _persist_continuation_checkpoint,
-                )
+            from app.agents.db_mutation import db_mutation_scope
+            from app.db import AsyncSessionLocal
+            from app.services.chat_service import (
+                _persist_continuation_checkpoint,
+            )
 
-                async with db_mutation_scope(stage_ctx.db_mutation_lock):
-                    await _persist_continuation_checkpoint(
-                        stage_ctx.db,
-                        assistant_msg,
-                        stage_ctx.run_id,
-                        checkpoint,
-                    )
-                return
-            raise RuntimeError("continuation checkpoint persistence is unavailable")
+            session_factory = stage_ctx.persistence_session_factory or AsyncSessionLocal
+            async with db_mutation_scope(stage_ctx.persistence_lock):
+                await _persist_continuation_checkpoint(
+                    session_factory,
+                    assistant_msg,
+                    stage_ctx.run_id,
+                    checkpoint,
+                )
 
         async def persist_or_record_failure(checkpoint: dict[str, Any]) -> None:
             """Persist a checkpoint or retain usage that no StageResult can return."""

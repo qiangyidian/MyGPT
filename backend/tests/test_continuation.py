@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.continuation import (
     ContinuationBuffer,
@@ -24,6 +25,7 @@ from app.services.chat_service import (
     _persist_continuation_checkpoint,
 )
 from app.services.chat_service import ChatService
+from tests.conftest import TestSessionLocal
 
 
 @pytest.mark.parametrize(
@@ -277,14 +279,14 @@ async def test_chat_service_checkpoint_is_durable_and_idempotent(db_session):
         status="running",
     )
     db_session.add(run)
-    await db_session.flush()
+    await db_session.commit()
     checkpoint = {"round": 1, "max_rounds": 2, "status": "continuing"}
 
     await _persist_continuation_checkpoint(
-        db_session, message, run.id, checkpoint
+        TestSessionLocal, message, run.id, checkpoint
     )
     await _persist_continuation_checkpoint(
-        db_session, message, run.id, checkpoint
+        TestSessionLocal, message, run.id, checkpoint
     )
     message_id, run_id = message.id, run.id
     db_session.expire_all()
@@ -297,58 +299,108 @@ async def test_chat_service_checkpoint_is_durable_and_idempotent(db_session):
     assert persisted_run.resume_token == "continuation:1"
 
 
-async def test_cancelled_checkpoint_rolls_back_poisoned_session_before_terminal_commit():
-    """Cancellation during commit must not strand the request session in failure."""
+async def test_independent_checkpoint_rollback_keeps_request_objects_usable(
+    db_session,
+):
+    """A failed checkpoint transaction must expire only its private session."""
 
-    class PoisonOnFirstCommitSession:
-        def __init__(self, run):
-            self.run = run
-            self.poisoned = False
-            self.commit_calls = 0
-            self.rollback_calls = 0
-
-        async def get(self, model, identity):
-            return self.run
+    class CancelFirstCommitSession(AsyncSession):
+        fail_next_commit = True
+        commit_calls = 0
+        rollback_calls = 0
 
         async def commit(self):
-            self.commit_calls += 1
-            if self.commit_calls == 1:
-                self.poisoned = True
+            type(self).commit_calls += 1
+            assert self.in_transaction()
+            await self.flush()
+            if type(self).fail_next_commit:
+                type(self).fail_next_commit = False
                 raise asyncio.CancelledError()
-            if self.poisoned:
-                raise RuntimeError("session remained poisoned after cancellation")
+            await super().commit()
 
         async def rollback(self):
-            self.rollback_calls += 1
-            self.poisoned = False
+            type(self).rollback_calls += 1
+            await super().rollback()
 
-    run = SimpleNamespace(output=None, current_step="", resume_token="")
-    message = Message(role="assistant", content="partial", metadata_={})
-    session = PoisonOnFirstCommitSession(run)
+    checkpoint_sessions = async_sessionmaker(
+        bind=db_session.bind,
+        class_=CancelFirstCommitSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+    user_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    conversation = Conversation(user_id=user_id, title="isolated checkpoint")
+    db_session.add(conversation)
+    await db_session.flush()
+    message = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content="partial answer",
+        metadata_={
+            "status": "pending",
+            "continuation": {"round": 1, "max_rounds": 2, "status": "continuing"},
+        },
+        model_name="gpt-test",
+    )
+    db_session.add(message)
+    await db_session.flush()
+    run = AgentRun(
+        conversation_id=conversation.id,
+        message_id=message.id,
+        user_id=user_id,
+        runtime="crewai",
+        flow_name="deep_research",
+        status="running",
+        output={"seed": True},
+    )
+    db_session.add(run)
+    await db_session.commit()
 
+    continuing = {"round": 1, "max_rounds": 2, "status": "continuing"}
     with pytest.raises(asyncio.CancelledError):
         await _persist_continuation_checkpoint(
-            session,
-            message,
-            uuid.uuid4(),
-            {"round": 1, "max_rounds": 2, "status": "continuing"},
+            checkpoint_sessions, message, run.id, continuing
         )
 
-    assert session.rollback_calls == 1
-    assert session.poisoned is False
+    assert CancelFirstCommitSession.rollback_calls == 1
+    # These are request-session ORM objects. Access must remain synchronous;
+    # an accidental rollback of db_session raises MissingGreenlet here.
+    assert message.content == "partial answer"
+    assert message.metadata_["continuation"]["status"] == "continuing"
+    assert run.output == {"seed": True}
 
+    cancelled = {"round": 1, "max_rounds": 2, "status": "cancelled"}
+    message.metadata_ = {**message.metadata_, "continuation": cancelled}
+    await _persist_continuation_checkpoint(
+        checkpoint_sessions, message, run.id, cancelled
+    )
+    usage = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    await ChatOrchestrator()._finalize_run(
+        db_session,
+        run,
+        ev_done(message_id=message.id, finish_reason="cancelled", usage=usage),
+        session_factory=checkpoint_sessions,
+    )
     await ChatService()._finalize_interrupted(
-        session,
+        db_session,
         message,
         finish_reason="cancelled",
-        usage={"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+        usage=usage,
         model_name="gpt-test",
     )
 
-    assert session.commit_calls == 2
-    assert message.metadata_["status"] == "cancelled"
-    assert message.metadata_["finish_reason"] == "cancelled"
-    assert message.total_tokens == 12
+    async with checkpoint_sessions() as verify:
+        durable_message = await verify.get(Message, message.id)
+        durable_run = await verify.get(AgentRun, run.id)
+        assert durable_message.content == "partial answer"
+        assert durable_message.metadata_["status"] == "cancelled"
+        assert durable_message.metadata_["continuation"] == cancelled
+        assert durable_message.total_tokens == 12
+        assert durable_run.status == "cancelled"
+        assert durable_run.output["seed"] is True
+        assert durable_run.output["continuation"] == cancelled
+        assert durable_run.output["finish_reason"] == "cancelled"
+        assert durable_run.output["usage"] == usage
 
 
 async def test_run_finalization_preserves_durable_continuation_checkpoint(db_session):

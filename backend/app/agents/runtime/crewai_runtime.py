@@ -36,7 +36,8 @@ from app.agents.approval_bridge import ApprovalBridge
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.continuation import aggregate_usage
-from app.agents.db_mutation import db_mutation_scope, rollback_safely
+from app.agents.db_mutation import db_mutation_scope
+from app.agents.persistence import persist_graph_snapshot, persist_research_plan
 from app.agents.crews import (
     build_debate_stages,
     build_parallel_research_stages,
@@ -70,7 +71,7 @@ from app.agents.stage_context import StageContext, make_stage_context
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
-from app.models import AgentRun
+from app.db import AsyncSessionLocal
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
 from app.providers.registry import get_provider_for_config
 
@@ -334,7 +335,10 @@ class CrewAIRuntime:
         stage_ctx.user_content = ctx.user_content
         stage_ctx.cancel_event = asyncio.Event()
         stage_ctx.db = ctx.db
-        stage_ctx.db_mutation_lock = ctx.extra.get("db_mutation_lock")
+        stage_ctx.persistence_session_factory = ctx.extra.get(
+            "persistence_session_factory"
+        ) or AsyncSessionLocal
+        stage_ctx.persistence_lock = ctx.extra.get("persistence_lock")
         persist_checkpoint = ctx.extra.get("persist_continuation_checkpoint")
         if callable(persist_checkpoint):
             stage_ctx.persist_continuation_checkpoint = persist_checkpoint
@@ -344,9 +348,12 @@ class CrewAIRuntime:
                     _persist_continuation_checkpoint,
                 )
 
-                async with db_mutation_scope(stage_ctx.db_mutation_lock):
+                async with db_mutation_scope(stage_ctx.persistence_lock):
                     await _persist_continuation_checkpoint(
-                        ctx.db, ctx.assistant_msg, ctx.run_id, checkpoint
+                        stage_ctx.persistence_session_factory,
+                        ctx.assistant_msg,
+                        ctx.run_id,
+                        checkpoint,
                     )
 
             stage_ctx.persist_continuation_checkpoint = persist_checkpoint_fallback
@@ -420,16 +427,12 @@ class CrewAIRuntime:
                 ],
                 "requires_confirmation": False,
             }
-            async with db_mutation_scope(stage_ctx.db_mutation_lock):
-                try:
-                    run_row = await ctx.db.get(AgentRun, ctx.run_id)
-                    if run_row is not None:
-                        run_row.plan = plan
-                        run_row.plan_status = "draft"
-                        await ctx.db.commit()
-                except BaseException:
-                    await rollback_safely(ctx.db)
-                    raise
+            async with db_mutation_scope(stage_ctx.persistence_lock):
+                await persist_research_plan(
+                    stage_ctx.persistence_session_factory,
+                    run_id=ctx.run_id,
+                    plan=plan,
+                )
             stage_ctx.emit(ev_research_plan(
                 run_id=ctx.run_id,
                 status="draft",
@@ -702,20 +705,17 @@ class CrewAIRuntime:
         definition: bool,
     ) -> None:
         """Write the graph snapshot to the AgentRun row (best-effort)."""
-        lock = ctx.extra.get("db_mutation_lock")
-        async with db_mutation_scope(lock):
-            try:
-                run = await ctx.db.get(AgentRun, ctx.run_id)
-                if run is None:
-                    return
-                snap = emitter.snapshot()
-                if definition:
-                    run.graph_definition = snap
-                run.graph_state = snap
-                await ctx.db.commit()
-            except BaseException as exc:
-                await rollback_safely(ctx.db)
-                if isinstance(exc, Exception):
-                    logger.warning("failed to persist agent graph snapshot", exc_info=True)
-                    return
-                raise
+        session_factory = ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
+        try:
+            async with db_mutation_scope(ctx.extra.get("persistence_lock")):
+                await persist_graph_snapshot(
+                    session_factory,
+                    run_id=ctx.run_id,
+                    snapshot=emitter.snapshot(),
+                    definition=definition,
+                )
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                logger.warning("failed to persist agent graph snapshot", exc_info=True)
+                return
+            raise

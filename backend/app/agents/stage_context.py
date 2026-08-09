@@ -156,7 +156,8 @@ class StageContext:
     user_content: str = ""
     cancel_event: Any = None
     db: Any = None
-    db_mutation_lock: asyncio.Lock | None = None
+    persistence_session_factory: Any = None
+    persistence_lock: asyncio.Lock | None = None
     persist_continuation_checkpoint: (
         Callable[[dict[str, Any]], Awaitable[None]] | None
     ) = None
