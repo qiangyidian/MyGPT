@@ -198,7 +198,32 @@ class StreamingWriterExecutor:
                 return
             raise RuntimeError("continuation checkpoint persistence is unavailable")
 
+        def cancellation_requested() -> bool:
+            ctl = get_run_control(stage_ctx.run_id)
+            cancel_evt = getattr(stage_ctx, "cancel_event", None)
+            return bool(
+                (ctl is not None and ctl.cancel.is_set())
+                or (cancel_evt is not None and cancel_evt.is_set())
+            )
+
+        async def persist_cancelled_continuation() -> dict[str, Any]:
+            checkpoint = {
+                "round": continuation_round,
+                "max_rounds": policy.max_rounds,
+                "status": "cancelled",
+            }
+            assistant_msg.metadata_ = {
+                **(assistant_msg.metadata_ or {}),
+                "continuation": checkpoint,
+            }
+            await persist_continuation(checkpoint)
+            return checkpoint
+
         while True:
+            if continuation_round and cancellation_requested():
+                finish_reason = "cancelled"
+                checkpoint = await persist_cancelled_continuation()
+                break
             round_raw = ""
             for attempt in (1, 2):
                 raw_parts: list[str] = []
@@ -339,7 +364,15 @@ class StreamingWriterExecutor:
                     **(assistant_msg.metadata_ or {}),
                     "continuation": checkpoint,
                 }
-                await persist_continuation(checkpoint)
+                try:
+                    await persist_continuation(checkpoint)
+                except asyncio.CancelledError:
+                    await persist_cancelled_continuation()
+                    raise
+                if cancellation_requested():
+                    finish_reason = "cancelled"
+                    checkpoint = await persist_cancelled_continuation()
+                    break
                 continue
             if continuation_round:
                 checkpoint = {

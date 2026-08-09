@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -35,6 +36,90 @@ logger = logging.getLogger(__name__)
 # Soft cap on the per-run event queue. Tools are not high-frequency; if this
 # ever fills we drop (logged) rather than block a worker thread.
 _QUEUE_MAX = 512
+
+
+@dataclass
+class _LLMUsageMeter:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    initialized: bool = False
+    last_claimed: dict[str, int | float] = field(default_factory=dict)
+
+
+@dataclass
+class _LLMUsageSlot:
+    meter: _LLMUsageMeter = field(default_factory=_LLMUsageMeter)
+    ref: weakref.ReferenceType[Any] | None = None
+    strong: Any = None
+
+    def matches(self, llm: Any) -> bool:
+        return (self.ref() if self.ref is not None else self.strong) is llm
+
+
+class LLMUsageCoordinator:
+    """Run-scoped exact-once allocator for cumulative per-LLM counters."""
+
+    def __init__(self) -> None:
+        self._slots: dict[int, _LLMUsageSlot] = {}
+
+    def _slot_for(self, llm: Any) -> _LLMUsageSlot:
+        key = id(llm)
+        current = self._slots.get(key)
+        if current is not None and current.matches(llm):
+            return current
+
+        slot = _LLMUsageSlot()
+        try:
+            def discard(ref: weakref.ReferenceType[Any], *, identity: int = key) -> None:
+                found = self._slots.get(identity)
+                if found is not None and found.ref is ref:
+                    self._slots.pop(identity, None)
+
+            slot.ref = weakref.ref(llm, discard)
+        except TypeError:
+            # Extension-backed clients may be non-weak-referenceable. The
+            # strong fallback is bounded by this StageContext/run lifetime.
+            slot.strong = llm
+        self._slots[key] = slot
+        return slot
+
+    async def begin(
+        self,
+        llm: Any,
+        snapshot: Callable[[], Awaitable[dict[str, int | float] | None]],
+    ) -> bool:
+        """Initialize one LLM's baseline under a short per-identity lock."""
+        if llm is None:
+            return False
+        slot = self._slot_for(llm)
+        async with slot.meter.lock:
+            current = await snapshot()
+            if current is None:
+                return False
+            if slot.meter.initialized:
+                return True
+            slot.meter.last_claimed = dict(current)
+            slot.meter.initialized = True
+            return True
+
+    async def claim(
+        self,
+        llm: Any,
+        snapshot: Callable[[], Awaitable[dict[str, int | float] | None]],
+    ) -> dict[str, int | float] | None:
+        """Atomically allocate cumulative usage not claimed by another stage."""
+        slot = self._slot_for(llm)
+        async with slot.meter.lock:
+            current = await snapshot()
+            if current is None or not slot.meter.initialized:
+                return None
+            before = slot.meter.last_claimed
+            delta = {
+                key: value - before.get(key, 0)
+                for key, value in current.items()
+                if value - before.get(key, 0) > 0
+            }
+            slot.meter.last_claimed = dict(current)
+            return delta or None
 
 
 @dataclass
@@ -82,6 +167,8 @@ class StageContext:
     # Metered tool/provider usage that is not represented by a successful
     # StageResult (for example a tool event or a failed writer attempt).
     usage_records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Cumulative CrewAI counters are shared by agents that reuse one LLM.
+    llm_usage: LLMUsageCoordinator = field(default_factory=LLMUsageCoordinator)
     # A sink the gateway can call to record that an AgentStep was written for
     # the current agent (used to keep graph_state's current_tool fresh). Optional.
     on_step_persisted: Callable[[str, str, str], None] | None = None  # (agent_id, tool_name, status)

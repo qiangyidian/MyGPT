@@ -166,6 +166,20 @@ class NativeChatRuntime:
                 db, assistant_msg, ctx.run_id, checkpoint
             )
 
+        async def persist_cancelled_continuation() -> dict[str, Any]:
+            checkpoint = {
+                "round": continuation_round,
+                "max_rounds": policy.max_rounds,
+                "status": "cancelled",
+            }
+            ctx.extra["continuation"] = checkpoint
+            assistant_msg.metadata_ = {
+                **(assistant_msg.metadata_ or {}),
+                "continuation": checkpoint,
+            }
+            await persist_continuation(checkpoint)
+            return checkpoint
+
         yield ev_step_started(
             step_id="answer", title="生成回答", step_type="llm", agent="assistant",
         )
@@ -176,6 +190,13 @@ class NativeChatRuntime:
                 if ctl is not None and ctl.cancel.is_set():
                     finish_reason = "cancelled"
                     _node_terminal = "cancelled"
+                    current_checkpoint = ctx.extra.get("continuation")
+                    if (
+                        continuation_round
+                        and isinstance(current_checkpoint, dict)
+                        and current_checkpoint.get("status") == "continuing"
+                    ):
+                        await persist_cancelled_continuation()
                     break
                 try:
                     guard.enter_step()
@@ -599,7 +620,17 @@ class NativeChatRuntime:
                         **(assistant_msg.metadata_ or {}),
                         "continuation": checkpoint,
                     }
-                    await persist_continuation(checkpoint)
+                    try:
+                        await persist_continuation(checkpoint)
+                    except asyncio.CancelledError:
+                        await persist_cancelled_continuation()
+                        raise
+                    ctl = ctx.extra.get("run_control")
+                    if ctl is not None and ctl.cancel.is_set():
+                        finish_reason = "cancelled"
+                        _node_terminal = "cancelled"
+                        await persist_cancelled_continuation()
+                        break
                     is_continuation_round = True
                     continue
                 if finish_reason == "length" and not pending_tool_calls:

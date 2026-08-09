@@ -35,6 +35,7 @@ from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError
 from app.providers.mock import MockProvider
+from app.services.chat_service import _persist_continuation_checkpoint
 
 _SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -273,6 +274,170 @@ async def test_crewai_stage_executor_records_failed_llm_usage_delta_in_finally()
         "prompt_tokens": 7,
         "completion_tokens": 2,
         "total_tokens": 9,
+    }
+
+
+async def test_crewai_parallel_shared_llm_usage_is_allocated_exactly_once():
+    class SharedLLM:
+        def __init__(self):
+            self.prompt_tokens = 0
+            self.completion_tokens = 0
+
+        def get_token_usage_summary(self):
+            return {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+            }
+
+    class FakeAgent:
+        tools = []
+
+        def __init__(self, llm, prompt_tokens, completion_tokens, delay):
+            self.llm = llm
+            self.prompt_tokens = prompt_tokens
+            self.completion_tokens = completion_tokens
+            self.delay = delay
+
+        async def aexecute_task(self, task, context=None):
+            await asyncio.sleep(self.delay)
+            self.llm.prompt_tokens += self.prompt_tokens
+            self.llm.completion_tokens += self.completion_tokens
+            return task.id
+
+    llm = SharedLLM()
+    stage_ctx = make_stage_context(uuid.uuid4())
+    executor = CrewAIStageExecutor()
+    results = await asyncio.gather(
+        executor.execute(
+            agent_id="researcher_a",
+            agent=FakeAgent(llm, 20, 3, 0.03),
+            task=SimpleNamespace(id="a", description="research A"),
+            context=None,
+            stage_ctx=stage_ctx,
+        ),
+        executor.execute(
+            agent_id="researcher_b",
+            agent=FakeAgent(llm, 10, 2, 0.01),
+            task=SimpleNamespace(id="b", description="research B"),
+            context=None,
+            stage_ctx=stage_ctx,
+        ),
+    )
+
+    assert aggregate_usage(result.usage for result in results) == {
+        "prompt_tokens": 30,
+        "completion_tokens": 5,
+        "total_tokens": 35,
+    }
+
+
+async def test_crewai_parallel_shared_llm_failure_usage_is_allocated_exactly_once():
+    class SharedAsyncLLM:
+        def __init__(self):
+            self.prompt_tokens = 0
+            self.completion_tokens = 0
+
+        async def get_token_usage_summary(self):
+            await asyncio.sleep(0)
+            return {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+            }
+
+    class FakeAgent:
+        tools = []
+
+        def __init__(self, llm, prompt_tokens, completion_tokens, delay, fail=False):
+            self.llm = llm
+            self.prompt_tokens = prompt_tokens
+            self.completion_tokens = completion_tokens
+            self.delay = delay
+            self.fail = fail
+
+        async def aexecute_task(self, task, context=None):
+            await asyncio.sleep(self.delay)
+            self.llm.prompt_tokens += self.prompt_tokens
+            self.llm.completion_tokens += self.completion_tokens
+            if self.fail:
+                raise RuntimeError("shared llm failed stage")
+            return task.id
+
+    llm = SharedAsyncLLM()
+    stage_ctx = make_stage_context(uuid.uuid4())
+    executor = CrewAIStageExecutor()
+    outcomes = await asyncio.gather(
+        executor.execute(
+            agent_id="researcher_a",
+            agent=FakeAgent(llm, 20, 3, 0.03, fail=True),
+            task=SimpleNamespace(id="a", description="research A"),
+            context=None,
+            stage_ctx=stage_ctx,
+        ),
+        executor.execute(
+            agent_id="researcher_b",
+            agent=FakeAgent(llm, 10, 2, 0.01),
+            task=SimpleNamespace(id="b", description="research B"),
+            context=None,
+            stage_ctx=stage_ctx,
+        ),
+        return_exceptions=True,
+    )
+
+    successful = [outcome for outcome in outcomes if isinstance(outcome, StageResult)]
+    assert len(successful) == 1
+    assert aggregate_usage(
+        [successful[0].usage, *stage_ctx.usage_records.values()]
+    ) == {
+        "prompt_tokens": 30,
+        "completion_tokens": 5,
+        "total_tokens": 35,
+    }
+
+
+async def test_crewai_distinct_llms_are_not_globally_serialized():
+    both_running = asyncio.Event()
+    running = 0
+
+    class DistinctLLM:
+        def __init__(self):
+            self.prompt_tokens = 0
+
+        def get_token_usage_summary(self):
+            return {"prompt_tokens": self.prompt_tokens}
+
+    class BarrierAgent:
+        tools = []
+
+        def __init__(self):
+            self.llm = DistinctLLM()
+
+        async def aexecute_task(self, task, context=None):
+            nonlocal running
+            running += 1
+            if running == 2:
+                both_running.set()
+            await asyncio.wait_for(both_running.wait(), timeout=0.5)
+            self.llm.prompt_tokens += 1
+            return task.id
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    executor = CrewAIStageExecutor()
+    results = await asyncio.gather(
+        *[
+            executor.execute(
+                agent_id=f"researcher_{index}",
+                agent=BarrierAgent(),
+                task=SimpleNamespace(id=str(index), description="research"),
+                context=None,
+                stage_ctx=stage_ctx,
+            )
+            for index in range(2)
+        ]
+    )
+
+    assert aggregate_usage(result.usage for result in results) == {
+        "prompt_tokens": 2,
+        "total_tokens": 2,
     }
 
 
@@ -538,6 +703,78 @@ async def test_writer_persists_checkpoint_before_followup_provider_dispatch(db_s
     ]
 
 
+async def test_writer_cancel_during_continuing_checkpoint_avoids_followup_dispatch(
+    db_session,
+):
+    provider = _ScriptedWriterProvider(
+        [
+            [ChatDelta(content="alpha"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="must not dispatch"), ChatDelta(finish_reason="stop")],
+        ]
+    )
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+    stage_ctx.cancel_event = asyncio.Event()
+    order = []
+
+    async def persist_checkpoint(checkpoint):
+        order.append(checkpoint["status"])
+        if checkpoint["status"] == "continuing":
+            stage_ctx.cancel_event.set()
+        await _persist_continuation_checkpoint(
+            db_session, msg, stage_ctx.run_id, checkpoint
+        )
+
+    stage_ctx.persist_continuation_checkpoint = persist_checkpoint
+
+    result = await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert len(provider.calls) == 1
+    assert order == ["continuing", "cancelled"]
+    assert result.structured["finish_reason"] == "cancelled"
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    assert run.output["continuation"]["status"] == "cancelled"
+
+
+async def test_writer_task_cancelled_during_checkpoint_replaces_stale_continuing(
+    db_session,
+):
+    provider = _ScriptedWriterProvider(
+        [[ChatDelta(content="alpha"), ChatDelta(finish_reason="length")]]
+    )
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+    order = []
+
+    async def persist_checkpoint(checkpoint):
+        order.append(checkpoint["status"])
+        await _persist_continuation_checkpoint(
+            db_session, msg, stage_ctx.run_id, checkpoint
+        )
+        if checkpoint["status"] == "continuing":
+            raise asyncio.CancelledError()
+
+    stage_ctx.persist_continuation_checkpoint = persist_checkpoint
+
+    with pytest.raises(asyncio.CancelledError):
+        await StreamingWriterExecutor(FakeStageExecutor()).execute(
+            agent_id="writer",
+            agent=None,
+            task=SimpleNamespace(description="q", id="t"),
+            context="verified",
+            stage_ctx=stage_ctx,
+        )
+
+    assert len(provider.calls) == 1
+    assert order == ["continuing", "cancelled"]
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    assert run.output["continuation"]["status"] == "cancelled"
+
+
 async def test_writer_stops_at_max_continuation_rounds(db_session):
     provider = _ScriptedWriterProvider(
         [
@@ -592,6 +829,41 @@ async def test_writer_usage_includes_empty_stream_retry(db_session):
         "completion_tokens": 1,
         "total_tokens": 12,
     }
+
+
+async def test_writer_direct_provider_usage_does_not_read_agent_llm_summary(db_session):
+    provider = _ScriptedWriterProvider(
+        [
+            [
+                ChatDelta(content="answer", finish_reason="stop"),
+                ChatDelta(usage={"prompt_tokens": 6, "completion_tokens": 2}),
+            ]
+        ]
+    )
+    stage_ctx, _msg = await _writer_ctx(db_session, provider)
+
+    class UnrelatedCrewLLM:
+        calls = 0
+
+        def get_token_usage_summary(self):
+            self.calls += 1
+            return {"prompt_tokens": 100, "completion_tokens": 50}
+
+    llm = UnrelatedCrewLLM()
+    result = await StreamingWriterExecutor(CrewAIStageExecutor()).execute(
+        agent_id="writer",
+        agent=SimpleNamespace(llm=llm),
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert result.usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 2,
+        "total_tokens": 8,
+    }
+    assert llm.calls == 0
 
 
 async def test_writer_provider_error_during_continuation_preserves_novel_partial(

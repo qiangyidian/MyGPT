@@ -20,6 +20,7 @@ from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.token_budget import PROMPT_TOO_LARGE, PromptAdmissionError
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError, ToolCallDef
+from app.services.chat_service import _persist_continuation_checkpoint
 from app.tools.base import BaseTool, ToolRegistry
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -298,6 +299,73 @@ async def test_native_persists_checkpoint_before_followup_provider_dispatch(
         ("provider", 2),
         ("persist", 1, "completed"),
     ]
+
+
+async def test_native_cancel_during_continuing_checkpoint_replaces_db_before_dispatch(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+    control = RunControl(run_id=str(ctx.run_id))
+    ctx.extra["run_control"] = control
+    order = []
+
+    async def persist_checkpoint(checkpoint):
+        order.append(("persist", checkpoint["status"]))
+        if checkpoint["status"] == "continuing":
+            control.cancel.set()
+        await _persist_continuation_checkpoint(
+            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+        )
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+    provider = _FakeProvider(
+        [
+            [ChatDelta(content="alpha"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="must not dispatch"), ChatDelta(finish_reason="stop")],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+
+    events = await _collect(ctx)
+
+    assert len(provider.calls) == 1
+    assert order == [("persist", "continuing"), ("persist", "cancelled")]
+    assert _find_all(events, "done")[-1]["finish_reason"] == "cancelled"
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"]["status"] == "cancelled"
+
+
+async def test_native_task_cancelled_during_checkpoint_replaces_stale_continuing(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+    order = []
+
+    async def persist_checkpoint(checkpoint):
+        order.append(checkpoint["status"])
+        await _persist_continuation_checkpoint(
+            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+        )
+        if checkpoint["status"] == "continuing":
+            raise asyncio.CancelledError()
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+    provider = _FakeProvider(
+        [[ChatDelta(content="alpha"), ChatDelta(finish_reason="length")]]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _collect(ctx)
+
+    assert len(provider.calls) == 1
+    assert order == ["continuing", "cancelled"]
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"]["status"] == "cancelled"
 
 
 async def test_native_stops_at_max_continuation_rounds_with_length(

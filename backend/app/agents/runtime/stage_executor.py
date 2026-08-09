@@ -111,15 +111,20 @@ class CrewAIStageExecutor:
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
-        usage_before = await _llm_usage_snapshot(agent)
+        llm = getattr(agent, "llm", None)
+        metered = await stage_ctx.llm_usage.begin(
+            llm, lambda: _llm_usage_snapshot(agent)
+        )
         completed = False
         llm_usage: dict[str, int | float] | None = None
         try:
             output = await agent.aexecute_task(task, context=admitted_context)
             completed = True
         finally:
-            usage_after = await _llm_usage_snapshot(agent)
-            llm_usage = _usage_delta(usage_before, usage_after)
+            if metered:
+                llm_usage = await stage_ctx.llm_usage.claim(
+                    llm, lambda: _llm_usage_snapshot(agent)
+                )
             if not completed and llm_usage:
                 stage_ctx.record_usage(
                     f"model:{agent_id}:{uuid.uuid4().hex}", llm_usage
@@ -128,7 +133,11 @@ class CrewAIStageExecutor:
         # CrewAI's installed Agent.aexecute_task returns a raw string. Its LLM
         # owns cumulative counters, so the before/after delta is authoritative
         # and must not be added again from duplicate output/agent snapshots.
-        usage = llm_usage or aggregate_usage(_extract_usage_rounds(output))
+        usage = (
+            llm_usage
+            if metered
+            else aggregate_usage(_extract_usage_rounds(output))
+        )
         return StageResult(
             agent_id=agent_id,
             raw=raw,
@@ -411,22 +420,6 @@ class SimpleUsageSource:
 
     def __init__(self, usage: Any) -> None:
         self.usage = usage
-
-
-def _usage_delta(
-    before: dict[str, int | float] | None,
-    after: dict[str, int | float] | None,
-) -> dict[str, int | float] | None:
-    """Return the non-negative delta between two cumulative snapshots."""
-    if not after:
-        return None
-    before = before or {}
-    delta = {
-        key: value - before.get(key, 0)
-        for key, value in after.items()
-        if value - before.get(key, 0) >= 0
-    }
-    return {key: value for key, value in delta.items() if value != 0} or None
 
 
 def _summarize(text: str, n: int) -> str:
