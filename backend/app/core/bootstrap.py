@@ -36,6 +36,41 @@ async def _create_tables() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Dev self-heal for schema drift. create_all only creates MISSING tables;
+        # it never ALTERs an existing table to add a column a model gained later.
+        # That left the dev DB diverged after a model change, 500-ing any query
+        # touching the new column (e.g. messages.prompt_tokens). Add any columns
+        # the models declare but the live tables lack. Idempotent + dev-only.
+        await conn.run_sync(_sync_columns)
+
+
+def _sync_columns(conn) -> None:
+    """ALTER each existing table to add any model columns it's missing.
+
+    Safe: only adds columns that don't exist, always NULLABLE (existing rows
+    back-fill to NULL). Production uses Alembic migrations — this is the dev
+    convenience that keeps AUTO_CREATE_TABLES in sync with the models.
+    """
+    from sqlalchemy import inspect, text
+
+    insp = inspect(conn)
+    for table_name, table in Base.metadata.tables.items():
+        if not insp.has_table(table_name):
+            continue
+        live = {c["name"] for c in insp.get_columns(table_name)}
+        for col in table.columns:
+            if col.name in live:
+                continue
+            try:
+                coltype = col.type.compile(dialect=conn.dialect)
+                conn.execute(
+                    text(f'ALTER TABLE "{table_name}" ADD COLUMN "{col.name}" {coltype}')
+                )
+                logger.warning(
+                    "schema-sync: added missing column %s.%s (%s)", table_name, col.name, coltype
+                )
+            except Exception as exc:  # noqa: BLE001 — never let a sync failure block startup
+                logger.warning("schema-sync: could not add %s.%s: %s", table_name, col.name, exc)
 
 
 async def _seed_admin(session) -> None:
