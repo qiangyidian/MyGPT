@@ -13,18 +13,36 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agents.runtime.crewai_runtime import CrewAIRuntime
+from app.agents.runtime.crewai_runtime import CrewAIRuntime, _writer_usage
 from app.agents.runtime.stage_executor import FakeStageExecutor
+from app.agents.runtime.stage_executor import StageResult
 from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.stage_context import make_stage_context
 from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun, Conversation, Message
-from app.providers.base import ChatDelta
+from app.providers.base import ChatDelta, ProviderError
 from app.providers.mock import MockProvider
 
 _SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+def test_crewai_runtime_extracts_writer_aggregate_usage():
+    stages = [SimpleNamespace(agent_id="researcher"), SimpleNamespace(agent_id="writer")]
+    outputs = {
+        "writer": StageResult(
+            agent_id="writer",
+            raw="",
+            structured={"usage": {"prompt_tokens": 22, "completion_tokens": 5, "total_tokens": 27}},
+        )
+    }
+
+    assert _writer_usage(stages, outputs) == {
+        "prompt_tokens": 22,
+        "completion_tokens": 5,
+        "total_tokens": 27,
+    }
 
 
 def _stage_ctx_with_provider(msg: Message) -> "make_stage_context":  # type: ignore[name-defined]
@@ -120,6 +138,199 @@ class _LengthProvider(MockProvider):
     async def stream_chat(self, messages, options=None):
         yield ChatDelta(content="partial code ")
         yield ChatDelta(content="", finish_reason="length")
+
+
+class _ScriptedWriterProvider(MockProvider):
+    def __init__(self, rounds):
+        super().__init__(base_url="http://x/v1", model="mock")
+        self.rounds = list(rounds)
+        self.calls = []
+
+    async def stream_chat(self, messages, options=None):
+        self.calls.append(list(messages))
+        for delta in self.rounds.pop(0):
+            yield delta
+
+
+async def _writer_ctx(db_session, provider):
+    conv = Conversation(user_id=_SEEDED, title="writer continuation")
+    db_session.add(conv)
+    await db_session.flush()
+    msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
+    db_session.add(msg)
+    await db_session.commit()
+    stage_ctx = make_stage_context(uuid.uuid4())
+    stage_ctx.provider = provider
+    stage_ctx.assistant_msg = msg
+    stage_ctx.user_content = "write a complete answer"
+    stage_ctx.model_config = SimpleNamespace(max_tokens=4096)
+    return stage_ctx, msg
+
+
+async def _writer_tokens(stage_ctx):
+    await asyncio.sleep(0.05)
+    tokens = []
+    while not stage_ctx.queue.empty():
+        event = stage_ctx.queue.get_nowait()
+        if event is not None and event.kind == "token":
+            tokens.append(event.data["delta"])
+    return tokens
+
+
+async def test_writer_auto_continues_length_and_emits_only_novel_tail(db_session):
+    provider = _ScriptedWriterProvider(
+        [
+            [
+                ChatDelta(content="alpha beta"),
+                ChatDelta(finish_reason="length"),
+                ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 2}),
+            ],
+            [
+                ChatDelta(content="beta gamma"),
+                ChatDelta(finish_reason="stop"),
+                ChatDelta(usage={"prompt_tokens": 12, "completion_tokens": 3}),
+            ],
+        ]
+    )
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+
+    result = await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert len(provider.calls) == 2
+    assert "continue" in provider.calls[1][-1]["content"].lower()
+    assert msg.content == "alpha beta gamma"
+    assert "".join(await _writer_tokens(stage_ctx)) == "alpha beta gamma"
+    assert result.structured["finish_reason"] == "stop"
+    assert result.structured["usage"] == {
+        "prompt_tokens": 22,
+        "completion_tokens": 5,
+        "total_tokens": 27,
+    }
+    assert msg.metadata_["continuation"]["status"] == "completed"
+
+
+async def test_writer_stops_at_max_continuation_rounds(db_session):
+    provider = _ScriptedWriterProvider(
+        [
+            [ChatDelta(content="A"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="A B"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="B C"), ChatDelta(finish_reason="length")],
+        ]
+    )
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+
+    result = await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert len(provider.calls) == 3
+    assert msg.content == "A B C"
+    assert result.structured["finish_reason"] == "length"
+    assert result.structured["continuation"]["status"] == "maxed"
+
+
+async def test_writer_usage_includes_empty_stream_retry(db_session):
+    provider = _ScriptedWriterProvider(
+        [
+            [
+                ChatDelta(finish_reason="stop"),
+                ChatDelta(usage={"prompt_tokens": 5, "completion_tokens": 0}),
+            ],
+            [
+                ChatDelta(content="answer", finish_reason="stop"),
+                ChatDelta(usage={"prompt_tokens": 6, "completion_tokens": 1}),
+            ],
+        ]
+    )
+    stage_ctx, _msg = await _writer_ctx(db_session, provider)
+
+    result = await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert result.structured["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 1,
+        "total_tokens": 12,
+    }
+
+
+async def test_writer_provider_error_during_continuation_preserves_novel_partial(
+    db_session,
+):
+    class ErroringContinuationProvider(MockProvider):
+        def __init__(self):
+            super().__init__(base_url="http://x/v1", model="mock")
+            self.calls = 0
+
+        async def stream_chat(self, messages, options=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield ChatDelta(content="alpha")
+                yield ChatDelta(finish_reason="length")
+                return
+            yield ChatDelta(content="alpha beta")
+            raise ProviderError("connection lost")
+
+    stage_ctx, msg = await _writer_ctx(db_session, ErroringContinuationProvider())
+
+    with pytest.raises(ProviderError):
+        await StreamingWriterExecutor(FakeStageExecutor()).execute(
+            agent_id="writer",
+            agent=None,
+            task=SimpleNamespace(description="q", id="t"),
+            context="verified",
+            stage_ctx=stage_ctx,
+        )
+
+    assert msg.content == "alpha beta"
+    assert "".join(await _writer_tokens(stage_ctx)) == "alpha beta"
+
+
+async def test_writer_cancel_before_continuation_avoids_followup_dispatch(db_session):
+    class CancelBeforeFollowupProvider(MockProvider):
+        def __init__(self):
+            super().__init__(base_url="http://x/v1", model="mock")
+            self.calls = 0
+            self.cancel_event = None
+
+        async def stream_chat(self, messages, options=None):
+            self.calls += 1
+            yield ChatDelta(content="partial")
+            yield ChatDelta(finish_reason="length")
+            self.cancel_event.set()
+
+    provider = CancelBeforeFollowupProvider()
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+    stage_ctx.cancel_event = asyncio.Event()
+    provider.cancel_event = stage_ctx.cancel_event
+
+    result = await StreamingWriterExecutor(FakeStageExecutor()).execute(
+        agent_id="writer",
+        agent=None,
+        task=SimpleNamespace(description="q", id="t"),
+        context="verified",
+        stage_ctx=stage_ctx,
+    )
+
+    assert provider.calls == 1
+    assert msg.content == "partial"
+    assert result.structured["finish_reason"] == "cancelled"
+    assert result.structured["continuation"]["status"] == "cancelled"
 
 
 async def test_writer_uses_configured_output_limit_and_parameter(db_session):

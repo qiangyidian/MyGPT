@@ -90,6 +90,38 @@ async def test_usage_only_chunk_does_not_end_generation():
     assert finishes == ["stop"], finishes
 
 
+async def test_usage_only_empty_choices_is_emitted_even_without_done_marker():
+    p = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+    deltas = await _collect(p, _sse(
+        '{"choices":[{"delta":{},"finish_reason":"length"}]}',
+        '{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
+    ))
+
+    usage_deltas = [delta for delta in deltas if delta.usage]
+    assert len(usage_deltas) == 1
+    assert usage_deltas[0].usage == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    assert usage_deltas[0].finish_reason is None
+    assert [d.finish_reason for d in deltas if d.finish_reason] == ["length"]
+
+
+async def test_usage_attached_to_terminal_choice_is_retained_once():
+    p = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+    deltas = await _collect(p, _sse(
+        '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}',
+        "[DONE]",
+    ))
+
+    usage_deltas = [delta for delta in deltas if delta.usage]
+    assert [delta.usage for delta in usage_deltas] == [
+        {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    ]
+    assert usage_deltas[0].finish_reason is None
+
+
 async def test_tool_calls_finish_not_overridden_by_done():
     p = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
     deltas = await _collect(p, _sse(

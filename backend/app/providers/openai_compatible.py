@@ -336,12 +336,12 @@ class OpenAICompatibleProvider(ModelProvider):
             except json.JSONDecodeError:
                 # Skip malformed chunk rather than killing the stream.
                 continue
+            if obj.get("usage"):
+                final_usage = obj["usage"]
             choices = obj.get("choices") or []
             if not choices:
                 # usage-only / routing chunk — capture usage (for token accounting)
                 # but never end generation on it.
-                if obj.get("usage"):
-                    final_usage = obj["usage"]
                 continue
             choice = choices[0]
             delta = choice.get("delta") or {}
@@ -377,6 +377,14 @@ class OpenAICompatibleProvider(ModelProvider):
                     tool_accum.clear()
                 yield ChatDelta(content="", tool_calls=None, finish_reason=finish_reason)
                 seen_real_finish = finish_reason
+
+        # Some compatible gateways close the HTTP body without a literal
+        # ``[DONE]`` marker. Usage-only chunks are still authoritative and must
+        # survive that transport variation; never synthesize a finish reason.
+        if final_usage is not None:
+            yield ChatDelta(
+                content="", tool_calls=None, finish_reason=None, usage=final_usage
+            )
 
     @staticmethod
     def _flush_tool_accum(tool_accum: dict[int, dict[str, Any]]) -> ChatDelta:

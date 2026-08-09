@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root (this file is backend/app/core/config.py → parents[3]). The config
@@ -255,6 +255,9 @@ class Settings(BaseSettings):
     # Backpressure: cap on concurrent in-flight model calls across the process.
     # Bounds DB-pool + provider-connection exhaustion under burst load.
     MAX_CONCURRENT_MODEL_CALLS: int = 16
+    # Automatic follow-up calls after an upstream output-token limit. Zero
+    # disables; the hard upper bound prevents runaway provider spend.
+    AUTO_CONTINUATION_MAX_ROUNDS: int = Field(default=2, ge=0, le=8)
     # Circuit breaker: open a provider's circuit after this many consecutive
     # failures, then fast-fail for the cooldown before a half-open probe.
     MODEL_CIRCUIT_FAILURE_THRESHOLD: int = 5

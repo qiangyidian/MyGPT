@@ -27,6 +27,11 @@ import asyncio
 import logging
 from typing import Any
 
+from app.agents.continuation import (
+    ContinuationBuffer,
+    ContinuationPolicy,
+    aggregate_usage,
+)
 from app.agents.runtime.stage_executor import (
     StageExecutor,
     StageResult,
@@ -35,10 +40,15 @@ from app.agents.runtime.stage_executor import (
 from app.agents.run_controls import get as get_run_control
 from app.agents.schemas import ev_token
 from app.agents.stage_context import StageContext
+from app.core.config import get_settings
 from app.model_capabilities import capabilities_from_config
 from app.providers.base import ChatOptions, ProviderError
 
 logger = logging.getLogger(__name__)
+
+_CONTINUE_INSTRUCTION = (
+    "Continue exactly where the answer stopped. Do not repeat any text already given."
+)
 
 # Agent ids that should stream their output (the final answer stage).
 _WRITER_AGENT_IDS = {"writer"}
@@ -152,68 +162,177 @@ class StreamingWriterExecutor:
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
 
-        # Some OpenAI-compatible gateways (e.g. the GLM proxy) occasionally
-        # return an EMPTY stream for an otherwise-valid prompt (a transient
-        # blank). provider.stream_chat does NOT error on empty — it just yields
-        # no content — so without a retry the writer would finish "green" with a
-        # blank answer. Retry once so a transient blank doesn't cost the answer.
-        accumulated: list[str] = []
+        # Some compatible gateways occasionally return an empty stream. Each
+        # logical answer round gets one bounded blank retry; length-truncated
+        # rounds additionally get the separately bounded continuation policy.
+        policy = ContinuationPolicy(
+            max_rounds=get_settings().AUTO_CONTINUATION_MAX_ROUNDS
+        )
+        continuation_round = 0
+        usage_rounds: list[dict[str, Any]] = []
+        full = assistant_msg.content or ""
         finish_reason = "stop"
-        for attempt in (1, 2):
-            accumulated = []
-            finish_reason = "stop"
-            try:
-                async for delta in provider.stream_chat(messages, options):
-                    ctl = get_run_control(stage_ctx.run_id)
-                    # Cooperative cancel between chunks: the Stop button / cancel
-                    # API sets ctl.cancel (the real signal). cancel_event is a
-                    # defensive secondary check. Honor either -> cancelled.
-                    cancel_evt = getattr(stage_ctx, "cancel_event", None)
-                    if (ctl is not None and ctl.cancel.is_set()) or (
-                        cancel_evt is not None and cancel_evt.is_set()
-                    ):
-                        finish_reason = "cancelled"
-                        break
-                    # Phase 2: honor a user-initiated pause mid-stream.
-                    if ctl is not None:
-                        while ctl.is_paused() and not ctl.cancel.is_set():
-                            await asyncio.sleep(0.1)
-                        if ctl.cancel.is_set():
+        checkpoint: dict[str, Any] | None = None
+        while True:
+            round_raw = ""
+            for attempt in (1, 2):
+                raw_parts: list[str] = []
+                novel_parts: list[str] = []
+                round_usage: dict[str, Any] | None = None
+                finish_reason = "stop"
+                continuation_buffer = (
+                    ContinuationBuffer(
+                        full, comparison_window=policy.comparison_window
+                    )
+                    if continuation_round
+                    else None
+                )
+                try:
+                    async for delta in provider.stream_chat(messages, options):
+                        ctl = get_run_control(stage_ctx.run_id)
+                        # Cooperative cancel between chunks: the Stop button / cancel
+                        # API sets ctl.cancel (the real signal). cancel_event is a
+                        # defensive secondary check. Honor either -> cancelled.
+                        cancel_evt = getattr(stage_ctx, "cancel_event", None)
+                        if (ctl is not None and ctl.cancel.is_set()) or (
+                            cancel_evt is not None and cancel_evt.is_set()
+                        ):
                             finish_reason = "cancelled"
                             break
-                    if delta.content:
-                        accumulated.append(delta.content)
-                        # Mutate incrementally so partial content survives cancel.
-                        assistant_msg.content = "".join(accumulated)
-                        stage_ctx.emit(ev_token(delta=delta.content))
-                    if delta.finish_reason:
-                        finish_reason = delta.finish_reason
-            except asyncio.CancelledError:
-                assistant_msg.content = "".join(accumulated)
-                stage_ctx.writer_streamed = True
-                raise
-            except ProviderError:
-                logger.warning("writer stream provider error", exc_info=True)
-                raise
-            except Exception:
-                logger.exception("writer streaming failed")
-                raise
-            # Done if we got content, or the user cancelled.
-            if accumulated or finish_reason == "cancelled":
-                break
-            if attempt == 1:
-                logger.info("writer stream returned empty; retrying once")
+                        # Phase 2: honor a user-initiated pause mid-stream.
+                        if ctl is not None:
+                            while ctl.is_paused() and not ctl.cancel.is_set():
+                                await asyncio.sleep(0.1)
+                            if ctl.cancel.is_set():
+                                finish_reason = "cancelled"
+                                break
+                        if delta.content:
+                            raw_parts.append(delta.content)
+                            novel = (
+                                continuation_buffer.feed(delta.content)
+                                if continuation_buffer is not None
+                                else delta.content
+                            )
+                            if novel:
+                                novel_parts.append(novel)
+                                full += novel
+                                assistant_msg.content = full
+                                stage_ctx.emit(ev_token(delta=novel))
+                        if delta.finish_reason:
+                            finish_reason = delta.finish_reason
+                        if delta.usage:
+                            round_usage = delta.usage
+                except asyncio.CancelledError:
+                    if continuation_buffer is not None:
+                        buffered = continuation_buffer.flush()
+                        if buffered:
+                            full += buffered
+                            assistant_msg.content = full
+                            stage_ctx.emit(ev_token(delta=buffered))
+                    stage_ctx.writer_streamed = True
+                    raise
+                except ProviderError:
+                    if continuation_buffer is not None:
+                        buffered = continuation_buffer.flush()
+                        if buffered:
+                            full += buffered
+                            assistant_msg.content = full
+                            stage_ctx.emit(ev_token(delta=buffered))
+                    stage_ctx.writer_streamed = True
+                    logger.warning("writer stream provider error", exc_info=True)
+                    raise
+                except Exception:
+                    if continuation_buffer is not None:
+                        buffered = continuation_buffer.flush()
+                        if buffered:
+                            full += buffered
+                            assistant_msg.content = full
+                            stage_ctx.emit(ev_token(delta=buffered))
+                    stage_ctx.writer_streamed = True
+                    logger.exception("writer streaming failed")
+                    raise
+                if continuation_buffer is not None:
+                    buffered = continuation_buffer.flush()
+                    if buffered:
+                        novel_parts.append(buffered)
+                        full += buffered
+                        assistant_msg.content = full
+                        stage_ctx.emit(ev_token(delta=buffered))
+                if round_usage is not None:
+                    usage_rounds.append(round_usage)
+                round_raw = "".join(raw_parts)
+                if round_raw or finish_reason == "cancelled":
+                    break
+                if attempt == 1:
+                    logger.info("writer stream returned empty; retrying once")
+
+            ctl = get_run_control(stage_ctx.run_id)
+            cancel_evt = getattr(stage_ctx, "cancel_event", None)
+            cancelled_before_followup = finish_reason == "length" and (
+                (ctl is not None and ctl.cancel.is_set())
+                or (cancel_evt is not None and cancel_evt.is_set())
+            )
+            if cancelled_before_followup:
+                finish_reason = "cancelled"
+                checkpoint = {
+                    "round": continuation_round,
+                    "max_rounds": policy.max_rounds,
+                    "status": "cancelled",
+                }
+                assistant_msg.metadata_ = {
+                    **(assistant_msg.metadata_ or {}),
+                    "continuation": checkpoint,
+                }
+            if finish_reason == "length" and continuation_round < policy.max_rounds:
+                messages.append({"role": "assistant", "content": round_raw})
+                messages.append({"role": "user", "content": _CONTINUE_INSTRUCTION})
+                continuation_round += 1
+                checkpoint = {
+                    "round": continuation_round,
+                    "max_rounds": policy.max_rounds,
+                    "status": "continuing",
+                }
+                assistant_msg.metadata_ = {
+                    **(assistant_msg.metadata_ or {}),
+                    "continuation": checkpoint,
+                }
+                continue
+            if continuation_round:
+                checkpoint = {
+                    "round": continuation_round,
+                    "max_rounds": policy.max_rounds,
+                    "status": (
+                        "maxed"
+                        if finish_reason == "length"
+                        else "cancelled"
+                        if finish_reason == "cancelled"
+                        else "completed"
+                    ),
+                }
+                assistant_msg.metadata_ = {
+                    **(assistant_msg.metadata_ or {}),
+                    "continuation": checkpoint,
+                }
+            break
 
         stage_ctx.writer_streamed = True
-        full = "".join(accumulated)
         assistant_msg.content = full
         # raw="" → runtime must NOT re-emit a bulk token. output_summary feeds
         # the activity feed / agent node card.
+        structured: dict[str, Any] = {
+            "finish_reason": finish_reason,
+            "streamed": True,
+        }
+        usage = aggregate_usage(usage_rounds)
+        if usage is not None:
+            structured["usage"] = usage
+        if checkpoint is not None:
+            structured["continuation"] = checkpoint
         return StageResult(
             agent_id=agent_id,
             raw="",
             output_summary=(full.strip().replace("\n", " ")[:160] or "（空回答）"),
-            structured={"finish_reason": finish_reason, "streamed": True},
+            structured=structured,
         )
 
 

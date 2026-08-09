@@ -124,6 +124,27 @@ def _finish_for_error_code(code: str | None) -> str:
     return _ERROR_FINISH.get(code, "error")
 
 
+def _apply_usage_accounting(
+    message: Message,
+    model_name: str | None,
+    usage: dict[str, Any] | None,
+) -> None:
+    """Persist one already-aggregated turn usage payload and its total cost."""
+    from app.core.pricing import compute_cost, normalize_usage
+
+    normalized = normalize_usage(usage)
+    if normalized is None:
+        return
+    message.prompt_tokens = normalized["prompt_tokens"]
+    message.completion_tokens = normalized["completion_tokens"]
+    message.total_tokens = normalized["total_tokens"]
+    message.cost_usd = compute_cost(model_name, usage)
+    message.metadata_ = {
+        **(message.metadata_ or {}),
+        "usage": dict(usage or {}),
+    }
+
+
 def _log_turn_outcome(
     label: str,
     *,
@@ -1083,13 +1104,9 @@ class ChatService:
                     # (propagated through the runtime's done event). The provider
                     # parses usage; it used to be discarded — now it answers
                     # "who spent what" and enables per-user budgets.
-                    from app.core.pricing import compute_cost, normalize_usage
-                    _usage = normalize_usage(evt.data.get("usage"))
-                    if _usage is not None:
-                        assistant_msg.prompt_tokens = _usage["prompt_tokens"]
-                        assistant_msg.completion_tokens = _usage["completion_tokens"]
-                        assistant_msg.total_tokens = _usage["total_tokens"]
-                        assistant_msg.cost_usd = compute_cost(cfg.model_name, evt.data.get("usage"))
+                    _apply_usage_accounting(
+                        assistant_msg, cfg.model_name, evt.data.get("usage")
+                    )
                     assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                     _log_turn_outcome(
                         "complete",

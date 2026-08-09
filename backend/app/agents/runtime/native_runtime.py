@@ -27,6 +27,11 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from app.agents.approval_coordinator import approval_coordinator
+from app.agents.continuation import (
+    ContinuationBuffer,
+    ContinuationPolicy,
+    aggregate_usage,
+)
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies import BudgetExceeded, BudgetGuard
 from app.agents.graph import build_single_agent_graph
@@ -50,6 +55,7 @@ from app.agents.schemas import (
     ev_tool_result,
 )
 from app.models import AgentRun
+from app.core.config import get_settings
 from app.providers.base import (
     ChatOptions,
     ProviderError,
@@ -60,6 +66,10 @@ from app.providers.registry import get_provider_for_config
 from app.tools.registry_init import get_default_registry
 
 logger = logging.getLogger(__name__)
+
+_CONTINUE_INSTRUCTION = (
+    "Continue exactly where the answer stopped. Do not repeat any text already given."
+)
 
 
 class NativeChatRuntime:
@@ -138,7 +148,12 @@ class NativeChatRuntime:
 
         working: list[dict[str, Any]] = list(ctx.messages)
         finish_reason = "stop"
-        turn_usage: dict[str, int] | None = None  # accumulated token usage (final chunk)
+        usage_rounds: list[dict[str, Any]] = []
+        policy = ContinuationPolicy(
+            max_rounds=get_settings().AUTO_CONTINUATION_MAX_ROUNDS
+        )
+        continuation_round = 0
+        is_continuation_round = False
 
         yield ev_step_started(
             step_id="answer", title="生成回答", step_type="llm", agent="assistant",
@@ -159,7 +174,17 @@ class NativeChatRuntime:
                     break
 
                 accumulated: list[str] = []
+                novel_parts: list[str] = []
                 pending_tool_calls: list[ToolCallDef] = []
+                round_usage: dict[str, Any] | None = None
+                continuation_buffer = (
+                    ContinuationBuffer(
+                        assistant_msg.content or "",
+                        comparison_window=policy.comparison_window,
+                    )
+                    if is_continuation_round
+                    else None
+                )
 
                 # Tool results expand ``working`` between rounds. Re-admit the
                 # exact payload immediately before every provider dispatch so
@@ -209,19 +234,41 @@ class NativeChatRuntime:
                             finish_reason = "cancelled"
                             _node_terminal = "cancelled"
                             break
+                        if ctl is not None:
+                            while ctl.is_paused() and not ctl.cancel.is_set():
+                                await asyncio.sleep(0.1)
+                            if ctl.cancel.is_set():
+                                finish_reason = "cancelled"
+                                _node_terminal = "cancelled"
+                                break
                         if delta.content:
                             accumulated.append(delta.content)
-                            yield ev_token(delta=delta.content)
+                            novel = (
+                                continuation_buffer.feed(delta.content)
+                                if continuation_buffer is not None
+                                else delta.content
+                            )
+                            if novel:
+                                novel_parts.append(novel)
+                                yield ev_token(delta=novel)
                         if delta.tool_calls:
                             pending_tool_calls.extend(delta.tool_calls)
                         if delta.finish_reason:
                             finish_reason = delta.finish_reason
                         if delta.usage:
-                            turn_usage = delta.usage
+                            # A provider may emit multiple snapshots in one call
+                            # (including a final usage-only chunk). Retain only
+                            # the final snapshot and add it once after the round.
+                            round_usage = delta.usage
                     model_breaker().record_success(_breaker_key)
                 except PromptAdmissionError as exc:
+                    if continuation_buffer is not None:
+                        buffered_novel = continuation_buffer.flush()
+                        if buffered_novel:
+                            novel_parts.append(buffered_novel)
+                            yield ev_token(delta=buffered_novel)
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
-                        accumulated
+                        novel_parts
                     )
                     finish_reason = "budget"
                     ctx.extra["admission_error_code"] = exc.code
@@ -239,7 +286,14 @@ class NativeChatRuntime:
                     # Fold this round's partial text before surfacing the error,
                     # so a mid-stream timeout/network failure still preserves
                     # everything generated so far.
-                    assistant_msg.content = (assistant_msg.content or "") + "".join(accumulated)
+                    if continuation_buffer is not None:
+                        buffered_novel = continuation_buffer.flush()
+                        if buffered_novel:
+                            novel_parts.append(buffered_novel)
+                            yield ev_token(delta=buffered_novel)
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(
+                        novel_parts
+                    )
                     logger.exception("provider error in native run: %s", exc)
                     yield ev_error(
                         code=getattr(exc, "code", "provider_error"), message=str(exc)
@@ -251,9 +305,18 @@ class NativeChatRuntime:
                 finally:
                     model_limiter().release()
 
+                if continuation_buffer is not None:
+                    buffered_novel = continuation_buffer.flush()
+                    if buffered_novel:
+                        novel_parts.append(buffered_novel)
+                        yield ev_token(delta=buffered_novel)
+                if round_usage is not None:
+                    usage_rounds.append(round_usage)
                 # Fold this round's streamed text into the assistant message so a
                 # mid-loop disconnect still leaves recoverable content.
-                assistant_msg.content = (assistant_msg.content or "") + "".join(accumulated)
+                assistant_msg.content = (assistant_msg.content or "") + "".join(
+                    novel_parts
+                )
 
                 # Tool-calling branch: execute via the gateway, append results, re-stream.
                 if (
@@ -409,7 +472,71 @@ class NativeChatRuntime:
 
                     # Re-stream with the tool results folded in.
                     finish_reason = "stop"  # reset; the next round decides
+                    is_continuation_round = False
                     continue
+
+                ctl = ctx.extra.get("run_control")
+                if (
+                    finish_reason == "length"
+                    and ctl is not None
+                    and ctl.cancel.is_set()
+                ):
+                    finish_reason = "cancelled"
+                    _node_terminal = "cancelled"
+                    checkpoint = {
+                        "round": continuation_round,
+                        "max_rounds": policy.max_rounds,
+                        "status": "cancelled",
+                    }
+                    ctx.extra["continuation"] = checkpoint
+                    assistant_msg.metadata_ = {
+                        **(assistant_msg.metadata_ or {}),
+                        "continuation": checkpoint,
+                    }
+                if finish_reason == "length" and not pending_tool_calls:
+                    if continuation_round < policy.max_rounds:
+                        working.append(
+                            {"role": "assistant", "content": "".join(accumulated)}
+                        )
+                        working.append(
+                            {"role": "user", "content": _CONTINUE_INSTRUCTION}
+                        )
+                        continuation_round += 1
+                        checkpoint = {
+                            "round": continuation_round,
+                            "max_rounds": policy.max_rounds,
+                            "status": "continuing",
+                        }
+                        ctx.extra["continuation"] = checkpoint
+                        assistant_msg.metadata_ = {
+                            **(assistant_msg.metadata_ or {}),
+                            "continuation": checkpoint,
+                        }
+                        is_continuation_round = True
+                        continue
+                    checkpoint = {
+                        "round": continuation_round,
+                        "max_rounds": policy.max_rounds,
+                        "status": "maxed",
+                    }
+                    ctx.extra["continuation"] = checkpoint
+                    assistant_msg.metadata_ = {
+                        **(assistant_msg.metadata_ or {}),
+                        "continuation": checkpoint,
+                    }
+                elif continuation_round:
+                    checkpoint = {
+                        "round": continuation_round,
+                        "max_rounds": policy.max_rounds,
+                        "status": (
+                            "cancelled" if finish_reason == "cancelled" else "completed"
+                        ),
+                    }
+                    ctx.extra["continuation"] = checkpoint
+                    assistant_msg.metadata_ = {
+                        **(assistant_msg.metadata_ or {}),
+                        "continuation": checkpoint,
+                    }
 
                 # No further tool calls — done.
                 break
@@ -425,11 +552,26 @@ class NativeChatRuntime:
                 yield _evt
             return
 
+        if continuation_round and finish_reason == "cancelled":
+            checkpoint = {
+                "round": continuation_round,
+                "max_rounds": policy.max_rounds,
+                "status": "cancelled",
+            }
+            ctx.extra["continuation"] = checkpoint
+            assistant_msg.metadata_ = {
+                **(assistant_msg.metadata_ or {}),
+                "continuation": checkpoint,
+            }
         ctx.extra["finish_reason"] = finish_reason
         ctx.extra["budget"] = guard.snapshot()
         for _evt in _native_terminal_events(ctx, _node_terminal, _assistant_started):
             yield _evt
-        yield ev_done(message_id=assistant_msg.id, finish_reason=finish_reason, usage=turn_usage)
+        yield ev_done(
+            message_id=assistant_msg.id,
+            finish_reason=finish_reason,
+            usage=aggregate_usage(usage_rounds),
+        )
 
     @staticmethod
     async def _set_run_status(ctx: AgentTurnContext, status: str) -> None:

@@ -115,6 +115,22 @@ def _writer_finish_reason(stages: list[StageSpec], outputs: dict[str, StageResul
     return "stop"
 
 
+def _writer_usage(
+    stages: list[StageSpec], outputs: dict[str, StageResult]
+) -> dict[str, Any] | None:
+    """Return the writer's already-aggregated provider usage, when available."""
+    for spec in stages:
+        if getattr(spec, "agent_id", "") != "writer":
+            continue
+        result = outputs.get(spec.agent_id)
+        if result and isinstance(result.structured, dict):
+            usage = result.structured.get("usage")
+            if isinstance(usage, dict) and usage:
+                return usage
+        break
+    return None
+
+
 def _map_run_error(exc: Exception) -> tuple[str, str]:
     """Map a multi-agent flow exception to (finish_reason, ev_error code)."""
     if isinstance(exc, PromptAdmissionError):
@@ -456,7 +472,11 @@ class CrewAIRuntime:
         ctx.extra["multi_agent"] = True
         if not streamed and final_text:
             yield ev_token(delta=final_text)
-        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason=finish)
+        yield ev_done(
+            message_id=ctx.assistant_msg.id,
+            finish_reason=finish,
+            usage=_writer_usage(stages, outputs),
+        )
 
     async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:
         """Honor user pause/resume + drain appended instructions between stages."""
