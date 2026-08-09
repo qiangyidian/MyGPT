@@ -775,6 +775,57 @@ async def test_writer_task_cancelled_during_checkpoint_replaces_stale_continuing
     assert run.output["continuation"]["status"] == "cancelled"
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [asyncio.CancelledError(), RuntimeError("checkpoint unavailable")],
+)
+async def test_writer_checkpoint_failure_records_completed_round_usage_once(
+    db_session, raised
+):
+    provider = _ScriptedWriterProvider(
+        [
+            [
+                ChatDelta(content="partial answer"),
+                ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 2}),
+                ChatDelta(finish_reason="length"),
+            ]
+        ]
+    )
+    stage_ctx, msg = await _writer_ctx(db_session, provider)
+
+    async def persist_checkpoint(checkpoint):
+        if checkpoint["status"] == "continuing":
+            raise raised
+        await _persist_continuation_checkpoint(
+            db_session, msg, stage_ctx.run_id, checkpoint
+        )
+
+    stage_ctx.persist_continuation_checkpoint = persist_checkpoint
+
+    with pytest.raises(type(raised)):
+        await StreamingWriterExecutor(FakeStageExecutor()).execute(
+            agent_id="writer",
+            agent=None,
+            task=SimpleNamespace(description="q", id="t"),
+            context="verified",
+            stage_ctx=stage_ctx,
+        )
+
+    assert len(provider.calls) == 1
+    assert msg.content == "partial answer"
+    assert aggregate_usage(stage_ctx.usage_records.values()) == {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+    assert len(stage_ctx.usage_records) == 1
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    if isinstance(raised, asyncio.CancelledError):
+        assert run.output["continuation"]["status"] == "cancelled"
+    else:
+        assert run.output is None
+
+
 async def test_writer_stops_at_max_continuation_rounds(db_session):
     provider = _ScriptedWriterProvider(
         [

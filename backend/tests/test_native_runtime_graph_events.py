@@ -368,6 +368,63 @@ async def test_native_task_cancelled_during_checkpoint_replaces_stale_continuing
     assert run.output["continuation"]["status"] == "cancelled"
 
 
+@pytest.mark.parametrize(
+    ("raised", "error_code"),
+    [
+        (asyncio.CancelledError(), None),
+        (RuntimeError("checkpoint unavailable"), "internal"),
+    ],
+)
+async def test_native_checkpoint_failure_preserves_completed_round_usage(
+    db_session, monkeypatch, raised, error_code
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+
+    async def persist_checkpoint(checkpoint):
+        if checkpoint["status"] == "continuing":
+            raise raised
+        await _persist_continuation_checkpoint(
+            db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+        )
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+    provider = _FakeProvider(
+        [
+            [
+                ChatDelta(content="partial answer"),
+                ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 2}),
+                ChatDelta(finish_reason="length"),
+            ]
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+
+    if isinstance(raised, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await _collect(ctx)
+        run = await db_session.get(AgentRun, ctx.run_id)
+        assert run.output["continuation"]["status"] == "cancelled"
+    else:
+        events = await _collect(ctx)
+        error = _find_all(events, "error")[-1]
+        assert error["code"] == error_code
+        assert error["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        }
+
+    assert len(provider.calls) == 1
+    assert ctx.assistant_msg.content == "partial answer"
+    assert ctx.extra["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+
+
 async def test_native_stops_at_max_continuation_rounds_with_length(
     db_session, monkeypatch
 ):

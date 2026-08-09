@@ -198,6 +198,17 @@ class StreamingWriterExecutor:
                 return
             raise RuntimeError("continuation checkpoint persistence is unavailable")
 
+        async def persist_or_record_failure(checkpoint: dict[str, Any]) -> None:
+            """Persist a checkpoint or retain usage that no StageResult can return."""
+            try:
+                await persist_continuation(checkpoint)
+            except asyncio.CancelledError:
+                record_failed_usage(None)
+                raise
+            except Exception:
+                record_failed_usage(None)
+                raise
+
         def cancellation_requested() -> bool:
             ctl = get_run_control(stage_ctx.run_id)
             cancel_evt = getattr(stage_ctx, "cancel_event", None)
@@ -216,7 +227,7 @@ class StreamingWriterExecutor:
                 **(assistant_msg.metadata_ or {}),
                 "continuation": checkpoint,
             }
-            await persist_continuation(checkpoint)
+            await persist_or_record_failure(checkpoint)
             return checkpoint
 
         while True:
@@ -291,7 +302,7 @@ class StreamingWriterExecutor:
                             **(assistant_msg.metadata_ or {}),
                             "continuation": checkpoint,
                         }
-                        await persist_continuation(checkpoint)
+                        await persist_or_record_failure(checkpoint)
                     raise
                 except ProviderError:
                     if continuation_buffer is not None:
@@ -365,7 +376,7 @@ class StreamingWriterExecutor:
                     "continuation": checkpoint,
                 }
                 try:
-                    await persist_continuation(checkpoint)
+                    await persist_or_record_failure(checkpoint)
                 except asyncio.CancelledError:
                     await persist_cancelled_continuation()
                     raise
@@ -395,7 +406,7 @@ class StreamingWriterExecutor:
                 "completed",
                 "cancelled",
             }:
-                await persist_continuation(checkpoint)
+                await persist_or_record_failure(checkpoint)
             break
 
         stage_ctx.writer_streamed = True
