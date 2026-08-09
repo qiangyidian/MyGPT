@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import { BarChart3, FileSearch, MessageSquare, PenLine, Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { getVisibleMessages } from "@/lib/message-visibility";
 import { MessageBubble } from "@/components/message-bubble";
 import type { Citation, Message, ResearchStep } from "@/lib/types";
 
@@ -62,12 +63,7 @@ export function MessageList({
 
   const isEmpty = messages.length === 0 && !streamingText && !isStreaming;
 
-  const shownMessages =
-    isStreaming && streamingText !== undefined
-      ? messages.filter(
-          (m, i) => !(m.role === "assistant" && !m.content && i === messages.length - 1)
-        )
-      : messages;
+  const shownMessages = getVisibleMessages(messages, Boolean(isStreaming && streamingText !== undefined));
 
   if (isEmpty) {
     return (
