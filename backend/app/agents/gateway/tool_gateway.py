@@ -29,6 +29,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.continuation import normalize_usage
 from app.agents.policies import (
     UnsafeSQLError,
     arguments_hash,
@@ -262,7 +263,13 @@ class ToolGateway:
             )
 
         # 6 + 7. Truncate + finalize (persists rows).
-        full_text, content, truncated = _stringify_and_truncate(result)
+        usage = normalize_usage(result.get("usage")) if isinstance(result, dict) else None
+        rendered_result = (
+            {key: value for key, value in result.items() if key != "usage"}
+            if isinstance(result, dict)
+            else result
+        )
+        full_text, content, truncated = _stringify_and_truncate(rendered_result)
         return await self._finalize(
             tool_call_id, tool_name, args, started,
             ok=True, status="success",
@@ -273,6 +280,7 @@ class ToolGateway:
             # complete JSON to extract 来源 (the 8000-char cap for the model context
             # used to cut the JSON mid-array and break source extraction).
             full_result=full_text,
+            usage=usage,
         )
 
     # ------------------------------------------------------------------ #
@@ -328,6 +336,7 @@ class ToolGateway:
         approval_id: uuid.UUID | None = None,
         truncated: bool = False,
         full_result: str | None = None,
+        usage: dict[str, int | float] | None = None,
         step_type: str = "tool",
         step_status: str | None = None,
     ) -> ToolExecution:
@@ -404,6 +413,7 @@ class ToolGateway:
             truncated=truncated,
             full_result=full_result,
             latency_ms=latency_ms,
+            usage=usage,
         )
 
 

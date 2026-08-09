@@ -24,6 +24,7 @@ from app.agents.policies.tool_policy import (
 )
 from app.agents.schemas import ExecutionMode
 from app.models import AgentRun, AgentStep, Conversation, Message, ToolApproval, ToolCall
+from app.tools.base import BaseTool, ToolRegistry
 from app.tools.registry_init import get_default_registry
 from tests.conftest import auth_headers
 
@@ -131,6 +132,47 @@ async def test_gateway_safe_tool_executes(db_session):
     assert len(rows) == 1
     steps = (await db_session.execute(__import__("sqlalchemy").select(AgentStep).where(AgentStep.run_id == run.id))).scalars().all()
     assert len(steps) == 1 and steps[0].step_type == "tool"
+
+
+async def test_gateway_separates_and_sanitizes_tool_usage_from_model_content(db_session):
+    class MeteredTool(BaseTool):
+        name = "metered_tool"
+        description = "returns metered data"
+
+        async def run(self, **kwargs):
+            return {
+                "answer": "safe result",
+                "usage": {
+                    "tool_units": 2,
+                    "cached_tokens": 3,
+                    "api_key": "must-not-leak",
+                    "negative": -1,
+                    "nested": {"secret": "must-not-leak"},
+                },
+            }
+
+    registry = ToolRegistry()
+    registry.register(MeteredTool())
+    _, msg, run = await _seed_run(db_session)
+    gw = ToolGateway(
+        db_session,
+        conversation_id=msg.conversation_id,
+        assistant_message_id=msg.id,
+        run_id=run.id,
+        user=None,
+        registry=registry,
+    )
+
+    execution = await gw.execute(
+        tool_call_id="metered-1", tool_name="metered_tool", arguments={}
+    )
+
+    assert execution.usage == {"tool_units": 2, "cached_tokens": 3}
+    model_content = execution.to_openai_tool_message()["content"]
+    assert "safe result" in model_content
+    assert "usage" not in model_content
+    assert "must-not-leak" not in model_content
+    assert "must-not-leak" not in (execution.full_result or "")
 
 
 async def test_gateway_dangerous_tool_requires_approval(db_session):

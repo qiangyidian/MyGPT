@@ -235,3 +235,8 @@ def aggregate_usage(
         for key, value in current.items():
             aggregate[key] = aggregate.get(key, 0) + value
     return aggregate or None
+
+
+def normalize_usage(raw: dict[str, Any] | None) -> dict[str, int | float] | None:
+    """Retain only finite, non-negative numeric metering fields."""
+    return aggregate_usage([raw])

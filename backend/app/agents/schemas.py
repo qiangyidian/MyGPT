@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import BaseModel, Field
 
+from app.agents.continuation import normalize_usage
 from app.providers.base import FinishReason
 from app.schemas import ChatRequest, Citation
 
@@ -280,8 +281,9 @@ def ev_tool_result(
         data["agent_id"] = agent_id
     if task_id:
         data["task_id"] = task_id
-    if usage is not None:
-        data["usage"] = usage
+    safe_usage = normalize_usage(usage)
+    if safe_usage is not None:
+        data["usage"] = safe_usage
     return AgentEvent(kind="tool_result", data=data)
 
 
@@ -510,6 +512,8 @@ class ToolExecution:
     # extraction). The model-facing content stays truncated (see to_openai_tool_message).
     full_result: str | None = None
     latency_ms: int | None = None
+    # Sanitized metering stays separate from model/UI result content.
+    usage: dict[str, int | float] | None = None
 
     def to_openai_tool_message(self) -> dict[str, Any]:
         """Render as an OpenAI ``tool``-role message for the next model round."""

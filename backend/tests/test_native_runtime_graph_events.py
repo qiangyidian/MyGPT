@@ -20,6 +20,7 @@ from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.token_budget import PROMPT_TOO_LARGE, PromptAdmissionError
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError, ToolCallDef
+from app.tools.base import BaseTool, ToolRegistry
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -73,6 +74,67 @@ class _FakeGateway:
             result={"content": "search hits"}, error=None,
             tool_call_id=tool_call_id, name=tool_name,
         )
+
+
+async def test_native_real_gateway_aggregates_sanitized_tool_usage_once(
+    db_session, monkeypatch
+):
+    class MeteredTool(BaseTool):
+        name = "metered_tool"
+        description = "returns metered data"
+
+        async def run(self, **kwargs):
+            return {
+                "answer": "search hits",
+                "usage": {
+                    "tool_units": 2,
+                    "api_key": "must-not-leak",
+                    "negative": -1,
+                },
+            }
+
+    registry = ToolRegistry()
+    registry.register(MeteredTool())
+    ctx = await _seed_native_ctx(db_session, enable_tools=True)
+    provider = _FakeProvider(
+        [
+            [
+                ChatDelta(
+                    tool_calls=[
+                        ToolCallDef(
+                            id="metered-call", name="metered_tool", arguments="{}"
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+                ChatDelta(usage={"prompt_tokens": 5, "completion_tokens": 1}),
+            ],
+            [
+                ChatDelta(content="done", finish_reason="stop"),
+                ChatDelta(usage={"prompt_tokens": 6, "completion_tokens": 2}),
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_default_registry", lambda: registry
+    )
+
+    events = await _collect(ctx)
+
+    tool_result = _find_all(events, "tool_result")[-1]
+    assert tool_result["usage"] == {"tool_units": 2}
+    assert "must-not-leak" not in str(tool_result["usage"])
+    assert "usage" not in provider.calls[1][-1]["content"]
+    assert "must-not-leak" not in provider.calls[1][-1]["content"]
+    assert _find_all(events, "done")[-1]["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 3,
+        "total_tokens": 14,
+        "tool_units": 2,
+    }
 
 
 async def _seed_native_ctx(db_session, *, enable_tools: bool) -> AgentTurnContext:
@@ -205,7 +267,7 @@ async def test_native_persists_checkpoint_before_followup_provider_dispatch(
 
     async def persist_checkpoint(checkpoint):
         await asyncio.sleep(0)
-        order.append(("persist", checkpoint["round"]))
+        order.append(("persist", checkpoint["round"], checkpoint["status"]))
 
     ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
 
@@ -230,7 +292,12 @@ async def test_native_persists_checkpoint_before_followup_provider_dispatch(
 
     await _collect(ctx)
 
-    assert order[:3] == [("provider", 1), ("persist", 1), ("provider", 2)]
+    assert order == [
+        ("provider", 1),
+        ("persist", 1, "continuing"),
+        ("provider", 2),
+        ("persist", 1, "completed"),
+    ]
 
 
 async def test_native_stops_at_max_continuation_rounds_with_length(
@@ -258,6 +325,10 @@ async def test_native_stops_at_max_continuation_rounds_with_length(
         "max_rounds": 2,
         "status": "maxed",
     }
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"] == ctx.extra["continuation"]
+    assert run.current_step == "continuation:2"
+    assert run.resume_token == "continuation:2"
 
 
 async def test_native_cancellation_during_continuation_preserves_partial(
@@ -320,6 +391,34 @@ async def test_native_cancellation_before_continuation_dispatch_updates_checkpoi
     assert _find_all(events, "done")[-1]["finish_reason"] == "cancelled"
     assert ctx.extra["continuation"]["status"] == "cancelled"
     assert ctx.extra["continuation"]["round"] == 0
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"] == ctx.extra["continuation"]
+
+
+async def test_native_terminal_checkpoint_failure_emits_error_not_done(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+
+    async def persist_checkpoint(checkpoint):
+        if checkpoint["status"] != "continuing":
+            raise RuntimeError("terminal checkpoint failed")
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+    provider = _FakeProvider(
+        [
+            [ChatDelta(content="A"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="A B"), ChatDelta(finish_reason="stop")],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config", lambda _cfg: provider
+    )
+
+    events = await _collect(ctx)
+
+    assert _find_all(events, "done") == []
+    assert _find_all(events, "error")[-1]["code"] == "internal"
 
 
 async def test_native_pause_during_continuation_delays_novel_output(
@@ -493,6 +592,9 @@ async def test_native_async_cancellation_after_tokens_flushes_partial_and_usage(
         "completion_tokens": 3,
         "total_tokens": 25,
     }
+    assert ctx.extra["continuation"]["status"] == "cancelled"
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"] == ctx.extra["continuation"]
 
 
 # --------------------------------------------------------------------------- #

@@ -14,7 +14,7 @@ from app.agents.continuation import (
     merge_continuation,
 )
 from app.agents.orchestrator import ChatOrchestrator
-from app.agents.schemas import ev_done
+from app.agents.schemas import ev_done, ev_tool_result
 from app.core.config import Settings
 from app.core.pricing import reset_pricing_cache
 from app.models import AgentRun, Conversation, Message
@@ -67,6 +67,25 @@ def test_continuation_policy_is_immutable_and_validates_bounds():
         ContinuationPolicy(max_rounds=-1)
     with pytest.raises(ValueError):
         ContinuationPolicy(max_rounds=9)
+
+
+def test_tool_result_event_keeps_only_safe_numeric_usage():
+    event = ev_tool_result(
+        id="tool-1",
+        name="metered",
+        ok=True,
+        result="safe",
+        usage={
+            "tool_units": 2,
+            "cached_tokens": 3.5,
+            "api_key": "must-not-leak",
+            "negative": -1,
+            "not_finite": float("inf"),
+            "nested": {"secret": "must-not-leak"},
+        },
+    )
+
+    assert event.data["usage"] == {"tool_units": 2, "cached_tokens": 3.5}
 
 
 def test_settings_configures_continuation_rounds_with_same_bounds():

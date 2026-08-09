@@ -179,6 +179,25 @@ class StreamingWriterExecutor:
             for index, usage in enumerate(failed_rounds):
                 stage_ctx.record_usage(f"model:{agent_id}:{index}", usage)
 
+        async def persist_continuation(checkpoint: dict[str, Any]) -> None:
+            persist_checkpoint = stage_ctx.persist_continuation_checkpoint
+            if callable(persist_checkpoint):
+                await persist_checkpoint(checkpoint)
+                return
+            if stage_ctx.db is not None:
+                from app.services.chat_service import (
+                    _persist_continuation_checkpoint,
+                )
+
+                await _persist_continuation_checkpoint(
+                    stage_ctx.db,
+                    assistant_msg,
+                    stage_ctx.run_id,
+                    checkpoint,
+                )
+                return
+            raise RuntimeError("continuation checkpoint persistence is unavailable")
+
         while True:
             round_raw = ""
             for attempt in (1, 2):
@@ -237,6 +256,17 @@ class StreamingWriterExecutor:
                             stage_ctx.emit(ev_token(delta=buffered))
                     stage_ctx.writer_streamed = True
                     record_failed_usage(round_usage)
+                    if continuation_round:
+                        checkpoint = {
+                            "round": continuation_round,
+                            "max_rounds": policy.max_rounds,
+                            "status": "cancelled",
+                        }
+                        assistant_msg.metadata_ = {
+                            **(assistant_msg.metadata_ or {}),
+                            "continuation": checkpoint,
+                        }
+                        await persist_continuation(checkpoint)
                     raise
                 except ProviderError:
                     if continuation_buffer is not None:
@@ -309,24 +339,7 @@ class StreamingWriterExecutor:
                     **(assistant_msg.metadata_ or {}),
                     "continuation": checkpoint,
                 }
-                persist_checkpoint = stage_ctx.persist_continuation_checkpoint
-                if callable(persist_checkpoint):
-                    await persist_checkpoint(checkpoint)
-                elif stage_ctx.db is not None:
-                    from app.services.chat_service import (
-                        _persist_continuation_checkpoint,
-                    )
-
-                    await _persist_continuation_checkpoint(
-                        stage_ctx.db,
-                        assistant_msg,
-                        stage_ctx.run_id,
-                        checkpoint,
-                    )
-                else:
-                    raise RuntimeError(
-                        "continuation checkpoint persistence is unavailable"
-                    )
+                await persist_continuation(checkpoint)
                 continue
             if continuation_round:
                 checkpoint = {
@@ -344,6 +357,12 @@ class StreamingWriterExecutor:
                     **(assistant_msg.metadata_ or {}),
                     "continuation": checkpoint,
                 }
+            if checkpoint is not None and checkpoint.get("status") in {
+                "maxed",
+                "completed",
+                "cancelled",
+            }:
+                await persist_continuation(checkpoint)
             break
 
         stage_ctx.writer_streamed = True

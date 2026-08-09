@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agents.adapters.tool_adapter import _execution_usage
+from app.agents.adapters.tool_adapter import _execution_usage, build_crewai_tool
 from app.agents.continuation import aggregate_usage
 from app.agents.runtime.crewai_runtime import (
     CrewAIRuntime,
@@ -22,7 +22,12 @@ from app.agents.runtime.crewai_runtime import (
 )
 from app.agents.runtime.stage_executor import CrewAIStageExecutor, FakeStageExecutor
 from app.agents.runtime.stage_executor import StageResult
-from app.agents.schemas import AgentTurnContext, ExecutionMode, ev_tool_result
+from app.agents.schemas import (
+    AgentTurnContext,
+    ExecutionMode,
+    ToolExecution,
+    ev_tool_result,
+)
 from app.agents.stage_context import make_stage_context
 from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.agents.streaming_writer import StreamingWriterExecutor
@@ -36,9 +41,51 @@ _SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 def test_crewai_tool_adapter_extracts_emitted_metering_usage():
     execution = SimpleNamespace(
-        result={"content": "hits", "usage": {"tool_units": 2, "cached_tokens": 3}}
+        usage={"tool_units": 2, "cached_tokens": 3},
+        result={"content": "hits", "usage": {"api_key": "must-not-leak"}},
     )
     assert _execution_usage(execution) == {"tool_units": 2, "cached_tokens": 3}
+
+
+async def test_crewai_tool_adapter_records_gateway_execution_usage_once(monkeypatch):
+    async def execute_via_gateway(*args, **kwargs):
+        return ToolExecution(
+            ok=True,
+            tool_call_id="gateway-call",
+            tool_name="metered_tool",
+            arguments={},
+            status="success",
+            result={"content": "safe result", "truncated": False},
+            full_result='{"answer":"safe result"}',
+            usage={"tool_units": 2},
+        )
+
+    monkeypatch.setattr(
+        "app.agents.adapters.tool_adapter._execute_via_gateway",
+        execute_via_gateway,
+    )
+    stage_ctx = make_stage_context(uuid.uuid4())
+    stage_ctx.set_stage(agent_id="researcher", task_id="task-1")
+    adapter = build_crewai_tool(
+        SimpleNamespace(name="metered_tool", description="metered", parameters=[]),
+        conversation_id=uuid.uuid4(),
+        message_id=uuid.uuid4(),
+        run_id=stage_ctx.run_id,
+        user_id=None,
+        stage_ctx=stage_ctx,
+    )
+
+    rendered = await asyncio.to_thread(adapter._run)
+    await asyncio.sleep(0.05)
+
+    assert "usage" not in rendered
+    assert _aggregate_crewai_usage([], {}, stage_ctx) == {"tool_units": 2}
+    tool_events = []
+    while not stage_ctx.queue.empty():
+        event = stage_ctx.queue.get_nowait()
+        if event is not None and event.kind == "tool_result":
+            tool_events.append(event)
+    assert tool_events[-1].data["usage"] == {"tool_units": 2}
 
 
 def test_crewai_runtime_extracts_writer_aggregate_usage():
@@ -92,6 +139,140 @@ async def test_crewai_stage_executor_captures_all_reported_model_attempt_usage()
         "total_tokens": 23,
         "cached_tokens": 1,
         "reasoning_tokens": 2,
+    }
+
+
+async def test_crewai_stage_executor_uses_async_llm_usage_delta_for_string_output():
+    class UsageMetric:
+        def __init__(self, prompt_tokens, completion_tokens, cached_tokens=0):
+            self.prompt_tokens = prompt_tokens
+            self.completion_tokens = completion_tokens
+            self.total_tokens = prompt_tokens + completion_tokens
+            self.cached_tokens = cached_tokens
+
+    class FakeLLM:
+        def __init__(self):
+            self.snapshots = iter(
+                [UsageMetric(10, 2, 1), UsageMetric(18, 5, 3)]
+            )
+
+        async def get_token_usage_summary(self):
+            return next(self.snapshots)
+
+    class FakeAgent:
+        tools = []
+        llm = FakeLLM()
+
+        async def aexecute_task(self, task, context=None):
+            return "research as a raw string"
+
+    result = await CrewAIStageExecutor().execute(
+        agent_id="researcher",
+        agent=FakeAgent(),
+        task=SimpleNamespace(id="t", description="research"),
+        context=None,
+        stage_ctx=make_stage_context(uuid.uuid4()),
+    )
+
+    assert result.raw == "research as a raw string"
+    assert result.usage == {
+        "prompt_tokens": 8,
+        "completion_tokens": 3,
+        "total_tokens": 11,
+        "cached_tokens": 2,
+    }
+
+
+async def test_crewai_stage_executor_deltas_cumulative_llm_usage_across_attempts():
+    class FakeLLM:
+        def __init__(self):
+            self.snapshots = iter(
+                [
+                    {"prompt_tokens": 0, "completion_tokens": 0},
+                    {"prompt_tokens": 10, "completion_tokens": 2},
+                    {"prompt_tokens": 10, "completion_tokens": 2},
+                    {"prompt_tokens": 16, "completion_tokens": 5},
+                ]
+            )
+
+        def get_token_usage_summary(self):
+            return next(self.snapshots)
+
+    class FakeAgent:
+        tools = []
+        llm = FakeLLM()
+
+        async def aexecute_task(self, task, context=None):
+            return "raw"
+
+    executor = CrewAIStageExecutor()
+    stage_ctx = make_stage_context(uuid.uuid4())
+    first = await executor.execute(
+        agent_id="researcher",
+        agent=FakeAgent(),
+        task=SimpleNamespace(id="t1", description="research"),
+        context=None,
+        stage_ctx=stage_ctx,
+    )
+    second = await executor.execute(
+        agent_id="researcher",
+        agent=FakeAgent(),
+        task=SimpleNamespace(id="t2", description="retry"),
+        context=None,
+        stage_ctx=stage_ctx,
+    )
+
+    assert first.usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+    assert second.usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 3,
+        "total_tokens": 9,
+    }
+    assert aggregate_usage([first.usage, second.usage]) == {
+        "prompt_tokens": 16,
+        "completion_tokens": 5,
+        "total_tokens": 21,
+    }
+
+
+async def test_crewai_stage_executor_records_failed_llm_usage_delta_in_finally():
+    class FakeLLM:
+        def __init__(self):
+            self.snapshots = iter(
+                [
+                    {"prompt_tokens": 20, "completion_tokens": 4},
+                    {"prompt_tokens": 27, "completion_tokens": 6},
+                ]
+            )
+
+        def get_token_usage_summary(self):
+            return next(self.snapshots)
+
+    class FakeAgent:
+        tools = []
+        llm = FakeLLM()
+
+        async def aexecute_task(self, task, context=None):
+            raise RuntimeError("provider failed after metering")
+
+    stage_ctx = make_stage_context(uuid.uuid4())
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await CrewAIStageExecutor().execute(
+            agent_id="analyst",
+            agent=FakeAgent(),
+            task=SimpleNamespace(id="t", description="analyse"),
+            context=None,
+            stage_ctx=stage_ctx,
+        )
+
+    assert aggregate_usage(stage_ctx.usage_records.values()) == {
+        "prompt_tokens": 7,
+        "completion_tokens": 2,
+        "total_tokens": 9,
     }
 
 
@@ -246,8 +427,18 @@ async def _writer_ctx(db_session, provider):
     await db_session.flush()
     msg = Message(conversation_id=conv.id, role="assistant", content="", metadata_={})
     db_session.add(msg)
-    await db_session.commit()
     stage_ctx = make_stage_context(uuid.uuid4())
+    run = AgentRun(
+        id=stage_ctx.run_id,
+        conversation_id=conv.id,
+        message_id=msg.id,
+        user_id=_SEEDED,
+        runtime="crewai",
+        flow_name="deep_research",
+        status="running",
+    )
+    db_session.add(run)
+    await db_session.commit()
     stage_ctx.provider = provider
     stage_ctx.db = db_session
     stage_ctx.assistant_msg = msg
@@ -302,6 +493,8 @@ async def test_writer_auto_continues_length_and_emits_only_novel_tail(db_session
         "total_tokens": 27,
     }
     assert msg.metadata_["continuation"]["status"] == "completed"
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    assert run.output["continuation"] == result.structured["continuation"]
 
 
 async def test_writer_persists_checkpoint_before_followup_provider_dispatch(db_session):
@@ -324,7 +517,7 @@ async def test_writer_persists_checkpoint_before_followup_provider_dispatch(db_s
 
     async def persist_checkpoint(checkpoint):
         await asyncio.sleep(0)
-        order.append(("persist", checkpoint["round"]))
+        order.append(("persist", checkpoint["round"], checkpoint["status"]))
 
     stage_ctx, _msg = await _writer_ctx(db_session, OrderedWriterProvider())
     stage_ctx.persist_continuation_checkpoint = persist_checkpoint
@@ -337,7 +530,12 @@ async def test_writer_persists_checkpoint_before_followup_provider_dispatch(db_s
         stage_ctx=stage_ctx,
     )
 
-    assert order[:3] == [("provider", 1), ("persist", 1), ("provider", 2)]
+    assert order == [
+        ("provider", 1),
+        ("persist", 1, "continuing"),
+        ("provider", 2),
+        ("persist", 1, "completed"),
+    ]
 
 
 async def test_writer_stops_at_max_continuation_rounds(db_session):
@@ -362,6 +560,8 @@ async def test_writer_stops_at_max_continuation_rounds(db_session):
     assert msg.content == "A B C"
     assert result.structured["finish_reason"] == "length"
     assert result.structured["continuation"]["status"] == "maxed"
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    assert run.output["continuation"] == result.structured["continuation"]
 
 
 async def test_writer_usage_includes_empty_stream_retry(db_session):
@@ -466,6 +666,10 @@ async def test_writer_failed_continuation_preserves_partial_and_all_usage(
         "completion_tokens": 3,
         "total_tokens": 25,
     }
+    if isinstance(raised, asyncio.CancelledError):
+        run = await db_session.get(AgentRun, stage_ctx.run_id)
+        assert msg.metadata_["continuation"]["status"] == "cancelled"
+        assert run.output["continuation"] == msg.metadata_["continuation"]
 
 
 async def test_writer_cancel_before_continuation_avoids_followup_dispatch(db_session):
@@ -498,6 +702,33 @@ async def test_writer_cancel_before_continuation_avoids_followup_dispatch(db_ses
     assert msg.content == "partial"
     assert result.structured["finish_reason"] == "cancelled"
     assert result.structured["continuation"]["status"] == "cancelled"
+    run = await db_session.get(AgentRun, stage_ctx.run_id)
+    assert run.output["continuation"] == result.structured["continuation"]
+
+
+async def test_writer_terminal_checkpoint_failure_is_not_silently_ignored(db_session):
+    provider = _ScriptedWriterProvider(
+        [
+            [ChatDelta(content="A"), ChatDelta(finish_reason="length")],
+            [ChatDelta(content="A B"), ChatDelta(finish_reason="stop")],
+        ]
+    )
+    stage_ctx, _msg = await _writer_ctx(db_session, provider)
+
+    async def persist_checkpoint(checkpoint):
+        if checkpoint["status"] != "continuing":
+            raise RuntimeError("terminal checkpoint failed")
+
+    stage_ctx.persist_continuation_checkpoint = persist_checkpoint
+
+    with pytest.raises(RuntimeError, match="terminal checkpoint failed"):
+        await StreamingWriterExecutor(FakeStageExecutor()).execute(
+            agent_id="writer",
+            agent=None,
+            task=SimpleNamespace(description="q", id="t"),
+            context="verified",
+            stage_ctx=stage_ctx,
+        )
 
 
 async def test_writer_uses_configured_output_limit_and_parameter(db_session):

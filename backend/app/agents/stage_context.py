@@ -100,9 +100,6 @@ class StageContext:
         """Thread-safe forward to the main-loop queue. Never blocks."""
         if getattr(event, "kind", None) == "tool_result":
             usage = event.data.get("usage")
-            result = event.data.get("result")
-            if usage is None and isinstance(result, dict):
-                usage = result.get("usage")
             if isinstance(usage, dict) and usage:
                 self.record_usage(
                     f"tool:{event.data.get('id') or len(self.usage_records)}", usage

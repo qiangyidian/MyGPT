@@ -158,10 +158,9 @@ def _result_preview(exec_: ToolExecution) -> Any:
 
 def _execution_usage(exec_: ToolExecution | Any) -> dict[str, Any] | None:
     """Extract optional metering emitted by a tool implementation."""
-    result = getattr(exec_, "result", None)
-    if isinstance(result, dict) and isinstance(result.get("usage"), dict):
-        return dict(result["usage"])
-    return None
+    from app.agents.continuation import normalize_usage
+
+    return normalize_usage(getattr(exec_, "usage", None))
 
 
 def build_crewai_tool(

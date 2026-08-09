@@ -17,6 +17,7 @@ off-loop.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -110,9 +111,24 @@ class CrewAIStageExecutor:
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
-        output = await agent.aexecute_task(task, context=admitted_context)
+        usage_before = await _llm_usage_snapshot(agent)
+        completed = False
+        llm_usage: dict[str, int | float] | None = None
+        try:
+            output = await agent.aexecute_task(task, context=admitted_context)
+            completed = True
+        finally:
+            usage_after = await _llm_usage_snapshot(agent)
+            llm_usage = _usage_delta(usage_before, usage_after)
+            if not completed and llm_usage:
+                stage_ctx.record_usage(
+                    f"model:{agent_id}:{uuid.uuid4().hex}", llm_usage
+                )
         raw = _extract_raw(output)
-        usage = aggregate_usage(_extract_usage_rounds(output, agent))
+        # CrewAI's installed Agent.aexecute_task returns a raw string. Its LLM
+        # owns cumulative counters, so the before/after delta is authoritative
+        # and must not be added again from duplicate output/agent snapshots.
+        usage = llm_usage or aggregate_usage(_extract_usage_rounds(output))
         return StageResult(
             agent_id=agent_id,
             raw=raw,
@@ -366,6 +382,51 @@ def _extract_usage_rounds(*sources: Any) -> list[dict[str, Any]]:
             if found:
                 return found
     return []
+
+
+async def _llm_usage_snapshot(agent: Any) -> dict[str, int | float] | None:
+    """Read and normalize CrewAI's cumulative LLM counters.
+
+    CrewAI-compatible LLMs expose both synchronous and asynchronous summary
+    methods, returning either dictionaries or UsageMetrics-like objects.
+    Metering is observational, so an unavailable/broken summary must not mask
+    the actual stage result or provider error.
+    """
+    summary = getattr(getattr(agent, "llm", None), "get_token_usage_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        value = summary()
+        if inspect.isawaitable(value):
+            value = await value
+        mappings = _extract_usage_rounds(SimpleUsageSource(value))
+        return aggregate_usage(mappings)
+    except Exception:  # noqa: BLE001 - usage collection is best-effort
+        logger.debug("could not read CrewAI LLM usage summary", exc_info=True)
+        return None
+
+
+class SimpleUsageSource:
+    """Adapter allowing the existing metrics normalizer to consume a value."""
+
+    def __init__(self, usage: Any) -> None:
+        self.usage = usage
+
+
+def _usage_delta(
+    before: dict[str, int | float] | None,
+    after: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    """Return the non-negative delta between two cumulative snapshots."""
+    if not after:
+        return None
+    before = before or {}
+    delta = {
+        key: value - before.get(key, 0)
+        for key, value in after.items()
+        if value - before.get(key, 0) >= 0
+    }
+    return {key: value for key, value in delta.items() if value != 0} or None
 
 
 def _summarize(text: str, n: int) -> str:

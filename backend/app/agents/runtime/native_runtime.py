@@ -155,6 +155,17 @@ class NativeChatRuntime:
         continuation_round = 0
         is_continuation_round = False
 
+        async def persist_continuation(checkpoint: dict[str, Any]) -> None:
+            persist_checkpoint = ctx.extra.get("persist_continuation_checkpoint")
+            if callable(persist_checkpoint):
+                await persist_checkpoint(checkpoint)
+                return
+            from app.services.chat_service import _persist_continuation_checkpoint
+
+            await _persist_continuation_checkpoint(
+                db, assistant_msg, ctx.run_id, checkpoint
+            )
+
         yield ev_step_started(
             step_id="answer", title="生成回答", step_type="llm", agent="assistant",
         )
@@ -304,6 +315,18 @@ class NativeChatRuntime:
                     if round_usage is not None:
                         usage_rounds.append(round_usage)
                     ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    if continuation_round:
+                        checkpoint = {
+                            "round": continuation_round,
+                            "max_rounds": policy.max_rounds,
+                            "status": "cancelled",
+                        }
+                        ctx.extra["continuation"] = checkpoint
+                        assistant_msg.metadata_ = {
+                            **(assistant_msg.metadata_ or {}),
+                            "continuation": checkpoint,
+                        }
+                        await persist_continuation(checkpoint)
                     raise
                 except ProviderError as exc:
                     model_breaker().record_failure(_breaker_key)
@@ -502,6 +525,10 @@ class NativeChatRuntime:
                                 })
                                 continue
 
+                        tool_usage = getattr(execution, "usage", None)
+                        if tool_usage:
+                            usage_rounds.append(tool_usage)
+                            ctx.extra["usage"] = aggregate_usage(usage_rounds)
                         yield ev_tool_result(
                             id=tc.id,
                             name=tc.name,
@@ -522,6 +549,7 @@ class NativeChatRuntime:
                             ),
                             error=execution.error,
                             agent_id="assistant",
+                            usage=tool_usage,
                         )
                         working.append(execution.to_openai_tool_message())
 
@@ -571,19 +599,7 @@ class NativeChatRuntime:
                         **(assistant_msg.metadata_ or {}),
                         "continuation": checkpoint,
                     }
-                    persist_checkpoint = ctx.extra.get(
-                        "persist_continuation_checkpoint"
-                    )
-                    if callable(persist_checkpoint):
-                        await persist_checkpoint(checkpoint)
-                    else:
-                        from app.services.chat_service import (
-                            _persist_continuation_checkpoint,
-                        )
-
-                        await _persist_continuation_checkpoint(
-                            db, assistant_msg, ctx.run_id, checkpoint
-                        )
+                    await persist_continuation(checkpoint)
                     is_continuation_round = True
                     continue
                 if finish_reason == "length" and not pending_tool_calls:
@@ -610,6 +626,14 @@ class NativeChatRuntime:
                         **(assistant_msg.metadata_ or {}),
                         "continuation": checkpoint,
                     }
+
+                terminal_checkpoint = ctx.extra.get("continuation")
+                if (
+                    isinstance(terminal_checkpoint, dict)
+                    and terminal_checkpoint.get("status")
+                    in {"maxed", "completed", "cancelled"}
+                ):
+                    await persist_continuation(terminal_checkpoint)
 
                 # No further tool calls — done.
                 break
