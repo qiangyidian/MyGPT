@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.common import ORMModel
 
@@ -58,6 +58,20 @@ class ModelConfigUpdate(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     is_embedding: bool | None = None
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls_for_non_nullable_fields(self) -> "ModelConfigUpdate":
+        nullable_updates = {"api_key", "embedding_model_name"}
+        explicit_nulls = [
+            field
+            for field in self.model_fields_set
+            if field not in nullable_updates and getattr(self, field) is None
+        ]
+        if explicit_nulls:
+            raise ValueError(
+                "fields cannot be null: " + ", ".join(sorted(explicit_nulls))
+            )
+        return self
 
 
 class ModelConfigOut(ORMModel):

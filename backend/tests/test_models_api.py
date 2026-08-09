@@ -74,6 +74,29 @@ async def test_model_capabilities_round_trip_through_api(client):
     assert updated.json()["output_token_parameter"] == "max_tokens"
 
 
+async def test_model_update_rejects_null_non_nullable_capability(client):
+    h = auth_headers()
+    created = await client.post(
+        "/api/models",
+        json={
+            "name": "Null guard",
+            "provider": "mock",
+            "api_base_url": "http://localhost/v1",
+            "model_name": "mock-model",
+        },
+        headers=h,
+    )
+    assert created.status_code == 201, created.text
+
+    updated = await client.put(
+        f"/api/models/{created.json()['id']}",
+        json={"max_context_tokens": None},
+        headers=h,
+    )
+
+    assert updated.status_code == 422
+
+
 async def test_model_test_endpoint_ok(client):
     h = auth_headers()
     created = await client.post(

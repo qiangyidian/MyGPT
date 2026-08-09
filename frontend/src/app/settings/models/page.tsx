@@ -7,6 +7,11 @@ import { Plus, Pencil, Trash2, FlaskConical, Zap, Bot } from "lucide-react";
 
 import { api, ApiError } from "@/lib/api";
 import type { ModelConfig, ModelConfigInput } from "@/lib/types";
+import {
+  parseOptionalNumber,
+  parseOptionalPositiveInteger,
+  validateModelConfigNumbers,
+} from "@/lib/model-config-validation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -145,6 +150,11 @@ export default function ModelsPage() {
   function submit() {
     if (!form.name.trim() || !form.model_name.trim() || !form.api_base_url.trim()) {
       toast.error("请填写名称、Base URL 和模型名");
+      return;
+    }
+    const numericError = validateModelConfigNumbers(form);
+    if (numericError) {
+      toast.error(numericError);
       return;
     }
     if (editing) updateMut.mutate({ id: editing.id, body: form });
@@ -304,9 +314,9 @@ export default function ModelsPage() {
                 <Input
                   type="number"
                   step="0.1"
-                  value={form.temperature ?? 0.7}
+                  value={form.temperature ?? ""}
                   onChange={(e) =>
-                    setForm({ ...form, temperature: parseFloat(e.target.value) })
+                    setForm({ ...form, temperature: parseOptionalNumber(e.target.value) })
                   }
                 />
               </Field>
@@ -314,9 +324,9 @@ export default function ModelsPage() {
                 <Input
                   type="number"
                   step="0.05"
-                  value={form.top_p ?? 1}
+                  value={form.top_p ?? ""}
                   onChange={(e) =>
-                    setForm({ ...form, top_p: parseFloat(e.target.value) })
+                    setForm({ ...form, top_p: parseOptionalNumber(e.target.value) })
                   }
                 />
               </Field>
@@ -324,9 +334,12 @@ export default function ModelsPage() {
                 <Input
                   type="number"
                   min={1}
-                  value={form.max_context_tokens ?? 8192}
+                  value={form.max_context_tokens ?? ""}
                   onChange={(e) =>
-                    setForm({ ...form, max_context_tokens: parseInt(e.target.value) })
+                    setForm({
+                      ...form,
+                      max_context_tokens: parseOptionalPositiveInteger(e.target.value),
+                    })
                   }
                 />
               </Field>
@@ -334,9 +347,12 @@ export default function ModelsPage() {
                 <Input
                   type="number"
                   min={1}
-                  value={form.max_tokens ?? 1024}
+                  value={form.max_tokens ?? ""}
                   onChange={(e) =>
-                    setForm({ ...form, max_tokens: parseInt(e.target.value) })
+                    setForm({
+                      ...form,
+                      max_tokens: parseOptionalPositiveInteger(e.target.value),
+                    })
                   }
                 />
               </Field>

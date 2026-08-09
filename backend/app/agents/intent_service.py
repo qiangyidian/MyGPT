@@ -36,7 +36,7 @@ from typing import Any
 
 from app.agents.context_fragments import ContextFragment, render_fragments
 from app.agents.schemas import IntentDecision
-from app.providers.base import ChatOptions, ProviderError
+from app.providers.base import ChatOptions, ProviderError, provider_output_token_parameter
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,7 @@ class IntentService:
         options = ChatOptions(
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
+            output_token_parameter=provider_output_token_parameter(provider),
         )
 
         last_reason = "no_attempt"

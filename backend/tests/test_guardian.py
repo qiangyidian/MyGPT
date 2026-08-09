@@ -18,9 +18,11 @@ class _ScriptedProvider(MockProvider):
         self._script = list(script or [])
         self._delay = delay
         self.calls = 0
+        self.last_options = None
 
     async def chat(self, messages, options=None):
         self.calls += 1
+        self.last_options = options
         if self._delay:
             await asyncio.sleep(self._delay)
         if not self._script:
@@ -40,6 +42,17 @@ async def test_guardian_allows_low_risk():
     p = _ScriptedProvider(script=['{"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"read only"}'])
     v = await GuardianService().judge(action=_action(), provider=p)
     assert v.allowed and v.risk_level == "low"
+
+
+async def test_guardian_uses_provider_output_token_parameter():
+    p = _ScriptedProvider(
+        script=['{"risk_level":"low","user_authorization":"high","outcome":"allow"}']
+    )
+    p.output_token_parameter = "max_completion_tokens"
+
+    await GuardianService().judge(action=_action(), provider=p)
+
+    assert p.last_options.output_token_parameter == "max_completion_tokens"
 
 
 async def test_guardian_denies_high_risk_even_when_authorized():

@@ -31,7 +31,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.providers.base import ChatOptions, ProviderError
+from app.providers.base import ChatOptions, ProviderError, provider_output_token_parameter
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,9 @@ class GuardianService:
             {"role": "user", "content": _build_user(action, transcript)},
         ]
         options = ChatOptions(
-            temperature=self._config.temperature, max_tokens=self._config.max_tokens
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_tokens,
+            output_token_parameter=provider_output_token_parameter(provider),
         )
         try:
             result = await asyncio.wait_for(

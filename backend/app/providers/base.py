@@ -95,10 +95,23 @@ class ModelProvider(ABC):
 
     provider_name: str = "base"
 
-    def __init__(self, *, base_url: str, api_key: str = "", model: str = "", **_: Any) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str = "",
+        model: str = "",
+        output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
+        **_: Any,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.output_token_parameter = (
+            output_token_parameter
+            if output_token_parameter in ("max_tokens", "max_completion_tokens")
+            else "max_tokens"
+        )
 
     @abstractmethod
     async def chat(self, messages: list[dict[str, Any]], options: ChatOptions | None = None) -> ChatResult: ...
@@ -110,3 +123,10 @@ class ModelProvider(ABC):
 
     @abstractmethod
     async def embeddings(self, texts: list[str], model: str | None = None) -> list[list[float]]: ...
+
+
+def provider_output_token_parameter(
+    provider: Any,
+) -> Literal["max_tokens", "max_completion_tokens"]:
+    value = getattr(provider, "output_token_parameter", "max_tokens")
+    return value if value in ("max_tokens", "max_completion_tokens") else "max_tokens"

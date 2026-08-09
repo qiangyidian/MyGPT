@@ -107,3 +107,72 @@ def test_chat_history_admission_never_silently_truncates_current_turn():
         _admit_and_trim_history(messages, cfg, model_name="mock-model")
 
     assert exc_info.value.code == "message_too_large"
+
+
+def test_protected_system_and_latest_turn_must_fit_together(monkeypatch):
+    from app.services import chat_service as module
+
+    monkeypatch.setattr(module, "_estimate_tokens", lambda text, _model: len(text))
+    messages = [
+        {"role": "system", "content": "s" * 600},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = SimpleNamespace(max_context_tokens=1_000, max_tokens=100)
+
+    with pytest.raises(PromptAdmissionError) as exc_info:
+        _admit_and_trim_history(messages, cfg, model_name="mock-model")
+
+    assert exc_info.value.code == "prompt_too_large"
+
+
+def test_multimodal_latest_turn_reserves_tokens_per_image():
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe these"},
+                *[
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
+                    for _ in range(3)
+                ],
+            ],
+        },
+    ]
+    cfg = SimpleNamespace(max_context_tokens=3_000, max_tokens=500)
+
+    with pytest.raises(PromptAdmissionError) as exc_info:
+        _admit_and_trim_history(messages, cfg, model_name="mock-model")
+
+    assert exc_info.value.code == "message_too_large"
+
+
+def test_final_admission_uses_final_tool_route(monkeypatch):
+    from app.services import chat_service as module
+    from app.services.chat_service import _finalize_prompt_messages
+
+    seen = {}
+
+    def estimate(_cfg, *, enable_tools, route, model_name):
+        seen.update(enable_tools=enable_tools, route=route, model_name=model_name)
+        return 700
+
+    monkeypatch.setattr(module, "_estimate_available_tool_schema_tokens", estimate)
+    cfg = SimpleNamespace(
+        max_context_tokens=1_000,
+        max_tokens=100,
+        model_name="mock-model",
+    )
+    route = object()
+
+    with pytest.raises(PromptAdmissionError) as exc_info:
+        _finalize_prompt_messages(
+            [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+            cfg,
+            enable_tools=True,
+            route=route,
+            image_parts=[],
+        )
+
+    assert exc_info.value.code == "invalid_prompt_budget"
+    assert seen == {"enable_tools": True, "route": route, "model_name": "mock-model"}

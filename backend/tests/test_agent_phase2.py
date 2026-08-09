@@ -97,6 +97,24 @@ async def test_summarize_history_with_mock_provider():
     assert summary  # mock returns a canned reply; heuristic fallback also non-empty
 
 
+async def test_summarize_history_uses_provider_output_token_parameter():
+    class CapturingProvider(MockProvider):
+        async def chat(self, messages, options=None):
+            self.last_options = options
+            return await super().chat(messages, options)
+
+    provider = CapturingProvider(
+        base_url="http://localhost/v1",
+        model="mock",
+        output_token_parameter="max_completion_tokens",
+    )
+    messages = [{"role": "user", "content": str(i)} for i in range(8)]
+
+    await summarize_history(provider, messages, keep_recent=6)
+
+    assert provider.last_options.output_token_parameter == "max_completion_tokens"
+
+
 async def test_maybe_summarize_persists_summary(db_session):
     """A large history triggers _maybe_summarize to write a summary memory."""
     conv = Conversation(user_id=_SEEDED_USER, title="big")

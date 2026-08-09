@@ -49,7 +49,12 @@ from app.agents.schemas import (
     ev_tool_result,
 )
 from app.models import AgentRun
-from app.providers.base import ChatOptions, ProviderError, ToolCallDef
+from app.providers.base import (
+    ChatOptions,
+    ProviderError,
+    ToolCallDef,
+    provider_output_token_parameter,
+)
 from app.providers.registry import get_provider_for_config
 from app.tools.registry_init import get_default_registry
 
@@ -98,7 +103,7 @@ class NativeChatRuntime:
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=safe_positive_int(cfg.max_tokens, 1024),
-            output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
+            output_token_parameter=provider_output_token_parameter(provider),
             tools=tool_schemas,
             tool_choice="auto",
         )

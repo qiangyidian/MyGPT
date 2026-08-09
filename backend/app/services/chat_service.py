@@ -52,7 +52,12 @@ from app.agents.schemas import (
     ExecutionMode,
 )
 from app.agents.state_store import load_state, save_summary, upsert_goal
-from app.agents.token_budget import admit_latest_turn, calculate_prompt_budget
+from app.agents.token_budget import (
+    PROMPT_TOO_LARGE,
+    PromptAdmissionError,
+    admit_latest_turn,
+    calculate_prompt_budget,
+)
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.models import Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
@@ -75,6 +80,11 @@ _DEFAULT_MAX_CONTEXT_TOKENS = 8192
 # Rough chars-per-token used for naive fallback counting when tiktoken has no
 # encoding for a model (e.g. obscure model names). Keeps trimming conservative.
 _CHARS_PER_TOKEN = 4
+
+# Conservative accounting for image inputs. Provider-side image tokenization
+# depends on dimensions/detail and cannot be derived from the base64 byte size;
+# reserve fixed prompt headroom per image while counting text parts normally.
+_IMAGE_INPUT_TOKEN_RESERVE = 1024
 
 # finish_reason → consumer-facing generation status, persisted in message
 # metadata so the UI can tell a real completion apart from a truncation,
@@ -313,12 +323,7 @@ def _trim_history(
     # Precompute each message's token cost ONCE. The old loop recomputed the
     # whole-list total on every deletion (re-serializing every message each
     # time) — O(n^2). Here we keep a running total and subtract in O(1).
-    import json
-
-    costs = [
-        _estimate_tokens(json.dumps(m, ensure_ascii=False, default=str), model_name)
-        for m in messages
-    ]
+    costs = [_estimate_message_tokens(message, model_name) for message in messages]
     total = sum(costs)
     if total <= max_tokens:
         return messages
@@ -336,15 +341,35 @@ def _trim_history(
     return messages
 
 
-def _latest_user_turn_tokens(messages: list[dict[str, Any]], model_name: str) -> int:
-    """Return the serialized cost of the newest user turn only."""
+def _estimate_message_tokens(message: dict[str, Any], model_name: str) -> int:
+    """Count serialized message text plus conservative multimodal reserves."""
     import json
 
+    content = message.get("content")
+    if not isinstance(content, list):
+        return _estimate_tokens(
+            json.dumps(message, ensure_ascii=False, default=str), model_name
+        )
+
+    image_count = 0
+    serialized_parts: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            image_count += 1
+            serialized_parts.append({"type": "image_url"})
+        elif isinstance(part, dict):
+            serialized_parts.append(part)
+    text_message = {**message, "content": serialized_parts}
+    return _estimate_tokens(
+        json.dumps(text_message, ensure_ascii=False, default=str), model_name
+    ) + image_count * _IMAGE_INPUT_TOKEN_RESERVE
+
+
+def _latest_user_turn_tokens(messages: list[dict[str, Any]], model_name: str) -> int:
+    """Return the serialized cost of the newest user turn only."""
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _estimate_tokens(
-                json.dumps(message, ensure_ascii=False, default=str), model_name
-            )
+            return _estimate_message_tokens(message, model_name)
     return 0
 
 
@@ -367,7 +392,16 @@ def _admit_and_trim_history(
     admit_latest_turn(
         _latest_user_turn_tokens(messages, effective_model), budget.input_tokens
     )
-    return _trim_history(list(messages), budget.input_tokens, effective_model)
+    admitted = _trim_history(list(messages), budget.input_tokens, effective_model)
+    admitted_total = sum(
+        _estimate_message_tokens(message, effective_model) for message in admitted
+    )
+    if admitted_total > budget.input_tokens:
+        raise PromptAdmissionError(
+            PROMPT_TOO_LARGE,
+            "The protected system prompt and latest message exceed the prompt budget",
+        )
+    return admitted
 
 
 def _estimate_available_tool_schema_tokens(
@@ -395,6 +429,32 @@ def _estimate_available_tool_schema_tokens(
     except Exception:  # noqa: BLE001 - estimation is best-effort
         logger.warning("tool schema token estimation failed", exc_info=True)
         return 0
+
+
+def _finalize_prompt_messages(
+    messages: list[dict[str, Any]],
+    cfg: ModelConfig,
+    *,
+    enable_tools: bool,
+    route: Any,
+    image_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Authoritatively admit the complete prompt immediately before dispatch."""
+
+    if image_parts:
+        _attach_image_parts(messages, image_parts)
+    tool_schema_tokens = _estimate_available_tool_schema_tokens(
+        cfg,
+        enable_tools=enable_tools,
+        route=route,
+        model_name=cfg.model_name,
+    )
+    return _admit_and_trim_history(
+        messages,
+        cfg,
+        model_name=cfg.model_name,
+        tool_schema_tokens=tool_schema_tokens,
+    )
 
 
 def _messages_to_dicts(
@@ -731,20 +791,17 @@ class ChatService:
                 source_message_id=None,
             )
 
-        # 4. Load + capability-aware admission and history trimming.
+        # 4. Early admission uses the largest possible input budget (no tool
+        # schema reserve), so it can fast-fail impossible latest turns without
+        # rejecting a turn whose intent routing later disables tools. A final,
+        # authoritative admission runs after routing/enrichment/images below.
         history = await _load_history(db, conversation.id)
         messages = _messages_to_dicts(system_prompt, history)
-        tool_schema_tokens = _estimate_available_tool_schema_tokens(
-            cfg,
-            enable_tools=enable_tools,
-            route=route,
-            model_name=cfg.model_name,
-        )
         messages = _admit_and_trim_history(
             messages,
             cfg,
             model_name=cfg.model_name,
-            tool_schema_tokens=tool_schema_tokens,
+            tool_schema_tokens=0,
         )
 
         # 4b. Gather multimodal image parts (data only — do NOT mutate messages
@@ -760,26 +817,6 @@ class ChatService:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("collect_image_parts failed: %s", exc)
                 _image_parts = []
-
-        # 5. Pending assistant message + meta event.
-        assistant_msg = Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content="",
-            model_name=cfg.model_name,
-            metadata_={"status": "pending"},
-        )
-        db.add(assistant_msg)
-        await db.flush()
-        await db.commit()  # durable IDs + history before streaming starts
-
-        yield _event(
-            "meta",
-            {
-                "message_id": str(assistant_msg.id),
-                "conversation_id": str(conversation.id),
-            },
-        )
 
         # 6a. Intent recognition (engineering-grade, model-driven). Assemble typed
         # context fragments, run the classifier, and let a trusted judgment steer
@@ -901,7 +938,39 @@ class ChatService:
         except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
             logger.warning("context enrichment failed; continuing without it", exc_info=True)
 
-        # 6. Build turn context and delegate to the orchestrator/runtime.
+        # 6c. Final authoritative admission sees the final intent route, all
+        # system/enrichment text, advertised tool schemas, and multimodal parts.
+        # It is intentionally the last prompt mutation before provider dispatch.
+        messages = _finalize_prompt_messages(
+            messages,
+            cfg,
+            enable_tools=enable_tools,
+            route=route,
+            image_parts=_image_parts,
+        )
+
+        # 7. Create the pending assistant only after admission succeeds, so a
+        # rejected oversized prompt never leaves a ghost pending response.
+        assistant_msg = Message(
+            conversation_id=conversation.id,
+            role="assistant",
+            content="",
+            model_name=cfg.model_name,
+            metadata_={"status": "pending"},
+        )
+        db.add(assistant_msg)
+        await db.flush()
+        await db.commit()  # durable IDs + history before streaming starts
+
+        yield _event(
+            "meta",
+            {
+                "message_id": str(assistant_msg.id),
+                "conversation_id": str(conversation.id),
+            },
+        )
+
+        # 8. Build turn context and delegate to the orchestrator/runtime.
         ctx = AgentTurnContext(
             db=db,
             user=user,
@@ -927,13 +996,6 @@ class ChatService:
                 "intent_fragments": intent_fragment_names,
             },
         )
-
-        # Apply multimodal vision parts NOW — after intent recognition and
-        # context enrichment (which read user content as a plain string). The
-        # last user message becomes an OpenAI content-parts list with the image
-        # data URLs; the provider passes it through unchanged.
-        if _image_parts:
-            _attach_image_parts(messages, _image_parts)
 
         try:
             async for evt in chat_orchestrator.stream(ctx):

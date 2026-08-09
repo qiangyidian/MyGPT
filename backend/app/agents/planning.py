@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.providers.base import ChatOptions, ModelProvider
+from app.providers.base import ChatOptions, ModelProvider, provider_output_token_parameter
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +412,11 @@ async def summarize_history(
         result = await provider.chat(
             [{"role": "system", "content": _SUMMARY_SYSTEM},
              {"role": "user", "content": transcript}],
-            ChatOptions(temperature=0.2, max_tokens=400),
+            ChatOptions(
+                temperature=0.2,
+                max_tokens=400,
+                output_token_parameter=provider_output_token_parameter(provider),
+            ),
         )
         summary = (result.content or "").strip()
         if summary:

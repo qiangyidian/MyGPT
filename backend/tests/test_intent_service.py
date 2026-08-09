@@ -28,9 +28,11 @@ class _ScriptedProvider(MockProvider):
         self._script = list(script or [])
         self._delay = delay
         self.calls = 0
+        self.last_options = None
 
     async def chat(self, messages, options=None):
         self.calls += 1
+        self.last_options = options
         if self._delay:
             await asyncio.sleep(self._delay)
         if not self._script:
@@ -53,6 +55,17 @@ async def test_judge_parses_plain_json():
     d = await _service().judge(user_content="写贪吃蛇", fragments=_fragments(), provider=p)
     assert d is not None and d.route == "native" and d.deliverable_kind == "code"
     assert d.confidence == pytest.approx(0.9)
+
+
+async def test_judge_uses_provider_output_token_parameter():
+    p = _ScriptedProvider(
+        script=['{"route":"native","deliverable_kind":"code","confidence":0.9}']
+    )
+    p.output_token_parameter = "max_completion_tokens"
+
+    await _service().judge(user_content="write code", fragments=_fragments(), provider=p)
+
+    assert p.last_options.output_token_parameter == "max_completion_tokens"
 
 
 async def test_judge_strips_markdown_fence():

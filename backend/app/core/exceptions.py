@@ -10,6 +10,7 @@ Every response uses the same shape so the frontend has one error parser.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -55,7 +56,9 @@ async def _validation_exception_handler(
 ) -> JSONResponse:
     # Collapse pydantic validation errors into a readable message; full detail
     # list is preserved under "details" for clients that want field-level info.
-    errors = exc.errors()
+    # Pydantic model validators may put the originating ValueError object in
+    # ``ctx.error``; normalize it so the uniform 422 envelope is always JSON-safe.
+    errors = json.loads(json.dumps(exc.errors(), default=str))
     first = errors[0] if errors else {}
     loc = ".".join(str(p) for p in first.get("loc", []) if p not in ("body",))
     msg = first.get("msg", "Validation failed")

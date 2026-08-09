@@ -28,11 +28,13 @@ def get_provider_for_config(cfg: ModelConfig) -> ModelProvider:
             base_url=cfg.api_base_url,
             api_key=api_key,
             model=cfg.model_name,
+            output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
         )
     if provider_type == "mock":
         return MockProvider(
             base_url=cfg.api_base_url,
             api_key=api_key,
             model=cfg.model_name,
+            output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
         )
     raise ProviderError(f"unknown provider type: {cfg.provider!r}")

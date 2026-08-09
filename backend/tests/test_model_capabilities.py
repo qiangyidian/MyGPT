@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from app.model_capabilities import ModelCapabilities, capabilities_from_config
 from app.providers.base import ChatOptions
 from app.providers.openai_compatible import OpenAICompatibleProvider
+from app.providers.registry import get_provider_for_config
 from app.schemas.model_config import ModelConfigCreate, ModelConfigUpdate
 from app.services.model_service import to_out
 
@@ -95,6 +96,22 @@ def test_model_config_schemas_validate_limits_and_output_parameter():
         ModelConfigUpdate(output_token_parameter="both")
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "supports_parallel_tools",
+        "supports_audio_input",
+        "supports_structured_output",
+        "output_token_parameter",
+        "max_context_tokens",
+        "max_tokens",
+    ],
+)
+def test_model_config_update_rejects_explicit_null_for_non_nullable_fields(field: str):
+    with pytest.raises(ValidationError):
+        ModelConfigUpdate.model_validate({field: None})
+
+
 def test_provider_maps_generic_output_limit_to_selected_parameter():
     payload = OpenAICompatibleProvider._build_chat_payload(
         "reasoner",
@@ -105,6 +122,20 @@ def test_provider_maps_generic_output_limit_to_selected_parameter():
 
     assert payload["max_completion_tokens"] == 500
     assert "max_tokens" not in payload
+
+
+def test_provider_registry_propagates_configured_output_parameter():
+    cfg = SimpleNamespace(
+        provider="openai-compatible",
+        api_base_url="https://example.test/v1",
+        api_key_encrypted="",
+        model_name="reasoner",
+        output_token_parameter="max_completion_tokens",
+    )
+
+    provider = get_provider_for_config(cfg)
+
+    assert provider.output_token_parameter == "max_completion_tokens"
 
 
 def test_chat_options_reject_unknown_output_parameter():

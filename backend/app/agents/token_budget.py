@@ -10,6 +10,7 @@ from app.model_capabilities import ModelCapabilities
 
 INVALID_PROMPT_BUDGET = "invalid_prompt_budget"
 MESSAGE_TOO_LARGE = "message_too_large"
+PROMPT_TOO_LARGE = "prompt_too_large"
 
 
 class PromptAdmissionError(AppException):
@@ -86,6 +87,9 @@ def admit_latest_turn(latest_turn_tokens: int, input_budget: int) -> None:
 
 
 __all__ = [
+    "INVALID_PROMPT_BUDGET",
+    "MESSAGE_TOO_LARGE",
+    "PROMPT_TOO_LARGE",
     "PromptAdmissionError",
     "TokenBudget",
     "admit_latest_turn",

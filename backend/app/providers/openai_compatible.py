@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 from tenacity import (
@@ -62,8 +62,21 @@ class OpenAICompatibleProvider(ModelProvider):
 
     provider_name = "openai-compatible"
 
-    def __init__(self, *, base_url: str, api_key: str = "", model: str = "", **_: Any) -> None:
-        super().__init__(base_url=base_url, api_key=api_key, model=model)
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str = "",
+        model: str = "",
+        output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
+        **_: Any,
+    ) -> None:
+        super().__init__(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            output_token_parameter=output_token_parameter,
+        )
         # Generous read timeout so slow / long (code) generations aren't killed
         # mid-stream; connect stays short. Driven by Settings, not hardcoded.
         s = get_settings()

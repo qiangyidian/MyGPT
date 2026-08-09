@@ -47,11 +47,13 @@ async def _create_tables() -> None:
 def _sync_columns(conn) -> None:
     """ALTER each existing table to add any model columns it's missing.
 
-    Safe: only adds columns that don't exist, always NULLABLE (existing rows
-    back-fill to NULL). Production uses Alembic migrations — this is the dev
-    convenience that keeps AUTO_CREATE_TABLES in sync with the models.
+    Safe: only adds columns that don't exist. Columns with a database default
+    retain that default and their NOT NULL contract, so existing rows backfill
+    safely. Columns without a database default stay nullable because an ALTER
+    cannot manufacture a value for existing rows. Production uses Alembic
+    migrations; this is the dev convenience for AUTO_CREATE_TABLES.
     """
-    from sqlalchemy import inspect, text
+    from sqlalchemy import inspect, literal, text
 
     insp = inspect(conn)
     for table_name, table in Base.metadata.tables.items():
@@ -63,8 +65,20 @@ def _sync_columns(conn) -> None:
                 continue
             try:
                 coltype = col.type.compile(dialect=conn.dialect)
+                default_sql = ""
+                if col.server_default is not None:
+                    arg = col.server_default.arg
+                    expression = literal(arg) if isinstance(arg, str) else arg
+                    compiled = expression.compile(
+                        dialect=conn.dialect, compile_kwargs={"literal_binds": True}
+                    )
+                    default_sql = f" DEFAULT {compiled}"
+                not_null_sql = " NOT NULL" if not col.nullable and default_sql else ""
                 conn.execute(
-                    text(f'ALTER TABLE "{table_name}" ADD COLUMN "{col.name}" {coltype}')
+                    text(
+                        f'ALTER TABLE "{table_name}" ADD COLUMN "{col.name}" '
+                        f"{coltype}{default_sql}{not_null_sql}"
+                    )
                 )
                 logger.warning(
                     "schema-sync: added missing column %s.%s (%s)", table_name, col.name, coltype
