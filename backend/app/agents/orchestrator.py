@@ -14,6 +14,7 @@ the model<->tool loop). For each turn the orchestrator:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,11 @@ from typing import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.db_mutation import (
+    commit_with_rollback,
+    db_mutation_scope,
+    rollback_safely,
+)
 from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.run_controls import drop as drop_run_control, get_or_create as get_run_control
 from app.agents.schemas import (
@@ -29,6 +35,7 @@ from app.agents.schemas import (
     AgentTurnContext,
     ExecutionMode,
     RuntimeKind,
+    ev_done,
     ev_error,
     ev_intent_recognized,
     ev_run_started,
@@ -75,17 +82,23 @@ class ChatOrchestrator:
 
     # ------------------------------------------------------------------ #
     async def stream(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
-        run = await self._create_run(ctx)
-        # Register cooperative pause/instruction controls for this run.
-        ctx.extra["run_control"] = get_run_control(run.id)
+        db_lock = ctx.extra.get("db_mutation_lock")
+        async with db_mutation_scope(db_lock):
+            try:
+                run = await self._create_run(ctx)
+                # Register cooperative pause/instruction controls for this run.
+                ctx.extra["run_control"] = get_run_control(run.id)
 
-        # Select the runtime BEFORE emitting run_started so the event reports the
-        # real runtime (native vs crewai), not the placeholder "native".
-        runtime, selection = self._select_runtime(ctx)
-        ctx.extra["runtime_selection"] = selection
-        run.runtime = runtime.name
-        run.status = "running"
-        await ctx.db.commit()
+                # Select the runtime BEFORE emitting run_started so the event reports the
+                # real runtime (native vs crewai), not the placeholder "native".
+                runtime, selection = self._select_runtime(ctx)
+                ctx.extra["runtime_selection"] = selection
+                run.runtime = runtime.name
+                run.status = "running"
+                await ctx.db.commit()
+            except BaseException:
+                await rollback_safely(ctx.db)
+                raise
 
         yield ev_run_started(
             run_id=run.id,
@@ -128,13 +141,25 @@ class ChatOrchestrator:
         try:
             async for evt in runtime.stream_turn(ctx):
                 if evt.kind in ("done", "error"):
-                    await self._finalize_run(ctx.db, run, evt)
+                    await self._finalize_run(ctx.db, run, evt, lock=db_lock)
                 yield evt
                 if evt.kind in ("done", "error"):
                     return
+        except asyncio.CancelledError:
+            await self._finalize_run(
+                ctx.db,
+                run,
+                ev_done(
+                    message_id=ctx.assistant_msg.id,
+                    finish_reason="cancelled",
+                    usage=ctx.extra.get("usage"),
+                ),
+                lock=db_lock,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 — runtime should self-handle, but be safe
             logger.exception("runtime %s crashed: %s", runtime.name, exc)
-            await self._fail_run(ctx.db, run, str(exc))
+            await self._fail_run(ctx.db, run, str(exc), lock=db_lock)
             yield ev_error(code="internal", message=str(exc))
             return
         finally:
@@ -297,7 +322,14 @@ class ChatOrchestrator:
         ctx.extra["run_id"] = run.id
         return run
 
-    async def _finalize_run(self, db: AsyncSession, run: AgentRun, evt: AgentEvent) -> None:
+    async def _finalize_run(
+        self,
+        db: AsyncSession,
+        run: AgentRun,
+        evt: AgentEvent,
+        *,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
         run.finished_at = datetime.now(timezone.utc)
         run.output = {**(run.output or {}), **dict(evt.data)}
         if evt.kind == "done":
@@ -310,20 +342,28 @@ class ChatOrchestrator:
         else:
             run.status = "failed"
             run.error_message = str(evt.data.get("message", ""))
-        try:
-            await db.commit()
-        except Exception:  # pragma: no cover - best effort
-            logger.exception("failed to finalize agent_run %s", run.id)
-            await db.rollback()
+        async with db_mutation_scope(lock):
+            try:
+                await commit_with_rollback(db)
+            except Exception:  # pragma: no cover - best effort
+                logger.exception("failed to finalize agent_run %s", run.id)
 
-    async def _fail_run(self, db: AsyncSession, run: AgentRun, message: str) -> None:
+    async def _fail_run(
+        self,
+        db: AsyncSession,
+        run: AgentRun,
+        message: str,
+        *,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
         run.finished_at = datetime.now(timezone.utc)
         run.status = "failed"
         run.error_message = message
-        try:
-            await db.commit()
-        except Exception:  # pragma: no cover
-            await db.rollback()
+        async with db_mutation_scope(lock):
+            try:
+                await commit_with_rollback(db)
+            except Exception:  # pragma: no cover
+                pass
 
 
 # Module-level singleton — stateless aside from the lazy crewai cache.

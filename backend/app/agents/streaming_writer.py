@@ -185,16 +185,18 @@ class StreamingWriterExecutor:
                 await persist_checkpoint(checkpoint)
                 return
             if stage_ctx.db is not None:
+                from app.agents.db_mutation import db_mutation_scope
                 from app.services.chat_service import (
                     _persist_continuation_checkpoint,
                 )
 
-                await _persist_continuation_checkpoint(
-                    stage_ctx.db,
-                    assistant_msg,
-                    stage_ctx.run_id,
-                    checkpoint,
-                )
+                async with db_mutation_scope(stage_ctx.db_mutation_lock):
+                    await _persist_continuation_checkpoint(
+                        stage_ctx.db,
+                        assistant_msg,
+                        stage_ctx.run_id,
+                        checkpoint,
+                    )
                 return
             raise RuntimeError("continuation checkpoint persistence is unavailable")
 

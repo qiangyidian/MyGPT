@@ -37,8 +37,13 @@ from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.agents.orchestrator import chat_orchestrator
+from app.agents.db_mutation import (
+    commit_with_rollback,
+    db_mutation_scope,
+    rollback_safely,
+)
 from app.agents.intent_router import decide_route, decide_route_with_intent
+from app.agents.orchestrator import chat_orchestrator
 from app.agents.planning import (
     extract_goal,
     is_casual_question,
@@ -629,9 +634,11 @@ async def _persist_partial(db: AsyncSession, assistant_msg: Message) -> None:
     try:
         if not assistant_msg.content:
             assistant_msg.content = ""
-        await db.commit()
+        await commit_with_rollback(db)
+    except asyncio.CancelledError:
+        raise
     except Exception:  # pragma: no cover - best effort only
-        await db.rollback()
+        pass
 
 
 async def _persist_continuation_checkpoint(
@@ -641,24 +648,28 @@ async def _persist_continuation_checkpoint(
     checkpoint: dict[str, Any],
 ) -> None:
     """Durably checkpoint a continuation before its next provider dispatch."""
-    snapshot = dict(checkpoint)
-    assistant_msg.metadata_ = {
-        **(assistant_msg.metadata_ or {}),
-        "continuation": snapshot,
-    }
     try:
-        run_uuid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
-    except (TypeError, ValueError):
-        run_uuid = None
-    if run_uuid is not None:
-        run = await db.get(AgentRun, run_uuid)
-        if run is not None:
-            run.output = {**(run.output or {}), "continuation": snapshot}
-            round_number = int(snapshot.get("round") or 0)
-            resume_marker = f"continuation:{round_number}"
-            run.current_step = resume_marker
-            run.resume_token = resume_marker
-    await db.commit()
+        snapshot = dict(checkpoint)
+        assistant_msg.metadata_ = {
+            **(assistant_msg.metadata_ or {}),
+            "continuation": snapshot,
+        }
+        try:
+            run_uuid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
+        except (TypeError, ValueError):
+            run_uuid = None
+        if run_uuid is not None:
+            run = await db.get(AgentRun, run_uuid)
+            if run is not None:
+                run.output = {**(run.output or {}), "continuation": snapshot}
+                round_number = int(snapshot.get("round") or 0)
+                resume_marker = f"continuation:{round_number}"
+                run.current_step = resume_marker
+                run.resume_token = resume_marker
+        await db.commit()
+    except BaseException:
+        await rollback_safely(db)
+        raise
 
 
 class ChatService:
@@ -1020,7 +1031,7 @@ class ChatService:
         )
         db.add(assistant_msg)
         await db.flush()
-        await db.commit()  # durable IDs + history before streaming starts
+        await commit_with_rollback(db)  # durable IDs + history before streaming starts
 
         yield _event(
             "meta",
@@ -1031,6 +1042,7 @@ class ChatService:
         )
 
         # 8. Build turn context and delegate to the orchestrator/runtime.
+        db_mutation_lock = asyncio.Lock()
         ctx = AgentTurnContext(
             db=db,
             user=user,
@@ -1054,13 +1066,15 @@ class ChatService:
                 "route": route,
                 "intent_decision": intent_decision,
                 "intent_fragments": intent_fragment_names,
+                "db_mutation_lock": db_mutation_lock,
             },
         )
 
         async def persist_continuation(checkpoint: dict[str, Any]) -> None:
-            await _persist_continuation_checkpoint(
-                db, assistant_msg, ctx.run_id, checkpoint
-            )
+            async with db_mutation_scope(db_mutation_lock):
+                await _persist_continuation_checkpoint(
+                    db, assistant_msg, ctx.run_id, checkpoint
+                )
 
         ctx.extra["persist_continuation_checkpoint"] = persist_continuation
 
@@ -1155,7 +1169,8 @@ class ChatService:
                     )
                     # Refresh the sidebar preview with the final assistant text.
                     conversation.last_message_preview = (assistant_msg.content or "")[:280]
-                    await db.commit()
+                    async with db_mutation_scope(db_mutation_lock):
+                        await commit_with_rollback(db)
                     # Rolling summary: if history grew past the budget, roll the
                     # older messages into a summary memory for future turns.
                     try:
@@ -1168,12 +1183,13 @@ class ChatService:
                     err_code = evt.data.get("code")
                     err_msg = evt.data.get("message", "error")
                     err_finish = _finish_for_error_code(err_code)
-                    await self._finalize_error(
-                        db, assistant_msg, err_msg,
-                        finish_reason=err_finish, code=err_code,
-                        usage=evt.data.get("usage"),
-                        model_name=cfg.model_name,
-                    )
+                    async with db_mutation_scope(db_mutation_lock):
+                        await self._finalize_error(
+                            db, assistant_msg, err_msg,
+                            finish_reason=err_finish, code=err_code,
+                            usage=evt.data.get("usage"),
+                            model_name=cfg.model_name,
+                        )
                     # Structured record for a FAILED turn (same field set as a
                     # completed one) so failed runs are queryable too.
                     sel = ctx.extra.get("runtime_selection")
@@ -1219,13 +1235,14 @@ class ChatService:
                 rag_skipped_reason=rag_skipped_reason,
                 citation_count=len(citations),
             )
-            await self._finalize_interrupted(
-                db,
-                assistant_msg,
-                finish_reason=reason,
-                usage=ctx.extra.get("usage"),
-                model_name=cfg.model_name,
-            )
+            async with db_mutation_scope(db_mutation_lock):
+                await self._finalize_interrupted(
+                    db,
+                    assistant_msg,
+                    finish_reason=reason,
+                    usage=ctx.extra.get("usage"),
+                    model_name=cfg.model_name,
+                )
             raise
 
     @staticmethod
@@ -1268,7 +1285,7 @@ class ChatService:
             md["provider_error_code"] = code
         assistant_msg.metadata_ = md
         _apply_usage_accounting(assistant_msg, model_name, usage)
-        await db.commit()
+        await commit_with_rollback(db)
 
     async def _finalize_interrupted(
         self,

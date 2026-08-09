@@ -32,6 +32,7 @@ from app.agents.continuation import (
     ContinuationPolicy,
     aggregate_usage,
 )
+from app.agents.db_mutation import db_mutation_scope
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies import BudgetExceeded, BudgetGuard
 from app.agents.graph import build_single_agent_graph
@@ -162,9 +163,10 @@ class NativeChatRuntime:
                 return
             from app.services.chat_service import _persist_continuation_checkpoint
 
-            await _persist_continuation_checkpoint(
-                db, assistant_msg, ctx.run_id, checkpoint
-            )
+            async with db_mutation_scope(ctx.extra.get("db_mutation_lock")):
+                await _persist_continuation_checkpoint(
+                    db, assistant_msg, ctx.run_id, checkpoint
+                )
 
         async def persist_cancelled_continuation() -> dict[str, Any]:
             checkpoint = {

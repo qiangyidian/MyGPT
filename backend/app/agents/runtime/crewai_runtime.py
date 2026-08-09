@@ -33,9 +33,10 @@ import uuid
 from typing import Any, AsyncIterator
 
 from app.agents.approval_bridge import ApprovalBridge
-from app.agents.continuation import aggregate_usage
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
+from app.agents.continuation import aggregate_usage
+from app.agents.db_mutation import db_mutation_scope, rollback_safely
 from app.agents.crews import (
     build_debate_stages,
     build_parallel_research_stages,
@@ -333,6 +334,7 @@ class CrewAIRuntime:
         stage_ctx.user_content = ctx.user_content
         stage_ctx.cancel_event = asyncio.Event()
         stage_ctx.db = ctx.db
+        stage_ctx.db_mutation_lock = ctx.extra.get("db_mutation_lock")
         persist_checkpoint = ctx.extra.get("persist_continuation_checkpoint")
         if callable(persist_checkpoint):
             stage_ctx.persist_continuation_checkpoint = persist_checkpoint
@@ -342,9 +344,10 @@ class CrewAIRuntime:
                     _persist_continuation_checkpoint,
                 )
 
-                await _persist_continuation_checkpoint(
-                    ctx.db, ctx.assistant_msg, ctx.run_id, checkpoint
-                )
+                async with db_mutation_scope(stage_ctx.db_mutation_lock):
+                    await _persist_continuation_checkpoint(
+                        ctx.db, ctx.assistant_msg, ctx.run_id, checkpoint
+                    )
 
             stage_ctx.persist_continuation_checkpoint = persist_checkpoint_fallback
         tools = self._build_tools(ctx, stage_ctx=stage_ctx)
@@ -417,11 +420,16 @@ class CrewAIRuntime:
                 ],
                 "requires_confirmation": False,
             }
-            run_row = await ctx.db.get(AgentRun, ctx.run_id)
-            if run_row is not None:
-                run_row.plan = plan
-                run_row.plan_status = "draft"
-                await ctx.db.commit()
+            async with db_mutation_scope(stage_ctx.db_mutation_lock):
+                try:
+                    run_row = await ctx.db.get(AgentRun, ctx.run_id)
+                    if run_row is not None:
+                        run_row.plan = plan
+                        run_row.plan_status = "draft"
+                        await ctx.db.commit()
+                except BaseException:
+                    await rollback_safely(ctx.db)
+                    raise
             stage_ctx.emit(ev_research_plan(
                 run_id=ctx.run_id,
                 status="draft",
@@ -429,12 +437,15 @@ class CrewAIRuntime:
                 steps=plan["steps"],
                 requires_confirmation=False,
             ))
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 — plan is best-effort
             logger.warning("research plan emission failed", exc_info=True)
 
         # ---- concurrent run + drain ----
         outputs: dict[str, StageResult] = {}
         run_exc: Exception | None = None
+        flow_cancelled = False
 
         async def run_flow() -> None:
             nonlocal run_exc
@@ -469,15 +480,24 @@ class CrewAIRuntime:
             approval_bridge.cancel_active()
             if not run_task.done():
                 run_task.cancel()
-                try:
-                    await run_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            try:
+                # Await even an already-done task: otherwise a completed
+                # CancelledError is never observed and the runtime falls
+                # through to a fabricated done/stop event.
+                await run_task
+            except asyncio.CancelledError:
+                flow_cancelled = True
+            except Exception as exc:  # pragma: no cover - run_flow captures these
+                if run_exc is None:
+                    run_exc = exc
             # Final snapshot persist.
             await self._persist_graph(ctx, emitter, definition=False)
             partial_usage = _aggregate_crewai_usage(stages, outputs, stage_ctx)
             if partial_usage is not None:
                 ctx.extra["usage"] = partial_usage
+
+        if flow_cancelled:
+            raise asyncio.CancelledError()
 
         if run_exc is not None:
             # Preserve any partial content the writer streamed before failing
@@ -682,18 +702,20 @@ class CrewAIRuntime:
         definition: bool,
     ) -> None:
         """Write the graph snapshot to the AgentRun row (best-effort)."""
-        try:
-            run = await ctx.db.get(AgentRun, ctx.run_id)
-            if run is None:
-                return
-            snap = emitter.snapshot()
-            if definition:
-                run.graph_definition = snap
-            run.graph_state = snap
-            await ctx.db.commit()
-        except Exception:  # pragma: no cover - persistence is best-effort
-            logger.warning("failed to persist agent graph snapshot", exc_info=True)
+        lock = ctx.extra.get("db_mutation_lock")
+        async with db_mutation_scope(lock):
             try:
-                await ctx.db.rollback()
-            except Exception:
-                pass
+                run = await ctx.db.get(AgentRun, ctx.run_id)
+                if run is None:
+                    return
+                snap = emitter.snapshot()
+                if definition:
+                    run.graph_definition = snap
+                run.graph_state = snap
+                await ctx.db.commit()
+            except BaseException as exc:
+                await rollback_safely(ctx.db)
+                if isinstance(exc, Exception):
+                    logger.warning("failed to persist agent graph snapshot", exc_info=True)
+                    return
+                raise

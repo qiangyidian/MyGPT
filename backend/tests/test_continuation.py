@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from types import SimpleNamespace
@@ -294,6 +295,60 @@ async def test_chat_service_checkpoint_is_durable_and_idempotent(db_session):
     assert persisted_run.output["continuation"] == checkpoint
     assert persisted_run.current_step == "continuation:1"
     assert persisted_run.resume_token == "continuation:1"
+
+
+async def test_cancelled_checkpoint_rolls_back_poisoned_session_before_terminal_commit():
+    """Cancellation during commit must not strand the request session in failure."""
+
+    class PoisonOnFirstCommitSession:
+        def __init__(self, run):
+            self.run = run
+            self.poisoned = False
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        async def get(self, model, identity):
+            return self.run
+
+        async def commit(self):
+            self.commit_calls += 1
+            if self.commit_calls == 1:
+                self.poisoned = True
+                raise asyncio.CancelledError()
+            if self.poisoned:
+                raise RuntimeError("session remained poisoned after cancellation")
+
+        async def rollback(self):
+            self.rollback_calls += 1
+            self.poisoned = False
+
+    run = SimpleNamespace(output=None, current_step="", resume_token="")
+    message = Message(role="assistant", content="partial", metadata_={})
+    session = PoisonOnFirstCommitSession(run)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _persist_continuation_checkpoint(
+            session,
+            message,
+            uuid.uuid4(),
+            {"round": 1, "max_rounds": 2, "status": "continuing"},
+        )
+
+    assert session.rollback_calls == 1
+    assert session.poisoned is False
+
+    await ChatService()._finalize_interrupted(
+        session,
+        message,
+        finish_reason="cancelled",
+        usage={"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+        model_name="gpt-test",
+    )
+
+    assert session.commit_calls == 2
+    assert message.metadata_["status"] == "cancelled"
+    assert message.metadata_["finish_reason"] == "cancelled"
+    assert message.total_tokens == 12
 
 
 async def test_run_finalization_preserves_durable_continuation_checkpoint(db_session):

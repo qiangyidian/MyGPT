@@ -1290,6 +1290,186 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
     )
 
 
+async def test_graph_persistence_shares_checkpoint_db_lock_without_overlap():
+    """The background writer and graph drainer must serialize one AsyncSession."""
+
+    class OverlapDetectingSession:
+        def __init__(self):
+            self.run = SimpleNamespace(
+                output=None,
+                current_step="",
+                resume_token="",
+                graph_definition=None,
+                graph_state=None,
+            )
+            self.active = False
+            self.overlaps = 0
+            self.first_get_started = asyncio.Event()
+            self.release_first_get = asyncio.Event()
+            self.get_calls = 0
+
+        async def get(self, model, identity):
+            if self.active:
+                self.overlaps += 1
+                raise RuntimeError("concurrent AsyncSession use")
+            self.active = True
+            self.get_calls += 1
+            try:
+                if self.get_calls == 1:
+                    self.first_get_started.set()
+                    await self.release_first_get.wait()
+                else:
+                    await asyncio.sleep(0)
+                return self.run
+            finally:
+                self.active = False
+
+        async def commit(self):
+            if self.active:
+                self.overlaps += 1
+                raise RuntimeError("concurrent AsyncSession use")
+            self.active = True
+            try:
+                await asyncio.sleep(0)
+            finally:
+                self.active = False
+
+        async def rollback(self):
+            await asyncio.sleep(0)
+
+    session = OverlapDetectingSession()
+    lock = asyncio.Lock()
+    run_id = uuid.uuid4()
+    message = SimpleNamespace(metadata_={})
+    ctx = SimpleNamespace(
+        db=session,
+        run_id=run_id,
+        extra={"db_mutation_lock": lock},
+    )
+    emitter = SimpleNamespace(snapshot=lambda: {"nodes": [], "edges": []})
+
+    async def persist_checkpoint():
+        async with lock:
+            await _persist_continuation_checkpoint(
+                session,
+                message,
+                run_id,
+                {"round": 1, "max_rounds": 2, "status": "continuing"},
+            )
+
+    checkpoint_task = asyncio.create_task(persist_checkpoint())
+    await asyncio.wait_for(session.first_get_started.wait(), timeout=1)
+    graph_task = asyncio.create_task(
+        CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
+    )
+    await asyncio.sleep(0)
+    session.release_first_get.set()
+    await asyncio.wait_for(
+        asyncio.gather(checkpoint_task, graph_task), timeout=1
+    )
+
+    assert session.overlaps == 0
+    assert session.run.graph_definition == {"nodes": [], "edges": []}
+
+
+async def test_cancelled_graph_commit_rolls_back_and_releases_request_lock():
+    class PoisonedGraphSession:
+        def __init__(self):
+            self.run = SimpleNamespace(graph_definition=None, graph_state=None)
+            self.poisoned = False
+            self.rollback_calls = 0
+
+        async def get(self, model, identity):
+            return self.run
+
+        async def commit(self):
+            self.poisoned = True
+            raise asyncio.CancelledError()
+
+        async def rollback(self):
+            self.rollback_calls += 1
+            self.poisoned = False
+
+    session = PoisonedGraphSession()
+    lock = asyncio.Lock()
+    ctx = SimpleNamespace(
+        db=session,
+        run_id=uuid.uuid4(),
+        extra={"db_mutation_lock": lock},
+    )
+    emitter = SimpleNamespace(snapshot=lambda: {"nodes": ["writer"]})
+
+    with pytest.raises(asyncio.CancelledError):
+        await CrewAIRuntime()._persist_graph(ctx, emitter, definition=False)
+
+    assert session.rollback_calls == 1
+    assert session.poisoned is False
+    assert lock.locked() is False
+
+
+async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
+    db_session, monkeypatch
+):
+    ctx = await _seed_ctx(db_session)
+    provider = _ScriptedWriterProvider(
+        [[
+            ChatDelta(content="partial answer"),
+            ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 2}),
+            ChatDelta(finish_reason="length"),
+        ]]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.crewai_runtime.get_provider_for_config",
+        lambda _cfg: provider,
+    )
+    ctx.extra["stage_executor"] = StreamingWriterExecutor(
+        FakeStageExecutor(
+            behaviors={
+                "researcher": FakeStageExecutor.Behavior(output="evidence"),
+                "analyst": FakeStageExecutor.Behavior(output="verified findings"),
+            }
+        )
+    )
+    db_lock = asyncio.Lock()
+    ctx.extra["db_mutation_lock"] = db_lock
+    checkpoint_statuses = []
+
+    async def persist_checkpoint(checkpoint):
+        checkpoint_statuses.append(checkpoint["status"])
+        async with db_lock:
+            await _persist_continuation_checkpoint(
+                db_session, ctx.assistant_msg, ctx.run_id, checkpoint
+            )
+        if checkpoint["status"] == "continuing":
+            raise asyncio.CancelledError()
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+    events = []
+
+    with pytest.raises(asyncio.CancelledError):
+        # First CrewAI import/build is intentionally lazy and can take several
+        # seconds on Windows; this bound detects deadlock without timing setup.
+        async with asyncio.timeout(15):
+            async for event in CrewAIRuntime().stream_turn(ctx):
+                events.append(event)
+
+    assert len(provider.calls) == 1
+    assert checkpoint_statuses == ["continuing", "cancelled"]
+    assert ctx.assistant_msg.content == "partial answer"
+    assert ctx.extra["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+    assert not any(event.kind == "done" for event in events)
+    assert any(
+        event.kind == "run_status" and event.data.get("status") == "cancelled"
+        for event in events
+    )
+    run = await db_session.get(AgentRun, ctx.run_id)
+    assert run.output["continuation"]["status"] == "cancelled"
+
+
 async def test_multi_agent_writer_streams_without_duplicate(db_session):
     ctx = await _seed_ctx(db_session)
     # Researcher/analyst use the fake; the writer is streamed by the wrapper.
