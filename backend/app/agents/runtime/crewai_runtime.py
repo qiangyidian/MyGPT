@@ -33,6 +33,7 @@ import uuid
 from typing import Any, AsyncIterator
 
 from app.agents.approval_bridge import ApprovalBridge
+from app.agents.continuation import aggregate_usage
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.crews import (
@@ -123,12 +124,33 @@ def _writer_usage(
         if getattr(spec, "agent_id", "") != "writer":
             continue
         result = outputs.get(spec.agent_id)
+        if result and result.usage:
+            return result.usage
         if result and isinstance(result.structured, dict):
             usage = result.structured.get("usage")
             if isinstance(usage, dict) and usage:
                 return usage
         break
     return None
+
+
+def _aggregate_crewai_usage(
+    stages: list[StageSpec],
+    outputs: dict[str, StageResult],
+    stage_ctx: StageContext,
+) -> dict[str, int | float] | None:
+    """Aggregate each stage plus idempotently recorded tool/failed-attempt usage."""
+    rounds: list[dict[str, Any] | None] = []
+    for spec in stages:
+        result = outputs.get(getattr(spec, "agent_id", ""))
+        if result is None:
+            continue
+        if result.usage:
+            rounds.append(result.usage)
+        elif isinstance(result.structured, dict):
+            rounds.append(result.structured.get("usage"))
+    rounds.extend(stage_ctx.usage_records.values())
+    return aggregate_usage(rounds)
 
 
 def _map_run_error(exc: Exception) -> tuple[str, str]:
@@ -310,6 +332,21 @@ class CrewAIRuntime:
         stage_ctx.assistant_msg = ctx.assistant_msg
         stage_ctx.user_content = ctx.user_content
         stage_ctx.cancel_event = asyncio.Event()
+        stage_ctx.db = ctx.db
+        persist_checkpoint = ctx.extra.get("persist_continuation_checkpoint")
+        if callable(persist_checkpoint):
+            stage_ctx.persist_continuation_checkpoint = persist_checkpoint
+        else:
+            async def persist_checkpoint_fallback(checkpoint: dict[str, Any]) -> None:
+                from app.services.chat_service import (
+                    _persist_continuation_checkpoint,
+                )
+
+                await _persist_continuation_checkpoint(
+                    ctx.db, ctx.assistant_msg, ctx.run_id, checkpoint
+                )
+
+            stage_ctx.persist_continuation_checkpoint = persist_checkpoint_fallback
         tools = self._build_tools(ctx, stage_ctx=stage_ctx)
 
         # The approval bridge is built after the emitter (it needs the emitter
@@ -438,13 +475,20 @@ class CrewAIRuntime:
                     pass
             # Final snapshot persist.
             await self._persist_graph(ctx, emitter, definition=False)
+            partial_usage = _aggregate_crewai_usage(stages, outputs, stage_ctx)
+            if partial_usage is not None:
+                ctx.extra["usage"] = partial_usage
 
         if run_exc is not None:
             # Preserve any partial content the writer streamed before failing
             # (the old code wiped assistant_msg.content here, losing partials).
             finish, code = _map_run_error(run_exc)
             ctx.extra["finish_reason"] = finish
-            yield ev_error(code=code, message=str(run_exc))
+            yield ev_error(
+                code=code,
+                message=str(run_exc),
+                usage=ctx.extra.get("usage"),
+            )
             return
 
         # The final stage (writer) holds the answer — unless it already streamed
@@ -468,6 +512,9 @@ class CrewAIRuntime:
         # Recover the writer's REAL finish_reason (length/stop/cancelled/...)
         # instead of clobbering it with a hard-coded "stop".
         finish = _writer_finish_reason(stages, outputs)
+        usage = _aggregate_crewai_usage(stages, outputs, stage_ctx)
+        if usage is not None:
+            ctx.extra["usage"] = usage
         ctx.extra["finish_reason"] = finish
         ctx.extra["multi_agent"] = True
         if not streamed and final_text:
@@ -475,7 +522,7 @@ class CrewAIRuntime:
         yield ev_done(
             message_id=ctx.assistant_msg.id,
             finish_reason=finish,
-            usage=_writer_usage(stages, outputs),
+            usage=usage,
         )
 
     async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:

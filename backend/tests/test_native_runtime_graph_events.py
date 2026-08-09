@@ -19,7 +19,7 @@ from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.schemas import AgentTurnContext, ExecutionMode
 from app.agents.token_budget import PROMPT_TOO_LARGE, PromptAdmissionError
 from app.models import AgentRun, Conversation, Message
-from app.providers.base import ChatDelta, ToolCallDef
+from app.providers.base import ChatDelta, ProviderError, ToolCallDef
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -195,6 +195,42 @@ async def test_native_auto_continues_length_and_streams_only_novel_tail(
         "max_rounds": 2,
         "status": "completed",
     }
+
+
+async def test_native_persists_checkpoint_before_followup_provider_dispatch(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+    order = []
+
+    async def persist_checkpoint(checkpoint):
+        await asyncio.sleep(0)
+        order.append(("persist", checkpoint["round"]))
+
+    ctx.extra["persist_continuation_checkpoint"] = persist_checkpoint
+
+    class OrderedProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream_chat(self, messages, options=None):
+            self.calls += 1
+            order.append(("provider", self.calls))
+            if self.calls == 1:
+                yield ChatDelta(content="alpha")
+                yield ChatDelta(finish_reason="length")
+                return
+            yield ChatDelta(content=" beta")
+            yield ChatDelta(finish_reason="stop")
+
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: OrderedProvider(),
+    )
+
+    await _collect(ctx)
+
+    assert order[:3] == [("provider", 1), ("persist", 1), ("provider", 2)]
 
 
 async def test_native_stops_at_max_continuation_rounds_with_length(
@@ -377,6 +413,86 @@ async def test_native_admission_error_during_continuation_preserves_novel_partia
     assert "".join(d["delta"] for d in _find_all(events, "token")) == "alpha beta"
     assert _find_all(events, "error")[-1]["code"] == PROMPT_TOO_LARGE
     assert not _find_all(events, "done")
+
+
+@pytest.mark.parametrize(
+    ("raised", "error_code"),
+    [
+        (ProviderError("lost"), "provider_error"),
+        (RuntimeError("boom"), "internal"),
+    ],
+)
+async def test_native_error_after_continuation_tokens_preserves_partial_and_usage(
+    db_session, monkeypatch, raised, error_code
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+
+    class ErrorAfterTokensProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream_chat(self, messages, options=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield ChatDelta(content="alpha")
+                yield ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 1})
+                yield ChatDelta(finish_reason="length")
+                return
+            yield ChatDelta(content="alpha beta")
+            yield ChatDelta(usage={"prompt_tokens": 12, "completion_tokens": 2})
+            raise raised
+
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: ErrorAfterTokensProvider(),
+    )
+
+    events = await _collect(ctx)
+
+    assert ctx.assistant_msg.content == "alpha beta"
+    error = _find_all(events, "error")[-1]
+    assert error["code"] == error_code
+    assert error["usage"] == {
+        "prompt_tokens": 22,
+        "completion_tokens": 3,
+        "total_tokens": 25,
+    }
+
+
+async def test_native_async_cancellation_after_tokens_flushes_partial_and_usage(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+
+    class CancelAfterTokensProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream_chat(self, messages, options=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield ChatDelta(content="alpha")
+                yield ChatDelta(usage={"prompt_tokens": 10, "completion_tokens": 1})
+                yield ChatDelta(finish_reason="length")
+                return
+            yield ChatDelta(content="alpha beta")
+            yield ChatDelta(usage={"prompt_tokens": 12, "completion_tokens": 2})
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: CancelAfterTokensProvider(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _collect(ctx)
+
+    assert ctx.assistant_msg.content == "alpha beta"
+    assert ctx.extra["usage"] == {
+        "prompt_tokens": 22,
+        "completion_tokens": 3,
+        "total_tokens": 25,
+    }
 
 
 # --------------------------------------------------------------------------- #

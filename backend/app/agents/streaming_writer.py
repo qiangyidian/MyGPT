@@ -173,6 +173,12 @@ class StreamingWriterExecutor:
         full = assistant_msg.content or ""
         finish_reason = "stop"
         checkpoint: dict[str, Any] | None = None
+
+        def record_failed_usage(current: dict[str, Any] | None) -> None:
+            failed_rounds = [*usage_rounds, *([current] if current is not None else [])]
+            for index, usage in enumerate(failed_rounds):
+                stage_ctx.record_usage(f"model:{agent_id}:{index}", usage)
+
         while True:
             round_raw = ""
             for attempt in (1, 2):
@@ -230,6 +236,7 @@ class StreamingWriterExecutor:
                             assistant_msg.content = full
                             stage_ctx.emit(ev_token(delta=buffered))
                     stage_ctx.writer_streamed = True
+                    record_failed_usage(round_usage)
                     raise
                 except ProviderError:
                     if continuation_buffer is not None:
@@ -239,6 +246,7 @@ class StreamingWriterExecutor:
                             assistant_msg.content = full
                             stage_ctx.emit(ev_token(delta=buffered))
                     stage_ctx.writer_streamed = True
+                    record_failed_usage(round_usage)
                     logger.warning("writer stream provider error", exc_info=True)
                     raise
                 except Exception:
@@ -249,6 +257,7 @@ class StreamingWriterExecutor:
                             assistant_msg.content = full
                             stage_ctx.emit(ev_token(delta=buffered))
                     stage_ctx.writer_streamed = True
+                    record_failed_usage(round_usage)
                     logger.exception("writer streaming failed")
                     raise
                 if continuation_buffer is not None:
@@ -283,7 +292,11 @@ class StreamingWriterExecutor:
                     **(assistant_msg.metadata_ or {}),
                     "continuation": checkpoint,
                 }
-            if finish_reason == "length" and continuation_round < policy.max_rounds:
+            if policy.should_continue(
+                finish_reason,
+                continuation_round,
+                cancelled=finish_reason == "cancelled",
+            ):
                 messages.append({"role": "assistant", "content": round_raw})
                 messages.append({"role": "user", "content": _CONTINUE_INSTRUCTION})
                 continuation_round += 1
@@ -296,6 +309,24 @@ class StreamingWriterExecutor:
                     **(assistant_msg.metadata_ or {}),
                     "continuation": checkpoint,
                 }
+                persist_checkpoint = stage_ctx.persist_continuation_checkpoint
+                if callable(persist_checkpoint):
+                    await persist_checkpoint(checkpoint)
+                elif stage_ctx.db is not None:
+                    from app.services.chat_service import (
+                        _persist_continuation_checkpoint,
+                    )
+
+                    await _persist_continuation_checkpoint(
+                        stage_ctx.db,
+                        assistant_msg,
+                        stage_ctx.run_id,
+                        checkpoint,
+                    )
+                else:
+                    raise RuntimeError(
+                        "continuation checkpoint persistence is unavailable"
+                    )
                 continue
             if continuation_round:
                 checkpoint = {
@@ -333,6 +364,7 @@ class StreamingWriterExecutor:
             raw="",
             output_summary=(full.strip().replace("\n", " ")[:160] or "（空回答）"),
             structured=structured,
+            usage=usage,
         )
 
 

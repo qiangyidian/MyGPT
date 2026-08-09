@@ -60,7 +60,7 @@ from app.agents.token_budget import (
 )
 from app.core.config import get_settings
 from app.core.exceptions import AppException
-from app.models import Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
+from app.models import AgentRun, Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.model_capabilities import capabilities_from_config
 from app.providers.registry import get_provider_for_config
 from app.rag.citations import sanitize_unbacked_source_markers
@@ -634,6 +634,33 @@ async def _persist_partial(db: AsyncSession, assistant_msg: Message) -> None:
         await db.rollback()
 
 
+async def _persist_continuation_checkpoint(
+    db: AsyncSession,
+    assistant_msg: Message,
+    run_id: uuid.UUID | str,
+    checkpoint: dict[str, Any],
+) -> None:
+    """Durably checkpoint a continuation before its next provider dispatch."""
+    snapshot = dict(checkpoint)
+    assistant_msg.metadata_ = {
+        **(assistant_msg.metadata_ or {}),
+        "continuation": snapshot,
+    }
+    try:
+        run_uuid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
+    except (TypeError, ValueError):
+        run_uuid = None
+    if run_uuid is not None:
+        run = await db.get(AgentRun, run_uuid)
+        if run is not None:
+            run.output = {**(run.output or {}), "continuation": snapshot}
+            round_number = int(snapshot.get("round") or 0)
+            resume_marker = f"continuation:{round_number}"
+            run.current_step = resume_marker
+            run.resume_token = resume_marker
+    await db.commit()
+
+
 class ChatService:
     """Orchestrates a single chat turn end to end."""
 
@@ -1030,6 +1057,13 @@ class ChatService:
             },
         )
 
+        async def persist_continuation(checkpoint: dict[str, Any]) -> None:
+            await _persist_continuation_checkpoint(
+                db, assistant_msg, ctx.run_id, checkpoint
+            )
+
+        ctx.extra["persist_continuation_checkpoint"] = persist_continuation
+
         try:
             async for evt in chat_orchestrator.stream(ctx):
                 if evt.kind == "done":
@@ -1137,6 +1171,8 @@ class ChatService:
                     await self._finalize_error(
                         db, assistant_msg, err_msg,
                         finish_reason=err_finish, code=err_code,
+                        usage=evt.data.get("usage"),
+                        model_name=cfg.model_name,
                     )
                     # Structured record for a FAILED turn (same field set as a
                     # completed one) so failed runs are queryable too.
@@ -1183,7 +1219,13 @@ class ChatService:
                 rag_skipped_reason=rag_skipped_reason,
                 citation_count=len(citations),
             )
-            await _persist_partial(db, assistant_msg)
+            await self._finalize_interrupted(
+                db,
+                assistant_msg,
+                finish_reason=reason,
+                usage=ctx.extra.get("usage"),
+                model_name=cfg.model_name,
+            )
             raise
 
     @staticmethod
@@ -1211,6 +1253,8 @@ class ChatService:
         *,
         finish_reason: str = "error",
         code: str | None = None,
+        usage: dict[str, Any] | None = None,
+        model_name: str | None = None,
     ) -> None:
         # Preserve partial content (assistant_msg.content is mutated by the
         # runtime as tokens stream) — only record why it stopped.
@@ -1223,7 +1267,25 @@ class ChatService:
         if code:
             md["provider_error_code"] = code
         assistant_msg.metadata_ = md
+        _apply_usage_accounting(assistant_msg, model_name, usage)
         await db.commit()
+
+    async def _finalize_interrupted(
+        self,
+        db: AsyncSession,
+        assistant_msg: Message,
+        *,
+        finish_reason: str,
+        usage: dict[str, Any] | None,
+        model_name: str | None,
+    ) -> None:
+        assistant_msg.metadata_ = {
+            **(assistant_msg.metadata_ or {}),
+            "finish_reason": finish_reason,
+            "status": _status_for_finish(finish_reason),
+        }
+        _apply_usage_accounting(assistant_msg, model_name, usage)
+        await _persist_partial(db, assistant_msg)
 
     async def _maybe_summarize(
         self,

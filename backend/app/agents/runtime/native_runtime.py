@@ -214,7 +214,11 @@ class NativeChatRuntime:
                     ctx.extra["finish_reason"] = finish_reason
                     ctx.extra["budget"] = guard.snapshot()
                     logger.info("native provider dispatch rejected: %s", exc.code)
-                    yield ev_error(code=exc.code, message=str(exc))
+                    yield ev_error(
+                        code=exc.code,
+                        message=str(exc),
+                        usage=aggregate_usage(usage_rounds),
+                    )
                     for _evt in _native_terminal_events(
                         ctx, "failed", _assistant_started
                     ):
@@ -270,17 +274,37 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
+                    if round_usage is not None:
+                        usage_rounds.append(round_usage)
+                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
                     finish_reason = "budget"
                     ctx.extra["admission_error_code"] = exc.code
                     ctx.extra["finish_reason"] = finish_reason
                     ctx.extra["budget"] = guard.snapshot()
                     logger.info("native provider payload rejected: %s", exc.code)
-                    yield ev_error(code=exc.code, message=str(exc))
+                    yield ev_error(
+                        code=exc.code,
+                        message=str(exc),
+                        usage=ctx.extra.get("usage"),
+                    )
                     for _evt in _native_terminal_events(
                         ctx, "failed", _assistant_started
                     ):
                         yield _evt
                     return
+                except asyncio.CancelledError:
+                    if continuation_buffer is not None:
+                        buffered_novel = continuation_buffer.flush()
+                        if buffered_novel:
+                            novel_parts.append(buffered_novel)
+                            yield ev_token(delta=buffered_novel)
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(
+                        novel_parts
+                    )
+                    if round_usage is not None:
+                        usage_rounds.append(round_usage)
+                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    raise
                 except ProviderError as exc:
                     model_breaker().record_failure(_breaker_key)
                     # Fold this round's partial text before surfacing the error,
@@ -294,12 +318,42 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
+                    if round_usage is not None:
+                        usage_rounds.append(round_usage)
+                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
                     logger.exception("provider error in native run: %s", exc)
                     yield ev_error(
-                        code=getattr(exc, "code", "provider_error"), message=str(exc)
+                        code=getattr(exc, "code", "provider_error"),
+                        message=str(exc),
+                        usage=ctx.extra.get("usage"),
                     )
                     _node_terminal = "failed"
                     for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
+                        yield _evt
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    model_breaker().record_failure(_breaker_key)
+                    if continuation_buffer is not None:
+                        buffered_novel = continuation_buffer.flush()
+                        if buffered_novel:
+                            novel_parts.append(buffered_novel)
+                            yield ev_token(delta=buffered_novel)
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(
+                        novel_parts
+                    )
+                    if round_usage is not None:
+                        usage_rounds.append(round_usage)
+                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    logger.exception("unexpected provider stream error: %s", exc)
+                    yield ev_error(
+                        code="internal",
+                        message="Internal error during generation",
+                        usage=ctx.extra.get("usage"),
+                    )
+                    _node_terminal = "failed"
+                    for _evt in _native_terminal_events(
+                        ctx, "failed", _assistant_started
+                    ):
                         yield _evt
                     return
                 finally:
@@ -312,6 +366,7 @@ class NativeChatRuntime:
                         yield ev_token(delta=buffered_novel)
                 if round_usage is not None:
                     usage_rounds.append(round_usage)
+                ctx.extra["usage"] = aggregate_usage(usage_rounds)
                 # Fold this round's streamed text into the assistant message so a
                 # mid-loop disconnect still leaves recoverable content.
                 assistant_msg.content = (assistant_msg.content or "") + "".join(
@@ -493,27 +548,45 @@ class NativeChatRuntime:
                         **(assistant_msg.metadata_ or {}),
                         "continuation": checkpoint,
                     }
+                if policy.should_continue(
+                    finish_reason,
+                    continuation_round,
+                    pending_tool_calls=bool(pending_tool_calls),
+                    cancelled=finish_reason == "cancelled",
+                ):
+                    working.append(
+                        {"role": "assistant", "content": "".join(accumulated)}
+                    )
+                    working.append(
+                        {"role": "user", "content": _CONTINUE_INSTRUCTION}
+                    )
+                    continuation_round += 1
+                    checkpoint = {
+                        "round": continuation_round,
+                        "max_rounds": policy.max_rounds,
+                        "status": "continuing",
+                    }
+                    ctx.extra["continuation"] = checkpoint
+                    assistant_msg.metadata_ = {
+                        **(assistant_msg.metadata_ or {}),
+                        "continuation": checkpoint,
+                    }
+                    persist_checkpoint = ctx.extra.get(
+                        "persist_continuation_checkpoint"
+                    )
+                    if callable(persist_checkpoint):
+                        await persist_checkpoint(checkpoint)
+                    else:
+                        from app.services.chat_service import (
+                            _persist_continuation_checkpoint,
+                        )
+
+                        await _persist_continuation_checkpoint(
+                            db, assistant_msg, ctx.run_id, checkpoint
+                        )
+                    is_continuation_round = True
+                    continue
                 if finish_reason == "length" and not pending_tool_calls:
-                    if continuation_round < policy.max_rounds:
-                        working.append(
-                            {"role": "assistant", "content": "".join(accumulated)}
-                        )
-                        working.append(
-                            {"role": "user", "content": _CONTINUE_INSTRUCTION}
-                        )
-                        continuation_round += 1
-                        checkpoint = {
-                            "round": continuation_round,
-                            "max_rounds": policy.max_rounds,
-                            "status": "continuing",
-                        }
-                        ctx.extra["continuation"] = checkpoint
-                        assistant_msg.metadata_ = {
-                            **(assistant_msg.metadata_ or {}),
-                            "continuation": checkpoint,
-                        }
-                        is_continuation_round = True
-                        continue
                     checkpoint = {
                         "round": continuation_round,
                         "max_rounds": policy.max_rounds,
@@ -541,13 +614,21 @@ class NativeChatRuntime:
                 # No further tool calls — done.
                 break
         except ProviderError as exc:
-            yield ev_error(code="provider_error", message=str(exc))
+            yield ev_error(
+                code="provider_error",
+                message=str(exc),
+                usage=aggregate_usage(usage_rounds),
+            )
             for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
                 yield _evt
             return
         except Exception as exc:  # noqa: BLE001 — never let the stream die silently
             logger.exception("unexpected error in native run: %s", exc)
-            yield ev_error(code="internal", message="Internal error during generation")
+            yield ev_error(
+                code="internal",
+                message="Internal error during generation",
+                usage=aggregate_usage(usage_rounds),
+            )
             for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
                 yield _evt
             return

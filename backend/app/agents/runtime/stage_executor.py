@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from app.agents.continuation import aggregate_usage
 from app.agents.stage_context import StageContext
 from app.agents.token_budget import (
     MESSAGE_TOO_LARGE,
@@ -63,6 +64,8 @@ class StageResult:
     # Tool calls that occurred during this stage (for the activity feed /
     # audit). Populated by the executor from events it observed.
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Aggregate for every model attempt performed by this stage.
+    usage: dict[str, int | float] | None = None
 
 
 @runtime_checkable
@@ -109,11 +112,13 @@ class CrewAIStageExecutor:
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
         output = await agent.aexecute_task(task, context=admitted_context)
         raw = _extract_raw(output)
+        usage = aggregate_usage(_extract_usage_rounds(output, agent))
         return StageResult(
             agent_id=agent_id,
             raw=raw,
             output_summary=_summarize(raw, self._summarize_chars),
             structured=output,
+            usage=usage,
         )
 
 
@@ -327,6 +332,40 @@ def _extract_raw(output: Any) -> str:
     if isinstance(output, str):
         return output
     return str(output)
+
+
+def _extract_usage_rounds(*sources: Any) -> list[dict[str, Any]]:
+    """Extract provider usage snapshots from CrewAI outputs/agents.
+
+    Output-owned usage is preferred because agent-level metrics commonly repeat
+    the same totals. Lists are retained as individual retry/model attempts.
+    """
+
+    def mappings(value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            out: list[dict[str, Any]] = []
+            for item in value:
+                out.extend(mappings(item))
+            return out
+        if isinstance(value, dict):
+            return [value]
+        dump = getattr(value, "model_dump", None)
+        if callable(dump):
+            dumped = dump()
+            return [dumped] if isinstance(dumped, dict) else []
+        attrs = getattr(value, "__dict__", None)
+        return [dict(attrs)] if isinstance(attrs, dict) else []
+
+    for source in sources:
+        if source is None:
+            continue
+        for attr in ("token_usage", "usage", "usage_metrics"):
+            found = mappings(getattr(source, attr, None))
+            if found:
+                return found
+    return []
 
 
 def _summarize(text: str, n: int) -> str:

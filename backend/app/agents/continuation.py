@@ -27,6 +27,22 @@ class ContinuationPolicy:
         if not 64 <= self.comparison_window <= 65_536:
             raise ValueError("comparison_window must be between 64 and 65536")
 
+    def should_continue(
+        self,
+        finish_reason: str | None,
+        round_number: int,
+        *,
+        pending_tool_calls: bool = False,
+        cancelled: bool = False,
+    ) -> bool:
+        """Whether another bounded, text-only provider round is permitted."""
+        return bool(
+            finish_reason == "length"
+            and round_number < self.max_rounds
+            and not pending_tool_calls
+            and not cancelled
+        )
+
 
 def _suffix_prefix_length(existing: str, prefix: str) -> int:
     """Return the longest suffix(existing) == prefix(prefix), in linear time."""

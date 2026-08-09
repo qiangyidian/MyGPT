@@ -13,10 +13,16 @@ from app.agents.continuation import (
     aggregate_usage,
     merge_continuation,
 )
+from app.agents.orchestrator import ChatOrchestrator
+from app.agents.schemas import ev_done
 from app.core.config import Settings
 from app.core.pricing import reset_pricing_cache
-from app.models import Conversation, Message
-from app.services.chat_service import _apply_usage_accounting
+from app.models import AgentRun, Conversation, Message
+from app.services.chat_service import (
+    _apply_usage_accounting,
+    _persist_continuation_checkpoint,
+)
+from app.services.chat_service import ChatService
 
 
 @pytest.mark.parametrize(
@@ -69,6 +75,29 @@ def test_settings_configures_continuation_rounds_with_same_bounds():
         Settings(AUTO_CONTINUATION_MAX_ROUNDS=-1)
     with pytest.raises(ValidationError):
         Settings(AUTO_CONTINUATION_MAX_ROUNDS=9)
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "round_number", "pending_tools", "cancelled", "expected"),
+    [
+        ("length", 0, False, False, True),
+        ("length", 1, False, False, True),
+        ("length", 2, False, False, False),
+        ("stop", 0, False, False, False),
+        ("length", 0, True, False, False),
+        ("length", 0, False, True, False),
+    ],
+)
+def test_continuation_policy_decides_only_safe_length_followups(
+    finish_reason, round_number, pending_tools, cancelled, expected
+):
+    policy = ContinuationPolicy(max_rounds=2)
+    assert policy.should_continue(
+        finish_reason,
+        round_number,
+        pending_tool_calls=pending_tools,
+        cancelled=cancelled,
+    ) is expected
 
 
 def test_continuation_buffer_delays_bounded_prefix_then_emits_only_novel_text():
@@ -154,3 +183,124 @@ async def test_chat_service_persists_aggregate_usage_and_computes_cost_once(
     assert persisted.cost_usd == 0.000032
     assert persisted.metadata_["usage"] == usage
     reset_pricing_cache()
+
+
+@pytest.mark.parametrize("terminal", ["error", "cancelled"])
+async def test_chat_service_terminal_paths_persist_usage_and_cost_once(
+    db_session, monkeypatch, terminal
+):
+    conversation = Conversation(
+        user_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        title=f"usage {terminal}",
+    )
+    db_session.add(conversation)
+    await db_session.flush()
+    message = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content="partial",
+        metadata_={},
+    )
+    db_session.add(message)
+    await db_session.flush()
+    usage = {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12}
+    cost_calls = []
+    monkeypatch.setattr(
+        "app.core.pricing.compute_cost",
+        lambda model_name, payload: cost_calls.append((model_name, payload)) or 0.25,
+    )
+
+    service = ChatService()
+    if terminal == "error":
+        await service._finalize_error(
+            db_session,
+            message,
+            "failed",
+            finish_reason="provider_error",
+            code="provider_error",
+            usage=usage,
+            model_name="gpt-test",
+        )
+    else:
+        await service._finalize_interrupted(
+            db_session,
+            message,
+            finish_reason="cancelled",
+            usage=usage,
+            model_name="gpt-test",
+        )
+
+    assert cost_calls == [("gpt-test", usage)]
+    assert message.prompt_tokens == 9
+    assert message.completion_tokens == 3
+    assert message.total_tokens == 12
+    assert message.cost_usd == 0.25
+    assert message.metadata_["usage"] == usage
+
+
+async def test_chat_service_checkpoint_is_durable_and_idempotent(db_session):
+    user_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    conversation = Conversation(user_id=user_id, title="checkpoint")
+    db_session.add(conversation)
+    await db_session.flush()
+    message = Message(
+        conversation_id=conversation.id, role="assistant", content="partial", metadata_={}
+    )
+    db_session.add(message)
+    await db_session.flush()
+    run = AgentRun(
+        conversation_id=conversation.id,
+        message_id=message.id,
+        user_id=user_id,
+        runtime="native",
+        flow_name="single_agent",
+        status="running",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    checkpoint = {"round": 1, "max_rounds": 2, "status": "continuing"}
+
+    await _persist_continuation_checkpoint(
+        db_session, message, run.id, checkpoint
+    )
+    await _persist_continuation_checkpoint(
+        db_session, message, run.id, checkpoint
+    )
+    message_id, run_id = message.id, run.id
+    db_session.expire_all()
+
+    persisted_message = await db_session.get(Message, message_id)
+    persisted_run = await db_session.get(AgentRun, run_id)
+    assert persisted_message.metadata_["continuation"] == checkpoint
+    assert persisted_run.output["continuation"] == checkpoint
+    assert persisted_run.current_step == "continuation:1"
+    assert persisted_run.resume_token == "continuation:1"
+
+
+async def test_run_finalization_preserves_durable_continuation_checkpoint(db_session):
+    user_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    conversation = Conversation(user_id=user_id, title="final checkpoint")
+    db_session.add(conversation)
+    await db_session.flush()
+    message = Message(conversation_id=conversation.id, role="assistant", content="done")
+    db_session.add(message)
+    await db_session.flush()
+    checkpoint = {"round": 1, "max_rounds": 2, "status": "continuing"}
+    run = AgentRun(
+        conversation_id=conversation.id,
+        message_id=message.id,
+        user_id=user_id,
+        status="running",
+        output={"continuation": checkpoint},
+    )
+    db_session.add(run)
+    await db_session.flush()
+
+    await ChatOrchestrator()._finalize_run(
+        db_session,
+        run,
+        ev_done(message_id=message.id, finish_reason="stop"),
+    )
+
+    assert run.output["continuation"] == checkpoint
+    assert run.output["finish_reason"] == "stop"

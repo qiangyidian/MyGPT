@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from app.agents.schemas import AgentEvent
@@ -70,11 +70,18 @@ class StageContext:
     assistant_msg: Any = None
     user_content: str = ""
     cancel_event: Any = None
+    db: Any = None
+    persist_continuation_checkpoint: (
+        Callable[[dict[str, Any]], Awaitable[None]] | None
+    ) = None
     # Phase 2: user instructions appended mid-run, drained into the next stage.
     pending_instructions: list = field(default_factory=list)
     # Set True by StreamingWriterExecutor once the writer has streamed its
     # tokens; the runtime reads this to skip the legacy bulk-token emission.
     writer_streamed: bool = False
+    # Metered tool/provider usage that is not represented by a successful
+    # StageResult (for example a tool event or a failed writer attempt).
+    usage_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     # A sink the gateway can call to record that an AgentStep was written for
     # the current agent (used to keep graph_state's current_tool fresh). Optional.
     on_step_persisted: Callable[[str, str, str], None] | None = None  # (agent_id, tool_name, status)
@@ -91,6 +98,15 @@ class StageContext:
 
     def emit(self, event: "AgentEvent") -> None:
         """Thread-safe forward to the main-loop queue. Never blocks."""
+        if getattr(event, "kind", None) == "tool_result":
+            usage = event.data.get("usage")
+            result = event.data.get("result")
+            if usage is None and isinstance(result, dict):
+                usage = result.get("usage")
+            if isinstance(usage, dict) and usage:
+                self.record_usage(
+                    f"tool:{event.data.get('id') or len(self.usage_records)}", usage
+                )
         # Coalesce duplicate tool_call events for the same (agent, call_id).
         if getattr(event, "kind", None) == "tool_call":
             key = (event.data.get("agent_id"), event.data.get("id"))
@@ -102,6 +118,11 @@ class StageContext:
         except RuntimeError:
             # Loop closed (run ended) — drop silently.
             pass
+
+    def record_usage(self, key: str, usage: dict[str, Any] | None) -> None:
+        """Idempotently retain one final usage snapshot for a logical attempt."""
+        if isinstance(usage, dict) and usage:
+            self.usage_records.setdefault(str(key), dict(usage))
 
     def _put_nowait(self, event: "AgentEvent") -> None:
         try:

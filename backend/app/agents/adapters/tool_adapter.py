@@ -156,6 +156,14 @@ def _result_preview(exec_: ToolExecution) -> Any:
     return None
 
 
+def _execution_usage(exec_: ToolExecution | Any) -> dict[str, Any] | None:
+    """Extract optional metering emitted by a tool implementation."""
+    result = getattr(exec_, "result", None)
+    if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+        return dict(result["usage"])
+    return None
+
+
 def build_crewai_tool(
     source: AppBaseTool,
     *,
@@ -239,6 +247,7 @@ def build_crewai_tool(
                     id=call_id, name=tool_name, ok=exec_.ok,
                     result=_result_preview(exec_), error=exec_.error,
                     agent_id=agent_id, task_id=task_id,
+                    usage=_execution_usage(exec_),
                 ))
 
             return _format_for_crewai(exec_)

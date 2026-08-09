@@ -299,7 +299,7 @@ class ChatOrchestrator:
 
     async def _finalize_run(self, db: AsyncSession, run: AgentRun, evt: AgentEvent) -> None:
         run.finished_at = datetime.now(timezone.utc)
-        run.output = dict(evt.data)
+        run.output = {**(run.output or {}), **dict(evt.data)}
         if evt.kind == "done":
             # Preserve a user-initiated cancel instead of overwriting it with
             # "completed" (the runtime emits ev_done with finish_reason=cancelled).

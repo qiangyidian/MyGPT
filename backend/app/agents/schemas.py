@@ -273,12 +273,15 @@ def ev_tool_result(
     error: str | None = None,
     agent_id: str | None = None,
     task_id: str | None = None,
+    usage: dict[str, int | float] | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {"id": id, "name": name, "ok": ok, "result": result, "error": error}
     if agent_id:
         data["agent_id"] = agent_id
     if task_id:
         data["task_id"] = task_id
+    if usage is not None:
+        data["usage"] = usage
     return AgentEvent(kind="tool_result", data=data)
 
 
@@ -324,8 +327,16 @@ def ev_done(
     return AgentEvent(kind="done", data=data)
 
 
-def ev_error(*, code: str, message: str) -> AgentEvent:
-    return AgentEvent(kind="error", data={"code": code, "message": message})
+def ev_error(
+    *,
+    code: str,
+    message: str,
+    usage: dict[str, int | float] | None = None,
+) -> AgentEvent:
+    data: dict[str, Any] = {"code": code, "message": message}
+    if usage is not None:
+        data["usage"] = usage
+    return AgentEvent(kind="error", data=data)
 
 
 # ---- multi-agent graph events (Phase: multi-agent visualization) -----------
