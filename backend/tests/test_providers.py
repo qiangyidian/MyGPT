@@ -222,6 +222,7 @@ async def test_openai_provider_clamps_requested_output_to_model_capability():
     provider = _RecordingOpenAIProvider(
         base_url="http://x/v1",
         model="m",
+        output_token_parameter="max_completion_tokens",
         capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=200),
     )
 
@@ -233,6 +234,48 @@ async def test_openai_provider_clamps_requested_output_to_model_capability():
     assert len(provider.requests) == 1
     assert provider.requests[0]["max_completion_tokens"] == 200
     assert "max_tokens" not in provider.requests[0]
+
+
+async def test_openai_provider_uses_configured_output_parameter_over_option_default():
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        output_token_parameter="max_completion_tokens",
+        capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=200),
+    )
+
+    await provider.chat(
+        [{"role": "user", "content": "bounded"}],
+        ChatOptions(max_tokens=100),
+    )
+
+    assert provider.requests[0]["max_completion_tokens"] == 100
+    assert "max_tokens" not in provider.requests[0]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ChatOptions(max_tokens=200, stop=["stop-item " * 10_000]),
+        ChatOptions(
+            max_tokens=200,
+            tools=[{"type": "function", "function": {"name": "small_tool"}}],
+            tool_choice={"payload": "choice-item " * 10_000},
+        ),
+    ],
+    ids=["stop", "tool_choice"],
+)
+async def test_openai_provider_budgets_supplemental_payload_before_dispatch(options):
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=1_000, max_output_tokens=200),
+    )
+
+    with pytest.raises(PromptAdmissionError):
+        await provider.chat([{"role": "user", "content": "small"}], options)
+
+    assert provider.requests == []
 
 
 async def test_openai_provider_rejects_extra_override_before_chat_dispatch():

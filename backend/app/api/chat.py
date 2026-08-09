@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.exceptions import AppException
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import Conversation, User
@@ -69,8 +70,23 @@ async def _event_generator(
                 await queue.put(event)
         except HTTPException:
             await queue.put({"event": "error", "data": {"code": "chat_error", "message": "chat failed"}})
-        except Exception as exc:  # noqa: BLE001 — never kill the stream silently
-            await queue.put({"event": "error", "data": {"code": "internal_error", "message": str(exc)}})
+        except AppException as exc:
+            await queue.put(
+                {
+                    "event": "error",
+                    "data": {"code": exc.code, "message": exc.message},
+                }
+            )
+        except Exception:  # noqa: BLE001 — never kill the stream silently
+            await queue.put(
+                {
+                    "event": "error",
+                    "data": {
+                        "code": "internal_error",
+                        "message": "Internal error during chat",
+                    },
+                }
+            )
         finally:
             await queue.put(sentinel)
 

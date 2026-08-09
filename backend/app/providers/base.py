@@ -179,18 +179,30 @@ def admit_provider_payload(
         caps.max_output_tokens if opts.max_tokens is None else opts.max_tokens
     )
     effective_output = min(requested_output, caps.max_output_tokens)
-    admitted_options = replace(opts, max_tokens=effective_output)
+    admitted_options = replace(
+        opts,
+        max_tokens=effective_output,
+        output_token_parameter=provider_output_token_parameter(provider),
+    )
     model_name = getattr(provider, "model", "") or ""
+    supplemental_payload: dict[str, Any] = {}
+    if admitted_options.tools:
+        supplemental_payload["tools"] = admitted_options.tools
+        supplemental_payload["tool_choice"] = admitted_options.tool_choice
+    if admitted_options.stop:
+        supplemental_payload["stop"] = admitted_options.stop
+    if admitted_options.extra:
+        supplemental_payload.update(admitted_options.extra)
     supplemental_tokens = (
         _estimate_tokens(
             json.dumps(
-                {"tools": admitted_options.tools, "extra": admitted_options.extra},
+                supplemental_payload,
                 ensure_ascii=False,
                 default=str,
             ),
             model_name,
         )
-        if admitted_options.tools or admitted_options.extra
+        if supplemental_payload
         else 0
     )
     budget = calculate_prompt_budget(
