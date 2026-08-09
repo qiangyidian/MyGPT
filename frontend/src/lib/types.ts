@@ -8,6 +8,9 @@ export type Role = "system" | "user" | "assistant" | "tool";
  * execution_mode/agent_profile are never shown to end users.
  */
 export type UserChatMode =
+  | "speed"
+  | "expert"
+  // Legacy values kept for displaying older conversations / backward compat:
   | "auto"
   | "search"
   | "deep_research"

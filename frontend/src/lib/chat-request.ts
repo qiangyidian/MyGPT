@@ -28,7 +28,7 @@ export function buildChatBody(o: BuildChatBodyOpts): ChatRequest {
     knowledge_base_ids: o.knowledgeBaseIds ?? [],
     content: o.content,
     regenerate: o.regenerate ?? false,
-    mode: o.mode ?? "auto",
+    mode: o.mode ?? "speed",
     attachment_ids: o.attachmentIds ?? [],
   };
 }

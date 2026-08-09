@@ -59,7 +59,8 @@ export function Composer({
     ensureConversationId
   );
 
-  const needsFile = mode === "data_analysis" && drafts.length === 0;
+  // Both modes accept optional attachments; neither requires a file.
+  const needsFile = false;
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter to send, Shift+Enter for newline. Ignore during IME composition.

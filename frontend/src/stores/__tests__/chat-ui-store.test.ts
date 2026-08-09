@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * The chat-mode store is the front-line guard against the demo-data leak: its
- * DEFAULT must be "auto" (not deep_research), and a stale legacy
- * "deep_research" persisted by the old bad default must NOT survive into a new
- * session. These tests drive the v2→v3 migration with a controlled localStorage.
+ * The chat-mode store persists the user's picker choice. The picker now exposes
+ * exactly two modes — speed | expert — and migrates the legacy 6-mode v3 value
+ * onto them: legacy multi-agent modes (deep_research, debate) → expert;
+ * everything else → speed.
  */
 
 type Store = Record<string, string>;
@@ -30,8 +30,6 @@ function makeStorage(initial: Store = {}) {
 async function loadStore(initial: Store) {
   vi.resetModules();
   const storage = makeStorage(initial);
-  // The store guards on `typeof window === "undefined"`; provide a window so it
-  // actually reads localStorage (mirroring the browser).
   (globalThis as { window?: unknown }).window = { localStorage: storage };
   (globalThis as { localStorage?: Storage }).localStorage = storage;
   const mod = await import("@/stores/chat-ui-store");
@@ -43,51 +41,53 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Strip the faked globals so they cannot leak into other test files.
   delete (globalThis as { window?: unknown }).window;
   delete (globalThis as { localStorage?: Storage }).localStorage;
 });
 
-describe("chat-ui-store mode default + migration", () => {
-  it("defaults to auto with no prior localStorage", async () => {
+describe("chat-ui-store mode default + v3→v4 migration", () => {
+  it("defaults to speed with no prior localStorage", async () => {
     const { mod } = await loadStore({});
-    expect(mod.useChatUiStore.getState().mode).toBe("auto");
+    expect(mod.useChatUiStore.getState().mode).toBe("speed");
   });
 
-  it("does NOT inherit a legacy v2 deep_research (the bad old default)", async () => {
-    const { mod, storage } = await loadStore({ "mygpt.chat.mode.v2": "deep_research" });
-    // The dangerous inherited value must be discarded for the safe default.
-    expect(mod.useChatUiStore.getState().mode).toBe("auto");
-    // v3 written as auto, v2 cleared so the migration never re-runs.
-    expect(storage.getItem("mygpt.chat.mode.v3")).toBe("auto");
-    expect(storage.getItem("mygpt.chat.mode.v2")).toBeNull();
+  it("migrates a legacy v3 deep_research to expert (multi-agent preserved)", async () => {
+    const { mod, storage } = await loadStore({ "mygpt.chat.mode.v3": "deep_research" });
+    expect(mod.useChatUiStore.getState().mode).toBe("expert");
+    expect(storage.getItem("mygpt.chat.mode.v4")).toBe("expert");
+    expect(storage.getItem("mygpt.chat.mode.v3")).toBeNull();
   });
 
-  it("carries forward an explicit non-default v2 choice (e.g. search)", async () => {
-    const { mod, storage } = await loadStore({ "mygpt.chat.mode.v2": "search" });
-    expect(mod.useChatUiStore.getState().mode).toBe("search");
-    expect(storage.getItem("mygpt.chat.mode.v3")).toBe("search");
-    expect(storage.getItem("mygpt.chat.mode.v2")).toBeNull();
+  it("migrates a legacy v3 debate to expert too", async () => {
+    const { mod } = await loadStore({ "mygpt.chat.mode.v3": "debate" });
+    expect(mod.useChatUiStore.getState().mode).toBe("expert");
   });
 
-  it("honors a genuine explicit deep_research stored under the new v3 schema", async () => {
-    // A deep_research written to v3 was a deliberate post-fix choice — keep it.
-    const { mod } = await loadStore({ "mygpt.chat.mode.v3": "deep_research" });
-    expect(mod.useChatUiStore.getState().mode).toBe("deep_research");
+  it("migrates a legacy v3 non-multi-agent mode (auto/search/create/data_analysis) to speed", async () => {
+    for (const legacy of ["auto", "search", "create", "data_analysis"]) {
+      const { mod } = await loadStore({ "mygpt.chat.mode.v3": legacy });
+      expect(mod.useChatUiStore.getState().mode).toBe("speed");
+    }
   });
 
-  it("setMode persists the choice under v3 (not v2)", async () => {
+  it("honors a genuine v4 choice (speed/expert) without migrating", async () => {
+    const a = (await loadStore({ "mygpt.chat.mode.v4": "expert" })).mod;
+    expect(a.useChatUiStore.getState().mode).toBe("expert");
+    const b = (await loadStore({ "mygpt.chat.mode.v4": "speed" })).mod;
+    expect(b.useChatUiStore.getState().mode).toBe("speed");
+  });
+
+  it("setMode persists the choice under v4", async () => {
     const { mod, storage } = await loadStore({});
-    mod.useChatUiStore.getState().setMode("deep_research");
-    expect(mod.useChatUiStore.getState().mode).toBe("deep_research");
-    expect(storage.getItem("mygpt.chat.mode.v3")).toBe("deep_research");
+    mod.useChatUiStore.getState().setMode("expert");
+    expect(mod.useChatUiStore.getState().mode).toBe("expert");
+    expect(storage.getItem("mygpt.chat.mode.v4")).toBe("expert");
   });
 
-  it("the persisted default mode and buildChatBody agree on auto", async () => {
+  it("the persisted default mode and buildChatBody agree on speed", async () => {
     const { mod } = await loadStore({});
     const { buildChatBody } = await import("@/lib/chat-request");
     const mode = mod.useChatUiStore.getState().mode;
-    // The request carries exactly the store mode; no hidden deep_research.
-    expect(buildChatBody({ content: "你都能干什么", mode }).mode).toBe("auto");
+    expect(buildChatBody({ content: "你都能干什么", mode }).mode).toBe("speed");
   });
 });

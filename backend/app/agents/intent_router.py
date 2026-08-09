@@ -23,7 +23,12 @@ from typing import Optional
 from app.agents.schemas import ExecutionMode
 
 # The stable wire enum the frontend sends. Kept here so backend + tests agree.
-VALID_MODES = {"auto", "search", "deep_research", "create", "data_analysis", "debate"}
+# The UI picker now exposes only `speed` and `expert`; the rest remain valid for
+# backward compatibility (older clients, internal escalation, tests).
+VALID_MODES = {
+    "speed", "expert",
+    "auto", "search", "deep_research", "create", "data_analysis", "debate",
+}
 
 # Tools considered "web" — disabled in create mode to keep it focused.
 _WEB_TOOLS = {"web_search", "http_get"}
@@ -66,9 +71,47 @@ def decide_route(
     user_content: str = "",
 ) -> RouteDecision:
     """Resolve a user-facing ``mode`` into a :class:`RouteDecision`."""
-    m = (mode or "auto").strip().lower()
+    m = (mode or "speed").strip().lower()
     if m not in VALID_MODES:
-        m = "auto"
+        m = "speed"
+
+    if m == "speed":
+        # 极速模式：强制单 Agent 原生直答。不启动多 Agent、不联网、不跑意图分类
+        # （首 token 最快）。就是"普通快速聊天"。
+        return RouteDecision(
+            execution_mode=ExecutionMode.auto,
+            agent_profile="general",
+            enable_tools=False,
+            use_multi_agent=False,
+            disable_web=True,
+            mode="speed",
+            requested_mode="speed",
+        )
+
+    if m == "expert":
+        # 专家模式：默认使用多 Agent 协作（研究 crew；绑了知识库走并行 research）。
+        # 代码请求例外 —— 研究 Writer 会截断代码，所以代码仍走原生（与 deep_research 一致）。
+        from app.agents.planning import looks_like_code_request
+
+        if looks_like_code_request(user_content):
+            return RouteDecision(
+                execution_mode=ExecutionMode.auto,
+                agent_profile="general",
+                enable_tools=False,
+                use_multi_agent=False,
+                disable_web=True,
+                mode="create",
+                requested_mode="expert",
+            )
+        profile = "parallel_research" if has_knowledge_base else "deep_research"
+        return RouteDecision(
+            execution_mode=ExecutionMode.agent,
+            agent_profile=profile,
+            enable_tools=True,
+            use_multi_agent=True,
+            mode="expert",
+            requested_mode="expert",
+        )
 
     if m == "search":
         # Web-first, native multi-turn tool loop. The user never sees "Native".
@@ -223,14 +266,17 @@ def decide_route_with_intent(
     (the keyword router) so intent recognition is an enhancement, never a hard
     dependency.
 
-    Mapping (the part that actually fixes "silent mis-routing"):
-      * ``deliverable_kind == "code"``  → native, no web. Code never enters the
-        research crew (which truncates it and writes prose).
-      * ``route == "debate"``           → debate crew, no web.
-      * ``route in {deep_research, parallel_research}`` → research crew
-        (parallel when a KB is bound).
-      * else (native / factual)         → native; enable only hinted tools.
+    ``speed`` is special: it ALWAYS stays native single-agent (the user picked
+    极速 on purpose) — any intent judgment is ignored.
     """
+    if (mode or "").strip().lower() == "speed":
+        return decide_route(
+            "speed",
+            has_knowledge_base=has_knowledge_base,
+            has_attachment=has_attachment,
+            user_content=user_content,
+        )
+
     from app.agents.schemas import IntentDecision
 
     trusted = (

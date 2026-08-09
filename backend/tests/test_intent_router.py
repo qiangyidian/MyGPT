@@ -46,21 +46,54 @@ def test_data_analysis_enables_tools():
     assert r.use_multi_agent is False
 
 
-def test_invalid_mode_falls_back_to_auto():
+def test_invalid_mode_falls_back_to_speed():
+    # The UI picker default is 极速 (speed); an unknown mode falls back to it.
     r = decide_route("nonsense")
-    assert r.mode == "auto"
+    assert r.mode == "speed"
     assert r.execution_mode == ExecutionMode.auto
+    assert r.use_multi_agent is False
 
 
 def test_valid_modes_set():
+    # speed | expert are the exposed picker modes; the rest remain valid for
+    # backward compatibility (legacy clients / internal escalation / tests).
     assert VALID_MODES == {
-        "auto",
-        "search",
-        "deep_research",
-        "create",
-        "data_analysis",
-        "debate",
+        "speed", "expert",
+        "auto", "search", "deep_research", "create", "data_analysis", "debate",
     }
+
+
+def test_speed_mode_is_native_no_multi_agent():
+    r = decide_route("speed")
+    assert r.use_multi_agent is False
+    assert r.enable_tools is False
+    assert r.execution_mode == ExecutionMode.auto
+
+
+def test_expert_mode_uses_multi_agent():
+    r = decide_route("expert")
+    assert r.use_multi_agent is True
+    assert r.execution_mode == ExecutionMode.agent
+    assert r.agent_profile == "deep_research"
+
+
+def test_expert_mode_with_kb_uses_parallel_crew():
+    r = decide_route("expert", has_knowledge_base=True)
+    assert r.use_multi_agent is True
+    assert r.agent_profile == "parallel_research"
+
+
+def test_speed_ignores_intent_judgment():
+    # 极速 always stays native even if an intent decision suggests multi-agent.
+    from app.agents.schemas import IntentDecision
+
+    intent = IntentDecision(
+        route="deep_research", deliverable_kind="factual",
+        tool_hints=["web_search"], confidence=0.9, rationale="x",
+    )
+    r = decide_route_with_intent("speed", user_content="research LLMs", intent=intent)
+    assert r.use_multi_agent is False
+    assert r.mode == "speed"
 
 
 def test_filter_tool_names_allowlist_and_disable_web():

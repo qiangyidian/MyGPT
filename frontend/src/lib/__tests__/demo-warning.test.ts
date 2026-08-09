@@ -12,14 +12,13 @@ describe("user-modes: label/value consistency + special modes", () => {
     }
   });
 
-  it("isSpecialMode flags exactly the pipeline-changing modes", () => {
-    expect(isSpecialMode("deep_research")).toBe(true);
-    expect(isSpecialMode("debate")).toBe(true);
-    expect(isSpecialMode("data_analysis")).toBe(true);
-    // Ordinary modes are NOT special — no badge in the composer for them.
+  it("isSpecialMode flags exactly the multi-agent picker mode", () => {
+    // 专家 (expert) is the only multi-agent picker mode → special (badge shown).
+    expect(isSpecialMode("expert")).toBe(true);
+    // 极速 (speed) and everything else are NOT special.
+    expect(isSpecialMode("speed")).toBe(false);
     expect(isSpecialMode("auto")).toBe(false);
-    expect(isSpecialMode("search")).toBe(false);
-    expect(isSpecialMode("create")).toBe(false);
+    expect(isSpecialMode("deep_research")).toBe(false);
     expect(isSpecialMode(undefined)).toBe(false);
   });
 });

@@ -523,7 +523,7 @@ export function useChatStream(): ChatStreamState {
             regenerate: isRegenerate,
             // Phase 1: send the user-facing mode + bound attachments. The
             // backend IntentRouter derives the runtime/profile/tools.
-            mode: opts.mode ?? "auto",
+            mode: opts.mode ?? "speed",
             attachmentIds: opts.attachmentIds,
           }),
           handlers,

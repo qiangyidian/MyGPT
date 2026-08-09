@@ -12,9 +12,9 @@ describe("buildChatBody (mode → request mapping)", () => {
     expect(body.enable_tools).toBeUndefined();
   });
 
-  it("defaults mode to auto and attachments to empty", () => {
+  it("defaults mode to speed and attachments to empty", () => {
     const body = buildChatBody({ content: "hi" });
-    expect(body.mode).toBe("auto");
+    expect(body.mode).toBe("speed");
     expect(body.attachment_ids).toEqual([]);
     expect(body.regenerate).toBe(false);
   });

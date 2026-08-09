@@ -87,9 +87,9 @@ def test_plain_compare_does_not_escalate():
     assert r.mode == "auto"
 
 
-def test_invalid_mode_falls_back_to_auto():
+def test_invalid_mode_falls_back_to_speed():
     r = decide_route("bogus", user_content="hi")
-    assert r.mode == "auto"
+    assert r.mode == "speed"
     assert r.use_multi_agent is False
 
 

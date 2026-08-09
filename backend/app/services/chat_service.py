@@ -710,7 +710,9 @@ class ChatService:
         intent_decision = None
         intent_fragment_names: list[str] = []
         agent_forced = (request.execution_mode or "auto").lower() == "agent" and request.mode == "auto"
-        if not agent_forced and should_recognize_intent(user_content):
+        # 极速 / 专家 两种模式都跳过意图分类：极速要首字最快、专家本就固定走多 Agent。
+        _mode_skips_intent = (request.mode or "speed").strip().lower() in ("speed", "expert")
+        if not agent_forced and not _mode_skips_intent and should_recognize_intent(user_content):
             from app.agents.context_fragments import (
                 IntentContextInput,
                 assemble_context_fragments,

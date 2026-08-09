@@ -53,11 +53,13 @@ class Citation(BaseModel):
 class ChatRequest(BaseModel):
     """POST /api/chat/stream body. conversation_id optional for ad-hoc chat.
 
-    ``mode`` is the user-facing capability selector (auto | search |
-    deep_research | create | data_analysis | debate). The backend IntentRouter
-    maps it to runtime/profile/tools. Legacy ``execution_mode``/``agent_profile``
-    are still accepted for backward compatibility and override the derived route
-    when set explicitly.
+    ``mode`` is the user-facing capability selector. The UI picker exposes two
+    modes — ``speed`` (极速: single-agent, no multi-agent, fastest first token)
+    and ``expert`` (专家: multi-agent research crew by default). Legacy values
+    (auto | search | deep_research | create | data_analysis | debate) remain
+    accepted for backward compatibility. The backend IntentRouter maps the mode
+    to runtime/profile/tools. Legacy ``execution_mode``/``agent_profile`` still
+    override the derived route when set explicitly.
     """
     conversation_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
@@ -69,7 +71,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     enable_tools: bool = False        # explicit override (legacy / advanced)
     # ---- Phase 1: user-facing mode + attachments ----
-    mode: str = "auto"                # auto | search | deep_research | create | data_analysis | debate
+    mode: str = "speed"               # speed | expert (UI picker); legacy: auto|search|deep_research|create|data_analysis|debate
     attachment_ids: list[uuid.UUID] = []
     # ---- Agent platform: legacy fields (still accepted) ----
     execution_mode: str = "auto"      # auto | chat | agent
