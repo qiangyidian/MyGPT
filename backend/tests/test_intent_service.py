@@ -13,6 +13,7 @@ import pytest
 from app.agents.context_fragments import IntentContextInput, assemble_context_fragments
 from app.agents.intent_service import IntentClassifierConfig, IntentService
 from app.providers.base import ChatResult, ProviderError
+from app.model_capabilities import ModelCapabilities
 from app.providers.mock import MockProvider
 
 
@@ -136,6 +137,20 @@ async def test_judge_returns_none_when_no_provider():
 async def test_judge_returns_none_for_empty_content():
     d = await _service().judge(user_content="   ", fragments=_fragments(), provider=_ScriptedProvider())
     assert d is None
+
+
+async def test_intent_oversized_payload_is_rejected_before_custom_provider_call():
+    p = _ScriptedProvider(script=['{"route":"native"}'])
+    p.capabilities = ModelCapabilities(context_window=1_000, max_output_tokens=200)
+
+    decision = await _service().judge(
+        user_content="oversized-item " * 10_000,
+        fragments=_fragments(),
+        provider=p,
+    )
+
+    assert decision is None
+    assert p.calls == 0
 
 
 async def test_judge_disabled_short_circuits_without_provider_call():

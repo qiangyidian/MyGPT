@@ -5,9 +5,18 @@ constructs raw HTTP to a model — it asks the registry for a provider.
 """
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator, Literal
+
+from app.agents.token_budget import (
+    INVALID_PROMPT_BUDGET,
+    PROMPT_TOO_LARGE,
+    PromptAdmissionError,
+    calculate_prompt_budget,
+)
+from app.model_capabilities import ModelCapabilities, UNKNOWN_MODEL_CAPABILITIES
 
 
 # Canonical termination reasons carried end-to-end (provider → runtime → SSE →
@@ -31,6 +40,20 @@ PROVIDER_ERR_TIMEOUT = "provider_timeout"
 PROVIDER_ERR_NETWORK = "provider_error"
 PROVIDER_ERR_AUTH = "provider_auth"
 
+_PROTECTED_CHAT_EXTRA_KEYS = {
+    "max_completion_tokens",
+    "max_tokens",
+    "messages",
+    "model",
+    "stop",
+    "stream",
+    "stream_options",
+    "temperature",
+    "tool_choice",
+    "tools",
+    "top_p",
+}
+
 
 class ProviderError(RuntimeError):
     """Raised on transport/timeout/auth errors talking to a model endpoint.
@@ -48,9 +71,8 @@ class ProviderError(RuntimeError):
 class ChatOptions:
     temperature: float = 0.7
     top_p: float = 1.0
-    # None = omit max_tokens from the request so the endpoint uses its own maximum
-    # (no output truncation). The multi-agent streaming Writer uses this so long
-    # code answers are never cut off at finish_reason=length.
+    # None requests the provider's canonical maximum; final admission resolves it
+    # to a concrete, capability-bounded value before dispatch.
     max_tokens: int | None = 1024
     output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     tools: list[dict[str, Any]] | None = None        # OpenAI tool schemas
@@ -102,6 +124,7 @@ class ModelProvider(ABC):
         api_key: str = "",
         model: str = "",
         output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
+        capabilities: ModelCapabilities | None = None,
         **_: Any,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -112,6 +135,7 @@ class ModelProvider(ABC):
             if output_token_parameter in ("max_tokens", "max_completion_tokens")
             else "max_tokens"
         )
+        self.capabilities = capabilities or UNKNOWN_MODEL_CAPABILITIES
 
     @abstractmethod
     async def chat(self, messages: list[dict[str, Any]], options: ChatOptions | None = None) -> ChatResult: ...
@@ -130,3 +154,56 @@ def provider_output_token_parameter(
 ) -> Literal["max_tokens", "max_completion_tokens"]:
     value = getattr(provider, "output_token_parameter", "max_tokens")
     return value if value in ("max_tokens", "max_completion_tokens") else "max_tokens"
+
+
+def admit_provider_payload(
+    provider: Any,
+    messages: list[dict[str, Any]],
+    options: ChatOptions | None = None,
+) -> ChatOptions:
+    """Admit an exact provider payload and clamp its requested output."""
+    from app.services.chat_service import _estimate_message_tokens, _estimate_tokens
+
+    caps = getattr(provider, "capabilities", None)
+    if not isinstance(caps, ModelCapabilities):
+        caps = UNKNOWN_MODEL_CAPABILITIES
+    opts = options or ChatOptions(
+        output_token_parameter=provider_output_token_parameter(provider)
+    )
+    if _PROTECTED_CHAT_EXTRA_KEYS.intersection(opts.extra):
+        raise PromptAdmissionError(
+            INVALID_PROMPT_BUDGET,
+            "Chat options cannot override protected provider payload fields",
+        )
+    requested_output = (
+        caps.max_output_tokens if opts.max_tokens is None else opts.max_tokens
+    )
+    effective_output = min(requested_output, caps.max_output_tokens)
+    admitted_options = replace(opts, max_tokens=effective_output)
+    model_name = getattr(provider, "model", "") or ""
+    supplemental_tokens = (
+        _estimate_tokens(
+            json.dumps(
+                {"tools": admitted_options.tools, "extra": admitted_options.extra},
+                ensure_ascii=False,
+                default=str,
+            ),
+            model_name,
+        )
+        if admitted_options.tools or admitted_options.extra
+        else 0
+    )
+    budget = calculate_prompt_budget(
+        caps,
+        requested_output=effective_output,
+        tool_schema_tokens=supplemental_tokens,
+    )
+    message_tokens = sum(
+        _estimate_message_tokens(message, model_name) for message in messages
+    )
+    if message_tokens > budget.input_tokens:
+        raise PromptAdmissionError(
+            PROMPT_TOO_LARGE,
+            "The final provider payload exceeds the configured prompt budget",
+        )
+    return admitted_options

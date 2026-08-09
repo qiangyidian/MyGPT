@@ -9,6 +9,7 @@ from app.agents.guardian import (
     RejectionCircuitBreaker,
 )
 from app.providers.base import ChatResult, ProviderError
+from app.model_capabilities import ModelCapabilities
 from app.providers.mock import MockProvider
 
 
@@ -89,6 +90,19 @@ async def test_guardian_fail_closed_on_timeout():
 async def test_guardian_no_provider_denies():
     v = await GuardianService().judge(action=_action(), provider=None)
     assert not v.allowed
+
+
+async def test_guardian_oversized_payload_is_rejected_before_custom_provider_call():
+    p = _ScriptedProvider(script=['{"risk_level":"low","outcome":"allow"}'])
+    p.capabilities = ModelCapabilities(context_window=1_000, max_output_tokens=200)
+
+    verdict = await GuardianService().judge(
+        action={"tool": "shell", "payload": "oversized-item " * 10_000},
+        provider=p,
+    )
+
+    assert not verdict.allowed
+    assert p.calls == 0
 
 
 def test_circuit_breaker_aborts_on_consecutive_denials():

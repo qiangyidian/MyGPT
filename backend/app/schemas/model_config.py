@@ -28,8 +28,8 @@ class ModelConfigBase(BaseModel):
     output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     max_context_tokens: int = Field(default=8192, gt=0)
     max_tokens: int = Field(default=1024, gt=0)
-    temperature: float = 0.7
-    top_p: float = 1.0
+    temperature: float = Field(default=0.7, ge=0, le=2, allow_inf_nan=False)
+    top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     is_embedding: bool = False
 
     @model_validator(mode="after")
@@ -61,8 +61,10 @@ class ModelConfigUpdate(BaseModel):
     output_token_parameter: Literal["max_tokens", "max_completion_tokens"] | None = None
     max_context_tokens: int | None = Field(default=None, gt=0)
     max_tokens: int | None = Field(default=None, gt=0)
-    temperature: float | None = None
-    top_p: float | None = None
+    temperature: float | None = Field(
+        default=None, ge=0, le=2, allow_inf_nan=False
+    )
+    top_p: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
     is_embedding: bool | None = None
 
     @model_validator(mode="after")

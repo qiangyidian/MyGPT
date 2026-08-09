@@ -15,6 +15,7 @@ import pytest
 from app.agents.graph import build_single_agent_graph
 from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.schemas import AgentTurnContext, ExecutionMode
+from app.agents.token_budget import PROMPT_TOO_LARGE, PromptAdmissionError
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ToolCallDef
 
@@ -207,6 +208,7 @@ async def test_native_rejects_oversized_tool_result_before_second_model_round(
     provider = _FakeProvider(
         [
             [
+                ChatDelta(content="partial before tool "),
                 ChatDelta(
                     tool_calls=[
                         ToolCallDef(
@@ -227,5 +229,44 @@ async def test_native_rejects_oversized_tool_result_before_second_model_round(
     events = await _collect(ctx)
 
     assert len(provider.calls) == 1
-    done = _find_all(events, "done")
-    assert done[-1]["finish_reason"] == "budget"
+    errors = _find_all(events, "error")
+    assert errors[-1]["code"] == "prompt_too_large"
+    assert "prompt budget" in errors[-1]["message"].lower()
+    assert ctx.assistant_msg.content == "partial before tool "
+    assert not _find_all(events, "done")
+    assert _find_all(events, "agent_status")[-1]["status"] == "failed"
+    assert _find_all(events, "run_status")[-1]["status"] == "failed"
+    error_index = max(i for i, (kind, _data) in enumerate(events) if kind == "error")
+    failed_index = max(
+        i
+        for i, (kind, data) in enumerate(events)
+        if kind == "run_status" and data["status"] == "failed"
+    )
+    assert error_index < failed_index
+
+
+async def test_native_surfaces_provider_boundary_admission_error(
+    db_session, monkeypatch
+):
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+
+    class BoundaryRejectingProvider:
+        async def stream_chat(self, messages, options=None):
+            if False:  # pragma: no cover - makes this an async generator
+                yield ChatDelta()
+            raise PromptAdmissionError(
+                PROMPT_TOO_LARGE,
+                "The final provider payload exceeds the configured prompt budget",
+            )
+
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: BoundaryRejectingProvider(),
+    )
+
+    events = await _collect(ctx)
+
+    assert _find_all(events, "error")[-1]["code"] == "prompt_too_large"
+    assert not _find_all(events, "done")
+    assert _find_all(events, "agent_status")[-1]["status"] == "failed"
+    assert _find_all(events, "run_status")[-1]["status"] == "failed"

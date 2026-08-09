@@ -409,15 +409,21 @@ async def summarize_history(
         return ""
 
     try:
-        result = await provider.chat(
-            [{"role": "system", "content": _SUMMARY_SYSTEM},
-             {"role": "user", "content": transcript}],
-            ChatOptions(
-                temperature=0.2,
-                max_tokens=400,
-                output_token_parameter=provider_output_token_parameter(provider),
-            ),
+        summary_messages = [
+            {"role": "system", "content": _SUMMARY_SYSTEM},
+            {"role": "user", "content": transcript},
+        ]
+        summary_options = ChatOptions(
+            temperature=0.2,
+            max_tokens=400,
+            output_token_parameter=provider_output_token_parameter(provider),
         )
+        from app.providers.base import admit_provider_payload
+
+        summary_options = admit_provider_payload(
+            provider, summary_messages, summary_options
+        )
+        result = await provider.chat(summary_messages, summary_options)
         summary = (result.content or "").strip()
         if summary:
             return summary

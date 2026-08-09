@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, AsyncIterator, Literal
 
 import httpx
@@ -18,6 +19,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from app.core.config import get_settings
 from app.providers.base import (
     ChatDelta,
     ChatOptions,
@@ -28,8 +30,10 @@ from app.providers.base import (
     PROVIDER_ERR_TIMEOUT,
     ProviderError,
     ToolCallDef,
+    admit_provider_payload,
 )
-from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # Retried transient failures: network blips, timeouts, and 5xx.
 _RETRYABLE_EXC = (
@@ -54,7 +58,10 @@ def _to_provider_error(exc: Exception, *, where: str) -> ProviderError:
         return ProviderError(
             f"model endpoint timed out ({where})", code=PROVIDER_ERR_TIMEOUT
         )
-    return ProviderError(f"transport failure ({where}): {exc}", code=PROVIDER_ERR_NETWORK)
+    logger.warning("model transport failure during %s: %r", where, exc)
+    return ProviderError(
+        f"model endpoint transport failure ({where})", code=PROVIDER_ERR_NETWORK
+    )
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -69,13 +76,14 @@ class OpenAICompatibleProvider(ModelProvider):
         api_key: str = "",
         model: str = "",
         output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
-        **_: Any,
+        **extra: Any,
     ) -> None:
         super().__init__(
             base_url=base_url,
             api_key=api_key,
             model=model,
             output_token_parameter=output_token_parameter,
+            **extra,
         )
         # Generous read timeout so slow / long (code) generations aren't killed
         # mid-stream; connect stays short. Driven by Settings, not hardcoded.
@@ -122,20 +130,17 @@ class OpenAICompatibleProvider(ModelProvider):
                     )
                 return resp
         # Unreachable: AsyncRetrying either returns or reraises.
-        raise ProviderError(f"unreachable retry exit for {url}")
+        raise ProviderError("model endpoint retry failed")
 
     @staticmethod
-    def _raise_for_status(resp: httpx.Response, url: str) -> None:
+    def _raise_for_status(resp: httpx.Response, _url: str) -> None:
         if resp.status_code >= 400:
-            # Surface the upstream body so callers can see the real error.
-            snippet = resp.text[:500] if resp.text else ""
+            logger.warning("model endpoint returned HTTP %s", resp.status_code)
             if resp.status_code in (401, 403):
                 raise ProviderError(
-                    f"auth error {resp.status_code} from {url}: {snippet}"
+                    "model endpoint authentication failed"
                 )
-            raise ProviderError(
-                f"HTTP {resp.status_code} from {url}: {snippet}"
-            )
+            raise ProviderError(f"model endpoint returned HTTP {resp.status_code}")
 
     # -- request body builders ---------------------------------------------
     @staticmethod
@@ -191,7 +196,10 @@ class OpenAICompatibleProvider(ModelProvider):
     async def chat(
         self, messages: list[dict[str, Any]], options: ChatOptions | None = None
     ) -> ChatResult:
-        payload = self._build_chat_payload(self.model, messages, options, stream=False)
+        admitted_options = admit_provider_payload(self, messages, options)
+        payload = self._build_chat_payload(
+            self.model, messages, admitted_options, stream=False
+        )
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await self._request(client, self._chat_url(), payload)
@@ -203,7 +211,7 @@ class OpenAICompatibleProvider(ModelProvider):
         try:
             data = resp.json()
         except ValueError as exc:
-            raise ProviderError(f"invalid JSON from model endpoint: {exc}") from exc
+            raise ProviderError("model endpoint returned invalid JSON") from exc
 
         try:
             choice = (data.get("choices") or [{}])[0]
@@ -231,7 +239,10 @@ class OpenAICompatibleProvider(ModelProvider):
         generator (the natural shape for an SSE stream) — callers iterate it
         with `async for`, which is compatible with the AsyncIterator contract.
         """
-        payload = self._build_chat_payload(self.model, messages, options, stream=True)
+        admitted_options = admit_provider_payload(self, messages, options)
+        payload = self._build_chat_payload(
+            self.model, messages, admitted_options, stream=True
+        )
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 # Retry the INITIAL response on transient errors (502/503/429/...)
@@ -250,16 +261,20 @@ class OpenAICompatibleProvider(ModelProvider):
                                     await asyncio.sleep(min(2 ** attempt, 10))
                                     continue
                                 raise ProviderError(
-                                    f"transient HTTP {resp.status_code} from {self._chat_url()} after retries"
+                                    f"model endpoint returned HTTP {resp.status_code} after retries"
                                 )
                             if resp.status_code >= 400:
-                                body = (await resp.aread()).decode(errors="replace")[:500]
+                                await resp.aread()
+                                logger.warning(
+                                    "model endpoint returned HTTP %s",
+                                    resp.status_code,
+                                )
                                 if resp.status_code in (401, 403):
                                     raise ProviderError(
-                                        f"auth error {resp.status_code} from {self._chat_url()}: {body}"
+                                        "model endpoint authentication failed"
                                     )
                                 raise ProviderError(
-                                    f"HTTP {resp.status_code} from {self._chat_url()}: {body}"
+                                    f"model endpoint returned HTTP {resp.status_code}"
                                 )
                             started_iter = True
                             async for chunk in self._iter_sse(resp):
@@ -392,7 +407,7 @@ class OpenAICompatibleProvider(ModelProvider):
         try:
             data = resp.json()
         except ValueError as exc:
-            raise ProviderError(f"invalid JSON from embeddings endpoint: {exc}") from exc
+            raise ProviderError("model endpoint returned invalid embeddings JSON") from exc
 
         items = data.get("data") or []
         # Preserve input order via the `index` field when present.

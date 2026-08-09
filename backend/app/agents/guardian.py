@@ -31,7 +31,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.providers.base import ChatOptions, ProviderError, provider_output_token_parameter
+from app.agents.token_budget import PromptAdmissionError
+from app.providers.base import (
+    ChatOptions,
+    ProviderError,
+    admit_provider_payload,
+    provider_output_token_parameter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +119,11 @@ class GuardianService:
             max_tokens=self._config.max_tokens,
             output_token_parameter=provider_output_token_parameter(provider),
         )
+        try:
+            options = admit_provider_payload(provider, messages, options)
+        except PromptAdmissionError as exc:  # fail closed on budget rejection
+            logger.warning("guardian payload rejected -> deny: %s", exc)
+            return _DENY
         try:
             result = await asyncio.wait_for(
                 provider.chat(messages, options), timeout=self._config.timeout_seconds

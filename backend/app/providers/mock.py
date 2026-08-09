@@ -22,6 +22,7 @@ from app.providers.base import (
     ChatResult,
     ModelProvider,
     ToolCallDef,
+    admit_provider_payload,
 )
 
 
@@ -55,6 +56,7 @@ class MockProvider(ModelProvider):
     async def chat(
         self, messages: list[dict[str, Any]], options: ChatOptions | None = None
     ) -> ChatResult:
+        admit_provider_payload(self, messages, options)
         # Simulate a little processing latency.
         await asyncio.sleep(0.01)
         content = self._canned_reply(messages)
@@ -82,7 +84,7 @@ class MockProvider(ModelProvider):
         this turn, emit a single simulated ``web_search`` call instead — the
         agent loop will execute it, feed the result back, and we answer next round.
         """
-        opts = options or ChatOptions()
+        opts = admit_provider_payload(self, messages, options)
         already_searched = any(m.get("role") == "tool" for m in messages)
         if opts.tools and not already_searched:
             query = (self._last_user_text(messages) or "the topic").strip().replace("\n", " ")[:80]

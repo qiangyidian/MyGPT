@@ -6,7 +6,13 @@ embeddings return vectors of the configured dimension.
 """
 from __future__ import annotations
 
+import httpx
+import pytest
+
+from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
+from app.model_capabilities import ModelCapabilities
+from app.providers.base import ChatOptions, ProviderError
 from app.providers.mock import MockProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -141,3 +147,221 @@ async def test_mock_embeddings_are_deterministic():
     a = await provider.embeddings(["same text"])
     b = await provider.embeddings(["same text"])
     assert a[0] == b[0]
+
+
+class _RecordingOpenAIProvider(OpenAICompatibleProvider):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.requests = []
+
+    async def _request(self, client, url, payload):
+        self.requests.append(payload)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+
+async def test_openai_provider_rejects_oversized_messages_before_http_dispatch():
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=1_000, max_output_tokens=200),
+    )
+
+    with pytest.raises(PromptAdmissionError) as exc_info:
+        await provider.chat(
+            [{"role": "user", "content": "oversized-item " * 10_000}],
+            ChatOptions(max_tokens=200),
+        )
+
+    assert exc_info.value.code == "prompt_too_large"
+    assert provider.requests == []
+
+
+async def test_openai_provider_rejects_oversized_tool_schema_before_stream_http(
+    monkeypatch,
+):
+    provider = OpenAICompatibleProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=1_000, max_output_tokens=200),
+    )
+    constructed = 0
+
+    def forbidden_client(*args, **kwargs):
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("HTTP client must not be constructed")
+
+    monkeypatch.setattr("app.providers.openai_compatible.httpx.AsyncClient", forbidden_client)
+    options = ChatOptions(
+        max_tokens=200,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "huge_tool",
+                    "description": "schema-item " * 10_000,
+                },
+            }
+        ],
+    )
+
+    with pytest.raises(PromptAdmissionError):
+        async for _delta in provider.stream_chat(
+            [{"role": "user", "content": "use a tool"}], options
+        ):
+            pass
+
+    assert constructed == 0
+
+
+async def test_openai_provider_clamps_requested_output_to_model_capability():
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=200),
+    )
+
+    await provider.chat(
+        [{"role": "user", "content": "bounded"}],
+        ChatOptions(max_tokens=999, output_token_parameter="max_completion_tokens"),
+    )
+
+    assert len(provider.requests) == 1
+    assert provider.requests[0]["max_completion_tokens"] == 200
+    assert "max_tokens" not in provider.requests[0]
+
+
+async def test_openai_provider_rejects_extra_override_before_chat_dispatch():
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=200),
+    )
+
+    with pytest.raises(PromptAdmissionError):
+        await provider.chat(
+            [{"role": "user", "content": "small"}],
+            ChatOptions(
+                extra={
+                    "messages": [{"role": "user", "content": "x" * 50_000}]
+                }
+            ),
+        )
+
+    assert provider.requests == []
+
+
+async def test_openai_provider_rejects_extra_override_before_stream_client(
+    monkeypatch,
+):
+    provider = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+    constructed = 0
+
+    def forbidden_client(*args, **kwargs):
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("HTTP client must not be constructed")
+
+    monkeypatch.setattr(
+        "app.providers.openai_compatible.httpx.AsyncClient", forbidden_client
+    )
+
+    with pytest.raises(PromptAdmissionError):
+        async for _delta in provider.stream_chat(
+            [{"role": "user", "content": "small"}],
+            ChatOptions(extra={"tools": [{"description": "x" * 50_000}]}),
+        ):
+            pass
+
+    assert constructed == 0
+
+
+async def test_openai_provider_http_error_does_not_expose_upstream_body():
+    secret = "upstream-secret-must-not-escape"
+
+    class ErrorProvider(_RecordingOpenAIProvider):
+        async def _request(self, client, url, payload):
+            return httpx.Response(
+                400,
+                text=f"bad request echoed {secret}",
+                request=httpx.Request("POST", url),
+            )
+
+    provider = ErrorProvider(base_url="http://x/v1", model="m")
+
+    with pytest.raises(ProviderError) as exc_info:
+        await provider.chat([{"role": "user", "content": "small"}])
+
+    assert secret not in str(exc_info.value)
+
+
+async def test_openai_provider_stream_error_does_not_expose_upstream_body(
+    monkeypatch,
+):
+    secret = "stream-secret-must-not-escape"
+
+    class ErrorResponse:
+        status_code = 400
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aread(self):
+            return f"bad request echoed {secret}".encode()
+
+    class ErrorClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return ErrorResponse()
+
+    monkeypatch.setattr(
+        "app.providers.openai_compatible.httpx.AsyncClient", ErrorClient
+    )
+    provider = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+
+    with pytest.raises(ProviderError) as exc_info:
+        async for _delta in provider.stream_chat(
+            [{"role": "user", "content": "small"}]
+        ):
+            pass
+
+    assert secret not in str(exc_info.value)
+
+
+async def test_openai_provider_uses_fixed_vision_reserve_not_data_url_length():
+    provider = _RecordingOpenAIProvider(
+        base_url="http://x/v1",
+        model="m",
+        capabilities=ModelCapabilities(context_window=2_000, max_output_tokens=200),
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{'A' * 50_000}"},
+                },
+            ],
+        }
+    ]
+
+    await provider.chat(messages, ChatOptions(max_tokens=200))
+
+    assert len(provider.requests) == 1

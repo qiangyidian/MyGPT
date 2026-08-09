@@ -186,8 +186,15 @@ class NativeChatRuntime:
                 except PromptAdmissionError as exc:
                     finish_reason = "budget"
                     ctx.extra["admission_error_code"] = exc.code
+                    ctx.extra["finish_reason"] = finish_reason
+                    ctx.extra["budget"] = guard.snapshot()
                     logger.info("native provider dispatch rejected: %s", exc.code)
-                    break
+                    yield ev_error(code=exc.code, message=str(exc))
+                    for _evt in _native_terminal_events(
+                        ctx, "failed", _assistant_started
+                    ):
+                        yield _evt
+                    return
 
                 # Backpressure (bound concurrent in-flight model calls) + circuit
                 # breaker (fast-fail when this provider endpoint is down).
@@ -212,6 +219,21 @@ class NativeChatRuntime:
                         if delta.usage:
                             turn_usage = delta.usage
                     model_breaker().record_success(_breaker_key)
+                except PromptAdmissionError as exc:
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(
+                        accumulated
+                    )
+                    finish_reason = "budget"
+                    ctx.extra["admission_error_code"] = exc.code
+                    ctx.extra["finish_reason"] = finish_reason
+                    ctx.extra["budget"] = guard.snapshot()
+                    logger.info("native provider payload rejected: %s", exc.code)
+                    yield ev_error(code=exc.code, message=str(exc))
+                    for _evt in _native_terminal_events(
+                        ctx, "failed", _assistant_started
+                    ):
+                        yield _evt
+                    return
                 except ProviderError as exc:
                     model_breaker().record_failure(_breaker_key)
                     # Fold this round's partial text before surfacing the error,

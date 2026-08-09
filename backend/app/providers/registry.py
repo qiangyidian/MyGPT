@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from app.core.security import decrypt_secret
 from app.models.model_config import ModelConfig
+from app.model_capabilities import capabilities_from_config
 from app.providers.base import ModelProvider, ProviderError
 from app.providers.mock import MockProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
@@ -22,6 +23,7 @@ def get_provider_for_config(cfg: ModelConfig) -> ModelProvider:
     """
     api_key = decrypt_secret(cfg.api_key_encrypted or "")
     provider_type = (cfg.provider or "").strip().lower()
+    capabilities = capabilities_from_config(cfg)
 
     if provider_type == "openai-compatible":
         return OpenAICompatibleProvider(
@@ -29,6 +31,7 @@ def get_provider_for_config(cfg: ModelConfig) -> ModelProvider:
             api_key=api_key,
             model=cfg.model_name,
             output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
+            capabilities=capabilities,
         )
     if provider_type == "mock":
         return MockProvider(
@@ -36,5 +39,6 @@ def get_provider_for_config(cfg: ModelConfig) -> ModelProvider:
             api_key=api_key,
             model=cfg.model_name,
             output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
+            capabilities=capabilities,
         )
     raise ProviderError(f"unknown provider type: {cfg.provider!r}")

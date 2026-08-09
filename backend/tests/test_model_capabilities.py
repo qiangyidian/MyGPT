@@ -96,6 +96,41 @@ def test_model_config_schemas_validate_limits_and_output_parameter():
         ModelConfigUpdate(output_token_parameter="both")
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["temperature", "top_p"])
+def test_model_config_schemas_reject_non_finite_sampling_values(field: str, value: float):
+    common = {
+        "name": "finite",
+        "api_base_url": "https://example.test/v1",
+        "model_name": "finite-model",
+    }
+    with pytest.raises(ValidationError):
+        ModelConfigCreate(**common, **{field: value})
+    with pytest.raises(ValidationError):
+        ModelConfigUpdate(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"temperature": -0.01},
+        {"temperature": 2.01},
+        {"top_p": 0.0},
+        {"top_p": 1.01},
+    ],
+)
+def test_model_config_schemas_enforce_sampling_ranges(payload: dict[str, float]):
+    common = {
+        "name": "ranges",
+        "api_base_url": "https://example.test/v1",
+        "model_name": "range-model",
+    }
+    with pytest.raises(ValidationError):
+        ModelConfigCreate(**common, **payload)
+    with pytest.raises(ValidationError):
+        ModelConfigUpdate(**payload)
+
+
 def test_parallel_tools_require_tool_support_in_create_and_update():
     common = {
         "name": "parallel",
@@ -146,11 +181,15 @@ def test_provider_registry_propagates_configured_output_parameter():
         api_key_encrypted="",
         model_name="reasoner",
         output_token_parameter="max_completion_tokens",
+        max_context_tokens=32_768,
+        max_tokens=2_048,
     )
 
     provider = get_provider_for_config(cfg)
 
     assert provider.output_token_parameter == "max_completion_tokens"
+    assert provider.capabilities.context_window == 32_768
+    assert provider.capabilities.max_output_tokens == 2_048
 
 
 def test_chat_options_reject_unknown_output_parameter():

@@ -1,6 +1,10 @@
 """Model-config API: CRUD + connectivity test, and the API-key-never-echoed rule."""
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from tests.conftest import auth_headers
 
 
@@ -117,6 +121,67 @@ async def test_model_validation_error_never_echoes_api_key_or_raw_input(client):
     assert secret not in response.text
     errors = response.json()["details"]["errors"]
     assert all("input" not in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("temperature", float("-inf")),
+        ("temperature", -0.01),
+        ("temperature", 2.01),
+        ("top_p", float("nan")),
+        ("top_p", float("inf")),
+        ("top_p", float("-inf")),
+        ("top_p", 0.0),
+        ("top_p", 1.01),
+    ],
+)
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_model_api_rejects_invalid_sampling_without_echoing_input_or_secret(
+    client, operation: str, field: str, value: float
+):
+    secret = "sk-nonfinite-must-never-echo"
+    headers = auth_headers()
+    if operation == "create":
+        method = "POST"
+        path = "/api/models"
+        payload = {
+            "name": "Invalid sampling",
+            "provider": "mock",
+            "api_base_url": "http://localhost/v1",
+            "api_key": secret,
+            "model_name": "mock-model",
+            field: value,
+        }
+    else:
+        created = await client.post(
+            "/api/models",
+            json={
+                "name": "Invalid sampling update",
+                "provider": "mock",
+                "api_base_url": "http://localhost/v1",
+                "model_name": "mock-model",
+            },
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        method = "PUT"
+        path = f"/api/models/{created.json()['id']}"
+        payload = {"api_key": secret, field: value}
+
+    response = await client.request(
+        method,
+        path,
+        content=json.dumps(payload, allow_nan=True),
+        headers={**headers, "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert secret not in response.text
+    errors = response.json()["details"]["errors"]
+    assert all("input" not in error and "ctx" not in error for error in errors)
 
 
 async def test_disabling_tools_also_disables_parallel_tools(client):

@@ -17,6 +17,7 @@ from app.agents.planning import (
 )
 from app.agents.schemas import ExecutionMode
 from app.agents.state_store import load_state, save_summary, upsert_goal
+from app.model_capabilities import ModelCapabilities
 from app.models import Conversation, ConversationMemory, Message, ModelConfig
 from app.services.chat_service import ChatService
 from app.providers.mock import MockProvider
@@ -113,6 +114,31 @@ async def test_summarize_history_uses_provider_output_token_parameter():
     await summarize_history(provider, messages, keep_recent=6)
 
     assert provider.last_options.output_token_parameter == "max_completion_tokens"
+
+
+async def test_summarize_history_rejects_oversized_payload_before_custom_provider_call():
+    class CapturingProvider(MockProvider):
+        def __init__(self):
+            super().__init__(base_url="http://localhost/v1", model="mock")
+            self.calls = 0
+            self.capabilities = ModelCapabilities(
+                context_window=1_000, max_output_tokens=200
+            )
+
+        async def chat(self, messages, options=None):
+            self.calls += 1
+            return await super().chat(messages, options)
+
+    provider = CapturingProvider()
+    messages = [
+        {"role": "user", "content": f"oversized-item {i} " * 2_000}
+        for i in range(8)
+    ]
+
+    summary = await summarize_history(provider, messages, keep_recent=6)
+
+    assert summary
+    assert provider.calls == 0
 
 
 async def test_maybe_summarize_persists_summary(db_session):

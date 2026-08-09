@@ -36,7 +36,13 @@ from typing import Any
 
 from app.agents.context_fragments import ContextFragment, render_fragments
 from app.agents.schemas import IntentDecision
-from app.providers.base import ChatOptions, ProviderError, provider_output_token_parameter
+from app.agents.token_budget import PromptAdmissionError
+from app.providers.base import (
+    ChatOptions,
+    ProviderError,
+    admit_provider_payload,
+    provider_output_token_parameter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +228,11 @@ class IntentService:
             max_tokens=self._config.max_tokens,
             output_token_parameter=provider_output_token_parameter(provider),
         )
+        try:
+            options = admit_provider_payload(provider, messages, options)
+        except PromptAdmissionError as exc:  # normal classifier fallback
+            logger.info("intent classifier payload rejected: %s", exc)
+            return None
 
         last_reason = "no_attempt"
         for attempt in range(self._config.max_retries + 1):
