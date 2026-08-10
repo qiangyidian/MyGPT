@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.approval_bus import approval_bus
 from app.agents.run_controls import get as get_run_control
+from app.agents.workflow import controls as durable_controls
 from app.services import audit_service
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
@@ -142,6 +143,8 @@ async def approve_run(
     ap.status = "approved"
     ap.approved_by = user.id
     ap.decided_at = datetime.now(timezone.utc)
+    # PERSIST FIRST: durable command, then commit, THEN publish the live signal.
+    await durable_controls.record_approve(db, run.id, ap.id, user_id=user.id)
     await db.commit()
 
     # Broadcast the decision across workers (also signals the local coordinator).
@@ -174,6 +177,10 @@ async def reject_run(
     ap.status = "rejected"
     ap.reason = body.reason or "rejected by user"
     ap.decided_at = datetime.now(timezone.utc)
+    # PERSIST FIRST: durable command, then commit, THEN publish the live signal.
+    await durable_controls.record_reject(
+        db, run.id, ap.id, reason=ap.reason, user_id=user.id
+    )
     await db.commit()
 
     await approval_bus.publish(approval_id=str(ap.id), decision="rejected", reason=ap.reason)
@@ -199,6 +206,8 @@ async def cancel_run(
 
     run.status = "cancelled"
     run.finished_at = datetime.now(timezone.utc)
+    # PERSIST FIRST: durable cancel command, then commit, THEN signal the run.
+    await durable_controls.record_cancel(db, run.id)
     await db.commit()
 
     # Signal the live run to stop cooperatively (flips the in-process cancel
@@ -263,6 +272,8 @@ async def append_instruction(
     instructions = list((run.user_instructions or {}).get("items", []))
     instructions.append(body.instruction)
     run.user_instructions = {"items": instructions}
+    # PERSIST FIRST: durable instruction command, then commit, THEN hand off.
+    await durable_controls.record_instruction(db, run.id, body.instruction)
     await db.commit()
     # Hand to a live run if one is in flight.
     ctl = get_run_control(run.id)
@@ -280,6 +291,8 @@ async def pause_run(
     run = await _load_run(db, run_id)
     await _assert_owned(run, user)
     run.paused_at = datetime.now(timezone.utc)
+    # PERSIST FIRST: durable pause command, then commit, THEN signal the run.
+    await durable_controls.record_pause(db, run.id)
     await db.commit()
     ctl = get_run_control(run.id)
     if ctl is not None:
@@ -296,6 +309,8 @@ async def resume_run(
     run = await _load_run(db, run_id)
     await _assert_owned(run, user)
     run.paused_at = None
+    # PERSIST FIRST: durable resume command, then commit, THEN signal the run.
+    await durable_controls.record_resume(db, run.id)
     await db.commit()
     ctl = get_run_control(run.id)
     if ctl is not None:

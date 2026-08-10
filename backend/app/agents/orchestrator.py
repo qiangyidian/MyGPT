@@ -28,6 +28,7 @@ from app.agents.db_mutation import (
     db_mutation_scope,
     rollback_safely,
 )
+from app.agents.events import append_event_safe
 from app.agents.persistence import persist_terminal_run
 from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.run_controls import drop as drop_run_control, get_or_create as get_run_control
@@ -97,6 +98,19 @@ class ChatOrchestrator:
                 ctx.extra["runtime_selection"] = selection
                 run.runtime = runtime.name
                 run.status = "running"
+                # Append the durable run.started event (Task 4) in the same
+                # transaction as the status flip. Best-effort: an event-store
+                # failure must never block a run from starting.
+                await append_event_safe(
+                    ctx.db,
+                    run.id,
+                    "run.started",
+                    {
+                        "runtime": runtime.name,
+                        "conversation_id": str(ctx.conversation.id),
+                        "message_id": str(ctx.assistant_msg.id),
+                    },
+                )
                 await ctx.db.commit()
             except BaseException:
                 await rollback_safely(ctx.db)
@@ -356,6 +370,33 @@ class ChatOrchestrator:
                 )
             except Exception:  # pragma: no cover - best effort
                 logger.exception("failed to finalize agent_run %s", run.id)
+            # Best-effort durable terminal event on a fresh session so the
+            # event log matches the persisted terminal status.
+            terminal_type = (
+                "run.cancelled"
+                if evt.kind == "done"
+                and (
+                    evt.data.get("finish_reason") == "cancelled"
+                    or getattr(run, "status", None) == "cancelled"
+                )
+                else ("run.completed" if evt.kind == "done" else "run.failed")
+            )
+            try:
+                async with session_factory() as sess:
+                    await append_event_safe(
+                        sess,
+                        run.id,
+                        terminal_type,
+                        {
+                            "finish_reason": evt.data.get("finish_reason"),
+                            "message": evt.data.get("message", ""),
+                        },
+                    )
+                    await sess.commit()
+            except Exception:  # pragma: no cover - best effort
+                logger.debug(
+                    "terminal event append failed for run %s", run.id, exc_info=True
+                )
             return
         run.finished_at = datetime.now(timezone.utc)
         run.output = {**(run.output or {}), **dict(evt.data)}
@@ -369,6 +410,18 @@ class ChatOrchestrator:
         else:
             run.status = "failed"
             run.error_message = str(evt.data.get("message", ""))
+        # Best-effort durable terminal event in the same transaction.
+        await append_event_safe(
+            db,
+            run.id,
+            "run.cancelled"
+            if run.status == "cancelled"
+            else ("run.completed" if run.status == "completed" else "run.failed"),
+            {
+                "finish_reason": evt.data.get("finish_reason"),
+                "message": evt.data.get("message", ""),
+            },
+        )
         async with db_mutation_scope(lock):
             try:
                 await commit_with_rollback(db)
@@ -394,10 +447,22 @@ class ChatOrchestrator:
                 )
             except Exception:  # pragma: no cover
                 pass
+            # Best-effort durable terminal event on a fresh session.
+            try:
+                async with session_factory() as sess:
+                    await append_event_safe(
+                        sess, run.id, "run.failed", {"message": message}
+                    )
+                    await sess.commit()
+            except Exception:  # pragma: no cover - best effort
+                logger.debug(
+                    "terminal event append failed for run %s", run.id, exc_info=True
+                )
             return
         run.finished_at = datetime.now(timezone.utc)
         run.status = "failed"
         run.error_message = message
+        await append_event_safe(db, run.id, "run.failed", {"message": message})
         async with db_mutation_scope(lock):
             try:
                 await commit_with_rollback(db)
