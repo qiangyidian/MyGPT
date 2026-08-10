@@ -333,6 +333,127 @@ async def test_failed_crewai_stage_charges_observed_model_usage_and_cost(monkeyp
     assert guard.cost_usd_used == pytest.approx(0.4)
 
 
+async def test_no_summary_stage_result_falls_back_to_output_usage_once():
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    stage_ctx = make_stage_context("no-summary-stage", budget_guard=guard)
+    stage_ctx.model_config = SimpleNamespace(model_name="unpriced-test")
+
+    class NoSummaryLLM:
+        pass
+
+    class Agent:
+        llm = NoSummaryLLM()
+
+        async def aexecute_task(self, task, context=None):
+            return SimpleNamespace(
+                raw="complete",
+                usage={"total_tokens": 5, "cost_usd": 0.2},
+            )
+
+    result = await CrewAIStageExecutor().execute(
+        agent_id="researcher",
+        agent=Agent(),
+        task=SimpleNamespace(id="task", description="research"),
+        context=None,
+        stage_ctx=stage_ctx,
+    )
+    assert result.usage_charged is False
+    stage_ctx.record_usage(
+        "crewai:stage:researcher", result.usage, model_usage=True
+    )
+    stage_ctx.record_usage(
+        "crewai:stage:researcher", result.usage, model_usage=True
+    )
+
+    assert guard.tokens_used == 5
+    assert guard.cost_usd_used == pytest.approx(0.2)
+
+
+async def test_empty_summary_failure_falls_back_to_exception_usage_once():
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    stage_ctx = make_stage_context("empty-summary-failure", budget_guard=guard)
+    stage_ctx.model_config = SimpleNamespace(model_name="unpriced-test")
+
+    class EmptySummaryLLM:
+        def get_token_usage_summary(self):
+            return None
+
+    class Agent:
+        llm = EmptySummaryLLM()
+
+        async def aexecute_task(self, task, context=None):
+            error = RuntimeError("provider failed with output usage")
+            error.usage = {"total_tokens": 3, "cost_usd": 0.1}
+            raise error
+
+    with pytest.raises(RuntimeError, match="provider failed with output usage"):
+        await CrewAIStageExecutor().execute(
+            agent_id="researcher",
+            agent=Agent(),
+            task=SimpleNamespace(id="task", description="research"),
+            context=None,
+            stage_ctx=stage_ctx,
+        )
+
+    assert guard.tokens_used == 3
+    assert guard.cost_usd_used == pytest.approx(0.1)
+
+
+async def test_summary_realtime_charge_is_not_duplicated_by_stage_fallback():
+    from app.agents.adapters.llm_adapter import wrap_crewai_llm_with_budget
+
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    stage_ctx = make_stage_context("realtime-summary-stage", budget_guard=guard)
+    stage_ctx.model_config = SimpleNamespace(
+        model_name="gpt-4o", max_context_tokens=4_000, max_tokens=200
+    )
+
+    class SummaryLLM:
+        def __init__(self):
+            self.total = 0
+
+        def call(self, *args, **kwargs):
+            raise AssertionError("sync path is not used")
+
+        async def acall(self, *args, **kwargs):
+            self.total += 5
+            return "model output"
+
+        def get_token_usage_summary(self):
+            return {"total_tokens": self.total, "cost_usd": self.total * 0.04}
+
+    class Agent:
+        def __init__(self):
+            self.llm = wrap_crewai_llm_with_budget(
+                SummaryLLM(), stage_ctx.model_config, budget_guard=guard
+            )
+
+        async def aexecute_task(self, task, context=None):
+            await self.llm.acall(
+                messages=[{"role": "user", "content": "research"}]
+            )
+            return SimpleNamespace(
+                raw="complete",
+                usage={"total_tokens": 5, "cost_usd": 0.2},
+            )
+
+    result = await CrewAIStageExecutor().execute(
+        agent_id="researcher",
+        agent=Agent(),
+        task=SimpleNamespace(id="task", description="research"),
+        context=None,
+        stage_ctx=stage_ctx,
+    )
+    if result.usage and not result.usage_charged:
+        stage_ctx.record_usage(
+            "crewai:stage:researcher", result.usage, model_usage=True
+        )
+
+    assert result.usage_charged is True
+    assert guard.tokens_used == 5
+    assert guard.cost_usd_used == pytest.approx(0.2)
+
+
 async def test_single_crewai_failure_charges_partial_cumulative_usage(monkeypatch):
     import crewai
 
@@ -390,6 +511,136 @@ async def test_single_crewai_failure_charges_partial_cumulative_usage(monkeypatc
     assert ctx.extra["usage"]["total_tokens"] == 6
     assert guard.tokens_used == 6
     assert guard.cost_usd_used == pytest.approx(0.3)
+
+
+async def test_single_crewai_failure_without_summary_uses_exception_usage(monkeypatch):
+    import crewai
+
+    from app.agents.runtime.crewai_runtime import CrewAIRuntime
+
+    class NoSummaryLLM:
+        pass
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeTask:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FailingCrew:
+        def __init__(self, **kwargs):
+            pass
+
+        async def kickoff_async(self):
+            error = RuntimeError("failed with provider-owned usage")
+            error.usage = {"total_tokens": 7, "cost_usd": 0.35}
+            raise error
+
+    monkeypatch.setattr(crewai, "Agent", FakeAgent)
+    monkeypatch.setattr(crewai, "Task", FakeTask)
+    monkeypatch.setattr(crewai, "Crew", FailingCrew)
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    ctx = SimpleNamespace(
+        enable_tools=False,
+        user_content="bounded request",
+        assistant_msg=SimpleNamespace(id="message", content="", metadata_={}),
+        extra={},
+        budget_guard=guard,
+        model_config=SimpleNamespace(model_name="unpriced-test"),
+    )
+
+    events = [
+        event
+        async for event in CrewAIRuntime()._run_single_agent(
+            ctx, NoSummaryLLM(), "chat"
+        )
+    ]
+
+    error = [event.data for event in events if event.kind == "error"][-1]
+    assert error["usage"]["total_tokens"] == 7
+    assert ctx.extra["usage"]["total_tokens"] == 7
+    assert guard.tokens_used == 7
+    assert guard.cost_usd_used == pytest.approx(0.35)
+
+
+async def test_single_crewai_result_fallback_does_not_duplicate_realtime_charge(
+    monkeypatch,
+):
+    import crewai
+
+    from app.agents.adapters.llm_adapter import wrap_crewai_llm_with_budget
+    from app.agents.runtime.crewai_runtime import CrewAIRuntime
+
+    class FlakySummaryLLM:
+        def __init__(self):
+            self.total = 0
+            self.summary_calls = 0
+
+        def call(self, *args, **kwargs):
+            raise AssertionError("sync path is not used")
+
+        async def acall(self, *args, **kwargs):
+            self.total = 5
+            return "complete"
+
+        def get_token_usage_summary(self):
+            self.summary_calls += 1
+            # Runtime baseline, wrapper baseline, wrapper final, runtime final.
+            if self.summary_calls == 4:
+                return None
+            return {"total_tokens": self.total, "cost_usd": self.total * 0.04}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeTask:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeCrew:
+        def __init__(self, *, agents, **kwargs):
+            self.agent = agents[0]
+
+        async def kickoff_async(self):
+            await self.agent.llm.acall(
+                messages=[{"role": "user", "content": "research"}]
+            )
+            return SimpleNamespace(
+                raw="complete",
+                usage={"total_tokens": 5, "cost_usd": 0.2},
+            )
+
+    monkeypatch.setattr(crewai, "Agent", FakeAgent)
+    monkeypatch.setattr(crewai, "Task", FakeTask)
+    monkeypatch.setattr(crewai, "Crew", FakeCrew)
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    cfg = SimpleNamespace(
+        model_name="gpt-4o", max_context_tokens=4_000, max_tokens=200
+    )
+    llm = wrap_crewai_llm_with_budget(
+        FlakySummaryLLM(), cfg, budget_guard=guard
+    )
+    ctx = SimpleNamespace(
+        enable_tools=False,
+        user_content="bounded request",
+        assistant_msg=SimpleNamespace(id="message", content="", metadata_={}),
+        extra={},
+        budget_guard=guard,
+        model_config=cfg,
+    )
+
+    events = [
+        event
+        async for event in CrewAIRuntime()._run_single_agent(ctx, llm, "chat")
+    ]
+
+    assert not any(event.kind == "error" for event in events)
+    assert guard.tokens_used == 5
+    assert guard.cost_usd_used == pytest.approx(0.2)
+    assert ctx.extra["usage"]["total_tokens"] == 5
 
 
 async def test_native_runtime_charges_provider_usage_and_stops_explicitly(

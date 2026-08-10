@@ -116,12 +116,15 @@ class CrewAIStageExecutor:
         )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
         llm = getattr(agent, "llm", None)
-        realtime_usage = bool(getattr(llm, "_usage_charged_realtime", False))
+        realtime_generation_before = int(
+            getattr(llm, "_usage_charge_generation", 0) or 0
+        )
         metered = await stage_ctx.llm_usage.begin(
             llm, lambda: _llm_usage_snapshot(agent)
         )
         completed = False
         llm_usage: dict[str, int | float] | None = None
+        failure_usage: dict[str, int | float] | None = None
         try:
             guard = stage_ctx.budget_guard
             if guard is not None:
@@ -139,15 +142,26 @@ class CrewAIStageExecutor:
             else:
                 output = await agent.aexecute_task(task, context=admitted_context)
             completed = True
+        except BaseException as exc:
+            # Some providers attach the final usage to an exception even when
+            # their cumulative summary endpoint is absent or returns empty.
+            # Preserve that last-resort signal before re-raising the original.
+            failure_usage = aggregate_usage(_extract_usage_rounds(exc))
+            raise
         finally:
             if metered:
                 llm_usage = await stage_ctx.llm_usage.claim(
                     llm, lambda: _llm_usage_snapshot(agent)
                 )
-            if not completed and llm_usage:
+            realtime_usage = (
+                int(getattr(llm, "_usage_charge_generation", 0) or 0)
+                > realtime_generation_before
+            )
+            observed_failure_usage = llm_usage or failure_usage
+            if not completed and observed_failure_usage:
                 stage_ctx.record_usage(
                     f"model:{agent_id}:{uuid.uuid4().hex}",
-                    llm_usage,
+                    observed_failure_usage,
                     model_usage=True,
                     charge=not realtime_usage,
                 )
@@ -155,10 +169,10 @@ class CrewAIStageExecutor:
         # CrewAI's installed Agent.aexecute_task returns a raw string. Its LLM
         # owns cumulative counters, so the before/after delta is authoritative
         # and must not be added again from duplicate output/agent snapshots.
-        usage = (
-            llm_usage
-            if metered
-            else aggregate_usage(_extract_usage_rounds(output))
+        usage = llm_usage or aggregate_usage(_extract_usage_rounds(output))
+        realtime_usage = (
+            int(getattr(llm, "_usage_charge_generation", 0) or 0)
+            > realtime_generation_before
         )
         return StageResult(
             agent_id=agent_id,

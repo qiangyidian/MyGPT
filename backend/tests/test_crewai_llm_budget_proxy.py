@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -29,12 +31,16 @@ class FakeCrewAILLM:
 
 
 class MeteredCrewAILLM(FakeCrewAILLM):
-    def __init__(self, *, per_call=5, fail=False, **kwargs):
+    def __init__(
+        self, *, per_call=5, fail=False, fail_sync=False, fail_async=False, **kwargs
+    ):
         super().__init__(**kwargs)
         self.total = 0
         self.cost = 0.0
         self.per_call = per_call
         self.fail = fail
+        self.fail_sync = fail_sync
+        self.fail_async = fail_async
         self.active = 0
         self.max_active = 0
 
@@ -43,9 +49,12 @@ class MeteredCrewAILLM(FakeCrewAILLM):
 
     def call(self, *args, **kwargs):
         self.sync_calls.append((args, kwargs))
+        # Keep the cumulative before/call/after window open long enough for a
+        # concurrent async entry point to overlap in the regression tests.
+        time.sleep(0.02)
         self.total += self.per_call
         self.cost += 0.2
-        if self.fail:
+        if self.fail or self.fail_sync:
             raise RuntimeError("metered provider failure")
         return "sync-result"
 
@@ -57,7 +66,7 @@ class MeteredCrewAILLM(FakeCrewAILLM):
             await asyncio.sleep(0.01)
             self.total += self.per_call
             self.cost += 0.2
-            if self.fail:
+            if self.fail or self.fail_async:
                 raise RuntimeError("metered provider failure")
             return "async-result"
         finally:
@@ -150,6 +159,258 @@ async def test_budget_proxy_concurrent_calls_do_not_double_count():
     assert guard.tokens_used == 8
     assert guard.cost_usd_used == pytest.approx(0.4)
     assert underlying.max_active == 1
+
+
+async def test_budget_proxy_mixed_sync_async_calls_charge_exactly_once():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    await asyncio.gather(
+        wrapped.acall(messages=[{"role": "user", "content": "async"}]),
+        asyncio.to_thread(
+            wrapped.call, [{"role": "user", "content": "sync"}]
+        ),
+    )
+
+    assert underlying.total == 8
+    assert guard.tokens_used == 8
+    assert guard.cost_usd_used == pytest.approx(0.4)
+
+
+async def test_budget_proxy_mixed_failure_still_charges_each_call_once():
+    underlying = MeteredCrewAILLM(
+        model="gpt-4o", per_call=4, fail_sync=True
+    )
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    results = await asyncio.gather(
+        wrapped.acall(messages=[{"role": "user", "content": "async"}]),
+        asyncio.to_thread(
+            wrapped.call, [{"role": "user", "content": "sync-fails"}]
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, RuntimeError) for result in results) == 1
+    assert underlying.total == 8
+    assert guard.tokens_used == 8
+    assert guard.cost_usd_used == pytest.approx(0.4)
+
+
+async def test_budget_proxy_sequential_mixed_calls_charge_exactly_once():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    await wrapped.acall(messages=[{"role": "user", "content": "async"}])
+    await asyncio.to_thread(
+        wrapped.call, [{"role": "user", "content": "sync"}]
+    )
+
+    assert guard.tokens_used == 8
+    assert guard.cost_usd_used == pytest.approx(0.4)
+
+
+async def test_budget_proxy_without_summary_does_not_claim_realtime_usage():
+    underlying = FakeCrewAILLM(model="gpt-4o")
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    await wrapped.acall(messages=[{"role": "user", "content": "no summary"}])
+
+    assert wrapped._usage_charged_realtime is False
+    assert guard.tokens_used == 0
+    assert guard.cost_usd_used == 0
+
+
+async def test_budget_proxy_cancelled_async_lock_waiter_does_not_leak_lock():
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    class BlockingMeteredLLM(MeteredCrewAILLM):
+        def call(self, *args, **kwargs):
+            self.sync_calls.append((args, kwargs))
+            sync_started.set()
+            assert release_sync.wait(timeout=2)
+            self.total += self.per_call
+            self.cost += 0.2
+            return "sync-result"
+
+    underlying = BlockingMeteredLLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+    sync_task = asyncio.create_task(
+        asyncio.to_thread(
+            wrapped.call, [{"role": "user", "content": "hold-lock"}]
+        )
+    )
+    assert await asyncio.to_thread(sync_started.wait, 1)
+
+    waiter = asyncio.create_task(
+        wrapped.acall(messages=[{"role": "user", "content": "cancel-me"}])
+    )
+    await asyncio.sleep(0.02)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release_sync.set()
+    await sync_task
+    assert await wrapped.acall(
+        messages=[{"role": "user", "content": "after-cancel"}]
+    ) == "async-result"
+    assert guard.tokens_used == 8
+    assert guard.cost_usd_used == pytest.approx(0.4)
+
+
+async def test_budget_proxy_async_lock_wait_keeps_event_loop_responsive():
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    class BlockingMeteredLLM(MeteredCrewAILLM):
+        def call(self, *args, **kwargs):
+            sync_started.set()
+            assert release_sync.wait(timeout=2)
+            self.total += self.per_call
+            self.cost += 0.2
+            return "sync-result"
+
+    underlying = BlockingMeteredLLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+    sync_task = asyncio.create_task(
+        asyncio.to_thread(
+            wrapped.call, [{"role": "user", "content": "hold-lock"}]
+        )
+    )
+    assert await asyncio.to_thread(sync_started.wait, 1)
+    waiting_call = asyncio.create_task(
+        wrapped.acall(messages=[{"role": "user", "content": "wait"}])
+    )
+
+    heartbeat = 0
+    try:
+        deadline = asyncio.get_running_loop().time() + 0.04
+        while asyncio.get_running_loop().time() < deadline:
+            heartbeat += 1
+            await asyncio.sleep(0.005)
+
+        assert heartbeat >= 2
+        assert waiting_call.done() is False
+    finally:
+        release_sync.set()
+    await asyncio.gather(sync_task, waiting_call)
+    assert guard.tokens_used == 8
+
+
+async def test_budget_proxy_sync_contention_on_event_loop_fails_fast():
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    class BlockingMeteredLLM(MeteredCrewAILLM):
+        def call(self, *args, **kwargs):
+            sync_started.set()
+            assert release_sync.wait(timeout=2)
+            self.total += self.per_call
+            self.cost += 0.2
+            return "sync-result"
+
+    underlying = BlockingMeteredLLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+    holder = asyncio.create_task(
+        asyncio.to_thread(
+            wrapped.call, [{"role": "user", "content": "hold-lock"}]
+        )
+    )
+    assert await asyncio.to_thread(sync_started.wait, 1)
+
+    async def invoke_sync_on_running_loop():
+        with pytest.raises(RuntimeError, match="event-loop"):
+            wrapped.call([{"role": "user", "content": "must-not-deadlock"}])
+
+    contender = asyncio.create_task(
+        asyncio.to_thread(lambda: asyncio.run(invoke_sync_on_running_loop()))
+    )
+    try:
+        await asyncio.wait_for(asyncio.shield(contender), timeout=0.2)
+    finally:
+        release_sync.set()
+        await asyncio.gather(holder, contender, return_exceptions=True)
+
+
+async def test_budget_proxy_zero_summary_delta_does_not_claim_ownership():
+    class ZeroUsageLLM(FakeCrewAILLM):
+        def get_token_usage_summary(self):
+            return {"total_tokens": 0, "cost_usd": 0.0}
+
+    underlying = ZeroUsageLLM(model="gpt-4o")
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    await wrapped.acall(messages=[{"role": "user", "content": "zero usage"}])
+
+    assert wrapped._usage_charged_realtime is False
+    assert wrapped._usage_charge_generation == 0
+    assert guard.tokens_used == 0
+    assert guard.cost_usd_used == 0
+
+
+async def test_budget_proxy_locks_are_isolated_between_wrapped_llms():
+    class ConcurrentLLM(MeteredCrewAILLM):
+        active = 0
+        max_active = 0
+
+        async def acall(self, *args, **kwargs):
+            type(self).active += 1
+            type(self).max_active = max(type(self).max_active, type(self).active)
+            try:
+                await asyncio.sleep(0.02)
+                self.total += self.per_call
+                self.cost += 0.2
+                return "async-result"
+            finally:
+                type(self).active -= 1
+
+    first_guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    second_guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    first = llm_adapter.wrap_crewai_llm_with_budget(
+        ConcurrentLLM(model="gpt-4o", per_call=4),
+        _config(),
+        budget_guard=first_guard,
+    )
+    second = llm_adapter.wrap_crewai_llm_with_budget(
+        ConcurrentLLM(model="gpt-4o", per_call=4),
+        _config(),
+        budget_guard=second_guard,
+    )
+
+    await asyncio.gather(
+        first.acall(messages=[{"role": "user", "content": "first"}]),
+        second.acall(messages=[{"role": "user", "content": "second"}]),
+    )
+
+    assert ConcurrentLLM.max_active == 2
+    assert first_guard.tokens_used == 4
+    assert second_guard.tokens_used == 4
 
 
 def test_budget_proxy_rejects_rebinding_to_another_run_guard():

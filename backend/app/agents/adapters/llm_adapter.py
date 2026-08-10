@@ -26,6 +26,8 @@ from app.core.pricing import usage_cost
 from app.model_capabilities import capabilities_from_config
 from app.models import ModelConfig
 
+_USAGE_LOCK_POLL_SECONDS = 0.005
+
 
 def _final_payload_parts(
     args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -123,6 +125,38 @@ def _usage_delta(
     return delta or None
 
 
+async def _acquire_usage_lock(lock: threading.Lock) -> None:
+    """Acquire a sync/async shared lock without blocking the event loop.
+
+    CrewAI can expose both ``call`` and ``acall`` over the same cumulative
+    usage counter.  A single thread lock protects that one counter's complete
+    before/call/after window.  The async path polls non-blockingly so a sync
+    call running in a worker thread cannot stall the event-loop thread.
+    """
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(_USAGE_LOCK_POLL_SECONDS)
+
+
+def _acquire_sync_usage_lock(lock: threading.Lock) -> None:
+    """Acquire from sync code without deadlocking a running event loop.
+
+    Normal CrewAI sync calls execute outside the event-loop thread and may
+    wait for the same LLM's async call. If a caller invokes ``call()`` directly
+    on a running loop while ``acall()`` owns the lock, blocking here would also
+    prevent the owner from resuming and releasing it, so fail explicitly.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        lock.acquire()
+        return
+    if not lock.acquire(blocking=False):
+        raise RuntimeError(
+            "CrewAI synchronous model call cannot wait for usage metering "
+            "on an event-loop thread"
+        )
+
+
 def wrap_crewai_llm_with_budget(
     llm: Any, cfg: Any, *, budget_guard: Any = None
 ) -> Any:
@@ -141,9 +175,15 @@ def wrap_crewai_llm_with_budget(
     if not callable(original_call):
         raise TypeError("CrewAI LLM must expose call()")
 
-    sync_usage_lock = threading.Lock()
-    async_usage_lock = asyncio.Lock()
+    # One lock is deliberately shared by call() and acall(). Separate locks
+    # allow overlapping snapshots of the same cumulative provider counters,
+    # causing the later delta to include usage already charged by the other
+    # entry point. The lock is local to this LLM/run wrapper, so unrelated
+    # models and runs remain concurrent.
+    usage_lock = threading.Lock()
     usage_sequence = count(1)
+    llm._usage_charged_realtime = False
+    llm._usage_charge_generation = 0
 
     def charge(before: Any, after: Any) -> None:
         if budget_guard is None:
@@ -159,6 +199,8 @@ def wrap_crewai_llm_with_budget(
             cost_usd=cost,
             usage_id=f"crewai:call:{next(usage_sequence)}",
         )
+        llm._usage_charged_realtime = True
+        llm._usage_charge_generation += 1
 
     @wraps(original_call)
     def guarded_call(*args: Any, **kwargs: Any) -> Any:
@@ -166,7 +208,8 @@ def wrap_crewai_llm_with_budget(
         _admit_final_crewai_payload(messages, tools, cfg)
         if budget_guard is None:
             return original_call(*args, **kwargs)
-        with sync_usage_lock:
+        _acquire_sync_usage_lock(usage_lock)
+        try:
             before = _sync_usage_snapshot(llm)
             budget_guard.enter_step()
             budget_guard.check()
@@ -174,6 +217,8 @@ def wrap_crewai_llm_with_budget(
                 return original_call(*args, **kwargs)
             finally:
                 charge(before, _sync_usage_snapshot(llm))
+        finally:
+            usage_lock.release()
 
     llm.call = guarded_call
 
@@ -186,7 +231,8 @@ def wrap_crewai_llm_with_budget(
             _admit_final_crewai_payload(messages, tools, cfg)
             if budget_guard is None:
                 return await original_acall(*args, **kwargs)
-            async with async_usage_lock:
+            await _acquire_usage_lock(usage_lock)
+            try:
                 before = await _async_usage_snapshot(llm)
                 budget_guard.enter_step()
                 budget_guard.check()
@@ -202,12 +248,13 @@ def wrap_crewai_llm_with_budget(
                         ) from exc
                 finally:
                     charge(before, await _async_usage_snapshot(llm))
+            finally:
+                usage_lock.release()
 
         llm.acall = guarded_acall
 
     llm._model_budget_guarded = True
     llm._run_budget_guard = budget_guard
-    llm._usage_charged_realtime = budget_guard is not None
     return llm
 
 
