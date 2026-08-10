@@ -34,13 +34,18 @@ class BudgetLimits:
         positive_ints = (
             "max_agent_steps",
             "max_tool_calls",
-            "max_tool_output_chars",
             "max_total_tokens",
         )
         for name in positive_ints:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.max_tool_output_chars, bool)
+            or not isinstance(self.max_tool_output_chars, int)
+            or self.max_tool_output_chars < 16
+        ):
+            raise ValueError("max_tool_output_chars must be at least 16")
         if (
             isinstance(self.max_replan_count, bool)
             or not isinstance(self.max_replan_count, int)
@@ -262,7 +267,12 @@ class BudgetGuard:
         self.check()
 
     def enter_replan(self) -> None:
-        """Call before revising the plan; raises if replans exhausted."""
+        """Call before revising the plan; raises if replans exhausted.
+
+        Task 3 exposes the authoritative gate. The durable planner/verifier
+        introduced by Task 6 must call this method before every revision; this
+        repository intentionally has no production replan path before then.
+        """
         with self._lock:
             self._replans += 1
         self.check()

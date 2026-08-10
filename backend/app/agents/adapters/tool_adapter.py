@@ -24,7 +24,13 @@ import uuid
 from typing import Any
 
 from app.agents.gateway.tool_gateway import ToolGateway
-from app.agents.schemas import BudgetExceeded, ToolExecution, ev_tool_call, ev_tool_result
+from app.agents.schemas import (
+    BudgetExceeded,
+    ToolExecution,
+    _bounded_text,
+    ev_tool_call,
+    ev_tool_result,
+)
 from app.agents.stage_context import StageContext
 from app.tools.base import BaseTool as AppBaseTool
 
@@ -132,11 +138,18 @@ async def _execute_via_gateway(
     return execution
 
 
-def _format_for_crewai(exec_: ToolExecution) -> str:
+def _format_for_crewai(
+    exec_: ToolExecution, max_chars: int = 8_000
+) -> str:
     """Render a ToolExecution as the string CrewAI feeds back to the agent."""
-    if exec_.ok:
-        return str(exec_.to_openai_tool_message().get("content") or "")
-    return json.dumps({"error": exec_.error or "tool failed"}, ensure_ascii=False)
+    content = str(
+        exec_.to_openai_tool_message(max_chars=max_chars).get("content") or ""
+    )
+    if exec_.truncated and "[truncated]" not in content:
+        content = _bounded_text(
+            content + "[truncated]", max_chars=max_chars
+        )
+    return content
 
 
 def _blocked_execution(orig: ToolExecution, reason: str) -> ToolExecution:
@@ -277,6 +290,6 @@ def build_crewai_tool(
                     guard.add_usage(usage, usage_id=f"tool:{call_id}")
                 guard.check()
 
-            return _format_for_crewai(exec_)
+            return _format_for_crewai(exec_, output_limit)
 
     return _Adapter()

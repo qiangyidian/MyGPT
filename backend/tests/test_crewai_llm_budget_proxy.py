@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.agents.adapters import llm_adapter
+from app.agents.policies.budget_policy import BudgetGuard, BudgetLimits
+from app.agents.schemas import BudgetExceeded
 from app.agents.runtime.crewai_runtime import CrewAIRuntime
 from app.agents.token_budget import PromptAdmissionError
 
@@ -37,6 +39,34 @@ def _config(*, context_window: int = 4_000, max_tokens: int = 200):
 def _wrap(llm, cfg):
     assert hasattr(llm_adapter, "wrap_crewai_llm_with_budget")
     return llm_adapter.wrap_crewai_llm_with_budget(llm, cfg)
+
+
+async def test_budget_proxy_gates_every_internal_async_model_turn():
+    underlying = FakeCrewAILLM(model="gpt-4o")
+    guard = BudgetGuard(BudgetLimits(max_agent_steps=1))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    assert await wrapped.acall(messages=[{"role": "user", "content": "one"}]) == "async-result"
+    with pytest.raises(BudgetExceeded, match="max agent steps"):
+        await wrapped.acall(messages=[{"role": "user", "content": "two"}])
+
+    assert len(underlying.async_calls) == 1
+
+
+def test_budget_proxy_rejects_rebinding_to_another_run_guard():
+    underlying = FakeCrewAILLM(model="gpt-4o")
+    first = BudgetGuard(BudgetLimits())
+    second = BudgetGuard(BudgetLimits())
+    llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=first
+    )
+
+    with pytest.raises(ValueError, match="another run"):
+        llm_adapter.wrap_crewai_llm_with_budget(
+            underlying, _config(), budget_guard=second
+        )
 
 
 def test_budget_proxy_accepts_sync_payload_and_delegates_unchanged_once():

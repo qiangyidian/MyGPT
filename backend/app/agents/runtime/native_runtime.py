@@ -42,6 +42,7 @@ from app.agents.token_budget import PromptAdmissionError
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
+    ToolExecution,
     ev_agent_graph,
     ev_agent_status,
     ev_approval_required,
@@ -54,6 +55,7 @@ from app.agents.schemas import (
     ev_token,
     ev_tool_call,
     ev_tool_result,
+    _bounded_text,
 )
 from app.models import AgentRun
 from app.core.config import get_settings
@@ -132,6 +134,7 @@ class NativeChatRuntime:
             output_token_parameter=provider_output_token_parameter(provider),
             tools=tool_schemas,
             tool_choice="auto",
+            retry_gate=lambda _attempt: _gate_model_retry(guard),
         )
 
         # Scope C: surface even single-agent native turns in the agent panel.
@@ -901,12 +904,23 @@ async def _execute_tool_with_budget(
 
 def _bounded_tool_message(execution: Any, max_chars: int) -> dict[str, Any]:
     """Apply the per-run observation cap before a tool result reaches a model."""
+    if isinstance(execution, ToolExecution):
+        return execution.to_openai_tool_message(max_chars=max_chars)
+    # Compatibility for protocol/plugin implementations that expose the
+    # legacy no-argument method. Invoke exactly once: an internal TypeError
+    # must propagate rather than being mistaken for a signature mismatch.
     message = execution.to_openai_tool_message()
-    content = message.get("content", "")
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, default=str)
-    message["content"] = content[:max_chars]
+    message["content"] = _bounded_text(
+        message.get("content", ""), max_chars=max_chars
+    )
     return message
+
+
+def _gate_model_retry(guard: BudgetGuard) -> float:
+    """Charge and authorize one provider transport retry for this run."""
+    guard.enter_step()
+    guard.check()
+    return guard.remaining_seconds
 
 
 # --------------------------------------------------------------------------- #

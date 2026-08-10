@@ -42,7 +42,12 @@ from app.agents.policies import (
     should_require_approval,
     validate_readonly_sql,
 )
-from app.agents.schemas import RiskLevel, ToolExecution
+from app.agents.schemas import (
+    RiskLevel,
+    ToolExecution,
+    _bounded_text,
+    bounded_json_preview,
+)
 from app.models import AgentStep, ToolApproval, ToolCall
 from app.models.user import User
 from app.tools.base import BaseTool, ToolError, ToolRegistry
@@ -441,4 +446,11 @@ def _stringify_and_truncate(
             full = json.dumps(result, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             full = str(result)
-    return full, full[:max_chars], len(full) > max_chars
+    if len(full) <= max_chars:
+        return full, full, False
+    bounded = (
+        _bounded_text(full, max_chars=max_chars)
+        if isinstance(result, str)
+        else bounded_json_preview(full, max_chars=max_chars)
+    )
+    return full, bounded, True

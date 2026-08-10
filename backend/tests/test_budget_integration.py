@@ -88,6 +88,11 @@ def test_per_run_overrides_can_only_reduce_limits_without_authorization():
     ).max_agent_steps == 5
 
 
+def test_tool_output_budget_rejects_caps_too_small_for_safe_truncation():
+    with pytest.raises(ValueError, match="at least 16"):
+        _limits(max_tool_output_chars=15)
+
+
 def test_usage_delta_and_cumulative_snapshots_charge_exactly_once():
     guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=10.0))
 
@@ -328,6 +333,65 @@ async def test_failed_crewai_stage_charges_observed_model_usage_and_cost(monkeyp
     assert guard.cost_usd_used == pytest.approx(0.4)
 
 
+async def test_single_crewai_failure_charges_partial_cumulative_usage(monkeypatch):
+    import crewai
+
+    from app.agents.runtime.crewai_runtime import CrewAIRuntime
+
+    class MeteredLLM:
+        total = 0
+
+        def get_token_usage_summary(self):
+            return {
+                "prompt_tokens": self.total,
+                "completion_tokens": 0,
+                "total_tokens": self.total,
+            }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeTask:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FailingCrew:
+        def __init__(self, *, agents, **kwargs):
+            self.agent = agents[0]
+
+        async def kickoff_async(self):
+            self.agent.llm.total = 6
+            raise RuntimeError("failed after provider metered usage")
+
+    monkeypatch.setattr(crewai, "Agent", FakeAgent)
+    monkeypatch.setattr(crewai, "Task", FakeTask)
+    monkeypatch.setattr(crewai, "Crew", FailingCrew)
+    monkeypatch.setattr("app.agents.runtime.crewai_runtime.usage_cost", lambda *_: 0.3)
+    guard = BudgetGuard(_limits(max_total_tokens=100, max_cost_usd=1.0))
+    ctx = SimpleNamespace(
+        enable_tools=False,
+        user_content="bounded request",
+        assistant_msg=SimpleNamespace(id="message", content="", metadata_={}),
+        extra={},
+        budget_guard=guard,
+        model_config=SimpleNamespace(model_name="priced-test"),
+    )
+
+    events = [
+        event
+        async for event in CrewAIRuntime()._run_single_agent(
+            ctx, MeteredLLM(), "chat"
+        )
+    ]
+
+    error = [event.data for event in events if event.kind == "error"][-1]
+    assert error["usage"]["total_tokens"] == 6
+    assert ctx.extra["usage"]["total_tokens"] == 6
+    assert guard.tokens_used == 6
+    assert guard.cost_usd_used == pytest.approx(0.3)
+
+
 async def test_native_runtime_charges_provider_usage_and_stops_explicitly(
     db_session, monkeypatch
 ):
@@ -408,6 +472,22 @@ async def test_native_runtime_bounds_model_call_by_remaining_wall_clock(
     assert provider.calls == 1
     assert _find_all(events, "error")[-1]["code"] == "agent_budget_exceeded"
     assert _find_all(events, "done")[-1]["finish_reason"] == "budget"
+
+
+def test_native_tool_formatter_internal_typeerror_is_not_retried():
+    from app.agents.runtime.native_runtime import _bounded_tool_message
+
+    class BrokenExecution:
+        calls = 0
+
+        def to_openai_tool_message(self, **kwargs):
+            self.calls += 1
+            raise TypeError("formatter bug")
+
+    execution = BrokenExecution()
+    with pytest.raises(TypeError, match="formatter bug"):
+        _bounded_tool_message(execution, 32)
+    assert execution.calls == 1
 
 
 async def test_native_runtime_times_out_while_waiting_for_model_limiter(
@@ -555,7 +635,31 @@ def test_crewai_adapter_does_not_reexpand_bounded_gateway_content():
         result={"content": "z" * 17, "truncated": True},
         truncated=True,
     )
-    assert _format_for_crewai(execution) == "z" * 17
+    rendered = _format_for_crewai(execution, max_chars=17)
+    assert len(rendered) <= 17
+    assert rendered.endswith("[truncated]")
+
+
+def test_crewai_adapter_bounds_huge_error_as_valid_json_with_marker():
+    import json
+
+    from app.agents.adapters.tool_adapter import _format_for_crewai
+    from app.agents.schemas import ToolExecution
+
+    execution = ToolExecution(
+        ok=False,
+        tool_call_id="failed",
+        tool_name="tool",
+        arguments={},
+        status="error",
+        error="failure-detail " * 10_000,
+    )
+
+    rendered = _format_for_crewai(execution, max_chars=96)
+
+    assert len(rendered) <= 96
+    assert json.loads(rendered)["truncated"] is True
+    assert "[truncated]" in rendered
 
 
 async def test_streaming_writer_gates_blank_retry_as_new_model_dispatch(

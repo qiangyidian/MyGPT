@@ -144,6 +144,7 @@ def test_crewai_llm_factory_uses_exact_output_parameter(
     CrewAILLMFactory.from_model_config(cfg)
 
     assert captured[expected_key] == 321
+    assert captured["max_retries"] == 0
     other_key = (
         "max_completion_tokens" if expected_key == "max_tokens" else "max_tokens"
     )

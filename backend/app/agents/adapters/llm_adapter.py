@@ -7,6 +7,7 @@ not read browser input or a separate secret store.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from functools import wraps
 from typing import Any
@@ -65,7 +66,9 @@ def _admit_final_crewai_payload(messages: Any, tools: Any, cfg: Any) -> None:
         )
 
 
-def wrap_crewai_llm_with_budget(llm: Any, cfg: Any) -> Any:
+def wrap_crewai_llm_with_budget(
+    llm: Any, cfg: Any, *, budget_guard: Any = None
+) -> Any:
     """Decorate CrewAI's real sync/async call boundary without changing type.
 
     CrewAI validates ``Agent.llm`` as a ``BaseLLM``. Decorating the existing
@@ -73,6 +76,8 @@ def wrap_crewai_llm_with_budget(llm: Any, cfg: Any) -> Any:
     capability methods, and every attribute while gating both final call paths.
     """
     if getattr(llm, "_model_budget_guarded", False):
+        if getattr(llm, "_run_budget_guard", None) is not budget_guard:
+            raise ValueError("CrewAI LLM cannot be rebound to another run budget guard")
         return llm
 
     original_call = getattr(llm, "call", None)
@@ -83,7 +88,13 @@ def wrap_crewai_llm_with_budget(llm: Any, cfg: Any) -> Any:
     def guarded_call(*args: Any, **kwargs: Any) -> Any:
         messages, tools = _final_payload_parts(args, kwargs)
         _admit_final_crewai_payload(messages, tools, cfg)
-        return original_call(*args, **kwargs)
+        if budget_guard is not None:
+            budget_guard.enter_step()
+            budget_guard.check()
+        result = original_call(*args, **kwargs)
+        if budget_guard is not None:
+            budget_guard.check()
+        return result
 
     llm.call = guarded_call
 
@@ -94,11 +105,26 @@ def wrap_crewai_llm_with_budget(llm: Any, cfg: Any) -> Any:
         async def guarded_acall(*args: Any, **kwargs: Any) -> Any:
             messages, tools = _final_payload_parts(args, kwargs)
             _admit_final_crewai_payload(messages, tools, cfg)
-            return await original_acall(*args, **kwargs)
+            if budget_guard is None:
+                return await original_acall(*args, **kwargs)
+            budget_guard.enter_step()
+            budget_guard.check()
+            try:
+                async with asyncio.timeout(budget_guard.remaining_seconds):
+                    result = await original_acall(*args, **kwargs)
+            except TimeoutError as exc:
+                from app.agents.schemas import BudgetExceeded
+
+                raise BudgetExceeded(
+                    f"time budget ({budget_guard.limits.max_runtime_seconds}s) exceeded"
+                ) from exc
+            budget_guard.check()
+            return result
 
         llm.acall = guarded_acall
 
     llm._model_budget_guarded = True
+    llm._run_budget_guard = budget_guard
     return llm
 
 
@@ -106,7 +132,7 @@ class CrewAILLMFactory:
     """Turn a ModelConfig row into a CrewAI LLM instance."""
 
     @staticmethod
-    def from_model_config(cfg: ModelConfig) -> Any:
+    def from_model_config(cfg: ModelConfig, *, budget_guard: Any = None) -> Any:
         from crewai import LLM  # lazy: crewai is optional
 
         api_key = decrypt_secret(cfg.api_key_encrypted or "") or "dummy"
@@ -125,10 +151,14 @@ class CrewAILLMFactory:
             # stays alive while tokens flow. Non-stream, a single 2048-token
             # reasoning call takes ~70s and 500s ("Actor timed out").
             stream=True,
+            # The workflow owns retries so each attempt crosses the run budget.
+            max_retries=0,
         )
         output_parameter = capabilities_from_config(cfg).output_token_parameter
         kwargs[output_parameter] = cfg.max_tokens
         if cfg.top_p is not None:
             kwargs["top_p"] = cfg.top_p
 
-        return wrap_crewai_llm_with_budget(LLM(**kwargs), cfg)
+        return wrap_crewai_llm_with_budget(
+            LLM(**kwargs), cfg, budget_guard=budget_guard
+        )

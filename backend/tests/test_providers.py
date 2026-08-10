@@ -9,6 +9,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.agents.policies.budget_policy import BudgetGuard, BudgetLimits
+from app.agents.schemas import BudgetExceeded
 from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
 from app.model_capabilities import ModelCapabilities
@@ -416,6 +418,57 @@ async def test_openai_provider_stream_error_does_not_expose_upstream_body(
             pass
 
     assert secret not in str(exc_info.value)
+
+
+async def test_openai_stream_retry_gate_stops_before_second_http_attempt(monkeypatch):
+    calls = 0
+
+    class RetryableResponse:
+        status_code = 503
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aread(self):
+            return b"unavailable"
+
+    class RetryClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return RetryableResponse()
+
+    monkeypatch.setattr(
+        "app.providers.openai_compatible.httpx.AsyncClient", RetryClient
+    )
+    guard = BudgetGuard(BudgetLimits(max_agent_steps=1))
+    guard.enter_step()  # the runtime owns the initial logical dispatch
+
+    def retry_gate(attempt: int) -> float:
+        guard.enter_step()
+        return guard.remaining_seconds
+
+    provider = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+    with pytest.raises(BudgetExceeded, match="max agent steps"):
+        async for _delta in provider.stream_chat(
+            [{"role": "user", "content": "small"}],
+            ChatOptions(retry_gate=retry_gate),
+        ):
+            pass
+
+    assert calls == 1
 
 
 async def test_openai_provider_uses_fixed_vision_reserve_not_data_url_length():

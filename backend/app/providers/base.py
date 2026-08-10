@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 
 from app.agents.token_budget import (
     INVALID_PROMPT_BUDGET,
@@ -79,6 +79,11 @@ class ChatOptions:
     tool_choice: Any = "auto"
     stop: list[str] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # Runtime-only hook. Providers call it before every transport retry (>1).
+    # It is intentionally absent from provider payload serialization.
+    retry_gate: Callable[[int], float | None] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.output_token_parameter not in ("max_tokens", "max_completion_tokens"):

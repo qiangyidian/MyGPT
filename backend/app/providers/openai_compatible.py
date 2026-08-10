@@ -108,6 +108,22 @@ class OpenAICompatibleProvider(ModelProvider):
     def _embeddings_url(self) -> str:
         return f"{self.base_url}/embeddings"
 
+    @staticmethod
+    async def _sleep_before_retry(
+        options: ChatOptions | None, next_attempt: int, delay: float
+    ) -> None:
+        """Authorize one retry before sleeping; bound sleep by run time left."""
+        gate = options.retry_gate if options is not None else None
+        remaining = gate(next_attempt) if gate is not None else None
+        try:
+            async with asyncio.timeout(remaining):
+                await asyncio.sleep(delay)
+        except TimeoutError as exc:
+            raise ProviderError(
+                "model retry exceeded the remaining run time",
+                code=PROVIDER_ERR_TIMEOUT,
+            ) from exc
+
     async def _request(
         self,
         client: httpx.AsyncClient,
@@ -258,7 +274,11 @@ class OpenAICompatibleProvider(ModelProvider):
                             if resp.status_code in _RETRYABLE_STATUS:
                                 await resp.aread()  # drain the error body before retrying
                                 if attempt < 5:
-                                    await asyncio.sleep(min(2 ** attempt, 10))
+                                    await self._sleep_before_retry(
+                                        admitted_options,
+                                        attempt + 1,
+                                        min(2 ** attempt, 10),
+                                    )
                                     continue
                                 raise ProviderError(
                                     f"model endpoint returned HTTP {resp.status_code} after retries"
@@ -285,7 +305,11 @@ class OpenAICompatibleProvider(ModelProvider):
                         # the comment). A mid-stream error (started_iter) is NOT
                         # retried — resending would duplicate emitted tokens.
                         if not started_iter and attempt < 5:
-                            await asyncio.sleep(min(2 ** attempt, 10))
+                            await self._sleep_before_retry(
+                                admitted_options,
+                                attempt + 1,
+                                min(2 ** attempt, 10),
+                            )
                             continue
                         raise _to_provider_error(exc, where="stream") from exc
         except ProviderError:

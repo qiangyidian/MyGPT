@@ -111,8 +111,6 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
-        if stage_ctx.budget_guard is not None:
-            stage_ctx.budget_guard.enter_step()
         admitted_context = admit_stage_dispatch(
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )

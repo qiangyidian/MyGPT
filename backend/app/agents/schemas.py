@@ -528,7 +528,9 @@ class ToolExecution:
     # Sanitized metering stays separate from model/UI result content.
     usage: dict[str, int | float] | None = None
 
-    def to_openai_tool_message(self) -> dict[str, Any]:
+    def to_openai_tool_message(
+        self, *, max_chars: int | None = None
+    ) -> dict[str, Any]:
         """Render as an OpenAI ``tool``-role message for the next model round."""
         if self.ok:
             if isinstance(self.result, str):
@@ -544,7 +546,11 @@ class ToolExecution:
             else:
                 content = _stringify(self.result)
         else:
-            content = _stringify({"error": self.error or "tool failed"})
+            content = _bounded_error_json(
+                self.error or "tool failed", max_chars=max_chars
+            )
+        if max_chars is not None and self.ok:
+            content = _bounded_text(content, max_chars=max_chars)
         return {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
@@ -562,6 +568,67 @@ def _stringify(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(value)
+
+
+_TRUNCATION_MARKER = "[truncated]"
+
+
+def _bounded_text(value: Any, *, max_chars: int) -> str:
+    text = value if isinstance(value, str) else _stringify(value)
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(_TRUNCATION_MARKER):
+        return _TRUNCATION_MARKER[:max_chars]
+    return text[: max_chars - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _bounded_error_json(error: str, *, max_chars: int | None) -> str:
+    payload = {"error": str(error)}
+    rendered = _stringify(payload)
+    if max_chars is None or len(rendered) <= max_chars:
+        return rendered
+    # Keep the observation valid JSON while making truncation explicit. Budget
+    # configuration guarantees enough room for this minimal envelope.
+    low, high = 0, len(str(error))
+    best = _stringify({"error": _TRUNCATION_MARKER, "truncated": True})
+    if len(best) > max_chars:
+        scalar = _stringify(_TRUNCATION_MARKER)
+        return scalar if len(scalar) <= max_chars else _TRUNCATION_MARKER[:max_chars]
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _stringify(
+            {
+                "error": str(error)[:middle] + _TRUNCATION_MARKER,
+                "truncated": True,
+            }
+        )
+        if len(candidate) <= max_chars:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def bounded_json_preview(value: str, *, max_chars: int) -> str:
+    """Return a valid JSON truncation envelope within the character cap."""
+    low, high = 0, len(value)
+    scalar = _stringify(_TRUNCATION_MARKER)
+    best = scalar if len(scalar) <= max_chars else _TRUNCATION_MARKER[:max_chars]
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _stringify(
+            {
+                "preview": value[:middle] + _TRUNCATION_MARKER,
+                "truncated": True,
+            }
+        )
+        if len(candidate) <= max_chars:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 # --------------------------------------------------------------------------- #

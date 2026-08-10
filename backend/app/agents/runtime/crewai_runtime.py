@@ -27,9 +27,11 @@ live LLM (tests inject a :class:`FakeStageExecutor` via ``ctx.extra``).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import uuid
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 from app.agents.approval_bridge import ApprovalBridge
@@ -197,6 +199,37 @@ def _map_run_error(exc: Exception) -> tuple[str, str]:
     return "error", "crewai_run_error"
 
 
+async def _single_llm_usage_snapshot(llm: Any) -> dict[str, int | float] | None:
+    summary = getattr(llm, "get_token_usage_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        value = summary()
+        if inspect.isawaitable(value):
+            value = await value
+        return aggregate_usage(_extract_usage_rounds(SimpleNamespace(usage=value)))
+    except Exception:  # usage must never mask the model outcome
+        logger.debug("single CrewAI usage snapshot failed", exc_info=True)
+        return None
+
+
+def _nonnegative_usage_delta(
+    before: dict[str, int | float] | None,
+    after: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    if not after:
+        return None
+    baseline = before or {}
+    delta = {
+        key: value - baseline.get(key, 0)
+        for key, value in after.items()
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value - baseline.get(key, 0) > 0
+    }
+    return delta or None
+
+
 _CREWAI_BODY_SANITIZER_INSTALLED = False
 
 
@@ -266,10 +299,12 @@ class CrewAIRuntime:
         # Coerce null assistant content on CrewAI's outgoing chat body so
         # Anthropic-strict OpenAI-compatible gateways (GLM proxy) don't 422.
         _install_chat_body_sanitizer()
-        _guard_for_context(ctx)
+        guard = _guard_for_context(ctx)
         # 1. LLM from the existing ModelConfig.
         try:
-            llm = CrewAILLMFactory.from_model_config(ctx.model_config)
+            llm = CrewAILLMFactory.from_model_config(
+                ctx.model_config, budget_guard=guard
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("crewai LLM build failed: %s", exc)
             yield ev_error(code="crewai_llm_error", message=str(exc))
@@ -330,18 +365,42 @@ class CrewAIRuntime:
             yield ev_error(code="crewai_setup_error", message=str(exc))
             return
 
+        usage_before = await _single_llm_usage_snapshot(agent.llm)
+        metered_usage: dict[str, int | float] | None = None
         try:
-            guard.enter_step()
             guard.check()
             try:
-                async with asyncio.timeout(guard.remaining_seconds):
-                    result = await crew.kickoff_async()
+                try:
+                    async with asyncio.timeout(guard.remaining_seconds):
+                        result = await crew.kickoff_async()
+                finally:
+                    usage_after = await _single_llm_usage_snapshot(agent.llm)
+                    metered_usage = _nonnegative_usage_delta(
+                        usage_before, usage_after
+                    )
+                    if metered_usage:
+                        cost = metered_usage.get("cost_usd")
+                        if cost is None:
+                            cost = usage_cost(
+                                getattr(
+                                    getattr(ctx, "model_config", None),
+                                    "model_name",
+                                    None,
+                                ),
+                                metered_usage,
+                            )
+                        guard.add_usage(
+                            metered_usage,
+                            cost_usd=cost,
+                            usage_id="crewai:single:cumulative",
+                        )
+                        ctx.extra["usage"] = metered_usage
             except TimeoutError as exc:
                 raise BudgetExceeded(
                     f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
                 ) from exc
-            usage = aggregate_usage(_extract_usage_rounds(result))
-            if usage:
+            usage = metered_usage or aggregate_usage(_extract_usage_rounds(result))
+            if usage and metered_usage is None:
                 cost = usage.get("cost_usd")
                 if cost is None:
                     cost = usage_cost(
@@ -377,7 +436,11 @@ class CrewAIRuntime:
             return
         except Exception as exc:  # noqa: BLE001
             logger.exception("crewai kickoff failed: %s", exc)
-            yield ev_error(code="crewai_run_error", message=str(exc))
+            yield ev_error(
+                code="crewai_run_error",
+                message=str(exc),
+                usage=ctx.extra.get("usage"),
+            )
             return
 
         final_text = str(getattr(result, "raw", "") or "")

@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_CALLS: int = Field(default=12, gt=0)
     AGENT_MAX_REPLAN_COUNT: int = Field(default=2, ge=0)
     AGENT_MAX_RUNTIME_SECONDS: float = Field(default=120.0, gt=0, allow_inf_nan=False)
-    AGENT_MAX_TOOL_OUTPUT_CHARS: int = Field(default=8_000, gt=0)
+    AGENT_MAX_TOOL_OUTPUT_CHARS: int = Field(default=8_000, ge=16)
     AGENT_MAX_TOTAL_TOKENS: int = Field(default=40_000, gt=0)
     AGENT_MAX_COST_USD: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     # Intent classifier (runs on the chat hot path before the first token).

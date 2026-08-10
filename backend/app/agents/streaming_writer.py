@@ -78,6 +78,12 @@ _CODE_SYSTEM = (
 )
 
 
+def _gate_writer_retry(guard: Any) -> float:
+    guard.enter_step()
+    guard.check()
+    return guard.remaining_seconds
+
+
 class StreamingWriterExecutor:
     """Wraps a base executor; streams the writer stage, delegates the rest.
 
@@ -158,6 +164,11 @@ class StreamingWriterExecutor:
             temperature=0.5,
             max_tokens=capabilities.max_output_tokens,
             output_token_parameter=capabilities.output_token_parameter,
+            retry_gate=(
+                lambda _attempt: _gate_writer_retry(stage_ctx.budget_guard)
+                if stage_ctx.budget_guard is not None
+                else None
+            ),
         )
 
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "writer")
