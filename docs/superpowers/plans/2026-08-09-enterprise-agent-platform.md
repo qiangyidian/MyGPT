@@ -26,7 +26,7 @@
 | 1. Model capabilities and token admission | P0 | Complete | Commits `d85423c` through `6d9ac57`; final spec PASS and quality APPROVED |
 | 2. Automatic continuation and usage accounting | P0 | Complete | Commits `0deeb3e` through `8375635`; backend 668/668; final spec PASS and quality APPROVED |
 | 3. Agent budgets and provider controls | P0 | Complete | Commits `267dfcf`–`decc619` plus gate-hardening commit; focused budget/native suites 76/76; backend 725 passed (1 known env-deferred web-search test); combined spec+quality review APPROVED (no Critical/Important) |
-| 4. Durable workflow schema/events/leases/controls | P0 | Not started | Awaiting Task 3 acceptance |
+| 4. Durable workflow schema/events/leases/controls | P0 | Complete | Commits `116b4e2` + `51c076f` (review fixes); migration `0007`, EventStore/CommandStore/LeaseStore, persist-first controls; targeted 45 passed, backend 753 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 5. Redis Streams worker/recovery/SSE replay | P0 | Not started | Awaiting Task 4 |
 | 6. Planner-executor-verifier | P1 | Not started | Awaiting durable workflow foundation |
 | 7. Compaction/output spill/long-term memory | P1 | Not started | Awaiting workflow state machine |
@@ -48,7 +48,7 @@
 - [x] Aggregate Native, CrewAI, writer, retry, continuation, and metered-tool usage exactly once, including concurrent agents sharing one cumulative LLM counter.
 - [x] Isolate checkpoint, graph, plan, and terminal persistence into short-lived ID-based sessions so rollback cannot expire request-owned ORM objects.
 - [x] Enforce real per-run step, tool, replan, wall-clock, token, output-size, and monetary budgets across every external await and dispatch.
-- [ ] Persist authoritative workflow events, attempts, commands, approvals, leases, checkpoints, and terminal states in PostgreSQL.
+- [x] Persist authoritative workflow events, attempts, commands, approvals, leases, checkpoints, and terminal states in PostgreSQL.
 - [ ] Move background execution to Redis Streams workers with idempotent enqueue, consumer groups, lease fencing, graceful shutdown, and stale-run recovery.
 - [ ] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
 - [ ] Eliminate stale legacy `running` rows and make recovery decisions explicit and auditable.
@@ -90,7 +90,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [ ] Database revision state lagged code migration head; Task 13 must enforce migration head at startup/deploy and test upgrades from both empty and current databases.
 - [ ] Qdrant client/server compatibility warning was present; Task 13 must pin and verify a compatible pair.
 - [ ] The web-search safe-default test is sensitive to repository `.env` loading; Tasks 11/13/14 must isolate tests from deployment secrets and verify secure defaults deterministically.
-- [ ] Current in-memory pause/resume/cancel/instruction controls are not durable; Task 4 replaces them with persisted commands.
+- [x] Current in-memory pause/resume/cancel/instruction controls are not durable; closed by Task 4 (persist-first durable commands).
 - [ ] Current SSE connection owns too much execution lifetime; Task 5 separates subscription lifetime from workflow lifetime and adds replay.
 - [ ] Current multi-agent profiles are not a general typed planner-executor-verifier engine; Task 6 provides the durable generic engine.
 - [ ] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; Task 7 unifies them.
@@ -322,7 +322,7 @@ Expected: all selected tests pass. (Verified: 69/69 focused; full backend 725 pa
 - Modify: `backend/app/models/__init__.py`
 - Modify: `backend/app/api/agent_runs.py`
 
-- [ ] **Step 1: Write failing monotonic event and exactly-once command tests**
+- [x] **Step 1: Write failing monotonic event and exactly-once command tests**
 
 ```python
 async def test_run_events_get_monotonic_sequences(db_session, run):
@@ -336,22 +336,22 @@ async def test_instruction_is_claimed_once(db_session, run):
     assert await commands.claim_pending(run.id) == []
 ```
 
-- [ ] **Step 2: Verify RED and add additive workflow tables**
+- [x] **Step 2: Verify RED and add additive workflow tables**
 
 Use a unique `(run_id, sequence)` constraint for events, command status transitions, and lease owner/expiry/version fields for optimistic fencing.
 
-- [ ] **Step 3: Implement transactional repositories**
+- [x] **Step 3: Implement transactional repositories**
 
 Event sequence allocation and step transitions execute in one database transaction. Commands move `pending -> claimed -> applied` and remain auditable.
 
-- [ ] **Step 4: Replace in-memory API controls with durable commands**
+- [x] **Step 4: Replace in-memory API controls with durable commands**
 
 Pause, resume, cancel, instruction, approve, and reject persist first and publish second. Database state remains correct when Redis is unavailable.
 
-- [ ] **Step 5: Run migration and repository tests**
+- [x] **Step 5: Run migration and repository tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_durable_events.py tests/test_durable_controls.py tests/test_agent_phase3.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 45 passed across durable + phase3 + migration + chat_stream + approval_bus; full backend 753 passed, 1 known env-deferred failure.)
 
 ### Task 5: Redis Streams queue, worker, recovery scheduler, and SSE replay
 
