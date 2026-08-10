@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,42 @@ class FakeCrewAILLM:
     async def acall(self, *args, **kwargs):
         self.async_calls.append((args, kwargs))
         return "async-result"
+
+
+class MeteredCrewAILLM(FakeCrewAILLM):
+    def __init__(self, *, per_call=5, fail=False, **kwargs):
+        super().__init__(**kwargs)
+        self.total = 0
+        self.cost = 0.0
+        self.per_call = per_call
+        self.fail = fail
+        self.active = 0
+        self.max_active = 0
+
+    def get_token_usage_summary(self):
+        return {"total_tokens": self.total, "cost_usd": self.cost}
+
+    def call(self, *args, **kwargs):
+        self.sync_calls.append((args, kwargs))
+        self.total += self.per_call
+        self.cost += 0.2
+        if self.fail:
+            raise RuntimeError("metered provider failure")
+        return "sync-result"
+
+    async def acall(self, *args, **kwargs):
+        self.async_calls.append((args, kwargs))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            self.total += self.per_call
+            self.cost += 0.2
+            if self.fail:
+                raise RuntimeError("metered provider failure")
+            return "async-result"
+        finally:
+            self.active -= 1
 
 
 def _config(*, context_window: int = 4_000, max_tokens: int = 200):
@@ -53,6 +90,66 @@ async def test_budget_proxy_gates_every_internal_async_model_turn():
         await wrapped.acall(messages=[{"role": "user", "content": "two"}])
 
     assert len(underlying.async_calls) == 1
+
+
+async def test_budget_proxy_charges_each_call_before_next_dispatch():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=10)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=10, max_cost_usd=1.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    assert await wrapped.acall(messages=[{"role": "user", "content": "one"}]) == "async-result"
+    assert guard.tokens_used == 10
+    assert guard.cost_usd_used == pytest.approx(0.2)
+    with pytest.raises(BudgetExceeded, match="token budget"):
+        await wrapped.acall(messages=[{"role": "user", "content": "two"}])
+    assert len(underlying.async_calls) == 1
+
+
+def test_budget_proxy_sync_call_charges_before_next_dispatch():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=10)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=10, max_cost_usd=1.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    assert wrapped.call([{"role": "user", "content": "one"}]) == "sync-result"
+    assert guard.tokens_used == 10
+    assert guard.cost_usd_used == pytest.approx(0.2)
+    with pytest.raises(BudgetExceeded, match="token budget"):
+        wrapped.call([{"role": "user", "content": "two"}])
+    assert len(underlying.sync_calls) == 1
+
+
+async def test_budget_proxy_charges_failed_call_immediately():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=4, fail=True)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=1.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    with pytest.raises(RuntimeError, match="metered provider failure"):
+        await wrapped.acall(messages=[{"role": "user", "content": "fail"}])
+    assert guard.tokens_used == 4
+    assert guard.cost_usd_used == pytest.approx(0.2)
+
+
+async def test_budget_proxy_concurrent_calls_do_not_double_count():
+    underlying = MeteredCrewAILLM(model="gpt-4o", per_call=4)
+    guard = BudgetGuard(BudgetLimits(max_total_tokens=100, max_cost_usd=2.0))
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+
+    await asyncio.gather(
+        wrapped.acall(messages=[{"role": "user", "content": "a"}]),
+        wrapped.acall(messages=[{"role": "user", "content": "b"}]),
+    )
+
+    assert guard.tokens_used == 8
+    assert guard.cost_usd_used == pytest.approx(0.4)
+    assert underlying.max_active == 1
 
 
 def test_budget_proxy_rejects_rebinding_to_another_run_guard():

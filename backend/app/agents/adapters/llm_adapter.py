@@ -8,16 +8,21 @@ not read browser input or a separate secret store.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import threading
 from functools import wraps
+from itertools import count
 from typing import Any
 
+from app.agents.continuation import aggregate_usage
 from app.agents.token_budget import (
     PROMPT_TOO_LARGE,
     PromptAdmissionError,
     calculate_prompt_budget,
 )
 from app.core.security import decrypt_secret
+from app.core.pricing import usage_cost
 from app.model_capabilities import capabilities_from_config
 from app.models import ModelConfig
 
@@ -66,6 +71,58 @@ def _admit_final_crewai_payload(messages: Any, tools: Any, cfg: Any) -> None:
         )
 
 
+def _usage_mapping(value: Any) -> dict[str, int | float] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        raw = value
+    else:
+        dump = getattr(value, "model_dump", None)
+        raw = dump() if callable(dump) else getattr(value, "__dict__", None)
+    return aggregate_usage([raw]) if isinstance(raw, dict) else None
+
+
+def _sync_usage_snapshot(llm: Any) -> dict[str, int | float] | None:
+    summary = getattr(llm, "get_token_usage_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        value = summary()
+        return None if inspect.isawaitable(value) else _usage_mapping(value)
+    except Exception:
+        return None
+
+
+async def _async_usage_snapshot(llm: Any) -> dict[str, int | float] | None:
+    summary = getattr(llm, "get_token_usage_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        value = summary()
+        if inspect.isawaitable(value):
+            value = await value
+        return _usage_mapping(value)
+    except Exception:
+        return None
+
+
+def _usage_delta(
+    before: dict[str, int | float] | None,
+    after: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    if not after:
+        return None
+    baseline = before or {}
+    delta = {
+        key: value - baseline.get(key, 0)
+        for key, value in after.items()
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value - baseline.get(key, 0) > 0
+    }
+    return delta or None
+
+
 def wrap_crewai_llm_with_budget(
     llm: Any, cfg: Any, *, budget_guard: Any = None
 ) -> Any:
@@ -84,17 +141,39 @@ def wrap_crewai_llm_with_budget(
     if not callable(original_call):
         raise TypeError("CrewAI LLM must expose call()")
 
+    sync_usage_lock = threading.Lock()
+    async_usage_lock = asyncio.Lock()
+    usage_sequence = count(1)
+
+    def charge(before: Any, after: Any) -> None:
+        if budget_guard is None:
+            return
+        delta = _usage_delta(before, after)
+        if not delta:
+            return
+        cost = delta.get("cost_usd")
+        if cost is None:
+            cost = usage_cost(getattr(cfg, "model_name", None), delta)
+        budget_guard.add_usage(
+            delta,
+            cost_usd=cost,
+            usage_id=f"crewai:call:{next(usage_sequence)}",
+        )
+
     @wraps(original_call)
     def guarded_call(*args: Any, **kwargs: Any) -> Any:
         messages, tools = _final_payload_parts(args, kwargs)
         _admit_final_crewai_payload(messages, tools, cfg)
-        if budget_guard is not None:
+        if budget_guard is None:
+            return original_call(*args, **kwargs)
+        with sync_usage_lock:
+            before = _sync_usage_snapshot(llm)
             budget_guard.enter_step()
             budget_guard.check()
-        result = original_call(*args, **kwargs)
-        if budget_guard is not None:
-            budget_guard.check()
-        return result
+            try:
+                return original_call(*args, **kwargs)
+            finally:
+                charge(before, _sync_usage_snapshot(llm))
 
     llm.call = guarded_call
 
@@ -107,24 +186,28 @@ def wrap_crewai_llm_with_budget(
             _admit_final_crewai_payload(messages, tools, cfg)
             if budget_guard is None:
                 return await original_acall(*args, **kwargs)
-            budget_guard.enter_step()
-            budget_guard.check()
-            try:
-                async with asyncio.timeout(budget_guard.remaining_seconds):
-                    result = await original_acall(*args, **kwargs)
-            except TimeoutError as exc:
-                from app.agents.schemas import BudgetExceeded
+            async with async_usage_lock:
+                before = await _async_usage_snapshot(llm)
+                budget_guard.enter_step()
+                budget_guard.check()
+                try:
+                    try:
+                        async with asyncio.timeout(budget_guard.remaining_seconds):
+                            return await original_acall(*args, **kwargs)
+                    except TimeoutError as exc:
+                        from app.agents.schemas import BudgetExceeded
 
-                raise BudgetExceeded(
-                    f"time budget ({budget_guard.limits.max_runtime_seconds}s) exceeded"
-                ) from exc
-            budget_guard.check()
-            return result
+                        raise BudgetExceeded(
+                            f"time budget ({budget_guard.limits.max_runtime_seconds}s) exceeded"
+                        ) from exc
+                finally:
+                    charge(before, await _async_usage_snapshot(llm))
 
         llm.acall = guarded_acall
 
     llm._model_budget_guarded = True
     llm._run_budget_guard = budget_guard
+    llm._usage_charged_realtime = budget_guard is not None
     return llm
 
 

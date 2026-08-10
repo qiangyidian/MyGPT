@@ -425,6 +425,7 @@ class ToolGateway:
             full_result=full_result,
             latency_ms=latency_ms,
             usage=usage,
+            _max_output_chars=self._max_result_chars,
         )
 
 

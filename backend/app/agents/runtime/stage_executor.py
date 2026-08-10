@@ -116,6 +116,7 @@ class CrewAIStageExecutor:
         )
         stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
         llm = getattr(agent, "llm", None)
+        realtime_usage = bool(getattr(llm, "_usage_charged_realtime", False))
         metered = await stage_ctx.llm_usage.begin(
             llm, lambda: _llm_usage_snapshot(agent)
         )
@@ -148,6 +149,7 @@ class CrewAIStageExecutor:
                     f"model:{agent_id}:{uuid.uuid4().hex}",
                     llm_usage,
                     model_usage=True,
+                    charge=not realtime_usage,
                 )
         raw = _extract_raw(output)
         # CrewAI's installed Agent.aexecute_task returns a raw string. Its LLM
@@ -164,6 +166,7 @@ class CrewAIStageExecutor:
             output_summary=_summarize(raw, self._summarize_chars),
             structured=output,
             usage=usage,
+            usage_charged=realtime_usage,
         )
 
 

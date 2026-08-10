@@ -27,7 +27,6 @@ from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.schemas import (
     BudgetExceeded,
     ToolExecution,
-    _bounded_text,
     ev_tool_call,
     ev_tool_result,
 )
@@ -142,14 +141,9 @@ def _format_for_crewai(
     exec_: ToolExecution, max_chars: int = 8_000
 ) -> str:
     """Render a ToolExecution as the string CrewAI feeds back to the agent."""
-    content = str(
+    return str(
         exec_.to_openai_tool_message(max_chars=max_chars).get("content") or ""
     )
-    if exec_.truncated and "[truncated]" not in content:
-        content = _bounded_text(
-            content + "[truncated]", max_chars=max_chars
-        )
-    return content
 
 
 def _blocked_execution(orig: ToolExecution, reason: str) -> ToolExecution:
@@ -169,6 +163,7 @@ def _blocked_execution(orig: ToolExecution, reason: str) -> ToolExecution:
         approval_id=orig.approval_id,
         truncated=False,
         latency_ms=orig.latency_ms,
+        _max_output_chars=orig._max_output_chars,
     )
 
 

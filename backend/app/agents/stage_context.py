@@ -217,6 +217,7 @@ class StageContext:
         usage: dict[str, Any] | None,
         *,
         model_usage: bool = False,
+        charge: bool = True,
     ) -> None:
         """Idempotently retain one final usage snapshot for a logical attempt."""
         if isinstance(usage, dict) and usage:
@@ -225,7 +226,7 @@ class StageContext:
                 return
             safe_usage = dict(usage)
             self.usage_records[record_key] = safe_usage
-            if self.budget_guard is not None:
+            if self.budget_guard is not None and charge:
                 cost = safe_usage.get("cost_usd")
                 if cost is None and model_usage and self.model_config is not None:
                     from app.core.pricing import usage_cost

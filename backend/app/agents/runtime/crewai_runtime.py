@@ -389,11 +389,14 @@ class CrewAIRuntime:
                                 ),
                                 metered_usage,
                             )
-                        guard.add_usage(
-                            metered_usage,
-                            cost_usd=cost,
-                            usage_id="crewai:single:cumulative",
-                        )
+                        if not getattr(
+                            agent.llm, "_usage_charged_realtime", False
+                        ):
+                            guard.add_usage(
+                                metered_usage,
+                                cost_usd=cost,
+                                usage_id="crewai:single:cumulative",
+                            )
                         ctx.extra["usage"] = metered_usage
             except TimeoutError as exc:
                 raise BudgetExceeded(

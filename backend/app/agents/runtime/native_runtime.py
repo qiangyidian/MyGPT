@@ -55,7 +55,7 @@ from app.agents.schemas import (
     ev_token,
     ev_tool_call,
     ev_tool_result,
-    _bounded_text,
+    bounded_json_observation,
 )
 from app.models import AgentRun
 from app.core.config import get_settings
@@ -910,7 +910,7 @@ def _bounded_tool_message(execution: Any, max_chars: int) -> dict[str, Any]:
     # legacy no-argument method. Invoke exactly once: an internal TypeError
     # must propagate rather than being mistaken for a signature mismatch.
     message = execution.to_openai_tool_message()
-    message["content"] = _bounded_text(
+    message["content"] = bounded_json_observation(
         message.get("content", ""), max_chars=max_chars
     )
     return message

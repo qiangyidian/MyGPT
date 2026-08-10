@@ -527,14 +527,17 @@ class ToolExecution:
     latency_ms: int | None = None
     # Sanitized metering stays separate from model/UI result content.
     usage: dict[str, int | float] | None = None
+    # Internal model-facing cap; event/API serializers never expose this field.
+    _max_output_chars: int | None = field(default=None, repr=False, compare=False)
 
     def to_openai_tool_message(
         self, *, max_chars: int | None = None
     ) -> dict[str, Any]:
         """Render as an OpenAI ``tool``-role message for the next model round."""
+        truncated = bool(self.truncated)
         if self.ok:
             if isinstance(self.result, str):
-                content = self.result
+                value: Any = self.result
             elif (
                 isinstance(self.result, dict)
                 and isinstance(self.result.get("content"), str)
@@ -542,15 +545,22 @@ class ToolExecution:
                 # ToolGateway has already serialized and bounded this exact
                 # observation. Re-serializing its envelope would add bytes after
                 # the cap and could exceed the per-run model-facing limit.
-                content = self.result["content"]
+                raw_content = self.result["content"]
+                truncated = truncated or bool(self.result.get("truncated"))
+                try:
+                    import json
+
+                    value = json.loads(raw_content)
+                except (TypeError, ValueError):
+                    value = raw_content
             else:
-                content = _stringify(self.result)
+                value = self.result
         else:
-            content = _bounded_error_json(
-                self.error or "tool failed", max_chars=max_chars
-            )
-        if max_chars is not None and self.ok:
-            content = _bounded_text(content, max_chars=max_chars)
+            value = {"error": self.error or "tool failed"}
+        effective_max = max_chars if max_chars is not None else self._max_output_chars
+        content = bounded_json_observation(
+            value, max_chars=effective_max, force_truncated=truncated
+        )
         return {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
@@ -583,6 +593,8 @@ def _bounded_text(value: Any, *, max_chars: int) -> str:
 
 
 def _bounded_error_json(error: str, *, max_chars: int | None) -> str:
+    import json
+
     payload = {"error": str(error)}
     rendered = _stringify(payload)
     if max_chars is None or len(rendered) <= max_chars:
@@ -592,7 +604,7 @@ def _bounded_error_json(error: str, *, max_chars: int | None) -> str:
     low, high = 0, len(str(error))
     best = _stringify({"error": _TRUNCATION_MARKER, "truncated": True})
     if len(best) > max_chars:
-        scalar = _stringify(_TRUNCATION_MARKER)
+        scalar = json.dumps(_TRUNCATION_MARKER, ensure_ascii=False)
         return scalar if len(scalar) <= max_chars else _TRUNCATION_MARKER[:max_chars]
     while low <= high:
         middle = (low + high) // 2
@@ -612,8 +624,10 @@ def _bounded_error_json(error: str, *, max_chars: int | None) -> str:
 
 def bounded_json_preview(value: str, *, max_chars: int) -> str:
     """Return a valid JSON truncation envelope within the character cap."""
+    import json
+
     low, high = 0, len(value)
-    scalar = _stringify(_TRUNCATION_MARKER)
+    scalar = json.dumps(_TRUNCATION_MARKER, ensure_ascii=False)
     best = scalar if len(scalar) <= max_chars else _TRUNCATION_MARKER[:max_chars]
     while low <= high:
         middle = (low + high) // 2
@@ -629,6 +643,26 @@ def bounded_json_preview(value: str, *, max_chars: int) -> str:
         else:
             high = middle - 1
     return best
+
+
+def bounded_json_observation(
+    value: Any,
+    *,
+    max_chars: int | None,
+    force_truncated: bool = False,
+) -> str:
+    """Serialize every model-facing tool observation as bounded valid JSON."""
+    import json
+
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = json.dumps(str(value), ensure_ascii=False)
+    if max_chars is None:
+        return rendered
+    if len(rendered) <= max_chars and not force_truncated:
+        return rendered
+    return bounded_json_preview(rendered, max_chars=max_chars)
 
 
 # --------------------------------------------------------------------------- #

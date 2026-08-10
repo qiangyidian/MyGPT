@@ -623,6 +623,8 @@ async def test_tool_gateway_enforces_per_run_output_limit(db_session):
 
 
 def test_crewai_adapter_does_not_reexpand_bounded_gateway_content():
+    import json
+
     from app.agents.adapters.tool_adapter import _format_for_crewai
     from app.agents.schemas import ToolExecution
 
@@ -637,7 +639,7 @@ def test_crewai_adapter_does_not_reexpand_bounded_gateway_content():
     )
     rendered = _format_for_crewai(execution, max_chars=17)
     assert len(rendered) <= 17
-    assert rendered.endswith("[truncated]")
+    assert json.loads(rendered) == "[truncated]"
 
 
 def test_crewai_adapter_bounds_huge_error_as_valid_json_with_marker():
@@ -660,6 +662,57 @@ def test_crewai_adapter_bounds_huge_error_as_valid_json_with_marker():
     assert len(rendered) <= 96
     assert json.loads(rendered)["truncated"] is True
     assert "[truncated]" in rendered
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain unicode 中文 😀",
+        {"items": ["quoted \\\" value", "中文"], "ok": True},
+        ["a", {"nested": "b"}],
+    ],
+)
+def test_tool_success_observation_is_always_valid_bounded_json(value):
+    import json
+
+    from app.agents.adapters.tool_adapter import _format_for_crewai
+    from app.agents.schemas import ToolExecution
+
+    execution = ToolExecution(
+        ok=True,
+        tool_call_id="success",
+        tool_name="tool",
+        arguments={},
+        status="success",
+        result=value,
+    )
+    rendered = _format_for_crewai(execution, max_chars=64)
+
+    assert len(rendered) <= 64
+    json.loads(rendered)
+    if len(json.dumps(value, ensure_ascii=False)) > 64:
+        assert "[truncated]" in rendered
+
+
+def test_tool_observation_minimum_cap_remains_valid_json():
+    import json
+
+    from app.agents.adapters.tool_adapter import _format_for_crewai
+    from app.agents.schemas import ToolExecution
+
+    execution = ToolExecution(
+        ok=True,
+        tool_call_id="small",
+        tool_name="tool",
+        arguments={},
+        status="success",
+        result="x" * 1_000,
+    )
+    rendered = _format_for_crewai(execution, max_chars=16)
+
+    assert len(rendered) <= 16
+    assert "[truncated]" in rendered
+    json.loads(rendered)
 
 
 async def test_streaming_writer_gates_blank_retry_as_new_model_dispatch(
