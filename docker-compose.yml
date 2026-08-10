@@ -66,6 +66,57 @@ services:
       - "${BACKEND_PORT:-8000}:8000"
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
+  # ----------------------------------------------------------- durable worker
+  # Processes the durable run queue: claims runs, acquires leases, executes each
+  # run, and acks on completion. Set BACKGROUND_WORKER=durable (or any non-
+  # "inprocess" value) + a reachable REDIS_URL to enable the Redis Streams
+  # transport; otherwise it falls back to single-worker InMemoryQueue.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads_data:${STORAGE_DIR:-/data/uploads}
+      - ./backend:/app
+    command: python -m app.worker
+    stop_grace_period: 30s   # let the worker drain its current run on SIGTERM
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ------------------------------------------------------- recovery scheduler
+  # Periodically scans for expired/stale leases, requeues retryable runs, and
+  # terminally fails exhausted ones. Runs the same image as the worker.
+  recovery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: python -m app.recovery
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   # ---------------------------------------------------------------- frontend
   # Dev mode with hot reload: builds the `dev` stage (node_modules + source) and
   # bind-mounts ./frontend so edits recompile live. node_modules/.next are kept as

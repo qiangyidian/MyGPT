@@ -1342,5 +1342,34 @@ class ChatService:
             await db.commit()
 
 
+# --------------------------------------------------------------------------- #
+# Task 5: durable execution seam (additive, gated behind BACKGROUND_WORKER)
+# --------------------------------------------------------------------------- #
+async def maybe_enqueue_durable_run(run_id: uuid.UUID | str) -> bool:
+    """When ``BACKGROUND_WORKER`` is the durable mode, enqueue ``run_id`` for the
+    background worker. In the default ``inprocess`` mode this is a no-op and the
+    existing inline stream handles execution.
+
+    Returns True if the run was enqueued (durable mode), False otherwise.
+
+    This is the single integration point the chat API calls after persisting an
+    AgentRun. It does NOT modify the existing ``stream`` path — the inline
+    generator runs unchanged when ``BACKGROUND_WORKER=inprocess`` (the default).
+    """
+    settings = get_settings()
+    if settings.BACKGROUND_WORKER == "inprocess":
+        return False
+    try:
+        from app.agents.workflow.queue import get_run_queue
+        from app.db import AsyncSessionLocal
+
+        queue = await get_run_queue()
+        await queue.enqueue(run_id, db_session_factory=AsyncSessionLocal)
+        return True
+    except Exception:  # noqa: BLE001 — never crash the request on enqueue failure
+        logger.warning("durable enqueue failed for run %s (inline fallback)", run_id, exc_info=True)
+        return False
+
+
 # Module-level singleton — the service is stateless, so one shared instance.
 chat_service = ChatService()

@@ -1,29 +1,41 @@
 """Agent-runs API (Phase 3): inspect a run and drive human-in-the-loop approvals.
 
-  GET    /api/agent-runs                 list runs (optionally by conversation)
-  GET    /api/agent-runs/{run_id}        run detail + steps + approvals
-  POST   /api/agent-runs/{run_id}/approve   approve a pending dangerous tool
-  POST   /api/agent-runs/{run_id}/reject    reject a pending dangerous tool
-  POST   /api/agent-runs/{run_id}/cancel    cancel a waiting run
+  GET    /api/agent-runs                       list runs (optionally by conversation)
+  GET    /api/agent-runs/{run_id}              run detail + steps + approvals
+  GET    /api/agent-runs/{run_id}/events       cursor-replay SSE (Task 5)
+  POST   /api/agent-runs/{run_id}/approve      approve a pending dangerous tool
+  POST   /api/agent-runs/{run_id}/reject       reject a pending dangerous tool
+  POST   /api/agent-runs/{run_id}/cancel       cancel a waiting run
 
 Approve/reject also signal the in-process :class:`ApprovalCoordinator` so a
 paused live stream resumes from the exact step. Cancel flips the run to
 ``cancelled`` and cancels any pending wait. Ownership is enforced (admin may
 view/act on any run).
+
+The ``/events`` endpoint (Task 5) is a read-only SSE subscription that replays
+the durable event log from a ``Last-Event-ID`` cursor then tails new events.
+It NEVER executes or cancels the run — a client disconnect closes only the
+subscription, the run keeps going.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from datetime import datetime, timezone
+from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.approval_bus import approval_bus
+from app.agents.events import EventStore
 from app.agents.run_controls import get as get_run_control
 from app.agents.workflow import controls as durable_controls
 from app.services import audit_service
+from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
@@ -316,3 +328,126 @@ async def resume_run(
     if ctl is not None:
         ctl.resume()
     return ActionResult(ok=True, status="resumed")
+
+
+# --------------------------------------------------------------------------- #
+# Task 5: cursor-replay SSE endpoint
+# --------------------------------------------------------------------------- #
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Event types that mark the end of a run's event stream.
+_TERMINAL_EVENT_TYPES = frozenset(
+    {"run.completed", "run.failed", "run.cancelled", "done", "error"}
+)
+
+
+def _sse_frame(event_type: str, data: dict, event_id: int | None = None) -> str:
+    """Format one SSE frame with optional ``id:`` line (for Last-Event-ID resume)."""
+    parts: list[str] = []
+    if event_id is not None:
+        parts.append(f"id: {event_id}")
+    parts.append(f"event: {event_type}")
+    parts.append(f"data: {json.dumps(data, default=str, ensure_ascii=False)}")
+    return "\n".join(parts) + "\n\n"
+
+
+async def _run_is_terminal(db: AsyncSession, run_id: uuid.UUID) -> bool:
+    """Check whether the run has reached a terminal status."""
+    result = await db.execute(
+        select(AgentRun.status).where(AgentRun.id == run_id)
+    )
+    current = result.scalar_one_or_none()
+    return current is None or current in _TERMINAL_STATUSES
+
+
+@router.get("/{run_id}/events")
+async def stream_run_events(
+    run_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(get_current_user),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Cursor-replay SSE: replay durable events from ``Last-Event-ID``, then tail.
+
+    This endpoint ONLY READS — it never executes or cancels the run. A client
+    disconnect closes the subscription; the run continues on the worker.
+
+    Frame format::
+
+        id: <sequence>
+        event: <event_type>
+        data: <json>
+
+    The ``Last-Event-ID`` header (set automatically by the browser EventSource
+    on reconnect from the last received ``id``) seeds the cursor so a reconnect
+    resumes exactly where it left off.
+    """
+    run = await _load_run(db, run_id)
+    await _assert_owned(run, user)
+
+    # Parse the cursor (default 0 = replay from the start).
+    try:
+        cursor = int(last_event_id) if last_event_id else 0
+    except (ValueError, TypeError):
+        cursor = 0
+
+    poll_interval = max(0.5, get_settings().WORKER_POLL_INTERVAL_SECONDS)
+    heartbeat = max(5, get_settings().SSE_HEARTBEAT_SECONDS)
+    target_run_id = run.id
+
+    # Build a session factory on the SAME engine as the request session so that
+    # test overrides (which bind the request session to the shared in-memory
+    # SQLite engine) propagate to the tailing loop. In production this is
+    # equivalent to ``app.db.AsyncSessionLocal``.
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    tail_factory = async_sessionmaker(
+        bind=db.bind, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+
+    async def _generator() -> AsyncIterator[str]:
+        last_seq = cursor
+        last_event_at = asyncio.get_event_loop().time()
+        already_terminal = await _run_is_terminal(db, target_run_id)
+
+        while True:
+            if await request.is_disconnected():
+                return
+
+            async with tail_factory() as tail_db:
+                events = await EventStore(tail_db).replay(
+                    target_run_id, after_sequence=last_seq
+                )
+                is_terminal = await _run_is_terminal(tail_db, target_run_id)
+
+            terminal_sent = False
+            for evt in events:
+                last_seq = evt.sequence
+                yield _sse_frame(evt.event_type, evt.data, event_id=evt.sequence)
+                if evt.event_type in _TERMINAL_EVENT_TYPES:
+                    terminal_sent = True
+
+            if terminal_sent or (already_terminal and not events):
+                return
+            if is_terminal and not events:
+                return
+
+            # Heartbeat if we've been idle too long.
+            now = asyncio.get_event_loop().time()
+            if events:
+                last_event_at = now
+            elif now - last_event_at >= heartbeat:
+                yield ": keepalive\n\n"
+                last_event_at = now
+
+            await asyncio.sleep(poll_interval)
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -102,6 +102,23 @@ class Settings(BaseSettings):
     # ---- Background worker ----
     BACKGROUND_WORKER: str = "inprocess"
 
+    # ---- Durable worker (Task 5) ----
+    # Redis stream + consumer group names for the durable run queue.
+    RUN_QUEUE_STREAM: str = "agent-run-queue"
+    RUN_QUEUE_GROUP: str = "workers"
+    # Lease TTL: how long a worker may hold a run before recovery can reclaim.
+    RUN_LEASE_TTL_SECONDS: int = 120
+    # How often the worker renews its lease while a run is in flight.
+    RUN_LEASE_RENEW_SECONDS: int = 30
+    # Worker poll interval when the queue is empty (InMemoryQueue / fallback).
+    WORKER_POLL_INTERVAL_SECONDS: float = 1.0
+    # xreadgroup block timeout for the Redis transport (seconds, 0 = non-blocking).
+    WORKER_BLOCK_TIMEOUT_SECONDS: int = 5
+    # Recovery scheduler scan interval.
+    RECOVERY_SCAN_INTERVAL_SECONDS: int = 30
+    # Max recovery retries before a run is terminally failed.
+    RUN_MAX_RETRIES: int = 3
+
     # ---- Agent platform (CrewAI / tool safety) ----
     # Master switch for the CrewAI runtime. Even when True, the runtime is only
     # used when execution_mode="agent" and the `crewai` package is importable;
