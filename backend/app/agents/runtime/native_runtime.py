@@ -34,7 +34,7 @@ from app.agents.continuation import (
 )
 from app.agents.db_mutation import db_mutation_scope
 from app.agents.gateway.tool_gateway import ToolGateway
-from app.agents.policies import BudgetExceeded, BudgetGuard
+from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.graph import build_single_agent_graph
 from app.agents.planning import build_plan, classify_intent
 from app.agents.runtime.stage_executor import safe_positive_int
@@ -57,6 +57,7 @@ from app.agents.schemas import (
 )
 from app.models import AgentRun
 from app.core.config import get_settings
+from app.core.pricing import usage_cost
 from app.db import AsyncSessionLocal
 from app.providers.base import (
     ChatOptions,
@@ -95,7 +96,19 @@ class NativeChatRuntime:
             user=ctx.user,
             registry=registry,
         )
-        guard = BudgetGuard()
+        settings = get_settings()
+        guard = ctx.budget_guard
+        if guard is None:
+            guard = BudgetGuard(
+                BudgetLimits.from_settings(
+                    settings,
+                    ctx.extra.get("budget_overrides"),
+                    allow_increase=bool(
+                        ctx.extra.get("budget_policy_authorized", False)
+                    ),
+                )
+            )
+            ctx.budget_guard = guard
 
         # Tools run when the user enabled them AND the model declares capability
         # (or it's the mock provider, which simulates a search step for demos).
@@ -151,8 +164,24 @@ class NativeChatRuntime:
         working: list[dict[str, Any]] = list(ctx.messages)
         finish_reason = "stop"
         usage_rounds: list[dict[str, Any]] = []
+        model_dispatches = 0
+
+        def record_usage_once(
+            usage: dict[str, Any] | None,
+            *,
+            usage_id: str,
+            model_usage: bool,
+        ) -> None:
+            if usage is None:
+                return
+            usage_rounds.append(usage)
+            cost = usage.get("cost_usd")
+            if cost is None and model_usage:
+                cost = usage_cost(cfg.model_name, usage)
+            guard.add_usage(usage, cost_usd=cost, usage_id=usage_id)
+            ctx.extra["usage"] = aggregate_usage(usage_rounds)
         policy = ContinuationPolicy(
-            max_rounds=get_settings().AUTO_CONTINUATION_MAX_ROUNDS
+            max_rounds=settings.AUTO_CONTINUATION_MAX_ROUNDS
         )
         continuation_round = 0
         is_continuation_round = False
@@ -266,41 +295,72 @@ class NativeChatRuntime:
                 from app.core.concurrency import model_breaker, model_limiter
                 _breaker_key = f"{getattr(provider, 'base_url', '')}|{getattr(provider, 'model', '')}"
                 model_breaker().before(_breaker_key)
-                await model_limiter().acquire()
+                limiter = model_limiter()
+                limiter_acquired = False
+                model_dispatches += 1
+                dispatch_usage_id = f"native:model:{model_dispatches}"
                 try:
-                    async for delta in provider.stream_chat(working, options):
-                        ctl = ctx.extra.get("run_control")
-                        if ctl is not None and ctl.cancel.is_set():
-                            finish_reason = "cancelled"
-                            _node_terminal = "cancelled"
-                            break
-                        if ctl is not None:
-                            while ctl.is_paused() and not ctl.cancel.is_set():
-                                await asyncio.sleep(0.1)
-                            if ctl.cancel.is_set():
+                    guard.check()
+                    async with asyncio.timeout(guard.remaining_seconds):
+                        await limiter.acquire()
+                        limiter_acquired = True
+                        async for delta in provider.stream_chat(working, options):
+                            ctl = ctx.extra.get("run_control")
+                            if ctl is not None and ctl.cancel.is_set():
                                 finish_reason = "cancelled"
                                 _node_terminal = "cancelled"
                                 break
-                        if delta.content:
-                            accumulated.append(delta.content)
-                            novel = (
-                                continuation_buffer.feed(delta.content)
-                                if continuation_buffer is not None
-                                else delta.content
-                            )
-                            if novel:
-                                novel_parts.append(novel)
-                                yield ev_token(delta=novel)
-                        if delta.tool_calls:
-                            pending_tool_calls.extend(delta.tool_calls)
-                        if delta.finish_reason:
-                            finish_reason = delta.finish_reason
-                        if delta.usage:
-                            # A provider may emit multiple snapshots in one call
-                            # (including a final usage-only chunk). Retain only
-                            # the final snapshot and add it once after the round.
-                            round_usage = delta.usage
+                            if ctl is not None:
+                                while ctl.is_paused() and not ctl.cancel.is_set():
+                                    await asyncio.sleep(0.1)
+                                if ctl.cancel.is_set():
+                                    finish_reason = "cancelled"
+                                    _node_terminal = "cancelled"
+                                    break
+                            if delta.content:
+                                accumulated.append(delta.content)
+                                novel = (
+                                    continuation_buffer.feed(delta.content)
+                                    if continuation_buffer is not None
+                                    else delta.content
+                                )
+                                if novel:
+                                    novel_parts.append(novel)
+                                    yield ev_token(delta=novel)
+                            if delta.tool_calls:
+                                pending_tool_calls.extend(delta.tool_calls)
+                            if delta.finish_reason:
+                                finish_reason = delta.finish_reason
+                            if delta.usage:
+                                # A provider may emit multiple snapshots in one
+                                # call. Keep only its final cumulative snapshot.
+                                round_usage = delta.usage
+                    guard.check()
                     model_breaker().record_success(_breaker_key)
+                except (BudgetExceeded, TimeoutError) as exc:
+                    if continuation_buffer is not None:
+                        buffered_novel = continuation_buffer.flush()
+                        if buffered_novel:
+                            novel_parts.append(buffered_novel)
+                            yield ev_token(delta=buffered_novel)
+                    assistant_msg.content = (assistant_msg.content or "") + "".join(
+                        novel_parts
+                    )
+                    record_usage_once(
+                        round_usage,
+                        usage_id=dispatch_usage_id,
+                        model_usage=True,
+                    )
+                    finish_reason = "budget"
+                    _node_terminal = "failed"
+                    reason = (
+                        exc.reason
+                        if isinstance(exc, BudgetExceeded)
+                        else f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                    )
+                    ctx.extra["budget_exceeded_reason"] = reason
+                    logger.info("native model dispatch hit budget: %s", reason)
+                    break
                 except PromptAdmissionError as exc:
                     if continuation_buffer is not None:
                         buffered_novel = continuation_buffer.flush()
@@ -310,9 +370,11 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
-                    if round_usage is not None:
-                        usage_rounds.append(round_usage)
-                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    record_usage_once(
+                        round_usage,
+                        usage_id=dispatch_usage_id,
+                        model_usage=True,
+                    )
                     finish_reason = "budget"
                     ctx.extra["admission_error_code"] = exc.code
                     ctx.extra["finish_reason"] = finish_reason
@@ -337,9 +399,11 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
-                    if round_usage is not None:
-                        usage_rounds.append(round_usage)
-                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    record_usage_once(
+                        round_usage,
+                        usage_id=dispatch_usage_id,
+                        model_usage=True,
+                    )
                     if continuation_round:
                         checkpoint = {
                             "round": continuation_round,
@@ -366,9 +430,11 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
-                    if round_usage is not None:
-                        usage_rounds.append(round_usage)
-                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    record_usage_once(
+                        round_usage,
+                        usage_id=dispatch_usage_id,
+                        model_usage=True,
+                    )
                     logger.exception("provider error in native run: %s", exc)
                     yield ev_error(
                         code=getattr(exc, "code", "provider_error"),
@@ -389,9 +455,11 @@ class NativeChatRuntime:
                     assistant_msg.content = (assistant_msg.content or "") + "".join(
                         novel_parts
                     )
-                    if round_usage is not None:
-                        usage_rounds.append(round_usage)
-                    ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                    record_usage_once(
+                        round_usage,
+                        usage_id=dispatch_usage_id,
+                        model_usage=True,
+                    )
                     logger.exception("unexpected provider stream error: %s", exc)
                     yield ev_error(
                         code="internal",
@@ -405,21 +473,32 @@ class NativeChatRuntime:
                         yield _evt
                     return
                 finally:
-                    model_limiter().release()
+                    if limiter_acquired:
+                        limiter.release()
 
                 if continuation_buffer is not None:
                     buffered_novel = continuation_buffer.flush()
                     if buffered_novel:
                         novel_parts.append(buffered_novel)
                         yield ev_token(delta=buffered_novel)
-                if round_usage is not None:
-                    usage_rounds.append(round_usage)
-                ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                record_usage_once(
+                    round_usage,
+                    usage_id=dispatch_usage_id,
+                    model_usage=True,
+                )
                 # Fold this round's streamed text into the assistant message so a
                 # mid-loop disconnect still leaves recoverable content.
                 assistant_msg.content = (assistant_msg.content or "") + "".join(
                     novel_parts
                 )
+                try:
+                    guard.check()
+                except BudgetExceeded as exc:
+                    finish_reason = "budget"
+                    _node_terminal = "failed"
+                    ctx.extra["budget_exceeded_reason"] = exc.reason
+                    logger.info("native model usage hit budget: %s", exc.reason)
+                    break
 
                 # Tool-calling branch: execute via the gateway, append results, re-stream.
                 if (
@@ -468,8 +547,17 @@ class NativeChatRuntime:
                     for tc, args in parsed_calls:
                         try:
                             guard.enter_tool_call()
+                            execution = await _execute_tool_with_budget(
+                                guard,
+                                gateway,
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                arguments=args,
+                            )
                         except BudgetExceeded as exc:
                             finish_reason = "budget"
+                            _node_terminal = "failed"
+                            ctx.extra["budget_exceeded_reason"] = exc.reason
                             logger.info("native run hit tool budget: %s", exc.reason)
                             # Surface an error tool_result so the transcript is coherent.
                             yield ev_tool_result(
@@ -477,13 +565,7 @@ class NativeChatRuntime:
                                 result=None, error=f"budget exceeded: {exc.reason}",
                                 agent_id="assistant",
                             )
-                            continue
-
-                        execution = await gateway.execute(
-                            tool_call_id=tc.id,
-                            tool_name=tc.name,
-                            arguments=args,
-                        )
+                            break
 
                         # Dangerous tools: pause the live stream for human approval.
                         if execution.status == "needs_approval" and execution.approval_id:
@@ -502,11 +584,34 @@ class NativeChatRuntime:
                                 tool_name=tc.name,
                             )
                             try:
-                                wr = await approval_coordinator.wait(execution.approval_id)
-                            except asyncio.TimeoutError:
-                                wr.decision = "timed_out"
+                                guard.check()
+                                try:
+                                    async with asyncio.timeout(guard.remaining_seconds):
+                                        wr = await approval_coordinator.wait(
+                                            execution.approval_id
+                                        )
+                                except TimeoutError:
+                                    guard.check()
+                                    wr.decision = "timed_out"
+                            except BudgetExceeded as exc:
+                                finish_reason = "budget"
+                                _node_terminal = "failed"
+                                ctx.extra["budget_exceeded_reason"] = exc.reason
                             finally:
                                 approval_coordinator.release(execution.approval_id)
+
+                            if finish_reason == "budget":
+                                yield ev_tool_result(
+                                    id=tc.id,
+                                    name=tc.name,
+                                    ok=False,
+                                    error=(
+                                        "budget exceeded: "
+                                        + ctx.extra["budget_exceeded_reason"]
+                                    ),
+                                    agent_id="assistant",
+                                )
+                                break
 
                             if wr.decision == "cancelled":
                                 await self._set_run_status(ctx, "cancelled")
@@ -515,11 +620,26 @@ class NativeChatRuntime:
                                 await self._set_run_status(ctx, "running")
                                 # Re-run through the gateway; it now finds the approved
                                 # ToolApproval and executes for real.
-                                execution = await gateway.execute(
-                                    tool_call_id=tc.id,
-                                    tool_name=tc.name,
-                                    arguments=args,
-                                )
+                                try:
+                                    execution = await _execute_tool_with_budget(
+                                        guard,
+                                        gateway,
+                                        tool_call_id=tc.id,
+                                        tool_name=tc.name,
+                                        arguments=args,
+                                    )
+                                except BudgetExceeded as exc:
+                                    finish_reason = "budget"
+                                    _node_terminal = "failed"
+                                    ctx.extra["budget_exceeded_reason"] = exc.reason
+                                    yield ev_tool_result(
+                                        id=tc.id,
+                                        name=tc.name,
+                                        ok=False,
+                                        error=f"budget exceeded: {exc.reason}",
+                                        agent_id="assistant",
+                                    )
+                                    break
                             elif wr.decision == "rejected":
                                 await self._set_run_status(ctx, "running")
                                 reason = wr.reason or "rejected by user"
@@ -552,8 +672,11 @@ class NativeChatRuntime:
 
                         tool_usage = getattr(execution, "usage", None)
                         if tool_usage:
-                            usage_rounds.append(tool_usage)
-                            ctx.extra["usage"] = aggregate_usage(usage_rounds)
+                            record_usage_once(
+                                tool_usage,
+                                usage_id=f"native:tool:{tc.id}",
+                                model_usage=False,
+                            )
                         yield ev_tool_result(
                             id=tc.id,
                             name=tc.name,
@@ -576,9 +699,22 @@ class NativeChatRuntime:
                             agent_id="assistant",
                             usage=tool_usage,
                         )
-                        working.append(execution.to_openai_tool_message())
+                        working.append(
+                            _bounded_tool_message(
+                                execution, guard.limits.max_tool_output_chars
+                            )
+                        )
+                        try:
+                            guard.check()
+                        except BudgetExceeded as exc:
+                            finish_reason = "budget"
+                            _node_terminal = "failed"
+                            ctx.extra["budget_exceeded_reason"] = exc.reason
+                            break
 
                     # Re-stream with the tool results folded in.
+                    if finish_reason == "budget":
+                        break
                     finish_reason = "stop"  # reset; the next round decides
                     is_continuation_round = False
                     continue
@@ -704,13 +840,32 @@ class NativeChatRuntime:
                 "continuation": checkpoint,
             }
         ctx.extra["finish_reason"] = finish_reason
-        ctx.extra["budget"] = guard.snapshot()
+        budget_snapshot = guard.snapshot()
+        ctx.extra["budget"] = budget_snapshot
+        assistant_msg.metadata_ = {
+            **(assistant_msg.metadata_ or {}),
+            "budget": budget_snapshot,
+        }
+        if finish_reason == "budget":
+            reason = (
+                ctx.extra.get("budget_exceeded_reason")
+                or budget_snapshot.get("reason")
+                or "agent execution budget exhausted"
+            )
+            yield ev_error(
+                code="agent_budget_exceeded",
+                message=f"Agent execution budget exceeded: {reason}",
+                usage=aggregate_usage(usage_rounds),
+                finish_reason="budget",
+                budget=budget_snapshot,
+            )
         for _evt in _native_terminal_events(ctx, _node_terminal, _assistant_started):
             yield _evt
         yield ev_done(
             message_id=assistant_msg.id,
             finish_reason=finish_reason,
             usage=aggregate_usage(usage_rounds),
+            budget=budget_snapshot,
         )
 
     @staticmethod
@@ -723,6 +878,35 @@ class NativeChatRuntime:
                 await ctx.db.commit()
         except Exception:  # pragma: no cover - status update is best-effort
             logger.warning("failed to set agent_run status=%s", status, exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+async def _execute_tool_with_budget(
+    guard: BudgetGuard,
+    gateway: ToolGateway,
+    **kwargs: Any,
+):
+    """Gate and time-bound one tool attempt against the run deadline."""
+    guard.check()
+    try:
+        async with asyncio.timeout(guard.remaining_seconds):
+            execution = await gateway.execute(**kwargs)
+    except TimeoutError as exc:
+        raise BudgetExceeded(
+            f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+        ) from exc
+    guard.check()
+    return execution
+
+
+def _bounded_tool_message(execution: Any, max_chars: int) -> dict[str, Any]:
+    """Apply the per-run observation cap before a tool result reaches a model."""
+    message = execution.to_openai_tool_message()
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, default=str)
+    message["content"] = content[:max_chars]
+    return message
 
 
 # --------------------------------------------------------------------------- #

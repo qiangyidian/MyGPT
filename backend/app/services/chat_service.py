@@ -112,6 +112,7 @@ _FINISH_STATUS: dict[str, str] = {
 # ev_error `code` → finish_reason, so a provider timeout is recorded as
 # finish_reason="timeout" instead of a generic "error".
 _ERROR_FINISH: dict[str, str] = {
+    "agent_budget_exceeded": "budget",
     "provider_timeout": "timeout",
     "provider_error": "provider_error",
     "stream_disconnected": "stream_disconnected",
@@ -136,7 +137,7 @@ def _apply_usage_accounting(
     usage: dict[str, Any] | None,
 ) -> None:
     """Persist one already-aggregated turn usage payload and its total cost."""
-    from app.core.pricing import compute_cost, normalize_usage
+    from app.core.pricing import normalize_usage, usage_cost
 
     normalized = normalize_usage(usage)
     if normalized is None:
@@ -144,7 +145,7 @@ def _apply_usage_accounting(
     message.prompt_tokens = normalized["prompt_tokens"]
     message.completion_tokens = normalized["completion_tokens"]
     message.total_tokens = normalized["total_tokens"]
-    message.cost_usd = compute_cost(model_name, usage)
+    message.cost_usd = usage_cost(model_name, usage)
     message.metadata_ = {
         **(message.metadata_ or {}),
         "usage": dict(usage or {}),
@@ -1182,13 +1183,16 @@ class ChatService:
                 if evt.kind == "error":
                     err_code = evt.data.get("code")
                     err_msg = evt.data.get("message", "error")
-                    err_finish = _finish_for_error_code(err_code)
+                    err_finish = evt.data.get("finish_reason") or _finish_for_error_code(
+                        err_code
+                    )
                     async with db_mutation_scope(db_mutation_lock):
                         await self._finalize_error(
                             db, assistant_msg, err_msg,
                             finish_reason=err_finish, code=err_code,
                             usage=evt.data.get("usage"),
                             model_name=cfg.model_name,
+                            budget=evt.data.get("budget"),
                         )
                     # Structured record for a FAILED turn (same field set as a
                     # completed one) so failed runs are queryable too.
@@ -1272,6 +1276,7 @@ class ChatService:
         code: str | None = None,
         usage: dict[str, Any] | None = None,
         model_name: str | None = None,
+        budget: dict[str, Any] | None = None,
     ) -> None:
         # Preserve partial content (assistant_msg.content is mutated by the
         # runtime as tokens stream) — only record why it stopped.
@@ -1283,6 +1288,8 @@ class ChatService:
         }
         if code:
             md["provider_error_code"] = code
+        if budget is not None:
+            md["budget"] = dict(budget)
         assistant_msg.metadata_ = md
         _apply_usage_accounting(assistant_msg, model_name, usage)
         await commit_with_rollback(db)

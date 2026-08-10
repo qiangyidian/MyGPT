@@ -53,7 +53,9 @@ from app.agents.runtime.stage_executor import (
     FakeStageExecutor,
     StageExecutor,
     StageResult,
+    _extract_usage_rounds,
 )
+from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -71,6 +73,7 @@ from app.agents.stage_context import StageContext, make_stage_context
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
+from app.core.pricing import usage_cost
 from app.db import AsyncSessionLocal
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
 from app.providers.registry import get_provider_for_config
@@ -79,6 +82,23 @@ logger = logging.getLogger(__name__)
 
 # Profiles that use the multi-agent graph + right-side panel.
 _MULTI_AGENT_PROFILES = {"deep_research", "parallel_research", "debate"}
+
+
+def _guard_for_context(ctx: Any) -> BudgetGuard:
+    """Resolve/inject the run guard, tolerating lightweight protocol fakes."""
+    guard = getattr(ctx, "budget_guard", None)
+    if guard is not None:
+        return guard
+    extra = getattr(ctx, "extra", {}) or {}
+    guard = BudgetGuard(
+        BudgetLimits.from_settings(
+            get_settings(),
+            extra.get("budget_overrides"),
+            allow_increase=bool(extra.get("budget_policy_authorized", False)),
+        )
+    )
+    setattr(ctx, "budget_guard", guard)
+    return guard
 
 
 def _demo_executor_enabled(settings: Any, request: Any) -> bool:
@@ -143,15 +163,24 @@ def _aggregate_crewai_usage(
 ) -> dict[str, int | float] | None:
     """Aggregate each stage plus idempotently recorded tool/failed-attempt usage."""
     rounds: list[dict[str, Any] | None] = []
+    directly_charged_prefixes: list[str] = []
     for spec in stages:
         result = outputs.get(getattr(spec, "agent_id", ""))
         if result is None:
             continue
         if result.usage:
             rounds.append(result.usage)
+            if result.usage_charged:
+                directly_charged_prefixes.append(
+                    f"model:{getattr(spec, 'agent_id', '')}:"
+                )
         elif isinstance(result.structured, dict):
             rounds.append(result.structured.get("usage"))
-    rounds.extend(stage_ctx.usage_records.values())
+    rounds.extend(
+        usage
+        for key, usage in stage_ctx.usage_records.items()
+        if not any(key.startswith(prefix) for prefix in directly_charged_prefixes)
+    )
     return aggregate_usage(rounds)
 
 
@@ -159,6 +188,8 @@ def _map_run_error(exc: Exception) -> tuple[str, str]:
     """Map a multi-agent flow exception to (finish_reason, ev_error code)."""
     if isinstance(exc, PromptAdmissionError):
         return "budget", exc.code
+    if isinstance(exc, BudgetExceeded):
+        return "budget", "agent_budget_exceeded"
     if isinstance(exc, ProviderError):
         if getattr(exc, "code", "") == PROVIDER_ERR_TIMEOUT:
             return "timeout", "provider_timeout"
@@ -235,6 +266,7 @@ class CrewAIRuntime:
         # Coerce null assistant content on CrewAI's outgoing chat body so
         # Anthropic-strict OpenAI-compatible gateways (GLM proxy) don't 422.
         _install_chat_body_sanitizer()
+        _guard_for_context(ctx)
         # 1. LLM from the existing ModelConfig.
         try:
             llm = CrewAILLMFactory.from_model_config(ctx.model_config)
@@ -275,6 +307,7 @@ class CrewAIRuntime:
         plan_summary, plan_steps = build_plan(intent, ctx.user_content)
         yield ev_plan_created(summary=plan_summary, steps=plan_steps)
 
+        guard = _guard_for_context(ctx)
         tools = self._build_tools(ctx, stage_ctx=None)
         try:
             agent = Agent(
@@ -298,10 +331,49 @@ class CrewAIRuntime:
             return
 
         try:
-            result = await crew.kickoff_async()
+            guard.enter_step()
+            guard.check()
+            try:
+                async with asyncio.timeout(guard.remaining_seconds):
+                    result = await crew.kickoff_async()
+            except TimeoutError as exc:
+                raise BudgetExceeded(
+                    f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                ) from exc
+            usage = aggregate_usage(_extract_usage_rounds(result))
+            if usage:
+                cost = usage.get("cost_usd")
+                if cost is None:
+                    cost = usage_cost(
+                        getattr(getattr(ctx, "model_config", None), "model_name", None),
+                        usage,
+                    )
+                guard.add_usage(
+                    usage,
+                    cost_usd=cost,
+                    usage_id="crewai:single:model:1",
+                )
+                ctx.extra["usage"] = usage
+            guard.check()
         except PromptAdmissionError as exc:
-            ctx.extra["finish_reason"] = "budget"
+            self._record_budget(ctx, guard, str(exc))
             yield ev_error(code=exc.code, message=str(exc))
+            return
+        except BudgetExceeded as exc:
+            self._record_budget(ctx, guard, exc.reason)
+            yield ev_error(
+                code="agent_budget_exceeded",
+                message=f"Agent execution budget exceeded: {exc.reason}",
+                usage=ctx.extra.get("usage"),
+                finish_reason="budget",
+                budget=ctx.extra.get("budget"),
+            )
+            yield ev_done(
+                message_id=ctx.assistant_msg.id,
+                finish_reason="budget",
+                usage=ctx.extra.get("usage"),
+                budget=ctx.extra.get("budget"),
+            )
             return
         except Exception as exc:  # noqa: BLE001
             logger.exception("crewai kickoff failed: %s", exc)
@@ -313,7 +385,18 @@ class CrewAIRuntime:
         if final_text:
             yield ev_token(delta=final_text)
         ctx.extra["finish_reason"] = "stop"
-        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason="stop")
+        snapshot = guard.snapshot()
+        ctx.extra["budget"] = snapshot
+        assistant = ctx.assistant_msg
+        assistant.metadata_ = {
+            **(getattr(assistant, "metadata_", None) or {}), "budget": snapshot
+        }
+        yield ev_done(
+            message_id=ctx.assistant_msg.id,
+            finish_reason="stop",
+            usage=ctx.extra.get("usage"),
+            budget=snapshot,
+        )
 
     # ====================================================================== #
     # Multi-agent path — real lifecycle orchestration
@@ -321,7 +404,8 @@ class CrewAIRuntime:
     async def _run_multi_agent(
         self, ctx: AgentTurnContext, llm: Any, profile: str
     ) -> AsyncIterator[AgentEvent]:
-        stage_ctx = make_stage_context(ctx.run_id)
+        guard = _guard_for_context(ctx)
+        stage_ctx = make_stage_context(ctx.run_id, budget_guard=guard)
         # Populate the streaming-writer fields so the writer stage can call the
         # provider directly and mutate the assistant message token-by-token.
         # All Optional; harmless for the non-writer stages and for fakes/demos.
@@ -507,11 +591,23 @@ class CrewAIRuntime:
             # (the old code wiped assistant_msg.content here, losing partials).
             finish, code = _map_run_error(run_exc)
             ctx.extra["finish_reason"] = finish
+            hard_budget_exceeded = isinstance(run_exc, BudgetExceeded)
+            if hard_budget_exceeded:
+                self._record_budget(ctx, guard, run_exc.reason)
             yield ev_error(
                 code=code,
                 message=str(run_exc),
                 usage=ctx.extra.get("usage"),
+                finish_reason="budget" if hard_budget_exceeded else None,
+                budget=(ctx.extra.get("budget") if hard_budget_exceeded else None),
             )
+            if hard_budget_exceeded:
+                yield ev_done(
+                    message_id=ctx.assistant_msg.id,
+                    finish_reason="budget",
+                    usage=ctx.extra.get("usage"),
+                    budget=ctx.extra.get("budget"),
+                )
             return
 
         # The final stage (writer) holds the answer — unless it already streamed
@@ -540,12 +636,19 @@ class CrewAIRuntime:
             ctx.extra["usage"] = usage
         ctx.extra["finish_reason"] = finish
         ctx.extra["multi_agent"] = True
+        snapshot = guard.snapshot()
+        ctx.extra["budget"] = snapshot
+        assistant = ctx.assistant_msg
+        assistant.metadata_ = {
+            **(getattr(assistant, "metadata_", None) or {}), "budget": snapshot
+        }
         if not streamed and final_text:
             yield ev_token(delta=final_text)
         yield ev_done(
             message_id=ctx.assistant_msg.id,
             finish_reason=finish,
             usage=usage,
+            budget=snapshot,
         )
 
     async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:
@@ -553,6 +656,9 @@ class CrewAIRuntime:
         ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
         if ctl is None:
             return
+        guard = stage_ctx.budget_guard
+        if guard is not None:
+            guard.check()
         # Honor a user-initiated cancel between stages.
         if ctl.cancel.is_set():
             raise asyncio.CancelledError()
@@ -565,7 +671,17 @@ class CrewAIRuntime:
             while ctl.is_paused():
                 if ctl.cancel.is_set():
                     break
-                await asyncio.sleep(0.1)
+                if guard is None:
+                    await asyncio.sleep(0.1)
+                else:
+                    try:
+                        async with asyncio.timeout(guard.remaining_seconds):
+                            await asyncio.sleep(0.1)
+                    except TimeoutError as exc:
+                        raise BudgetExceeded(
+                            f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                        ) from exc
+                    guard.check()
             stage_ctx.emit(ev_run_resumed(run_id=ctx.run_id))
 
     async def _walk_stages(
@@ -619,6 +735,7 @@ class CrewAIRuntime:
         outputs: dict[str, StageResult],
     ) -> None:
         """Run a single agent stage with real lifecycle events around it."""
+        guard = stage_ctx.budget_guard
         # Build the context string from dependency outputs (the handoff).
         context_parts = []
         for dep_id in spec.depends_on:
@@ -641,14 +758,43 @@ class CrewAIRuntime:
             return
 
         try:
-            result = await executor.execute(
-                agent_id=spec.agent_id,
-                agent=spec.agent,
-                task=spec.task,
-                context=context_str,
-                stage_ctx=stage_ctx,
-            )
+            if guard is None:
+                result = await executor.execute(
+                    agent_id=spec.agent_id,
+                    agent=spec.agent,
+                    task=spec.task,
+                    context=context_str,
+                    stage_ctx=stage_ctx,
+                )
+            else:
+                guard.check()
+                try:
+                    async with asyncio.timeout(guard.remaining_seconds):
+                        result = await executor.execute(
+                            agent_id=spec.agent_id,
+                            agent=spec.agent,
+                            task=spec.task,
+                            context=context_str,
+                            stage_ctx=stage_ctx,
+                        )
+                except TimeoutError as exc:
+                    raise BudgetExceeded(
+                        f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                    ) from exc
             outputs[spec.agent_id] = result
+            if guard is not None and result.usage and not result.usage_charged:
+                cost = result.usage.get("cost_usd")
+                if cost is None:
+                    cost = usage_cost(
+                        getattr(stage_ctx.model_config, "model_name", None),
+                        result.usage,
+                    )
+                guard.add_usage(
+                    result.usage,
+                    cost_usd=cost,
+                    usage_id=f"crewai:stage:{spec.agent_id}",
+                )
+                guard.check()
             emitter.emit_agent_completed(
                 spec.agent_id, output_summary=result.output_summary or None
             )
@@ -691,11 +837,33 @@ class CrewAIRuntime:
                         run_id=ctx.run_id,
                         user_id=user_id,
                         stage_ctx=stage_ctx,
+                        budget_guard=ctx.budget_guard,
+                        max_result_chars=(
+                            ctx.budget_guard.limits.max_tool_output_chars
+                            if ctx.budget_guard is not None
+                            else 8_000
+                        ),
                     )
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("failed to adapt tool %s: %s", src.name, exc)
         return tools
+
+    @staticmethod
+    def _record_budget(
+        ctx: AgentTurnContext, guard: BudgetGuard, reason: str
+    ) -> None:
+        ctx.extra["finish_reason"] = "budget"
+        ctx.extra["budget_exceeded_reason"] = reason
+        snapshot = guard.snapshot()
+        if snapshot.get("reason") is None:
+            snapshot["exhausted"] = True
+            snapshot["reason"] = reason
+        ctx.extra["budget"] = snapshot
+        assistant = ctx.assistant_msg
+        assistant.metadata_ = {
+            **(getattr(assistant, "metadata_", None) or {}), "budget": snapshot
+        }
 
     async def _persist_graph(
         self,

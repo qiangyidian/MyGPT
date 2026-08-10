@@ -24,7 +24,7 @@ import uuid
 from typing import Any
 
 from app.agents.gateway.tool_gateway import ToolGateway
-from app.agents.schemas import ToolExecution, ev_tool_call, ev_tool_result
+from app.agents.schemas import BudgetExceeded, ToolExecution, ev_tool_call, ev_tool_result
 from app.agents.stage_context import StageContext
 from app.tools.base import BaseTool as AppBaseTool
 
@@ -82,6 +82,9 @@ async def _execute_via_gateway(
     user_id,
     agent_id: str,
     task_id: str,
+    tool_call_id: str,
+    budget_guard=None,
+    max_result_chars: int = 8_000,
 ) -> ToolExecution:
     """Open a fresh session, run the tool through the gateway, commit, return."""
     from sqlalchemy import select
@@ -89,38 +92,50 @@ async def _execute_via_gateway(
     from app.db import AsyncSessionLocal
     from app.models.user import User
 
-    async with AsyncSessionLocal() as db:
-        user = None
-        if user_id is not None:
-            user = (
-                await db.execute(select(User).where(User.id == user_id))
-            ).scalar_one_or_none()
-        gw = ToolGateway(
-            db,
-            conversation_id=conversation_id,
-            assistant_message_id=message_id,
-            run_id=run_id,
-            user=user,
-        )
-        gw.set_attribution(agent_id=agent_id, task_id=task_id)
-        exec_ = await gw.execute(
-            tool_call_id=str(uuid.uuid4()),
-            tool_name=tool_name,
-            arguments=kwargs,
-            agent_id=agent_id,
-            task_id=task_id,
-        )
-        await db.commit()
-        return exec_
+    async def run() -> ToolExecution:
+        async with AsyncSessionLocal() as db:
+            user = None
+            if user_id is not None:
+                user = (
+                    await db.execute(select(User).where(User.id == user_id))
+                ).scalar_one_or_none()
+            gw = ToolGateway(
+                db,
+                conversation_id=conversation_id,
+                assistant_message_id=message_id,
+                run_id=run_id,
+                user=user,
+                max_result_chars=max_result_chars,
+            )
+            gw.set_attribution(agent_id=agent_id, task_id=task_id)
+            exec_ = await gw.execute(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                arguments=kwargs,
+                agent_id=agent_id,
+                task_id=task_id,
+            )
+            await db.commit()
+            return exec_
+
+    if budget_guard is None:
+        return await run()
+    budget_guard.check()
+    try:
+        async with asyncio.timeout(budget_guard.remaining_seconds):
+            execution = await run()
+    except TimeoutError as exc:
+        raise BudgetExceeded(
+            f"time budget ({budget_guard.limits.max_runtime_seconds}s) exceeded"
+        ) from exc
+    budget_guard.check()
+    return execution
 
 
 def _format_for_crewai(exec_: ToolExecution) -> str:
     """Render a ToolExecution as the string CrewAI feeds back to the agent."""
     if exec_.ok:
-        r = exec_.result
-        if isinstance(r, dict):
-            return json.dumps(r, ensure_ascii=False, default=str)
-        return str(r) if r is not None else ""
+        return str(exec_.to_openai_tool_message().get("content") or "")
     return json.dumps({"error": exec_.error or "tool failed"}, ensure_ascii=False)
 
 
@@ -171,6 +186,8 @@ def build_crewai_tool(
     run_id,
     user_id,
     stage_ctx: StageContext | None = None,
+    budget_guard=None,
+    max_result_chars: int = 8_000,
 ) -> Any:
     """Construct a CrewAI ``BaseTool`` wrapping an app tool.
 
@@ -186,6 +203,8 @@ def build_crewai_tool(
     tool_name = source.name
     conv_id, msg_id, rid, uid = conversation_id, message_id, run_id, user_id
     ctx = stage_ctx
+    guard = budget_guard or (ctx.budget_guard if ctx is not None else None)
+    output_limit = max_result_chars
 
     class _Adapter(BaseTool):
         name: str = source.name
@@ -207,6 +226,8 @@ def build_crewai_tool(
                     id=call_id, name=tool_name, arguments=kwargs,
                     agent_id=agent_id, task_id=task_id,
                 ))
+            elif guard is not None:
+                guard.enter_tool_call()
 
             exec_ = _bridge_async(
                 _execute_via_gateway(
@@ -214,6 +235,7 @@ def build_crewai_tool(
                     self._conversation_id, self._message_id,
                     self._run_id, self._user_id,
                     agent_id, task_id,
+                    call_id, guard, output_limit,
                 )
             )
 
@@ -236,6 +258,7 @@ def build_crewai_tool(
                             self._conversation_id, self._message_id,
                             self._run_id, self._user_id,
                             agent_id, task_id,
+                            call_id, guard, output_limit,
                         )
                     )
                 else:
@@ -248,6 +271,11 @@ def build_crewai_tool(
                     agent_id=agent_id, task_id=task_id,
                     usage=_execution_usage(exec_),
                 ))
+            elif guard is not None:
+                usage = _execution_usage(exec_)
+                if usage:
+                    guard.add_usage(usage, usage_id=f"tool:{call_id}")
+                guard.check()
 
             return _format_for_crewai(exec_)
 

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
+    from app.agents.policies.budget_policy import BudgetGuard
     from app.agents.schemas import AgentEvent
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,7 @@ class StageContext:
 
     run_id: str
     loop: asyncio.AbstractEventLoop
+    budget_guard: "BudgetGuard | None" = None
     # Bounded but generous: structural events (agent_status/edge/run_status) are
     # few; tool events are the only high-frequency source. If this ever fills
     # (thousands of tool calls in one run), we coalesce + drop noisily-once
@@ -187,12 +189,16 @@ class StageContext:
 
     def emit(self, event: "AgentEvent") -> None:
         """Thread-safe forward to the main-loop queue. Never blocks."""
+        if getattr(event, "kind", None) == "tool_call" and self.budget_guard is not None:
+            self.budget_guard.enter_tool_call()
         if getattr(event, "kind", None) == "tool_result":
             usage = event.data.get("usage")
             if isinstance(usage, dict) and usage:
                 self.record_usage(
                     f"tool:{event.data.get('id') or len(self.usage_records)}", usage
                 )
+            if self.budget_guard is not None:
+                self.budget_guard.check()
         # Coalesce duplicate tool_call events for the same (agent, call_id).
         if getattr(event, "kind", None) == "tool_call":
             key = (event.data.get("agent_id"), event.data.get("id"))
@@ -205,10 +211,31 @@ class StageContext:
             # Loop closed (run ended) — drop silently.
             pass
 
-    def record_usage(self, key: str, usage: dict[str, Any] | None) -> None:
+    def record_usage(
+        self,
+        key: str,
+        usage: dict[str, Any] | None,
+        *,
+        model_usage: bool = False,
+    ) -> None:
         """Idempotently retain one final usage snapshot for a logical attempt."""
         if isinstance(usage, dict) and usage:
-            self.usage_records.setdefault(str(key), dict(usage))
+            record_key = str(key)
+            if record_key in self.usage_records:
+                return
+            safe_usage = dict(usage)
+            self.usage_records[record_key] = safe_usage
+            if self.budget_guard is not None:
+                cost = safe_usage.get("cost_usd")
+                if cost is None and model_usage and self.model_config is not None:
+                    from app.core.pricing import usage_cost
+
+                    cost = usage_cost(
+                        getattr(self.model_config, "model_name", None), safe_usage
+                    )
+                self.budget_guard.add_usage(
+                    safe_usage, cost_usd=cost, usage_id=record_key
+                )
 
     def _put_nowait(self, event: "AgentEvent") -> None:
         try:
@@ -233,6 +260,12 @@ class StageContext:
             pass
 
 
-def make_stage_context(run_id: str) -> StageContext:
+def make_stage_context(
+    run_id: str, *, budget_guard: "BudgetGuard | None" = None
+) -> StageContext:
     """Build a StageContext bound to the currently-running event loop."""
-    return StageContext(run_id=run_id, loop=asyncio.get_running_loop())
+    return StageContext(
+        run_id=run_id,
+        loop=asyncio.get_running_loop(),
+        budget_guard=budget_guard,
+    )

@@ -73,6 +73,7 @@ class ToolGateway:
         guardian_provider: "object | None" = None,
         guardian_breaker: "object | None" = None,
         pre_tool_use_handlers: "list | None" = None,
+        max_result_chars: int = _MAX_RESULT_CHARS,
     ) -> None:
         self.db = db
         self.conversation_id = conversation_id
@@ -97,6 +98,9 @@ class ToolGateway:
         # handlers. A handler can BLOCK (deny), REWRITE args (updated_input), or
         # note additional context (attached to the result for the runtime).
         self._pre_tool_use_handlers = list(pre_tool_use_handlers or [])
+        if isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int) or max_result_chars <= 0:
+            raise ValueError("max_result_chars must be a positive integer")
+        self._max_result_chars = max_result_chars
 
     def set_attribution(self, *, agent_id: str = "", task_id: str = "") -> None:
         """Set the agent/task id for subsequent tool executions in this run."""
@@ -269,7 +273,9 @@ class ToolGateway:
             if isinstance(result, dict)
             else result
         )
-        full_text, content, truncated = _stringify_and_truncate(rendered_result)
+        full_text, content, truncated = _stringify_and_truncate(
+            rendered_result, self._max_result_chars
+        )
         return await self._finalize(
             tool_call_id, tool_name, args, started,
             ok=True, status="success",
@@ -417,7 +423,9 @@ class ToolGateway:
         )
 
 
-def _stringify_and_truncate(result: Any) -> tuple[str, str, bool]:
+def _stringify_and_truncate(
+    result: Any, max_chars: int = _MAX_RESULT_CHARS
+) -> tuple[str, str, bool]:
     """Return (full_text, truncated_text, truncated) for a tool result.
 
     ``truncated_text`` is capped at ``_MAX_RESULT_CHARS`` (for the model context +
@@ -433,4 +441,4 @@ def _stringify_and_truncate(result: Any) -> tuple[str, str, bool]:
             full = json.dumps(result, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             full = str(result)
-    return full, full[:_MAX_RESULT_CHARS], len(full) > _MAX_RESULT_CHARS
+    return full, full[:max_chars], len(full) > max_chars

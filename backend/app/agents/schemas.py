@@ -46,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids runtime DB imports
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.models import Conversation, Message, ModelConfig, User
+    from app.agents.policies.budget_policy import BudgetGuard
 
 
 # --------------------------------------------------------------------------- #
@@ -321,11 +322,14 @@ def ev_done(
     *,
     message_id: uuid.UUID | str,
     finish_reason: FinishReason = "stop",
-    usage: dict[str, int] | None = None,
+    usage: dict[str, int | float] | None = None,
+    budget: dict[str, Any] | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {"message_id": str(message_id), "finish_reason": finish_reason}
     if usage is not None:
         data["usage"] = usage
+    if budget is not None:
+        data["budget"] = budget
     return AgentEvent(kind="done", data=data)
 
 
@@ -334,10 +338,16 @@ def ev_error(
     code: str,
     message: str,
     usage: dict[str, int | float] | None = None,
+    finish_reason: FinishReason | None = None,
+    budget: dict[str, Any] | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {"code": code, "message": message}
     if usage is not None:
         data["usage"] = usage
+    if finish_reason is not None:
+        data["finish_reason"] = finish_reason
+    if budget is not None:
+        data["budget"] = budget
     return AgentEvent(kind="error", data=data)
 
 
@@ -487,6 +497,9 @@ class AgentTurnContext:
     # Phase 1: the user-facing capability mode the UI sent (auto | search |
     # deep_research | create | data_analysis). Runtimes may read this for telemetry.
     mode: str = "auto"
+    # One run-scoped guard shared by every runtime/stage/tool adapter. Runtimes
+    # construct this from Settings when tests/orchestration did not inject one.
+    budget_guard: "BudgetGuard | None" = None
     # Populated by the orchestrator; runtimes may attach extra bookkeeping here.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -518,7 +531,18 @@ class ToolExecution:
     def to_openai_tool_message(self) -> dict[str, Any]:
         """Render as an OpenAI ``tool``-role message for the next model round."""
         if self.ok:
-            content = self.result if isinstance(self.result, str) else _stringify(self.result)
+            if isinstance(self.result, str):
+                content = self.result
+            elif (
+                isinstance(self.result, dict)
+                and isinstance(self.result.get("content"), str)
+            ):
+                # ToolGateway has already serialized and bounded this exact
+                # observation. Re-serializing its envelope would add bytes after
+                # the cap and could exceed the per-run model-facing limit.
+                content = self.result["content"]
+            else:
+                content = _stringify(self.result)
         else:
             content = _stringify({"error": self.error or "tool failed"})
         return {

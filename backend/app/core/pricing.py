@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from functools import lru_cache
 from typing import Any
 
@@ -64,6 +65,20 @@ def compute_cost(model_name: str | None, usage: dict[str, Any] | None) -> float 
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
     return round((prompt / 1_000_000.0) * p_per_1m + (completion / 1_000_000.0) * c_per_1m, 6)
+
+
+def usage_cost(model_name: str | None, usage: dict[str, Any] | None) -> float | None:
+    """Return authoritative metered cost, falling back to configured pricing."""
+    if usage:
+        actual = usage.get("cost_usd")
+        if (
+            isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+            and math.isfinite(float(actual))
+            and float(actual) >= 0
+        ):
+            return float(actual)
+    return compute_cost(model_name, usage)
 
 
 def normalize_usage(usage: dict[str, Any] | None) -> dict[str, int | None] | None:

@@ -38,7 +38,7 @@ from app.agents.runtime.stage_executor import (
     admit_stage_dispatch,
 )
 from app.agents.run_controls import get as get_run_control
-from app.agents.schemas import ev_token
+from app.agents.schemas import BudgetExceeded, ev_token
 from app.agents.stage_context import StageContext
 from app.core.config import get_settings
 from app.model_capabilities import capabilities_from_config
@@ -170,14 +170,18 @@ class StreamingWriterExecutor:
         )
         continuation_round = 0
         usage_rounds: list[dict[str, Any]] = []
+        model_dispatches = 0
         full = assistant_msg.content or ""
         finish_reason = "stop"
         checkpoint: dict[str, Any] | None = None
 
         def record_failed_usage(current: dict[str, Any] | None) -> None:
-            failed_rounds = [*usage_rounds, *([current] if current is not None else [])]
-            for index, usage in enumerate(failed_rounds):
-                stage_ctx.record_usage(f"model:{agent_id}:{index}", usage)
+            if current is not None:
+                stage_ctx.record_usage(
+                    f"model:{agent_id}:{model_dispatches}",
+                    current,
+                    model_usage=True,
+                )
 
         async def persist_continuation(checkpoint: dict[str, Any]) -> None:
             persist_checkpoint = stage_ctx.persist_continuation_checkpoint
@@ -238,6 +242,7 @@ class StreamingWriterExecutor:
                 break
             round_raw = ""
             for attempt in (1, 2):
+                model_dispatches += 1
                 raw_parts: list[str] = []
                 novel_parts: list[str] = []
                 round_usage: dict[str, Any] | None = None
@@ -250,40 +255,62 @@ class StreamingWriterExecutor:
                     else None
                 )
                 try:
-                    async for delta in provider.stream_chat(messages, options):
-                        ctl = get_run_control(stage_ctx.run_id)
+                    guard = stage_ctx.budget_guard
+                    if guard is not None:
+                        guard.enter_step()
+                        guard.check()
+                    timeout = (
+                        guard.remaining_seconds if guard is not None else None
+                    )
+                    async with asyncio.timeout(timeout):
+                        async for delta in provider.stream_chat(messages, options):
+                            ctl = get_run_control(stage_ctx.run_id)
                         # Cooperative cancel between chunks: the Stop button / cancel
                         # API sets ctl.cancel (the real signal). cancel_event is a
                         # defensive secondary check. Honor either -> cancelled.
-                        cancel_evt = getattr(stage_ctx, "cancel_event", None)
-                        if (ctl is not None and ctl.cancel.is_set()) or (
-                            cancel_evt is not None and cancel_evt.is_set()
-                        ):
-                            finish_reason = "cancelled"
-                            break
-                        # Phase 2: honor a user-initiated pause mid-stream.
-                        if ctl is not None:
-                            while ctl.is_paused() and not ctl.cancel.is_set():
-                                await asyncio.sleep(0.1)
-                            if ctl.cancel.is_set():
+                            cancel_evt = getattr(stage_ctx, "cancel_event", None)
+                            if (ctl is not None and ctl.cancel.is_set()) or (
+                                cancel_evt is not None and cancel_evt.is_set()
+                            ):
                                 finish_reason = "cancelled"
                                 break
-                        if delta.content:
-                            raw_parts.append(delta.content)
-                            novel = (
-                                continuation_buffer.feed(delta.content)
-                                if continuation_buffer is not None
-                                else delta.content
-                            )
-                            if novel:
-                                novel_parts.append(novel)
-                                full += novel
-                                assistant_msg.content = full
-                                stage_ctx.emit(ev_token(delta=novel))
-                        if delta.finish_reason:
-                            finish_reason = delta.finish_reason
-                        if delta.usage:
-                            round_usage = delta.usage
+                        # Phase 2: honor a user-initiated pause mid-stream.
+                            if ctl is not None:
+                                while ctl.is_paused() and not ctl.cancel.is_set():
+                                    await asyncio.sleep(0.1)
+                                if ctl.cancel.is_set():
+                                    finish_reason = "cancelled"
+                                    break
+                            if delta.content:
+                                raw_parts.append(delta.content)
+                                novel = (
+                                    continuation_buffer.feed(delta.content)
+                                    if continuation_buffer is not None
+                                    else delta.content
+                                )
+                                if novel:
+                                    novel_parts.append(novel)
+                                    full += novel
+                                    assistant_msg.content = full
+                                    stage_ctx.emit(ev_token(delta=novel))
+                            if delta.finish_reason:
+                                finish_reason = delta.finish_reason
+                            if delta.usage:
+                                round_usage = delta.usage
+                    if guard is not None:
+                        guard.check()
+                except TimeoutError as exc:
+                    if continuation_buffer is not None:
+                        buffered = continuation_buffer.flush()
+                        if buffered:
+                            full += buffered
+                            assistant_msg.content = full
+                            stage_ctx.emit(ev_token(delta=buffered))
+                    stage_ctx.writer_streamed = True
+                    record_failed_usage(round_usage)
+                    raise BudgetExceeded(
+                        f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                    ) from exc
                 except asyncio.CancelledError:
                     if continuation_buffer is not None:
                         buffered = continuation_buffer.flush()
@@ -336,6 +363,13 @@ class StreamingWriterExecutor:
                         stage_ctx.emit(ev_token(delta=buffered))
                 if round_usage is not None:
                     usage_rounds.append(round_usage)
+                    stage_ctx.record_usage(
+                        f"model:{agent_id}:{model_dispatches}",
+                        round_usage,
+                        model_usage=True,
+                    )
+                    if stage_ctx.budget_guard is not None:
+                        stage_ctx.budget_guard.check()
                 round_raw = "".join(raw_parts)
                 if round_raw or finish_reason == "cancelled":
                     break
@@ -429,6 +463,7 @@ class StreamingWriterExecutor:
             output_summary=(full.strip().replace("\n", " ")[:160] or "（空回答）"),
             structured=structured,
             usage=usage,
+            usage_charged=True,
         )
 
 

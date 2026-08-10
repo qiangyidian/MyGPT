@@ -765,7 +765,7 @@ async def test_native_tool_events_attributed_to_assistant(db_session, monkeypatc
     }
 
 
-async def test_native_rejects_oversized_tool_result_before_second_model_round(
+async def test_native_bounds_oversized_tool_result_before_second_model_round(
     db_session, monkeypatch
 ):
     huge_content = "tool-result-item " * 10_000
@@ -813,21 +813,12 @@ async def test_native_rejects_oversized_tool_result_before_second_model_round(
 
     events = await _collect(ctx)
 
-    assert len(provider.calls) == 1
-    errors = _find_all(events, "error")
-    assert errors[-1]["code"] == "prompt_too_large"
-    assert "prompt budget" in errors[-1]["message"].lower()
-    assert ctx.assistant_msg.content == "partial before tool "
-    assert not _find_all(events, "done")
-    assert _find_all(events, "agent_status")[-1]["status"] == "failed"
-    assert _find_all(events, "run_status")[-1]["status"] == "failed"
-    error_index = max(i for i, (kind, _data) in enumerate(events) if kind == "error")
-    failed_index = max(
-        i
-        for i, (kind, data) in enumerate(events)
-        if kind == "run_status" and data["status"] == "failed"
-    )
-    assert error_index < failed_index
+    assert len(provider.calls) == 2
+    tool_message = provider.calls[1][-1]
+    assert tool_message["role"] == "tool"
+    assert len(tool_message["content"]) <= 8_000
+    assert ctx.assistant_msg.content == "partial before tool must not run"
+    assert _find_all(events, "done")[-1]["finish_reason"] == "stop"
 
 
 async def test_native_surfaces_provider_boundary_admission_error(

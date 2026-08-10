@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from app.agents.continuation import aggregate_usage
+from app.agents.schemas import BudgetExceeded
 from app.agents.stage_context import StageContext
 from app.agents.token_budget import (
     MESSAGE_TOO_LARGE,
@@ -67,6 +68,9 @@ class StageResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Aggregate for every model attempt performed by this stage.
     usage: dict[str, int | float] | None = None
+    # True when the executor charged each underlying model attempt directly.
+    # The runtime still reports ``usage`` but must not charge its aggregate again.
+    usage_charged: bool = False
 
 
 @runtime_checkable
@@ -107,6 +111,8 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
+        if stage_ctx.budget_guard is not None:
+            stage_ctx.budget_guard.enter_step()
         admitted_context = admit_stage_dispatch(
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )
@@ -118,7 +124,21 @@ class CrewAIStageExecutor:
         completed = False
         llm_usage: dict[str, int | float] | None = None
         try:
-            output = await agent.aexecute_task(task, context=admitted_context)
+            guard = stage_ctx.budget_guard
+            if guard is not None:
+                guard.check()
+                try:
+                    async with asyncio.timeout(guard.remaining_seconds):
+                        output = await agent.aexecute_task(
+                            task, context=admitted_context
+                        )
+                except TimeoutError as exc:
+                    raise BudgetExceeded(
+                        f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                    ) from exc
+                guard.check()
+            else:
+                output = await agent.aexecute_task(task, context=admitted_context)
             completed = True
         finally:
             if metered:
@@ -127,7 +147,9 @@ class CrewAIStageExecutor:
                 )
             if not completed and llm_usage:
                 stage_ctx.record_usage(
-                    f"model:{agent_id}:{uuid.uuid4().hex}", llm_usage
+                    f"model:{agent_id}:{uuid.uuid4().hex}",
+                    llm_usage,
+                    model_usage=True,
                 )
         raw = _extract_raw(output)
         # CrewAI's installed Agent.aexecute_task returns a raw string. Its LLM
@@ -240,6 +262,8 @@ class FakeStageExecutor:
         from app.agents.schemas import ev_tool_call, ev_tool_result
 
         b = self.behaviors.get(agent_id, self.Behavior())
+        if stage_ctx.budget_guard is not None:
+            stage_ctx.budget_guard.enter_step()
         stage_ctx.set_stage(agent_id=agent_id, task_id="fake-task")
         self.started.append(agent_id)
         # Emit tool events in real time (routed through the stage ctx queue).

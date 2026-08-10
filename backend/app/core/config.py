@@ -118,9 +118,13 @@ class Settings(BaseSettings):
     # without code changes.
     NETWORK_POLICY_FILE: str = ""
     # Agent hard-stop budgets (see app.agents.policies.budget_policy).
-    AGENT_MAX_STEPS: int = 8
-    AGENT_MAX_TOOL_CALLS: int = 12
-    AGENT_MAX_RUNTIME_SECONDS: int = 120
+    AGENT_MAX_STEPS: int = Field(default=8, gt=0)
+    AGENT_MAX_TOOL_CALLS: int = Field(default=12, gt=0)
+    AGENT_MAX_REPLAN_COUNT: int = Field(default=2, ge=0)
+    AGENT_MAX_RUNTIME_SECONDS: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+    AGENT_MAX_TOOL_OUTPUT_CHARS: int = Field(default=8_000, gt=0)
+    AGENT_MAX_TOTAL_TOKENS: int = Field(default=40_000, gt=0)
+    AGENT_MAX_COST_USD: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     # Intent classifier (runs on the chat hot path before the first token).
     # Master switch: when False, intent recognition is skipped entirely and the
     # keyword router handles routing (zero model calls, zero added latency).
