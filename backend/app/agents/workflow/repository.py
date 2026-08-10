@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.run_command import RunCommand
@@ -52,45 +52,70 @@ class CommandStore:
         run_id: uuid.UUID | str,
         owner: str = _DEFAULT_CLAIM_OWNER,
     ) -> list[RunCommand]:
-        """Atomically claim all pending commands for a run (FIFO by created_at).
+        """Atomically claim all pending commands for a run (exactly-once).
 
-        Returns the claimed rows (now status=claimed) so the caller can apply
-        them. A subsequent call returns ``[]`` — each command is claimed once.
+        Implemented as a status-guarded ``UPDATE ... RETURNING``: it flips only
+        rows still in ``pending`` to ``claimed`` and returns the exact set of
+        ids this worker claimed. Under READ COMMITTED this is race-free by
+        construction — a second concurrent worker finds the rows already
+        ``claimed`` and its UPDATE matches zero rows, so each command is claimed
+        exactly once.
+
+        Because the bulk UPDATE bypasses ORM tracking, each claimed object is
+        explicitly refreshed from the DB so callers see its new ``claimed``
+        state (e.g. :meth:`mark_applied`'s status guard). Few commands per run
+        makes the per-row refresh cheap.
         """
         run_id = _as_uuid(run_id)
-        result = await self._session.execute(
-            select(RunCommand)
-            .where(RunCommand.run_id == run_id, RunCommand.status == "pending")
-            .order_by(RunCommand.created_at, RunCommand.id)
-        )
-        pending = list(result.scalars().all())
-        if not pending:
-            return []
         now = datetime.now(timezone.utc)
-        for command in pending:
-            command.status = "claimed"
-            command.claimed_at = now
-            command.claimed_by = owner
-        await self._session.flush()
-        return pending
+        claim_stmt = (
+            update(RunCommand)
+            .where(RunCommand.run_id == run_id, RunCommand.status == "pending")
+            .values(status="claimed", claimed_at=now, claimed_by=owner)
+            .returning(RunCommand.id)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(claim_stmt)
+        claimed_ids = list(result.scalars().all())
+        if not claimed_ids:
+            return []
+        claimed = []
+        for cid in claimed_ids:
+            command = await self._session.get(RunCommand, cid)
+            await self._session.refresh(command)
+            claimed.append(command)
+        claimed.sort(key=lambda c: (c.created_at, c.id))
+        return claimed
 
-    async def mark_applied(self, command_id: uuid.UUID | str) -> None:
+    async def mark_applied(self, command_id: uuid.UUID | str) -> bool:
+        """Flip a claimed command to ``applied``. Returns whether it transitioned.
+
+        Only a ``claimed`` command can be applied, so an already-applied/failed
+        command is left untouched.
+        """
         command = await self._session.get(RunCommand, _as_uuid(command_id))
-        if command is None:
-            return
+        if command is None or command.status != "claimed":
+            return False
         command.status = "applied"
         command.applied_at = datetime.now(timezone.utc)
         await self._session.flush()
+        return True
 
     async def mark_failed(
         self, command_id: uuid.UUID | str, error: str
-    ) -> None:
+    ) -> bool:
+        """Flip a claimed command to ``failed``. Returns whether it transitioned.
+
+        Only a ``claimed`` command can fail; in particular this will NOT
+        overwrite an ``applied`` command.
+        """
         command = await self._session.get(RunCommand, _as_uuid(command_id))
-        if command is None:
-            return
+        if command is None or command.status != "claimed":
+            return False
         command.status = "failed"
         command.error = error
         await self._session.flush()
+        return True
 
 
 class LeaseStore:
@@ -175,8 +200,6 @@ class LeaseStore:
         self, lease: RunLease, now: datetime | None = None
     ) -> bool:
         """Pure logic: True when ``now`` is at/after the lease's expiry."""
-        if lease.expires_at is None:
-            return False
         if now is None:
             now = datetime.now(timezone.utc)
         return now >= lease.expires_at

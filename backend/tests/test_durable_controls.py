@@ -75,13 +75,13 @@ async def test_mark_applied_and_failed(db_session):
     commands = CommandStore(db_session)
     cmd = await commands.append(run.id, "resume", {})
     await commands.claim_pending(run.id)
-    await commands.mark_applied(cmd.id)
+    assert await commands.mark_applied(cmd.id) is True
     assert cmd.status == "applied"
     assert cmd.applied_at is not None
 
     cmd2 = await commands.append(run.id, "pause", {})
     await commands.claim_pending(run.id)
-    await commands.mark_failed(cmd2.id, "boom")
+    assert await commands.mark_failed(cmd2.id, "boom") is True
     assert cmd2.status == "failed"
     assert cmd2.error == "boom"
 
@@ -106,6 +106,35 @@ async def test_claim_does_not_reclaim_applied(db_session):
     await commands.mark_applied(cmd.id)
     # Already-applied commands are never re-claimed.
     assert await commands.claim_pending(run.id) == []
+
+
+async def test_mark_transitions_only_apply_to_claimed_commands(db_session):
+    """mark_applied/mark_failed guard on status=='claimed' and report the flip.
+
+    A pending command cannot skip the claim step, and mark_failed must never
+    overwrite an applied command.
+    """
+    run = await _make_run(db_session)
+    commands = CommandStore(db_session)
+    cmd = await commands.append(run.id, "pause", {})
+    # Pending -> applied is rejected (must be claimed first).
+    assert await commands.mark_applied(cmd.id) is False
+    assert cmd.status == "pending"
+    assert await commands.mark_failed(cmd.id, "early") is False
+    assert cmd.status == "pending"
+
+    # Claim, then applied succeeds.
+    await commands.claim_pending(run.id)
+    assert await commands.mark_applied(cmd.id) is True
+    assert cmd.status == "applied"
+    # mark_failed must NOT overwrite an applied command.
+    assert await commands.mark_failed(cmd.id, "late") is False
+    assert cmd.status == "applied"
+    assert cmd.error is None
+
+    # Unknown command id -> False, no error.
+    assert await commands.mark_applied(uuid.uuid4()) is False
+    assert await commands.mark_failed(uuid.uuid4(), "x") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -236,3 +265,87 @@ async def test_lease_is_expired(db_session):
     # A moment later than expiry -> expired.
     future = datetime.now(timezone.utc) + timedelta(hours=1)
     assert leases.is_expired(lease, now=future) is True
+
+
+# --------------------------------------------------------------------------- #
+# API endpoint: persist-first ordering (regression guard)
+# --------------------------------------------------------------------------- #
+async def test_cancel_endpoint_persists_command_before_signal(client, db_session):
+    """A control endpoint must PERSIST a RunCommand before flipping the run.
+
+    Locks the persist-first ordering in as a regression guard: the durable
+    command row exists even when there is no live run to signal.
+    """
+    from sqlalchemy import select as _sel
+
+    from tests.conftest import auth_headers
+
+    conv = Conversation(user_id=_SEEDED_USER, title="durable cancel")
+    db_session.add(conv)
+    await db_session.flush()
+    run = AgentRun(
+        conversation_id=conv.id,
+        user_id=_SEEDED_USER,
+        runtime="native",
+        flow_name="test",
+        status="running",
+    )
+    db_session.add(run)
+    await db_session.commit()
+    await db_session.refresh(run)
+
+    h = auth_headers()
+    r = await client.post(f"/api/agent-runs/{run.id}/cancel", headers=h)
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    # The durable cancel command was committed (persist-first).
+    cmds = (
+        await db_session.execute(
+            _sel(RunCommand).where(RunCommand.run_id == run.id)
+        )
+    ).scalars().all()
+    assert len(cmds) == 1
+    assert cmds[0].command_type == "cancel"
+    assert cmds[0].status == "pending"
+    # And the run status flipped to cancelled.
+    status = (
+        await db_session.execute(
+            _sel(AgentRun.status).where(AgentRun.id == run.id)
+        )
+    ).scalar_one()
+    assert status == "cancelled"
+
+
+async def test_pause_endpoint_persists_command(client, db_session):
+    """The pause endpoint also writes a durable command (persist-first)."""
+    from sqlalchemy import select as _sel
+
+    from tests.conftest import auth_headers
+
+    conv = Conversation(user_id=_SEEDED_USER, title="durable pause")
+    db_session.add(conv)
+    await db_session.flush()
+    run = AgentRun(
+        conversation_id=conv.id,
+        user_id=_SEEDED_USER,
+        runtime="native",
+        flow_name="test",
+        status="running",
+    )
+    db_session.add(run)
+    await db_session.commit()
+    await db_session.refresh(run)
+
+    h = auth_headers()
+    r = await client.post(f"/api/agent-runs/{run.id}/pause", headers=h)
+    assert r.status_code == 200
+
+    cmds = (
+        await db_session.execute(
+            _sel(RunCommand).where(RunCommand.run_id == run.id)
+        )
+    ).scalars().all()
+    assert len(cmds) == 1
+    assert cmds[0].command_type == "pause"
+    assert cmds[0].status == "pending"

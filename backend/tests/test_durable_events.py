@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import uuid
 
-from app.agents.events import EventStore
-from app.models import AgentRun, Conversation, Message
+from sqlalchemy.exc import IntegrityError
+
+from app.agents.events import EventStore, append_event_safe
+from app.models import AgentRun, Conversation, Message, RunEvent
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -108,3 +110,69 @@ async def test_event_persists_across_sessions(db_session):
     assert len(events) == 1
     assert events[0].event_type == "run.started"
     assert events[0].data == {"x": 1}
+
+
+async def test_event_append_retries_on_sequence_conflict(db_session, monkeypatch):
+    """A unique (run_id, sequence) collision must be retried, not dropped.
+
+    Simulates a concurrent appender winning the sequence: the first flush raises
+    IntegrityError (the constraint violation), and the bounded retry re-reads
+    max(sequence) and inserts with the correct next value.
+    """
+    run = await _make_run(db_session)
+    store = EventStore(db_session)
+    await store.append(run.id, "run.started", {})  # sequence 1
+    await db_session.commit()
+
+    real_flush = db_session.flush
+    calls = {"n": 0}
+
+    async def flaky_flush(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntegrityError("simulated unique violation", {}, None)
+        return await real_flush(*args, **kwargs)
+
+    monkeypatch.setattr(db_session, "flush", flaky_flush)
+    event = await store.append(run.id, "step.started", {"retry": True})
+
+    # The append retried after the IntegrityError and stored the event.
+    assert calls["n"] >= 2
+    assert event.sequence == 2
+    await db_session.commit()
+    events = await EventStore(db_session).replay(run.id)
+    assert [e.sequence for e in events] == [1, 2]
+    assert events[1].data == {"retry": True}
+
+
+async def test_append_event_safe_keeps_session_usable(db_session, monkeypatch):
+    """A failed best-effort append must never poison the outer session.
+
+    Forces EventStore.append to raise inside append_event_safe and asserts the
+    session is still usable for the run's own subsequent status commit — the
+    guarantee the orchestrator relies on.
+    """
+    run = await _make_run(db_session)
+    await db_session.commit()
+
+    async def boom(self, *args, **kwargs):
+        raise RuntimeError("simulated event-store failure")
+
+    monkeypatch.setattr(EventStore, "append", boom)
+    result = await append_event_safe(db_session, run.id, "run.started", {})
+    assert result is None
+
+    # The outer transaction is clean: a normal mutation + commit still works.
+    run.status = "completed"
+    await db_session.commit()
+    assert run.status == "completed"
+
+    # And no event row was left behind.
+    from sqlalchemy import select as _sel
+
+    rows = (
+        await db_session.execute(
+            _sel(RunEvent).where(RunEvent.run_id == run.id)
+        )
+    ).scalars().all()
+    assert rows == []
