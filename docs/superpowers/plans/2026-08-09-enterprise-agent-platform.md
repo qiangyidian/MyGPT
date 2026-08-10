@@ -1,4 +1,4 @@
-# Enterprise Agent Platform Implementation Plan
+# Enterprise Agent Platform Master Task Checklist
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -7,6 +7,105 @@
 **Architecture:** FastAPI remains the API plane while PostgreSQL becomes the authoritative workflow/event store and Redis Streams becomes the execution and signal fabric. A separate worker executes a typed planner–executor–verifier state machine; all built-in, workspace, sandbox, browser, MCP, connector, and multimodal tools pass through one audited gateway. Next.js consumes replayable run events and first-class artifact/memory APIs.
 
 **Tech Stack:** Python 3.13, FastAPI, SQLAlchemy async, Alembic, PostgreSQL 16, Redis 7 Streams, Qdrant, httpx, Docker/Kubernetes-compatible runners, Next.js 14, React 18, TypeScript, Vitest, pytest.
+
+---
+
+## Progress tracking rules
+
+- Last updated: 2026-08-10 (Asia/Shanghai).
+- `- [x]` means the implementation, focused verification, specification review, and quality review required by that item are complete, unless the item explicitly names a narrower completed sub-step.
+- `- [ ]` means the item is not complete. Work may be in progress, but it is not accepted until its tests and review gates pass.
+- The active implementation order is strictly Task 1 through Task 14. A later task is not marked complete merely because part of its infrastructure already exists.
+- Every accepted task must end with focused tests, affected regression suites, full verification, compile/type/build checks, `git diff --check`, a clean commit, an independent specification review, and an independent code-quality review.
+- This file is the authoritative progress document. When an item is accepted, its checkbox is updated before work advances.
+
+## Current status dashboard
+
+| Task | Priority | State | Acceptance evidence |
+|---|---|---|---|
+| 1. Model capabilities and token admission | P0 | Complete | Commits `d85423c` through `6d9ac57`; final spec PASS and quality APPROVED |
+| 2. Automatic continuation and usage accounting | P0 | Complete | Commits `0deeb3e` through `8375635`; backend 668/668; final spec PASS and quality APPROVED |
+| 3. Agent budgets and provider controls | P0 | In progress | Core/runtime focused suites are green; final commit and two-stage review still pending |
+| 4. Durable workflow schema/events/leases/controls | P0 | Not started | Awaiting Task 3 acceptance |
+| 5. Redis Streams worker/recovery/SSE replay | P0 | Not started | Awaiting Task 4 |
+| 6. Planner-executor-verifier | P1 | Not started | Awaiting durable workflow foundation |
+| 7. Compaction/output spill/long-term memory | P1 | Not started | Awaiting workflow state machine |
+| 8. Workspace tools and isolated runner | P1 | Not started | Awaiting workflow and policy contracts |
+| 9. MCP transports and connectors | P1 | Not started | Awaiting unified tool gateway hardening |
+| 10. Artifacts and multimodal | P1 | Not started | Awaiting storage/provider contracts |
+| 11. Observability/quotas/readiness/evals | P2 | Not started | Uses durable events and real usage/budgets |
+| 12. Enterprise frontend surfaces | P2 | Not started | Uses durable APIs from Tasks 4-11 |
+| 13. Production deployment/migrations/backups | P0/P2 | Not started | Finalizes runtime topology and operations |
+| 14. Full acceptance verification | P0 | Not started | Final release gate |
+
+## Complete discovered scope
+
+### P0: correctness, durability, safety, and cost control
+
+- [x] Replace implicit model limits with validated model capability records, provider parameter mapping, and prompt admission.
+- [x] Reserve output/tool-schema/safety tokens and reject an oversized newest user turn instead of silently truncating it.
+- [x] Add bounded automatic continuation with overlap removal, resumable checkpoints, partial-safe cancellation, and usage-only provider-tail support.
+- [x] Aggregate Native, CrewAI, writer, retry, continuation, and metered-tool usage exactly once, including concurrent agents sharing one cumulative LLM counter.
+- [x] Isolate checkpoint, graph, plan, and terminal persistence into short-lived ID-based sessions so rollback cannot expire request-owned ORM objects.
+- [ ] Enforce real per-run step, tool, replan, wall-clock, token, output-size, and monetary budgets across every external await and dispatch.
+- [ ] Persist authoritative workflow events, attempts, commands, approvals, leases, checkpoints, and terminal states in PostgreSQL.
+- [ ] Move background execution to Redis Streams workers with idempotent enqueue, consumer groups, lease fencing, graceful shutdown, and stale-run recovery.
+- [ ] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
+- [ ] Eliminate stale legacy `running` rows and make recovery decisions explicit and auditable.
+- [ ] Enforce tenant/user authorization, secret redaction, path confinement, command policy, approval policy, and immutable audit records.
+- [ ] Require migration head, dependency readiness, production-safe configuration, backup/restore drills, and release acceptance gates.
+
+### P1: advanced agent capability
+
+- [ ] Implement typed planner-executor-verifier workflows with dependency-aware parallelism, retries, bounded replanning, and structured verification.
+- [ ] Express research, parallel research, debate, and tool-heavy runs as templates over the same durable state machine.
+- [ ] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
+- [ ] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
+- [ ] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
+- [ ] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
+- [ ] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
+
+### P2: enterprise operability and user experience
+
+- [ ] Add OpenTelemetry-compatible traces, Prometheus metrics, structured logs, correlation IDs, and sensitive-data redaction.
+- [ ] Add concurrent-run, token, cost, storage, connector, and tool quotas with admin-visible enforcement reasons.
+- [ ] Add deterministic evaluation suites, quality/security thresholds, dependency readiness, and CI release gates.
+- [ ] Add frontend background runs, reconnect/replay, plan review, pause/resume/cancel/instruction/approval controls, memory/connector management, artifacts, and multimodal composer.
+- [ ] Align dependency versions, add production Compose/Kubernetes topology, zero-downtime migration rules, PITR/object/Qdrant backups, and restore validation.
+
+## Initial audit findings that this checklist must close
+
+The following is the observed baseline from the initial repository/runtime audit. Counts are a point-in-time diagnostic snapshot; the checkbox tracks whether the underlying class of defect has been closed.
+
+- [x] Strong model rows used small implicit defaults (`context_window=32768`, `max_output_tokens=2048`) without a complete capability contract. Closed by Task 1.
+- [x] Chat input lacked final-payload admission and output reservation across every dispatch path. Closed by Task 1.
+- [x] StreamingWriter could bypass output limits and auxiliary/CrewAI calls could bypass final prompt admission. Closed by Task 1.
+- [x] Automatic continuation, overlap-safe merge, usage-only tail parsing, and complete multi-round accounting were absent. Closed by Task 2.
+- [x] Only a small fraction of historical assistant messages had token accounting populated; new execution paths now persist complete aggregate usage/cost. Historical backfill/reporting remains part of Task 11.
+- [x] Existing continuation/checkpoint code was not safe under shared CrewAI LLM counters, cancellation races, concurrent AsyncSession use, rollback expiry, or checkpoint commit failures. Closed by Task 2.
+- [ ] Budget settings existed but were not authoritative across Native/CrewAI/Writer/tool dispatches; Task 3 is closing this.
+- [ ] At audit time 11 of 66 AgentRun rows were stale `running`; Tasks 4 and 5 must reconcile them and prevent recurrence through leases/recovery.
+- [ ] At audit time only PostgreSQL and Qdrant services were up; backend, frontend, Redis, worker, and recovery topology must become health-checked production services in Tasks 5 and 13.
+- [ ] `BACKGROUND_WORKER=inprocess` and development configuration were active; production must use isolated worker/recovery processes with no reload in Task 13.
+- [ ] Database revision state lagged code migration head; Task 13 must enforce migration head at startup/deploy and test upgrades from both empty and current databases.
+- [ ] Qdrant client/server compatibility warning was present; Task 13 must pin and verify a compatible pair.
+- [ ] The web-search safe-default test is sensitive to repository `.env` loading; Tasks 11/13/14 must isolate tests from deployment secrets and verify secure defaults deterministically.
+- [ ] Current in-memory pause/resume/cancel/instruction controls are not durable; Task 4 replaces them with persisted commands.
+- [ ] Current SSE connection owns too much execution lifetime; Task 5 separates subscription lifetime from workflow lifetime and adds replay.
+- [ ] Current multi-agent profiles are not a general typed planner-executor-verifier engine; Task 6 provides the durable generic engine.
+- [ ] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; Task 7 unifies them.
+- [ ] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; Tasks 8 and 9 close it.
+- [ ] Generated files and multimodal content are not first-class authorized artifacts; Task 10 closes it.
+- [ ] Metrics, quotas, readiness, evaluation gates, frontend durable controls, and production operations remain incomplete; Tasks 11-14 close them.
+
+## Definition of enterprise completion
+
+- [ ] Every mutating command is durable, idempotent, tenant-authorized, auditable, and safe under retry.
+- [ ] Every model/tool/connector operation is bounded by time, token, cost, output, and policy controls.
+- [ ] Every background run survives API disconnect, worker restart, Redis notification loss, and lease expiry without duplicate side effects.
+- [ ] Every final answer exposes accurate status, finish reason, aggregate usage/cost, artifacts, citations, and recoverable checkpoints.
+- [ ] Every production dependency has readiness checks, metrics, alerts, backup/restore procedures, and pinned compatible versions.
+- [ ] Backend, frontend, migrations, security suites, offline durability scenarios, and production builds all pass from a clean checkout.
 
 ---
 
@@ -43,7 +142,7 @@
 - Modify: `frontend/src/lib/types.ts`
 - Modify: `frontend/src/app/settings/models/page.tsx`
 
-- [ ] **Step 1: Write failing capability and budget tests**
+- [x] **Step 1: Write failing capability and budget tests**
 
 ```python
 def test_prompt_budget_reserves_output_tools_and_margin():
@@ -57,12 +156,12 @@ def test_oversized_latest_turn_is_rejected_not_silently_trimmed():
     assert exc.value.code == "message_too_large"
 ```
 
-- [ ] **Step 2: Run tests and verify missing contracts fail**
+- [x] **Step 2: Run tests and verify missing contracts fail**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_model_capabilities.py tests/test_token_budget.py -q`
 Expected: collection failures for missing modules.
 
-- [ ] **Step 3: Implement validated capabilities and prompt admission**
+- [x] **Step 3: Implement validated capabilities and prompt admission**
 
 ```python
 @dataclass(frozen=True)
@@ -84,18 +183,28 @@ def calculate_prompt_budget(caps, requested_output, tool_schema_tokens=0, safety
     return TokenBudget(caps.context_window - reserve - tool_schema_tokens - margin, reserve, margin)
 ```
 
-- [ ] **Step 4: Persist capability fields and map provider parameters**
+- [x] **Step 4: Persist capability fields and map provider parameters**
 
 Add additive model columns and translate `max_output_tokens` to the configured provider parameter (`max_tokens` by default, `max_completion_tokens` when selected). Validate positive ranges in Pydantic schemas.
 
-- [ ] **Step 5: Integrate admission before history trimming**
+- [x] **Step 5: Integrate admission before history trimming**
 
 Calculate tool-schema tokens, reserve output, reject an oversized newest turn with code `message_too_large`, and trim history only to the remaining input budget.
 
-- [ ] **Step 6: Verify tests and existing chat tests**
+- [x] **Step 6: Verify tests and existing chat tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_model_capabilities.py tests/test_token_budget.py tests/test_chat_stream.py tests/test_context_compaction.py -q`
 Expected: all selected tests pass.
+
+**Accepted completion details:**
+
+- [x] Validate null, boolean, NaN, infinity, ranges, and `supports_parallel_tools => supports_tools` invariants in backend and frontend schemas.
+- [x] Backfill additive capability columns through Alembic migration `0006_model_capabilities` with safe server defaults and not-null constraints.
+- [x] Map `max_tokens` versus `max_completion_tokens` from authoritative provider configuration.
+- [x] Admit the final provider payload, including messages, tools, tool choice, stop sequences, and permitted extra fields; reject protected-field overrides.
+- [x] Gate Native, CrewAI, StreamingWriter, intent, guardian, summarizer, and direct-provider dispatches.
+- [x] Preserve stable prompt-admission error codes through the SSE boundary and redact upstream/API-key validation bodies.
+- [x] Complete independent specification review and independent quality review with no Critical/Important findings.
 
 ### Task 2: Automatic continuation and complete usage accounting
 
@@ -108,7 +217,7 @@ Expected: all selected tests pass.
 - Modify: `backend/app/providers/openai_compatible.py`
 - Modify: `frontend/src/hooks/useChatStream.ts`
 
-- [ ] **Step 1: Write failing overlap and continuation-policy tests**
+- [x] **Step 1: Write failing overlap and continuation-policy tests**
 
 ```python
 def test_merge_continuation_removes_repeated_overlap():
@@ -120,20 +229,47 @@ def test_auto_continue_is_bounded():
     assert not policy.should_continue("length", round_number=2)
 ```
 
-- [ ] **Step 2: Verify RED, then implement bounded continuation**
+- [x] **Step 2: Verify RED, then implement bounded continuation**
 
 The runtime persists each continuation round, asks the model to continue without repetition, merges overlap, stops on non-length finish, and records a resumable checkpoint if the configured round limit is reached.
 
-- [ ] **Step 3: Accumulate usage across every model round**
+- [x] **Step 3: Accumulate usage across every model round**
 
 Replace last-chunk-only usage assignment with additive prompt/completion/cached/reasoning token accounting and compute cost from the aggregate.
 
-- [ ] **Step 4: Run continuation, streaming, and accounting tests**
+- [x] **Step 4: Run continuation, streaming, and accounting tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_continuation.py tests/test_streaming_writer.py tests/test_chat_stream.py tests/test_analytics.py -q`
 Expected: all selected tests pass.
 
+**Accepted completion details:**
+
+- [x] Remove bounded exact/whitespace-normalized overlap efficiently for Latin text, CJK text, full-window overlap, and no-overlap cases.
+- [x] Stream only novel continuation text and preserve partial content on provider errors, generic errors, timeout, cancellation, and checkpoint failure.
+- [x] Persist `continuing`, `completed`, `maxed`, and `cancelled` checkpoints before the next dispatch/terminal event.
+- [x] Persist Message and AgentRun checkpoint state through short-lived independent sessions and ID-based updates.
+- [x] Aggregate Native, CrewAI researcher/analyst/writer, retry, continuation, failed-attempt, and metered-tool usage exactly once.
+- [x] Coordinate shared cumulative CrewAI LLM counters under parallel execution without serializing unrelated model calls.
+- [x] Preserve provider usage-only EOF chunks and terminal-choice usage.
+- [x] Keep runtime usage/cost persistence exact-once across done, error, and cancellation paths.
+- [x] Serialize short persistence transactions, preserve terminal checkpoint merges, and prevent rollback-expired ORM/MissingGreenlet failures.
+- [x] Verify full backend at 668/668 and complete independent specification and quality approval.
+
 ### Task 3: Wire real Agent budgets and provider controls
+
+**Status: in progress. The completed sub-steps below are implementation progress, not final Task 3 acceptance.**
+
+- [x] Add RED tests for settings, validation, boundary semantics, cumulative/delta usage, cost, snapshots, replans, timeouts, tool output, Native, CrewAI, and Writer retries.
+- [x] Implement immutable validated `BudgetLimits.from_settings` and complete `BudgetGuard` snapshots/watermarks.
+- [x] Share one run guard across Native, CrewAI stages, StreamingWriter, ToolGateway, and CrewAI tool adapters.
+- [x] Bound model limiter acquisition, provider streams, tool execution, stage execution, retries, and continuation dispatches by remaining wall-clock time.
+- [x] Enforce per-run tool-output character limits before tool output re-enters a prompt.
+- [x] Unify runtime and terminal cost calculation, preferring provider-reported `cost_usd` and otherwise using configured pricing.
+- [x] Map budget exhaustion to stable `agent_budget_exceeded`/`finish_reason=budget` payloads with a full budget snapshot.
+- [ ] Produce the final Task 3 commit with a clean worktree.
+- [ ] Pass independent Task 3 specification review.
+- [ ] Pass independent Task 3 code-quality review.
+- [ ] Update the dashboard and mark Task 3 accepted.
 
 **Files:**
 - Create: `backend/tests/test_budget_integration.py`
@@ -143,7 +279,7 @@ Expected: all selected tests pass.
 - Modify: `backend/app/agents/runtime/stage_executor.py`
 - Modify: `backend/app/core/config.py`
 
-- [ ] **Step 1: Write failing settings, token, cost, timeout, and replan budget tests**
+- [x] **Step 1: Write failing settings, token, cost, timeout, and replan budget tests**
 
 ```python
 def test_budget_limits_are_built_from_settings(monkeypatch):
@@ -157,11 +293,11 @@ def test_usage_consumes_token_and_cost_budget():
         guard.check()
 ```
 
-- [ ] **Step 2: Verify RED and implement `from_settings` plus real usage**
+- [x] **Step 2: Verify RED and implement `from_settings` plus real usage**
 
 Add `max_cost_usd`, serialize complete snapshots, and invoke gates before and after every model/tool/step/replan operation.
 
-- [ ] **Step 3: Wrap every CrewAI stage in the remaining wall-clock timeout**
+- [x] **Step 3: Wrap every CrewAI stage in the remaining wall-clock timeout**
 
 Use `asyncio.timeout(guard.remaining_seconds)` and record stage usage through the shared guard.
 
@@ -173,7 +309,7 @@ Expected: all selected tests pass.
 ### Task 4: Durable workflow schema, event store, leases, and controls
 
 **Files:**
-- Create: `backend/migrations/versions/0006_enterprise_workflow.py`
+- Create: `backend/migrations/versions/0007_enterprise_workflow.py` (`0006_model_capabilities` already exists)
 - Create: `backend/app/models/run_event.py`
 - Create: `backend/app/models/run_lease.py`
 - Create: `backend/app/models/run_command.py`
@@ -646,4 +782,3 @@ Exercise disconnect/replay, API restart, worker restart, lease expiry, duplicate
 
 Run: `git diff --check && git status --short`
 Expected: no whitespace errors; only intentional implementation changes remain before the final commit.
-
