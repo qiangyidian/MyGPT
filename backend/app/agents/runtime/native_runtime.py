@@ -90,14 +90,6 @@ class NativeChatRuntime:
 
         provider = get_provider_for_config(cfg)
         registry = get_default_registry()
-        gateway = ToolGateway(
-            db,
-            conversation_id=conversation_id,
-            assistant_message_id=assistant_msg.id,
-            run_id=ctx.run_id,
-            user=ctx.user,
-            registry=registry,
-        )
         settings = get_settings()
         guard = ctx.budget_guard
         if guard is None:
@@ -111,6 +103,17 @@ class NativeChatRuntime:
                 )
             )
             ctx.budget_guard = guard
+        gateway = ToolGateway(
+            db,
+            conversation_id=conversation_id,
+            assistant_message_id=assistant_msg.id,
+            run_id=ctx.run_id,
+            user=ctx.user,
+            registry=registry,
+            # Match the persisted-output cap to the run's tool-output budget so a
+            # limit above the gateway default isn't silently capped lower here.
+            max_result_chars=guard.limits.max_tool_output_chars,
+        )
 
         # Tools run when the user enabled them AND the model declares capability
         # (or it's the mock provider, which simulates a search step for demos).
@@ -910,9 +913,13 @@ def _bounded_tool_message(execution: Any, max_chars: int) -> dict[str, Any]:
     # legacy no-argument method. Invoke exactly once: an internal TypeError
     # must propagate rather than being mistaken for a signature mismatch.
     message = execution.to_openai_tool_message()
-    message["content"] = bounded_json_observation(
-        message.get("content", ""), max_chars=max_chars
-    )
+    content = message.get("content", "")
+    if isinstance(content, str):
+        # Truncate raw text directly; bounded_json_observation would json.dumps
+        # the string and wrap it in quotes, double-encoding it for the model.
+        message["content"] = content[: max(0, max_chars)]
+    else:
+        message["content"] = bounded_json_observation(content, max_chars=max_chars)
     return message
 
 

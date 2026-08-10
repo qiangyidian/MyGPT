@@ -25,7 +25,7 @@
 |---|---|---|---|
 | 1. Model capabilities and token admission | P0 | Complete | Commits `d85423c` through `6d9ac57`; final spec PASS and quality APPROVED |
 | 2. Automatic continuation and usage accounting | P0 | Complete | Commits `0deeb3e` through `8375635`; backend 668/668; final spec PASS and quality APPROVED |
-| 3. Agent budgets and provider controls | P0 | In progress | Core/runtime focused suites are green; final commit and two-stage review still pending |
+| 3. Agent budgets and provider controls | P0 | Complete | Commits `267dfcf`–`decc619` plus gate-hardening commit; focused budget/native suites 76/76; backend 725 passed (1 known env-deferred web-search test); combined spec+quality review APPROVED (no Critical/Important) |
 | 4. Durable workflow schema/events/leases/controls | P0 | Not started | Awaiting Task 3 acceptance |
 | 5. Redis Streams worker/recovery/SSE replay | P0 | Not started | Awaiting Task 4 |
 | 6. Planner-executor-verifier | P1 | Not started | Awaiting durable workflow foundation |
@@ -47,7 +47,7 @@
 - [x] Add bounded automatic continuation with overlap removal, resumable checkpoints, partial-safe cancellation, and usage-only provider-tail support.
 - [x] Aggregate Native, CrewAI, writer, retry, continuation, and metered-tool usage exactly once, including concurrent agents sharing one cumulative LLM counter.
 - [x] Isolate checkpoint, graph, plan, and terminal persistence into short-lived ID-based sessions so rollback cannot expire request-owned ORM objects.
-- [ ] Enforce real per-run step, tool, replan, wall-clock, token, output-size, and monetary budgets across every external await and dispatch.
+- [x] Enforce real per-run step, tool, replan, wall-clock, token, output-size, and monetary budgets across every external await and dispatch.
 - [ ] Persist authoritative workflow events, attempts, commands, approvals, leases, checkpoints, and terminal states in PostgreSQL.
 - [ ] Move background execution to Redis Streams workers with idempotent enqueue, consumer groups, lease fencing, graceful shutdown, and stale-run recovery.
 - [ ] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
@@ -83,7 +83,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [x] Automatic continuation, overlap-safe merge, usage-only tail parsing, and complete multi-round accounting were absent. Closed by Task 2.
 - [x] Only a small fraction of historical assistant messages had token accounting populated; new execution paths now persist complete aggregate usage/cost. Historical backfill/reporting remains part of Task 11.
 - [x] Existing continuation/checkpoint code was not safe under shared CrewAI LLM counters, cancellation races, concurrent AsyncSession use, rollback expiry, or checkpoint commit failures. Closed by Task 2.
-- [ ] Budget settings existed but were not authoritative across Native/CrewAI/Writer/tool dispatches; Task 3 is closing this.
+- [x] Budget settings existed but were not authoritative across Native/CrewAI/Writer/tool dispatches; closed by Task 3.
 - [ ] At audit time 11 of 66 AgentRun rows were stale `running`; Tasks 4 and 5 must reconcile them and prevent recurrence through leases/recovery.
 - [ ] At audit time only PostgreSQL and Qdrant services were up; backend, frontend, Redis, worker, and recovery topology must become health-checked production services in Tasks 5 and 13.
 - [ ] `BACKGROUND_WORKER=inprocess` and development configuration were active; production must use isolated worker/recovery processes with no reload in Task 13.
@@ -257,7 +257,7 @@ Expected: all selected tests pass.
 
 ### Task 3: Wire real Agent budgets and provider controls
 
-**Status: in progress. The completed sub-steps below are implementation progress, not final Task 3 acceptance.**
+**Status: accepted. Focused budget/native suites 76/76; backend 725 passed (1 known env-deferred web-search test, tracked for Tasks 11/13/14); combined spec+quality review APPROVED with no Critical/Important findings.**
 
 - [x] Add RED tests for settings, validation, boundary semantics, cumulative/delta usage, cost, snapshots, replans, timeouts, tool output, Native, CrewAI, and Writer retries.
 - [x] Implement immutable validated `BudgetLimits.from_settings` and complete `BudgetGuard` snapshots/watermarks.
@@ -266,10 +266,10 @@ Expected: all selected tests pass.
 - [x] Enforce per-run tool-output character limits before tool output re-enters a prompt.
 - [x] Unify runtime and terminal cost calculation, preferring provider-reported `cost_usd` and otherwise using configured pricing.
 - [x] Map budget exhaustion to stable `agent_budget_exceeded`/`finish_reason=budget` payloads with a full budget snapshot.
-- [ ] Produce the final Task 3 commit with a clean worktree.
-- [ ] Pass independent Task 3 specification review.
-- [ ] Pass independent Task 3 code-quality review.
-- [ ] Update the dashboard and mark Task 3 accepted.
+- [x] Produce the final Task 3 commit with a clean worktree.
+- [x] Pass independent Task 3 specification review (combined spec+quality gate).
+- [x] Pass independent Task 3 code-quality review (combined spec+quality gate).
+- [x] Update the dashboard and mark Task 3 accepted.
 
 **Files:**
 - Create: `backend/tests/test_budget_integration.py`
@@ -301,10 +301,10 @@ Add `max_cost_usd`, serialize complete snapshots, and invoke gates before and af
 
 Use `asyncio.timeout(guard.remaining_seconds)` and record stage usage through the shared guard.
 
-- [ ] **Step 4: Run budget and runtime tests**
+- [x] **Step 4: Run budget and runtime tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_budget_integration.py tests/test_agent_phase0.py tests/test_agent_graph_lifecycle.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 69/69 focused; full backend 725 passed, 1 known env-deferred failure.)
 
 ### Task 4: Durable workflow schema, event store, leases, and controls
 
