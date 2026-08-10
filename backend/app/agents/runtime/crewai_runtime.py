@@ -366,6 +366,16 @@ class CrewAIRuntime:
             return
 
         usage_before = await _single_llm_usage_snapshot(agent.llm)
+        realtime_generation_before = int(
+            getattr(agent.llm, "_usage_charge_generation", 0) or 0
+        )
+
+        def realtime_usage_charged() -> bool:
+            return (
+                int(getattr(agent.llm, "_usage_charge_generation", 0) or 0)
+                > realtime_generation_before
+            )
+
         metered_usage: dict[str, int | float] | None = None
         try:
             guard.check()
@@ -389,9 +399,7 @@ class CrewAIRuntime:
                                 ),
                                 metered_usage,
                             )
-                        if not getattr(
-                            agent.llm, "_usage_charged_realtime", False
-                        ):
+                        if not realtime_usage_charged():
                             guard.add_usage(
                                 metered_usage,
                                 cost_usd=cost,
@@ -410,11 +418,12 @@ class CrewAIRuntime:
                         getattr(getattr(ctx, "model_config", None), "model_name", None),
                         usage,
                     )
-                guard.add_usage(
-                    usage,
-                    cost_usd=cost,
-                    usage_id="crewai:single:model:1",
-                )
+                if not realtime_usage_charged():
+                    guard.add_usage(
+                        usage,
+                        cost_usd=cost,
+                        usage_id="crewai:single:model:1",
+                    )
                 ctx.extra["usage"] = usage
             guard.check()
         except PromptAdmissionError as exc:
@@ -438,6 +447,28 @@ class CrewAIRuntime:
             )
             return
         except Exception as exc:  # noqa: BLE001
+            failure_usage = aggregate_usage(_extract_usage_rounds(exc))
+            if failure_usage:
+                # Providers without cumulative summary APIs may still attach
+                # usage to their terminal exception. Charge it only when no
+                # outer delta or real-time wrapper already owns the attempt.
+                if metered_usage is None and not realtime_usage_charged():
+                    cost = failure_usage.get("cost_usd")
+                    if cost is None:
+                        cost = usage_cost(
+                            getattr(
+                                getattr(ctx, "model_config", None),
+                                "model_name",
+                                None,
+                            ),
+                            failure_usage,
+                        )
+                    guard.add_usage(
+                        failure_usage,
+                        cost_usd=cost,
+                        usage_id="crewai:single:failure",
+                    )
+                ctx.extra["usage"] = failure_usage
             logger.exception("crewai kickoff failed: %s", exc)
             yield ev_error(
                 code="crewai_run_error",
