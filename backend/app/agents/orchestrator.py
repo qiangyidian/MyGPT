@@ -11,6 +11,26 @@ the model<->tool loop). For each turn the orchestrator:
   3. Forwards the runtime's events, intercepting the terminal ``done``/``error``
      to flip the run row to ``completed``/``failed``.
   4. On an unexpected exception, marks the run ``failed`` and emits ``error``.
+
+Task 6 note (planner-executor-verifier engine): a general, typed, durable
+workflow engine that generalizes the static graph model into a verifiable
+plan->execute->verify->replan state machine now lives in
+:mod:`app.agents.workflow` (``schemas`` / ``planner`` / ``executor`` /
+``verifier`` / ``engine`` / ``attempts``). Its templates
+(:func:`~app.agents.workflow.planner.build_plan_for_profile`) mirror the
+existing ``build_*_graph`` topology for ``deep_research``,
+``parallel_research``, and ``debate``, and a
+:class:`~app.agents.workflow.executor.StageAdapterExecutor` delegates each
+step to the existing CrewAI stage runner so the engine can drive real crews
+without reimplementing them.
+
+Routing expert multi-step turns through the new engine is INTENTIONALLY
+DEFERRED: the engine is fully built and unit-tested in isolation (see
+``tests/test_workflow_engine.py``, ``tests/test_workflow_replan.py``), but the
+live single-turn / CrewAI debate / research paths above are unchanged so the
+hard constraint (do not break existing multi-agent flows) holds. A follow-up
+turn can opt a NEW profile (or a guarded flag) onto the engine without
+touching the proven execution paths.
 """
 from __future__ import annotations
 
