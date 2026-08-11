@@ -23,6 +23,9 @@ from app.models.tool_call import ToolCall
 from app.models.user import User
 from app.models.user_memory import UserMemory
 
+# Task 9: encrypted tenant-scoped MCP connectors.
+from app.connectors.models import Connector
+
 __all__ = [
     "AuditEvent",
     "User",
@@ -51,4 +54,6 @@ __all__ = [
     "RunCommand",
     "RunLease",
     "AgentAttempt",
+    # ---- Task 9: MCP connectors ----
+    "Connector",
 ]

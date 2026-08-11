@@ -20,6 +20,13 @@ from app.schemas.auth import (
     UserOut,
 )
 from app.schemas.background_task import BackgroundTaskEnqueue, BackgroundTaskOut
+from app.schemas.connector import (
+    ConnectorCreate,
+    ConnectorOut,
+    ConnectorRotate,
+    ConnectorUpdate,
+    ProviderManifestOut,
+)
 from app.schemas.chat import (
     ChatMessage,
     ChatRequest,
@@ -106,6 +113,9 @@ __all__ = [
     "MemoryOut", "MemoryUpdate",
     # Task 7: opt-in semantic user memory
     "UserMemoryOut", "UserMemoryPropose", "UserMemoryEdit", "UserMemoryBulkAction",
+    # Task 9: MCP connectors
+    "ConnectorCreate", "ConnectorUpdate", "ConnectorRotate", "ConnectorOut",
+    "ProviderManifestOut",
     # knowledge base / documents
     "KnowledgeBaseCreate", "KnowledgeBaseUpdate", "KnowledgeBaseOut",
     "DocumentOut", "ReindexResult",

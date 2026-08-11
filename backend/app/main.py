@@ -31,6 +31,7 @@ from app.api import (
     background_tasks,
     chat,
     chat_attachments,
+    connectors,
     conversations,
     documents,
     knowledge_bases,
@@ -57,10 +58,27 @@ async def lifespan(app: FastAPI):
     # Start the cross-worker approval signal subscriber (no-op without Redis).
     from app.agents.approval_bus import approval_bus
     await approval_bus.start_subscriber()
+    # Lazily connect configured MCP servers (failure-isolated: never crashes
+    # boot; no-op when no servers are configured). The registry is attached to
+    # app.state so the agent layer can route MCP tool calls through it.
+    from app.agents.mcp_client import McpClientRegistry
+    app.state.mcp_registry = McpClientRegistry(settings.mcp_servers if hasattr(settings, "mcp_servers") else [])
+    try:
+        await app.state.mcp_registry.connect_all()
+    except Exception:  # noqa: BLE001 — MCP must never block app boot
+        import logging
+        logging.getLogger(__name__).warning("mcp connect_all failed at boot; continuing", exc_info=True)
     try:
         yield
     finally:
         await approval_bus.stop()
+        # Close MCP sessions so their subprocesses/HTTP pools don't leak.
+        registry = getattr(app.state, "mcp_registry", None)
+        if registry is not None:
+            try:
+                await registry.disconnect_all()
+            except Exception:  # noqa: BLE001
+                pass
         # Close shared clients so their connection pools don't leak on reload /
         # graceful shutdown (each used to live for the process with no close).
         from app.rag.qdrant_store import close_vector_store
@@ -111,6 +129,7 @@ def create_app() -> FastAPI:
     app.include_router(projects.router)
     app.include_router(memories.router)
     app.include_router(memories.user_router)
+    app.include_router(connectors.router)
     app.include_router(background_tasks.router)
     app.include_router(usage.router)
 

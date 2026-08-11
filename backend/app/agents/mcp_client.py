@@ -1,13 +1,14 @@
-"""Optional MCP client adapter (Codex pattern).
+"""MCP client adapter (Codex pattern).
 
 Connects to configured MCP servers, aggregates their tools into the catalog
-(:mod:`app.agents.mcp_catalog`), and routes tool calls back to the owning server.
+(:mod:`app.agents.mcp_catalog`), and routes tool calls back to the owning
+server via the real JSON-RPC transports in :mod:`app.agents.mcp_transport`.
 
-Guarded by design: if the ``mcp`` SDK isn't importable or no servers are
-configured, every method no-ops and the app boots unchanged. The catalog is the
-provenance/aggregation core (unit-tested); this module is the live-connection
-layer. Full transport wiring (stdio/SSE session lifecycle) needs a real MCP
-server to validate, so connection is lazy and failure-isolated per server.
+Guarded by design: if no servers are configured, every method no-ops and the
+app boots unchanged. The catalog is the provenance/aggregation core
+(unit-tested); this module is the live-connection layer. Connection is lazy
+and per-server failure-isolated, so one unreachable server never blocks the
+others or the app boot.
 """
 from __future__ import annotations
 
@@ -16,19 +17,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agents.mcp_catalog import McpCatalog, McpToolInfo
+from app.agents.mcp_transport import McpSession
 
 logger = logging.getLogger(__name__)
-
-try:  # optional dependency
-    import mcp as _mcp  # type: ignore  # noqa: F401
-    _MCP_AVAILABLE = True
-except Exception:  # noqa: BLE001
-    _MCP_AVAILABLE = False
 
 
 @dataclass
 class McpServerConfig:
-    """One MCP server connection (stdio transport by default)."""
+    """One MCP server connection (stdio transport by default).
+
+    For HTTP transports, ``command`` holds the server URL and ``transport`` is
+    ``"http"`` (or ``"sse"``).
+    """
 
     name: str
     command: str
@@ -43,12 +43,14 @@ class McpClientRegistry:
     def __init__(self, servers: list[McpServerConfig] | None = None) -> None:
         self._servers = list(servers or [])
         self._catalog = McpCatalog()
-        self._sessions: dict[str, Any] = {}  # server name -> live session
+        self._sessions: dict[str, McpSession] = {}  # server name -> live session
         self._connected = False
 
     @property
     def enabled(self) -> bool:
-        return bool(self._servers) and _MCP_AVAILABLE
+        # The transport now implements JSON-RPC directly (no optional SDK), so
+        # we are enabled whenever servers are configured.
+        return bool(self._servers)
 
     @property
     def catalog(self) -> McpCatalog:
@@ -62,25 +64,34 @@ class McpClientRegistry:
         """
         if not self.enabled:
             return self._catalog
-        # NOTE: full transport wiring (mcp.ClientSession over stdio/sse) requires a
-        # live server to validate and is intentionally left as the integration
-        # point — populate self._catalog from each session's list_tools() here.
         for srv in self._servers:
             try:
                 await self._connect_one(srv)
             except Exception:  # noqa: BLE001 — isolate per-server failures
-                logger.warning("mcp server %s failed to connect; skipped", srv.name, exc_info=True)
+                logger.warning(
+                    "mcp server %s failed to connect; skipped", srv.name, exc_info=True
+                )
         self._connected = True
         return self._catalog
 
     async def _connect_one(self, srv: McpServerConfig) -> None:
-        """Connect to one server and add its tools to the catalog.
-
-        Concrete transport implementation goes here (open stdio/SSE, call
-        list_tools, translate to McpToolInfo). Left as a documented hook so the
-        module is shippable without a live MCP server in CI.
-        """
-        logger.info("mcp connect (%s, %s): transport wiring pending", srv.name, srv.transport)
+        """Open a real transport session and add the server's tools to the catalog."""
+        session = McpSession(srv)
+        await session.initialize()
+        tools_raw = await session.list_tools()
+        infos = [
+            McpToolInfo(
+                server=srv.name,
+                name=t.name,
+                description=t.description,
+                input_schema=t.input_schema or {"type": "object", "properties": {}},
+                source="config",
+            )
+            for t in tools_raw
+        ]
+        self._catalog.register(srv.name, infos, source="config")
+        self._sessions[srv.name] = session
+        logger.info("mcp server %s connected: %d tools", srv.name, len(infos))
 
     def register_static(self, server: str, tools: list[McpToolInfo], source: str = "config") -> None:
         """Inject pre-discovered tools (e.g. from a cached manifest) without connecting."""
@@ -96,18 +107,104 @@ class McpClientRegistry:
         session = self._sessions.get(info.server)
         if session is None:
             raise RuntimeError(f"mcp server {info.server} not connected")
-        # Delegate to the live session: return await session.call_tool(info.name, arguments)
-        raise NotImplementedError("live mcp call_tool requires transport wiring")
+        return await session.call_tool(info.name, arguments)
 
     async def disconnect_all(self) -> None:
         for name, session in list(self._sessions.items()):
             try:
-                close = getattr(session, "aclose", None) or getattr(session, "close", None)
-                if close is not None:
-                    res = close()
-                    if hasattr(res, "__await__"):
-                        await res
+                await session.close()
             except Exception:  # noqa: BLE001
                 logger.warning("mcp disconnect %s failed", name, exc_info=True)
         self._sessions.clear()
         self._connected = False
+
+
+# --------------------------------------------------------------------------- #
+# Gateway routing: wrap each catalogued MCP tool as a BaseTool so it flows
+# through ToolGateway (approval, audit, truncation, budget) like a builtin.
+# --------------------------------------------------------------------------- #
+class McpToolWrapper:
+    """A :class:`~app.tools.base.BaseTool` adapter over one MCP tool.
+
+    ``run(**kwargs)`` delegates to the owning :class:`McpSession` via a
+    caller-supplied async callable (so the wrapper is decoupled from the
+    registry and unit-testable with a fake). The tool surfaces under its
+    namespaced name (``mcp__<server>__<tool>``) and carries the server's
+    validated JSON schema, so it routes through :class:`ToolGateway` with the
+    same approval / audit / truncation / budget treatment as builtins.
+
+    ``dangerous`` defaults to False (the gateway still audits + truncates every
+    call); callers may flip it on for write-side tools that should require
+    human approval.
+    """
+
+    # Declared as class attributes to satisfy the BaseTool structural contract.
+    category: str = "mcp"
+    dangerous: bool = False
+
+    def __init__(
+        self,
+        *,
+        namespaced_name: str,
+        server: str,
+        tool_name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        caller: Any,
+        dangerous: bool = False,
+    ) -> None:
+        self.name = namespaced_name
+        self._server = server
+        self._tool_name = tool_name
+        self.description = f"[mcp/{server}] {description}".strip()
+        self._input_schema = input_schema or {"type": "object", "properties": {}}
+        self._caller = caller  # async (tool_name, arguments) -> result
+        self.dangerous = bool(dangerous)
+
+    async def run(self, **kwargs: Any) -> Any:
+        """Delegate to the owning MCP session through the injected caller."""
+        return await self._caller(self._tool_name, kwargs)
+
+    def to_openai_schema(self) -> dict[str, Any]:
+        """Render the MCP tool's (already-validated) JSON schema for the model."""
+        schema = dict(self._input_schema or {"type": "object", "properties": {}})
+        schema.setdefault("type", "object")
+        schema.setdefault("properties", {})
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": schema,
+            },
+        }
+
+
+def build_gateway_tools(
+    registry: McpClientRegistry,
+) -> list[McpToolWrapper]:
+    """Build :class:`McpToolWrapper` adapters for every catalogued tool.
+
+    Each wrapper delegates to :meth:`McpClientRegistry.call_tool` so execution
+    flows through the gateway (approval / audit / truncation / budget). Returns
+    an empty list when the registry has no connected servers (no-op guard).
+    """
+    wrappers: list[McpToolWrapper] = []
+    for info in registry.catalog.all():
+        def _make(tool_name: str, namespaced: str) -> Any:
+            async def _caller(args_name: str, arguments: dict[str, Any]) -> Any:
+                return await registry.call_tool(namespaced, arguments)
+
+            return _caller
+
+        wrappers.append(
+            McpToolWrapper(
+                namespaced_name=info.namespaced_name,
+                server=info.server,
+                tool_name=info.name,
+                description=info.description,
+                input_schema=info.input_schema,
+                caller=_make(info.name, info.namespaced_name),
+            )
+        )
+    return wrappers
