@@ -129,6 +129,39 @@ async def _assert_owned(db: AsyncSession, conv_id: uuid.UUID, user: User) -> Non
         raise HTTPException(NOT_FOUND, "Conversation not found")
 
 
+async def _durable_event_generator(
+    request: Request,
+    run_id: uuid.UUID,
+    db: AsyncSession,
+) -> AsyncIterator[str]:
+    """SSE bridge for durable dispatch: emit ``meta`` then tail the run's events.
+
+    The chat API calls :meth:`ChatService.create_and_enqueue_durable_run` to
+    create the turn records + enqueue the run_id, then returns this generator
+    as a StreamingResponse. The client consumes the SAME durable event log the
+    ``GET /api/agent-runs/{run_id}/events`` endpoint serves — the worker
+    processes the run asynchronously and its events flow through this tail.
+
+    A ``meta`` frame (message_id + conversation_id) is emitted first so the
+    client receives the same initial handshake the inline path provides.
+    """
+    from app.api.agent_runs import tail_run_events
+    from app.models import AgentRun
+
+    # Emit the meta frame (the inline path's first event). The run row already
+    # has message_id + conversation_id from create_and_enqueue_durable_run.
+    run = await db.get(AgentRun, run_id)
+    if run is not None and run.message_id is not None:
+        yield _sse("meta", {
+            "message_id": str(run.message_id),
+            "conversation_id": str(run.conversation_id),
+        })
+
+    # Tail the durable event log; the worker produces events as it executes.
+    async for frame in tail_run_events(request, run_id, cursor=0, bind=db.bind):
+        yield frame
+
+
 @router.post("/stream",
              dependencies=[Depends(rate_limit_user(60, 60, "chat"))])
 async def chat_stream(
@@ -145,6 +178,26 @@ async def chat_stream(
         await _assert_owned(db, payload.conversation_id, user)
 
     chat_service = _get_chat_service()
+
+    # Durable dispatch: when BACKGROUND_WORKER != "inprocess", create the turn
+    # records, enqueue the run for a background worker, and return an SSE stream
+    # that tails the durable event log. The inline executor (_run) is NOT called
+    # — execution happens on the worker via execute_run → run_durable_turn.
+    if get_settings().BACKGROUND_WORKER != "inprocess":
+        run_id = await chat_service.create_and_enqueue_durable_run(db, user, payload)
+        generator = _durable_event_generator(request, run_id, db)
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Durable-Run-Id": str(run_id),
+            },
+        )
+
+    # Inline mode (default): existing path.
     generator = _event_generator(request, chat_service, db, user, payload)
     return StreamingResponse(
         generator,

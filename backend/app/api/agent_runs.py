@@ -23,7 +23,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -359,6 +359,75 @@ async def _run_is_terminal(db: AsyncSession, run_id: uuid.UUID) -> bool:
     return current is None or current in _TERMINAL_STATUSES
 
 
+async def tail_run_events(
+    request: Request,
+    run_id: uuid.UUID,
+    *,
+    cursor: int = 0,
+    bind: Any = None,
+) -> AsyncIterator[str]:
+    """Replay durable events from ``cursor`` then tail new events as SSE frames.
+
+    Factored from :func:`stream_run_events` so the durable chat dispatch can
+    reuse the exact same cursor-replay + tail loop. READ-ONLY: never executes
+    or cancels the run. A client disconnect closes only this subscription.
+
+    ``bind`` is an :class:`~sqlalchemy.ext.asyncio.AsyncEngine` (or compatible
+    bind) for the short-lived tail sessions. It defaults to the app's
+    ``AsyncSessionLocal`` engine so production works without arguments; tests
+    pass the test engine.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    if bind is None:
+        from app.db import AsyncSessionLocal as _factory
+
+        bind = _factory.kw["bind"]
+
+    tail_factory = async_sessionmaker(
+        bind=bind, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+    poll_interval = max(0.5, get_settings().WORKER_POLL_INTERVAL_SECONDS)
+    heartbeat = max(5, get_settings().SSE_HEARTBEAT_SECONDS)
+
+    last_seq = cursor
+    last_event_at = asyncio.get_event_loop().time()
+    async with tail_factory() as probe:
+        already_terminal = await _run_is_terminal(probe, run_id)
+
+    while True:
+        if await request.is_disconnected():
+            return
+
+        async with tail_factory() as tail_db:
+            events = await EventStore(tail_db).replay(
+                run_id, after_sequence=last_seq
+            )
+            is_terminal = await _run_is_terminal(tail_db, run_id)
+
+        terminal_sent = False
+        for evt in events:
+            last_seq = evt.sequence
+            yield _sse_frame(evt.event_type, evt.data, event_id=evt.sequence)
+            if evt.event_type in _TERMINAL_EVENT_TYPES:
+                terminal_sent = True
+
+        if terminal_sent or (already_terminal and not events):
+            return
+        if is_terminal and not events:
+            return
+
+        # Heartbeat if we've been idle too long.
+        now = asyncio.get_event_loop().time()
+        if events:
+            last_event_at = now
+        elif now - last_event_at >= heartbeat:
+            yield ": keepalive\n\n"
+            last_event_at = now
+
+        await asyncio.sleep(poll_interval)
+
+
 @router.get("/{run_id}/events")
 async def stream_run_events(
     run_id: uuid.UUID,
@@ -391,59 +460,9 @@ async def stream_run_events(
     except (ValueError, TypeError):
         cursor = 0
 
-    poll_interval = max(0.5, get_settings().WORKER_POLL_INTERVAL_SECONDS)
-    heartbeat = max(5, get_settings().SSE_HEARTBEAT_SECONDS)
-    target_run_id = run.id
-
-    # Build a session factory on the SAME engine as the request session so that
-    # test overrides (which bind the request session to the shared in-memory
-    # SQLite engine) propagate to the tailing loop. In production this is
-    # equivalent to ``app.db.AsyncSessionLocal``.
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-    tail_factory = async_sessionmaker(
-        bind=db.bind, class_=AsyncSession, expire_on_commit=False, autoflush=False
-    )
-
-    async def _generator() -> AsyncIterator[str]:
-        last_seq = cursor
-        last_event_at = asyncio.get_event_loop().time()
-        already_terminal = await _run_is_terminal(db, target_run_id)
-
-        while True:
-            if await request.is_disconnected():
-                return
-
-            async with tail_factory() as tail_db:
-                events = await EventStore(tail_db).replay(
-                    target_run_id, after_sequence=last_seq
-                )
-                is_terminal = await _run_is_terminal(tail_db, target_run_id)
-
-            terminal_sent = False
-            for evt in events:
-                last_seq = evt.sequence
-                yield _sse_frame(evt.event_type, evt.data, event_id=evt.sequence)
-                if evt.event_type in _TERMINAL_EVENT_TYPES:
-                    terminal_sent = True
-
-            if terminal_sent or (already_terminal and not events):
-                return
-            if is_terminal and not events:
-                return
-
-            # Heartbeat if we've been idle too long.
-            now = asyncio.get_event_loop().time()
-            if events:
-                last_event_at = now
-            elif now - last_event_at >= heartbeat:
-                yield ": keepalive\n\n"
-                last_event_at = now
-
-            await asyncio.sleep(poll_interval)
-
+    generator = tail_run_events(request, run.id, cursor=cursor, bind=db.bind)
     return StreamingResponse(
-        _generator(),
+        generator,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

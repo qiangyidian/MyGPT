@@ -8,12 +8,18 @@ so a long run doesn't lose ownership.
 
 The execution function is **injected** (``execute_fn``) so the worker mechanics
 are fully testable without the real runtime. The production executor
-(:func:`execute_run`) reconstructs the turn context and runs the orchestrator;
-see its docstring for the deferred wiring note.
+(:func:`execute_run`) reconstructs the turn context and runs the orchestrator.
 
 Design:
   * Each run executes on its OWN session (never reused across runs/tasks).
+  * Durable event appends use a FRESH short-lived session (not ``exec_session``)
+    so a runtime intermediate ORM write can never be flushed half-formed — the
+    ``exec_session`` stays the runtime's sole property.
   * The lease renewal loop runs as a background task, stopped on finalize.
+    If the lease is LOST (expired + taken over by another worker) the renewal
+    loop signals the execution loop via a shared ``asyncio.Event``; the
+    execution loop stops mutating the run and exits WITHOUT acking, leaving
+    recovery to requeue the run. This prevents split-brain execution.
   * Terminal events (``run.completed`` / ``run.failed``) close the run and ack.
   * A transient exception during execution requeues the run for retry (bounded
     by :class:`~app.agents.workflow.recovery.RecoveryScheduler`).
@@ -93,7 +99,13 @@ class RunWorker:
 
     # ------------------------------------------------------------------ #
     async def _process(self, run_id: uuid.UUID) -> None:
-        """Acquire lease, execute, finalize. Handles transient failures."""
+        """Acquire lease, execute, finalize. Handles transient failures.
+
+        On lease loss mid-execution (the renewal loop detected another owner
+        took over), the worker stops mutating the run and exits WITHOUT
+        acking — recovery owns the requeue. This prevents two workers from
+        executing the same run concurrently (split-brain).
+        """
         # 1. Acquire lease (take over from any expired one).
         async with self._session_factory() as session:
             run = await session.get(AgentRun, run_id)
@@ -115,14 +127,26 @@ class RunWorker:
 
         # 2. Execute with lease renewal.
         renewal_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
         renewal_task = asyncio.create_task(
-            self._renewal_loop(run_id, renewal_stop)
+            self._renewal_loop(run_id, renewal_stop, lease_lost)
         )
         terminal = False
+        lease_aborted = False
         try:
             async with self._session_factory() as exec_session:
                 async for evt in self._execute_fn(run_id, exec_session):
-                    await _persist_event(exec_session, run_id, evt)
+                    # Lease-loss fence: stop persisting + finalizing the moment
+                    # the renewal loop detects we lost ownership. Recovery will
+                    # requeue the run for another worker.
+                    if lease_lost.is_set():
+                        logger.warning(
+                            "worker %s: aborting run %s after lease loss "
+                            "(recovery will requeue)", self._owner, run_id,
+                        )
+                        lease_aborted = True
+                        break
+                    await self._persist_event(run_id, evt)
                     if evt.kind in _TERMINAL_EVENT_TYPES:
                         terminal = True
                         break
@@ -141,12 +165,45 @@ class RunWorker:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
 
-        # 3. Finalize: release lease + ack.
+        # 3. Finalize.
+        if lease_aborted:
+            # Lease lost: do NOT finalize or ack. The run stays in-flight in the
+            # queue; recovery detects the expired/stolen lease and requeues it.
+            logger.info(
+                "worker %s: leaving run %s for recovery after lease loss",
+                self._owner, run_id,
+            )
+            return
         await self._finalize_success(run_id, terminal)
 
     # ------------------------------------------------------------------ #
-    async def _renewal_loop(self, run_id: uuid.UUID, stop: asyncio.Event) -> None:
-        """Periodically renew the lease so a long run keeps ownership."""
+    async def _persist_event(self, run_id: uuid.UUID, evt: AgentEvent) -> None:
+        """Persist one AgentEvent as a durable RunEvent on a SHORT-LIVED session.
+
+        Using a fresh session (instead of ``exec_session``) isolates the durable
+        event append from the runtime's ORM state on ``exec_session`` — a
+        runtime intermediate write can never be flushed half-formed by the
+        event-append commit. Best-effort: a failure is logged, not raised.
+        """
+        try:
+            async with self._session_factory() as session:
+                await append_event_safe(session, run_id, evt.kind, evt.data)
+                await session.commit()
+        except Exception:  # noqa: BLE001 — best-effort durability
+            logger.debug(
+                "worker %s: durable event append failed (%s for run %s)",
+                self._owner, evt.kind, run_id, exc_info=True,
+            )
+
+    async def _renewal_loop(
+        self, run_id: uuid.UUID, stop: asyncio.Event, lease_lost: asyncio.Event
+    ) -> None:
+        """Periodically renew the lease so a long run keeps ownership.
+
+        On lease loss (``renew`` returns ``None`` — another owner took over
+        after TTL expiry), signals ``lease_lost`` so :meth:`_process` can abort
+        the execution loop instead of continuing to mutate the run.
+        """
         try:
             while not stop.is_set():
                 try:
@@ -160,10 +217,12 @@ class RunWorker:
                         run_id, self._owner, self._ttl
                     )
                     if renewed is None:
-                        # Lost the lease (expired and taken over). Stop executing.
+                        # Lost the lease (expired and taken over). Signal the
+                        # execution loop to stop; do NOT touch the run further.
                         logger.warning(
                             "worker %s: lost lease for run %s", self._owner, run_id
                         )
+                        lease_lost.set()
                         return
                     await session.commit()
         except asyncio.CancelledError:
@@ -193,12 +252,6 @@ class RunWorker:
                 run.error_message = error
             await session.commit()
         await self._queue.ack(run_id, self._owner)
-
-
-async def _persist_event(session: AsyncSession, run_id: uuid.UUID, evt: AgentEvent) -> None:
-    """Persist one AgentEvent as a durable RunEvent (best-effort)."""
-    await append_event_safe(session, run_id, evt.kind, evt.data)
-    await session.commit()
 
 
 def _default_session_factory() -> Callable[[], AsyncSession]:

@@ -1341,6 +1341,107 @@ class ChatService:
             await save_summary(db, conversation.id, user_id, summary)
             await db.commit()
 
+    # ------------------------------------------------------------------ #
+    # Task 5: durable dispatch (additive — inline path unchanged)
+    # ------------------------------------------------------------------ #
+    async def create_and_enqueue_durable_run(
+        self, db: AsyncSession, user: User, request: ChatRequest
+    ) -> uuid.UUID:
+        """Create the turn records and enqueue for background execution.
+
+        Reuses the SAME lower-level helpers as :meth:`_run`
+        (:func:`_get_or_create_conversation`, :func:`_resolve_model_config`) so
+        conversation/model resolution is identical to the inline path. Creates:
+
+          * the user Message (unless regenerating),
+          * a pending assistant Message,
+          * a ``pending`` AgentRun (the worker flips it to ``running``).
+
+        Then enqueues ``run.id`` on the run queue and returns it. The caller
+        (the chat API) opens an SSE stream tailing the run's durable events so
+        the client consumes the result identically to the inline path.
+
+        The heavy context-building (system prompt, RAG, history trimming, intent
+        recognition, enrichment) is deferred to :func:`run_durable_turn` which
+        the worker invokes — it is NOT duplicated here.
+        """
+        from datetime import datetime, timezone
+
+        # 1. Resolve conversation + model (same helpers as _run).
+        conversation = await _get_or_create_conversation(db, user, request)
+        cfg = await _resolve_model_config(db, request, conversation)
+        # Ownership (same guard as _run).
+        if cfg.user_id is not None and cfg.user_id != user.id:
+            raise AppException(404, "model_not_found", "Model config not found")
+
+        # 2. Persist the user message (same shape as _run; no regenerate support
+        #    in durable dispatch for now — regenerate is an inline-only path).
+        user_content = request.content or ""
+        if user_content.strip():
+            user_msg = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content=user_content,
+            )
+            db.add(user_msg)
+            await db.flush()
+
+        # 3. Create the pending assistant Message (same shape as _run).
+        assistant_msg = Message(
+            conversation_id=conversation.id,
+            role="assistant",
+            content="",
+            model_name=cfg.model_name,
+            metadata_={"status": "pending"},
+        )
+        db.add(assistant_msg)
+        await db.flush()
+
+        # 4. Create the AgentRun (status=pending; the worker flips it to running).
+        snapshot = {
+            "provider": cfg.provider,
+            "model_name": cfg.model_name,
+            "api_base_url": cfg.api_base_url,
+            "temperature": cfg.temperature,
+            "top_p": cfg.top_p,
+            "max_tokens": cfg.max_tokens,
+            "supports_tools": getattr(cfg, "supports_tools", False),
+        }
+        run = AgentRun(
+            conversation_id=conversation.id,
+            message_id=assistant_msg.id,
+            user_id=user.id,
+            runtime="native",
+            flow_name="native_chat",
+            status="pending",
+            current_step="",
+            input={
+                "content": user_content,
+                "enable_tools": bool(request.enable_tools),
+                "execution_mode": (request.execution_mode or "auto"),
+                "agent_profile": request.agent_profile or "general",
+                "knowledge_base_id": (
+                    str(request.knowledge_base_id) if request.knowledge_base_id else None
+                ),
+            },
+            model_config_snapshot=snapshot,
+        )
+        db.add(run)
+        await db.flush()
+        conversation.last_message_preview = (user_content or "").strip()[:280]
+        await commit_with_rollback(db)
+
+        # 5. Enqueue for the background worker.
+        from app.agents.workflow.queue import get_run_queue
+
+        queue = await get_run_queue()
+        await queue.enqueue(run.id, db_session_factory=self._persistence_session_factory)
+        logger.info(
+            "durable dispatch: enqueued run %s for conversation %s (user %s)",
+            run.id, conversation.id, user.id,
+        )
+        return run.id
+
 
 # --------------------------------------------------------------------------- #
 # Task 5: durable execution seam (additive, gated behind BACKGROUND_WORKER)
@@ -1529,6 +1630,12 @@ async def run_durable_turn(
     turn_started = time.monotonic()
     try:
         async for evt in chat_orchestrator.stream(ctx):
+            # M5: the durable worker already appended ``run.started`` (dotted,
+            # Task-4 scheme) when it acquired the lease. Suppress the
+            # orchestrator's ``run_started`` (underscore) AgentEvent on the
+            # durable path so ``EventStore.replay`` shows a single start event.
+            if evt.kind == "run_started":
+                continue
             if evt.kind == "done":
                 finish = evt.data.get("finish_reason", "stop")
                 assistant_msg.metadata_ = ChatService._meta(

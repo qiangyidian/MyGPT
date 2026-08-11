@@ -141,6 +141,11 @@ async def test_durable_run_executes_end_to_end(db_session):
             events = await EventStore(s).replay(run.id)
             kinds = [e.event_type for e in events]
             assert "run.started" in kinds, f"missing run.started in {kinds}"
+            # M5: exactly ONE start event — the dotted Task-4 ``run.started``.
+            # The orchestrator's underscore ``run_started`` is suppressed.
+            assert "run_started" not in kinds, (
+                f"duplicate start event in {kinds}"
+            )
             assert len(events) > 1, (
                 f"expected events beyond run.started, got {kinds}"
             )
@@ -148,7 +153,7 @@ async def test_durable_run_executes_end_to_end(db_session):
             # of these real execution events.
             assert any(
                 k in kinds
-                for k in ("token", "done", "run_started", "runtime_selected")
+                for k in ("token", "done", "runtime_selected")
             ), f"no execution events in {kinds}"
 
             # 3. Assistant message has non-empty content + usage metadata.
