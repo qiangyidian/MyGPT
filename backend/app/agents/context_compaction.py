@@ -90,6 +90,8 @@ def compact_messages(
     summarize_fn: Callable[[list[dict]], str],
     keep_recent_tokens: int = 4000,
     prefill_baseline_tokens: int = 0,
+    preserve_tool_pairs: bool = True,
+    protected_count: int = 0,
 ) -> tuple[list[dict], str]:
     """Compact a message list: summarize the older prefix, keep a verbatim tail.
 
@@ -98,8 +100,19 @@ def compact_messages(
     older prefix is summarized via ``summarize_fn``. Returns
     ``(new_messages, summary)`` where summary is "" if nothing was compacted.
 
-    Mid-turn compaction (interrupting an in-flight agent loop) is a follow-up;
-    this implements the pre-turn / between-turns case.
+    Mid-turn / mid-run compaction (interrupting an in-flight agent loop) is
+    supported via the same path: call this between workflow steps or agent-loop
+    iterations with the current in-flight transcript.
+
+    Tool-pair retention (``preserve_tool_pairs=True``, the default): a
+    ``(assistant tool_call, tool tool_result)`` pair is treated as an atomic
+    unit — both kept verbatim or both summarized together. Compaction NEVER
+    emits a ``tool`` role message whose matching ``assistant`` tool_call was
+    dropped, which would be an invalid transcript for the provider.
+
+    ``protected_count`` extends the always-preserved leading block past the
+    system message(s) by that many additional messages (protected fragments
+    that must survive compaction verbatim).
     """
     if not messages:
         return list(messages), ""
@@ -114,6 +127,14 @@ def compact_messages(
     sys_msgs = messages[:sys_count]
     body_msgs = messages[sys_count:]
 
+    # Protected non-system fragments (e.g. a pinned instruction block) survive
+    # verbatim — they are pulled out of the compactable body and re-prepended.
+    protected_body: list[dict] = []
+    if protected_count > 0:
+        cut = min(protected_count, len(body_msgs))
+        protected_body = body_msgs[:cut]
+        body_msgs = body_msgs[cut:]
+
     # Walk newest-first to pick the verbatim tail within budget.
     tail: list[dict] = []
     used = 0
@@ -126,6 +147,16 @@ def compact_messages(
         if used >= keep_recent_tokens:
             break
     tail.reverse()
+
+    # Tool-pair retention: if the tail contains a ``tool`` result whose issuing
+    # ``assistant`` tool_call message is NOT in the tail, pull that assistant
+    # message in (it must travel with its result). Conversely, never leave a
+    # tool_result behind in the summarized prefix while its caller is in the
+    # tail. Group an assistant-with-tool_calls together with its immediately
+    # following ``tool`` results as one atomic unit.
+    if preserve_tool_pairs:
+        tail = _enforce_tool_pair_atomicity(body_msgs, tail)
+
     keep_ids = {id(m) for m in tail}
     older = [m for m in body_msgs if id(m) not in keep_ids]
 
@@ -144,4 +175,66 @@ def compact_messages(
         "context compacted: %d older msgs -> summary (%d tokens); kept %d tail msgs (%d tokens)",
         len(older), estimate_tokens(summary), len(tail), used,
     )
-    return sys_msgs + [summary_msg] + tail, summary
+    return sys_msgs + protected_body + [summary_msg] + tail, summary
+
+
+def _enforce_tool_pair_atomicity(body_msgs: list[dict], tail: list[dict]) -> list[dict]:
+    """Treat each ``(assistant tool_call, tool tool_result)`` pair as atomic.
+
+    Compaction must NEVER produce an invalid transcript: a ``tool`` role message
+    whose issuing ``assistant`` tool_call was dropped, OR an ``assistant`` with
+    ``tool_calls`` whose ``tool`` results were dropped. Both directions are
+    handled — if ANY member of a tool-pair unit is in the tail, the WHOLE unit
+    is pulled into the tail (caller + all its results), accepting a small
+    budget overshoot in exchange for transcript validity.
+
+    Returns the (possibly extended) tail, rebuilt in original body order so an
+    assistant always precedes its tool results.
+    """
+    if not tail:
+        return tail
+
+    # Index: tool_call_id -> (assistant message, [tool result messages])
+    caller_of: dict[str, dict] = {}
+    results_of: dict[str, list[dict]] = {}
+    for m in body_msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                tid = tc.get("id") if isinstance(tc, dict) else None
+                if tid:
+                    caller_of[tid] = m
+                    results_of.setdefault(tid, [])
+        elif m.get("role") == "tool":
+            tid = m.get("tool_call_id")
+            if tid:
+                results_of.setdefault(tid, []).append(m)
+
+    # Iteratively close the closure: any tool_call referenced (as caller OR as
+    # result) by a tailed message pulls in the whole unit; pulled-in members may
+    # themselves reference further pairs, so loop until stable.
+    tail_ids = {id(m) for m in tail}
+    queue = list(tail)
+    while queue:
+        m = queue.pop()
+        referenced_ids: set[str] = set()
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                tid = tc.get("id") if isinstance(tc, dict) else None
+                if tid:
+                    referenced_ids.add(tid)
+        elif m.get("role") == "tool":
+            tid = m.get("tool_call_id")
+            if tid:
+                referenced_ids.add(tid)
+        for tid in referenced_ids:
+            caller = caller_of.get(tid)
+            if caller is not None and id(caller) not in tail_ids:
+                tail_ids.add(id(caller))
+                queue.append(caller)
+            for res in results_of.get(tid, []):
+                if id(res) not in tail_ids:
+                    tail_ids.add(id(res))
+                    queue.append(res)
+
+    # Rebuild the tail in original body order so the assistant precedes results.
+    return [m for m in body_msgs if id(m) in tail_ids]

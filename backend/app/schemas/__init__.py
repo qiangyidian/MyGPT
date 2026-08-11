@@ -55,6 +55,12 @@ from app.schemas.knowledge_base import (
     KnowledgeBaseUpdate,
 )
 from app.schemas.memory import MemoryOut, MemoryUpdate
+from app.schemas.user_memory import (
+    UserMemoryBulkAction,
+    UserMemoryEdit,
+    UserMemoryOut,
+    UserMemoryPropose,
+)
 from app.schemas.message import MessageOut
 from app.schemas.model_config import (
     ModelConfigCreate,
@@ -98,6 +104,8 @@ __all__ = [
     "ProjectCreate", "ProjectUpdate", "ProjectOut",
     "BackgroundTaskEnqueue", "BackgroundTaskOut",
     "MemoryOut", "MemoryUpdate",
+    # Task 7: opt-in semantic user memory
+    "UserMemoryOut", "UserMemoryPropose", "UserMemoryEdit", "UserMemoryBulkAction",
     # knowledge base / documents
     "KnowledgeBaseCreate", "KnowledgeBaseUpdate", "KnowledgeBaseOut",
     "DocumentOut", "ReindexResult",

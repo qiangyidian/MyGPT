@@ -28,6 +28,27 @@ class SpillResult:
     path: str | None  # filesystem path to the full artifact when spilled
 
 
+@dataclass
+class ArtifactHandle:
+    """Opaque, authorized reference to a spilled artifact (Task 7 seam).
+
+    Generalizes ``SpillResult.path`` into a handle the model can reference but
+    cannot misuse as a raw filesystem path. ``id`` is what the model sees
+    (e.g. ``artifact:<uuid>``); ``storage_key`` is the opaque writer-returned
+    key the backend resolves to the real bytes via the artifact service.
+
+    The full artifact service (auth / checksum / retention / signed retrieval)
+    lands in Task 10; this seam wires the contract today so a spilled blob
+    never reaches the model as a raw path.
+    """
+
+    id: str          # model-facing opaque id, e.g. "artifact:<uuid>"
+    storage_key: str # opaque writer key the artifact service resolves later
+
+    def __str__(self) -> str:
+        return self.id
+
+
 def maybe_spill(
     text: str,
     *,
@@ -75,3 +96,43 @@ def _default_writer(name: str, content: str) -> str:
     with open(p, "w", encoding="utf-8") as f:
         f.write(content)
     return p
+
+
+def spill(
+    text: str,
+    *,
+    budget_tokens: int,
+    write_fn: Callable[[str, str], str] | None = None,
+    key: str = "blob",
+) -> tuple[str, ArtifactHandle | None]:
+    """Spill ``text`` to an opaque artifact handle when it exceeds the budget.
+
+    Returns ``(in_context_preview, handle)``. When the text fits the budget
+    (or budget is 0 / writer fails — best-effort), ``handle is None`` and the
+    original text is returned unchanged. When it spills, the model sees a
+    head/tail preview + an opaque ``artifact:<id>`` handle; the writer returns
+    an opaque storage key (NOT a raw path) that the Task-10 artifact service
+    will resolve with auth/checksum/retention.
+
+    The default writer is a storage-backed stub (a temp file keyed by ``key``)
+    sufficient to satisfy the seam today; it is replaced by the full artifact
+    service in Task 10.
+    """
+    if budget_tokens <= 0 or not text:
+        return text, None
+    if estimate_tokens(text) <= budget_tokens:
+        return text, None
+
+    writer = write_fn or _default_writer
+    import uuid as _uuid
+
+    artifact_id = f"artifact:{_uuid.uuid4().hex}"
+    try:
+        storage_key = writer(key, text)
+    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+        return text, None
+
+    preview = _preview(text)
+    handle = ArtifactHandle(id=artifact_id, storage_key=storage_key)
+    in_context = f"{preview}\n\n[完整内容已溢出，句柄：{handle.id}]"
+    return in_context, handle

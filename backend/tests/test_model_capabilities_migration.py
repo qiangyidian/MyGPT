@@ -66,7 +66,7 @@ def test_model_capability_migration_upgrades_legacy_rows(tmp_path: Path):
     alembic("upgrade", "head")
     with sqlite3.connect(database_path) as conn:
         revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert revision == "0007_enterprise_workflow"
+        assert revision == "0008_user_memories"
         info = {row[1]: row for row in conn.execute("PRAGMA table_info(model_configs)")}
         for name in CAPABILITY_DEFAULTS:
             assert info[name][3] == 1  # NOT NULL

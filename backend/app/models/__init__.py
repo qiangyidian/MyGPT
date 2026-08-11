@@ -21,6 +21,7 @@ from app.models.run_lease import RunLease
 from app.models.tool_approval import ToolApproval
 from app.models.tool_call import ToolCall
 from app.models.user import User
+from app.models.user_memory import UserMemory
 
 __all__ = [
     "AuditEvent",
@@ -37,6 +38,8 @@ __all__ = [
     "AgentStep",
     "ConversationMemory",
     "ToolApproval",
+    # ---- Task 7: opt-in semantic long-term user memory ----
+    "UserMemory",
     # ---- Phase 1: product upgrade ----
     "ChatAttachment",
     "MessageFeedback",

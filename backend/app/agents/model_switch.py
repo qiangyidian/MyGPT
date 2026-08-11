@@ -45,3 +45,25 @@ def is_downshift(
     if previous_window_tokens <= 0 or current_window_tokens <= 0:
         return False
     return current_window_tokens < previous_window_tokens and active_tokens >= current_window_tokens
+
+
+def recompact_on_downshift(
+    manager,
+    *,
+    previous_window_tokens: int,
+    current_window_tokens: int,
+    active_messages: list[dict],
+):
+    """On a model-switch downshift, trigger mid-run compaction via the ONE
+    :class:`~app.agents.context_manager.ContextManager`.
+
+    Returns the manager's :class:`~app.agents.context_manager.DownshiftDirective`
+    (``must_recompact`` reflects whether the downshift threshold was crossed).
+    Delegates the actual compaction to the ContextManager so tool-pair retention,
+    protected fragments, and budget partitioning are centralized in one place.
+    """
+    return manager.downshift_compaction(
+        previous_window_tokens=previous_window_tokens,
+        current_window_tokens=current_window_tokens,
+        active_messages=active_messages,
+    )

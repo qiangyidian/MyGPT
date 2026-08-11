@@ -110,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_runs.router)
     app.include_router(projects.router)
     app.include_router(memories.router)
+    app.include_router(memories.user_router)
     app.include_router(background_tasks.router)
     app.include_router(usage.router)
 

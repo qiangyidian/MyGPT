@@ -56,6 +56,7 @@ from app.agents.schemas import (
     AgentTurnContext,
     ExecutionMode,
 )
+from app.agents.context_manager import ContextManager
 from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.agents.token_budget import (
     PROMPT_TOO_LARGE,
@@ -222,6 +223,81 @@ _AGENT_TASK_PREAMBLE = (
     "3) 证据充分后给出简洁、有条理的最终回答，并用 [source N] 标注来源。\n"
     "不要在回答中暴露你的内部推理过程，直接给出结论与依据。"
 )
+
+
+# --------------------------------------------------------------------------- #
+# Task 7: the ONE ContextManager used for prompt assembly (and available for
+# mid-run compaction / model-switch downshift / output spill). Pure-core: the
+# summarizer is injected; chat_service uses it for ASSEMBLY here, and the
+# native runtime / workflow engine may call compact() / downshift_compaction()
+# / spill_tool_result() between steps. The effective system prompt assembled
+# below is a PURE function of persisted fragments (conversation, flow state,
+# active user memories, RAG) — no process-local mutable world state — so any
+# worker produces the same prompt.
+# --------------------------------------------------------------------------- #
+def _default_summarize_for_compaction(older: list[dict]) -> str:
+    """Compact, dependency-free summarizer used only if the ContextManager's
+    compaction path is invoked without a real LLM summarizer wired. Returns a
+    faithful prose roll-up of the older messages so tool-pair-aware compaction
+    never silently drops context."""
+    parts: list[str] = []
+    for m in older:
+        role = m.get("role", "msg")
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        if content:
+            parts.append(f"[{role}] {content[:280]}")
+    return "Earlier turns summarized:\n" + "\n".join(parts)
+
+
+_CONTEXT_MANAGER = ContextManager(summarize_fn=_default_summarize_for_compaction)
+
+
+def _is_expired(expires_at, now) -> bool:
+    """Robust expiry check across DB dialects (SQLite returns naive datetimes;
+    Postgres returns aware). Treat naive as UTC."""
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        from datetime import timezone
+
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        from datetime import timezone
+
+        now = now.replace(tzinfo=timezone.utc)
+    return expires_at <= now
+
+
+async def _load_active_user_memories(
+    db: AsyncSession, user_id: uuid.UUID
+) -> list[str]:
+    """Return the user's active, non-expired USER-level memory contents.
+
+    These are the opt-in semantic memories (Task 7) folded into the effective
+    system prompt each turn. Pure read — no embedding round-trip. Tenant-scoped
+    by user_id; never crosses users.
+    """
+    from datetime import datetime, timezone
+
+    from app.models import UserMemory
+
+    rows = (
+        await db.execute(
+            select(UserMemory)
+            .where(
+                UserMemory.user_id == user_id,
+                UserMemory.active.is_(True),
+            )
+            .order_by(UserMemory.updated_at.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    return [r.content for r in rows if not _is_expired(r.expires_at, now)]
 
 
 def _event(name: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -835,20 +911,25 @@ class ChatService:
         flow_state = await load_state(db, conversation.id, user.id)
 
         system_prompt = _build_system_prompt(conversation, rag_context)
-        prefix = ""
+        # Task 7: assemble the COMPLETE effective system prompt via the ONE
+        # ContextManager — a pure function of persisted fragments (no
+        # process-local mutable world state). The tool-use preamble, rolling
+        # summary, ongoing goal, and the user's opt-in semantic memories are
+        # all folded in here; the single-model honesty backstop closes it.
+        active_user_memories = await _load_active_user_memories(db, user.id)
+        behavior_blocks: list[str] = []
         if enable_tools:
-            # Agent / tools mode: structured execution, no raw chain-of-thought.
-            prefix += _AGENT_TASK_PREAMBLE + "\n\n"
-        if flow_state.conversation_summary:
-            prefix += (
-                "Earlier in this conversation (summary):\n"
-                f"{flow_state.conversation_summary}\n\n"
-            )
-        if flow_state.user_goal:
-            prefix += f"User's ongoing goal: {flow_state.user_goal}\n\n"
-        system_prompt = prefix + system_prompt
-        # Single-model honesty backstop (see _MULTI_AGENT_HONESTY).
-        system_prompt = system_prompt + "\n\n" + _MULTI_AGENT_HONESTY
+            behavior_blocks.append(_AGENT_TASK_PREAMBLE)
+        behavior_blocks.append(_MULTI_AGENT_HONESTY)
+        system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
+            base=system_prompt,
+            rag_context="",  # already folded into base by _build_system_prompt
+            summary=flow_state.conversation_summary or "",
+            goal=flow_state.user_goal or "",
+            memories=active_user_memories,
+            intent_block=None,
+            behavior_blocks=behavior_blocks,
+        )
 
         # Remember the user's goal for this conversation (single 'task' memory).
         if user_content.strip():

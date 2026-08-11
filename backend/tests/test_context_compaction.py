@@ -68,3 +68,34 @@ def test_compact_nothing_to_compact_returns_unchanged():
     new_msgs, summary = compact_messages(messages, summarize_fn=lambda _: "X", keep_recent_tokens=10000)
     assert new_msgs == messages
     assert summary == ""
+
+
+def test_compact_never_orphans_tool_result_or_tool_call():
+    """Tool-pair retention is bidirectional: never emit a tool result whose
+    caller was dropped, AND never emit an assistant tool_call whose result was
+    dropped. Both produce invalid provider transcripts."""
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "old question " + "a" * 2000},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "s", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_a", "name": "s", "content": "ra " + "b" * 2000},
+        {"role": "assistant", "content": "old answer " + "c" * 2000},
+        {"role": "user", "content": "new question"},
+    ]
+    new_msgs, _ = compact_messages(
+        messages, summarize_fn=lambda older: "OLD", keep_recent_tokens=30
+    )
+    # Invariant (closed transcript): every tool_call id that appears must also
+    # appear as a tool result, and vice versa. No orphans in either direction.
+    call_ids = {
+        tc["id"] for m in new_msgs if m.get("role") == "assistant"
+        for tc in (m.get("tool_calls") or []) if isinstance(tc, dict)
+    }
+    result_ids = {
+        m["tool_call_id"] for m in new_msgs if m.get("role") == "tool"
+    }
+    assert result_ids == call_ids, (
+        f"tool pair split: calls={call_ids} results={result_ids}"
+    )
