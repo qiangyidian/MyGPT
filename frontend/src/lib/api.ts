@@ -703,59 +703,75 @@ export async function streamRunEvents(
     headers["Last-Event-ID"] = String(opts.lastEventId);
   }
 
-  const res = await fetch(`${API_BASE}/api/agent-runs/${runId}/events`, {
-    method: "GET",
-    headers,
-    credentials: "include",
-    signal: opts.signal,
-  });
-
-  if (!res.ok || !res.body) {
-    let message = res.statusText;
-    try {
-      const d = await res.json();
-      message = d.message || d.detail || message;
-    } catch {
-      /* ignore */
-    }
-    if (res.status === 401 && _attempt < 1) {
-      const ok = await refreshAccessToken();
-      if (ok) return streamRunEvents(runId, handlers, opts, _attempt + 1);
-    }
-    handlers.onError?.({ code: "http_error", message });
-    return;
-  }
-
-  let cursor = opts.lastEventId ?? 0;
-  for await (const frame of parseSSEStream(res.body, opts.signal)) {
-    if (!frame.data) continue;
-    let data: Record<string, unknown>;
-    try {
-      data = JSON.parse(frame.data);
-    } catch {
-      continue; // malformed JSON — drop this one frame only
-    }
-    // Prefer the SSE `id:` line (the durable sequence); fall back to a
-    // `sequence` field in the payload for streams that don't stamp `id:`.
-    let sequence = -1;
-    if (frame.id !== undefined && /^\d+$/.test(frame.id)) {
-      sequence = parseInt(frame.id, 10);
-    } else if (typeof data.sequence === "number") {
-      sequence = data.sequence;
-    }
-    if (sequence > cursor) cursor = sequence;
-    handlers.onEvent?.({
-      runId,
-      sequence,
-      event_type: frame.event || "message",
-      data,
-      ...(frame.id !== undefined ? { id: frame.id } : {}),
+  try {
+    const res = await fetch(`${API_BASE}/api/agent-runs/${runId}/events`, {
+      method: "GET",
+      headers,
+      credentials: "include",
+      signal: opts.signal,
     });
-    handlers.onCursor?.(cursor);
-  }
-  // Socket ended without an abort → network drop / server-side close. Signal
-  // the caller so it can decide to reconnect from the persisted cursor.
-  if (!opts.signal?.aborted) {
-    handlers.onDisconnect?.();
+
+    if (!res.ok || !res.body) {
+      let message = res.statusText;
+      try {
+        const d = await res.json();
+        message = d.message || d.detail || message;
+      } catch {
+        /* ignore */
+      }
+      if (res.status === 401 && _attempt < 1) {
+        const ok = await refreshAccessToken();
+        if (ok) return streamRunEvents(runId, handlers, opts, _attempt + 1);
+      }
+      handlers.onError?.({ code: "http_error", message });
+      return;
+    }
+
+    let cursor = opts.lastEventId ?? 0;
+    for await (const frame of parseSSEStream(res.body, opts.signal)) {
+      if (!frame.data) continue;
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(frame.data);
+      } catch {
+        continue; // malformed JSON — drop this one frame only
+      }
+      // Prefer the SSE `id:` line (the durable sequence); fall back to a
+      // `sequence` field in the payload for streams that don't stamp `id:`.
+      let sequence = -1;
+      if (frame.id !== undefined && /^\d+$/.test(frame.id)) {
+        sequence = parseInt(frame.id, 10);
+      } else if (typeof data.sequence === "number") {
+        sequence = data.sequence;
+      }
+      if (sequence > cursor) cursor = sequence;
+      handlers.onEvent?.({
+        runId,
+        sequence,
+        event_type: frame.event || "message",
+        data,
+        ...(frame.id !== undefined ? { id: frame.id } : {}),
+      });
+      handlers.onCursor?.(cursor);
+    }
+    // Socket ended without an abort → network drop / server-side close. Signal
+    // the caller so it can decide to reconnect from the persisted cursor.
+    if (!opts.signal?.aborted) {
+      handlers.onDisconnect?.();
+    }
+  } catch (err) {
+    // Intentional cancellation: the caller aborted the AbortController
+    // (component unmount / runId switch / explicit clear). fetch() and the
+    // stream iterator then reject with an AbortError — that's not a real
+    // error, so swallow it silently (no onError, no onDisconnect). Anything
+    // else is a genuine network failure: surface it so the caller reconnects.
+    const aborted =
+      opts.signal?.aborted === true ||
+      (err instanceof DOMException && err.name === "AbortError");
+    if (aborted) return;
+    handlers.onError?.({
+      code: "network_error",
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
 }
