@@ -226,14 +226,22 @@ _AGENT_TASK_PREAMBLE = (
 
 
 # --------------------------------------------------------------------------- #
-# Task 7: the ONE ContextManager used for prompt assembly (and available for
-# mid-run compaction / model-switch downshift / output spill). Pure-core: the
-# summarizer is injected; chat_service uses it for ASSEMBLY here, and the
-# native runtime / workflow engine may call compact() / downshift_compaction()
-# / spill_tool_result() between steps. The effective system prompt assembled
-# below is a PURE function of persisted fragments (conversation, flow state,
-# active user memories, RAG) — no process-local mutable world state — so any
-# worker produces the same prompt.
+# Task 7: the ONE ContextManager. Invocation sites (precise):
+#   * ASSEMBLY — here, on BOTH the inline path (``ChatService._run``) and the
+#     durable path (``run_durable_turn``): ``assemble_system_prompt`` builds the
+#     complete effective system prompt from persisted fragments.
+#   * MID-RUN COMPACTION — the NATIVE runtime
+#     (``app.agents.runtime.native_runtime``) calls ``compact_async`` (gated by
+#     ``should_compact_midrun``) in its per-round loop, with an LLM-backed
+#     ``summarize_fn_async`` that reuses ``planning.summarize_prefix``. The
+#     heuristic ``_default_summarize_for_compaction`` below is ONLY a unit-test
+#     double for the sync ``compact`` path; it is NOT load-bearing in
+#     production (the runtime uses the async LLM-backed path).
+#   * The workflow engine (Task 6) does NOT yet consume the ContextManager;
+#     that wiring is deferred to the workflow-engine task.
+# The effective system prompt assembled here is a PURE function of persisted
+# fragments (conversation, flow state, active user memories, RAG) — no
+# process-local mutable world state — so any worker produces the same prompt.
 # --------------------------------------------------------------------------- #
 def _default_summarize_for_compaction(older: list[dict]) -> str:
     """Compact, dependency-free summarizer used only if the ContextManager's
@@ -254,22 +262,6 @@ def _default_summarize_for_compaction(older: list[dict]) -> str:
 
 
 _CONTEXT_MANAGER = ContextManager(summarize_fn=_default_summarize_for_compaction)
-
-
-def _is_expired(expires_at, now) -> bool:
-    """Robust expiry check across DB dialects (SQLite returns naive datetimes;
-    Postgres returns aware). Treat naive as UTC."""
-    if expires_at is None:
-        return False
-    if expires_at.tzinfo is None:
-        from datetime import timezone
-
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if now.tzinfo is None:
-        from datetime import timezone
-
-        now = now.replace(tzinfo=timezone.utc)
-    return expires_at <= now
 
 
 async def _load_active_user_memories(
@@ -297,6 +289,8 @@ async def _load_active_user_memories(
         )
     ).scalars().all()
     now = datetime.now(timezone.utc)
+    from app.core.datetime_utils import is_expired as _is_expired
+
     return [r.content for r in rows if not _is_expired(r.expires_at, now)]
 
 
@@ -1663,9 +1657,22 @@ async def run_durable_turn(
     route = replace(route, use_multi_agent=False)
 
     # Rebuild the system prompt + trimmed history using the shared helpers.
+    # Task 7: route the durable path through the SAME ContextManager assembly
+    # as the inline path so active user memories are folded in consistently
+    # (M-2). Summary / goal remain deferred on the durable path (no flow-state
+    # re-hydration), matching the prior behavior.
     history = await _load_history(db, conversation.id)
+    _active_user_memories = await _load_active_user_memories(db, user.id)
     system_prompt = _build_system_prompt(conversation, rag_context="")
-    system_prompt = system_prompt + "\n\n" + _MULTI_AGENT_HONESTY
+    system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
+        base=system_prompt,
+        rag_context="",
+        summary="",
+        goal="",
+        memories=_active_user_memories,
+        intent_block=None,
+        behavior_blocks=[_MULTI_AGENT_HONESTY],
+    )
     messages = _messages_to_dicts(system_prompt, history)
     messages = _admit_and_trim_history(
         messages,

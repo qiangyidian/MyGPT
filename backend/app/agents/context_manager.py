@@ -1,12 +1,13 @@
 """Task 7: the ONE ContextManager.
 
-A single object used by both the chat path and the workflow engine for:
+A single object used for:
 
   * **Budget partitioning** — split the Task-1 ``TokenBudget`` into prompt
     slices (protected prefix / recent-keep tail / compactable body budget).
-  * **Tool-pair-aware mid-run compaction** — compact between workflow steps or
-    agent-loop iterations (not only pre-turn), never splitting a tool_call
-    from its tool_result.
+  * **Tool-pair-aware mid-run compaction** — compact between agent-loop
+    iterations (not only pre-turn), never splitting a tool_call from its
+    tool_result. ``compact`` is sync (unit-test double summarizer);
+    ``compact_async`` takes an async LLM-backed summarizer for production.
   * **Protected-fragment preservation** — leading protected blocks survive
     compaction verbatim.
   * **Attachment / memory folding** — assemble a COMPLETE effective system
@@ -15,6 +16,14 @@ A single object used by both the chat path and the workflow engine for:
   * **Output spill** — replace an oversized tool result with an opaque
     authorized ``ArtifactHandle`` (the full artifact service lands in Task 10).
 
+Invocation sites (as of Task 7):
+  * ``app.services.chat_service`` — ``assemble_system_prompt`` for the
+    effective system prompt on BOTH the inline and durable paths.
+  * ``app.agents.runtime.native_runtime`` — ``compact_async`` (gated by
+    ``should_compact_midrun``) in the per-round loop, with an LLM-backed
+    ``summarize_fn_async`` reusing ``planning.summarize_prefix``.
+  * The workflow engine (Task 6) does NOT yet consume this manager.
+
 The core is **pure + offline-testable**: the summarizer and spill writer are
 injected, mirroring ``context_compaction.compact_messages``'s ``summarize_fn``
 pattern. Nothing here reaches for a live LLM, DB, or Qdrant.
@@ -22,9 +31,11 @@ pattern. Nothing here reaches for a live LLM, DB, or Qdrant.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from app.agents.context_compaction import (
+    _assemble_compacted,
+    _split_for_compaction,
     compact_messages,
     estimate_messages_tokens,
     estimate_tokens,
@@ -193,6 +204,52 @@ class ContextManager:
             protected_count=protected_body_count,
         )
         return new_msgs
+
+    async def compact_async(
+        self,
+        messages: list[dict],
+        *,
+        input_budget: int,
+        summarize_fn_async: Callable[[list[dict]], Awaitable[str]],
+        prefill_baseline_tokens: int = 0,
+        protected_count: int = 0,
+    ) -> list[dict]:
+        """Async mid-run compaction with an LLM-backed summarizer.
+
+        Same split / tool-pair atomicity / protected-fragment semantics as
+        :meth:`compact`, but the older prefix is summarized by an async function
+        (e.g. the provider-backed ``summarize_history`` path). This is the
+        production entry point invoked from the native runtime's per-round loop:
+        when ``should_compact_midrun`` is False the transcript is returned
+        UNCHANGED, so runs that don't hit budget pressure behave identically to
+        today. When it is True, the older prefix is summarized via the injected
+        async summarizer and the verbatim recent tail + tool pairs are kept.
+        """
+        if not messages:
+            return list(messages)
+
+        if not self.should_compact_midrun(
+            messages,
+            input_budget=input_budget,
+            prefill_baseline_tokens=prefill_baseline_tokens,
+        ):
+            return list(messages)
+
+        recent_keep = max(256, int(input_budget * self._recent_keep_fraction))
+        sys_msgs, protected_body, tail, older, used = _split_for_compaction(
+            messages,
+            keep_recent_tokens=recent_keep,
+            preserve_tool_pairs=True,
+            protected_count=protected_count,
+        )
+        if not older:
+            return list(messages)
+
+        summary = (await summarize_fn_async(older)) or ""
+        return _assemble_compacted(
+            sys_msgs, protected_body, tail, older, summary,
+            prefill_baseline_tokens=prefill_baseline_tokens, used=used,
+        )
 
     # ------------------------------------------------------------------ #
     # Output spill → opaque artifact handle

@@ -36,9 +36,11 @@ from app.agents.db_mutation import db_mutation_scope
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.graph import build_single_agent_graph
-from app.agents.planning import build_plan, classify_intent
+from app.agents.planning import build_plan, classify_intent, summarize_prefix
+from app.agents.context_manager import ContextManager
 from app.agents.runtime.stage_executor import safe_positive_int
-from app.agents.token_budget import PromptAdmissionError
+from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
+from app.model_capabilities import capabilities_from_config
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -172,6 +174,19 @@ class NativeChatRuntime:
         usage_rounds: list[dict[str, Any]] = []
         model_dispatches = 0
 
+        # Task 7: mid-run compaction wiring (gated, LLM-backed). The per-round
+        # loop compacts the in-flight transcript when it crosses the soft budget
+        # threshold, preserving older context as a summary instead of letting
+        # the FIFO trim silently drop it. The summarize_fn reuses the SAME
+        # provider-backed summarize_prefix the post-turn summarization uses
+        # (NOT the heuristic chat_service stub — that stays a unit-test double).
+        # ``_midrun_manager._summarize_fn`` is never invoked because the runtime
+        # path goes through ``compact_async`` + ``summarize_fn_async``.
+        _midrun_manager = ContextManager(summarize_fn=lambda older: "")
+
+        async def _summarize_older_for_midrun(older_msgs: list[dict[str, Any]]) -> str:
+            return await summarize_prefix(provider, older_msgs)
+
         def record_usage_once(
             usage: dict[str, Any] | None,
             *,
@@ -272,6 +287,45 @@ class NativeChatRuntime:
                     if options.tools
                     else 0
                 )
+                # Task 7: gated mid-run compaction. Between rounds, tool results
+                # expand ``working``. If the in-flight transcript crossed the
+                # soft compaction threshold, summarize the older prefix (keeping
+                # the recent tail + tool pairs verbatim) BEFORE the FIFO trim —
+                # so context the FIFO trim would silently drop is preserved as a
+                # summary. Gated by should_compact_midrun: when the budget is
+                # NOT exceeded mid-run, behavior is IDENTICAL to today (no
+                # summary round-trip, no message changes). Best-effort: a
+                # summarization failure falls through to the FIFO trim below.
+                _caps = capabilities_from_config(cfg)
+                _input_budget = calculate_prompt_budget(
+                    _caps,
+                    requested_output=_caps.max_output_tokens,
+                    tool_schema_tokens=tool_schema_tokens,
+                ).input_tokens
+                if _midrun_manager.should_compact_midrun(
+                    working, input_budget=_input_budget
+                ):
+                    try:
+                        _pre_compact_n = len(working)
+                        working = await _midrun_manager.compact_async(
+                            working,
+                            input_budget=_input_budget,
+                            summarize_fn_async=_summarize_older_for_midrun,
+                        )
+                        ctx.extra["midrun_compaction"] = True
+                        ctx.extra["midrun_compaction_from"] = _pre_compact_n
+                        logger.info(
+                            "mid-run compaction fired: %d -> %d msgs (budget=%d)",
+                            _pre_compact_n, len(working), _input_budget,
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort; never block
+                        logger.warning(
+                            "mid-run compaction failed; falling back to FIFO trim",
+                            exc_info=True,
+                        )
+                # FIFO trim remains the authoritative admission backstop; after
+                # compaction it is typically a no-op. It guarantees the final
+                # transcript fits and fast-fails an impossible latest turn.
                 try:
                     working = _admit_and_trim_history(
                         working,

@@ -183,3 +183,48 @@ async def test_durable_run_unknown_run_id_yields_error(db_session):
             events.append(evt)
     assert events
     assert events[-1].kind == "error"
+
+
+@pytest.mark.asyncio
+async def test_durable_turn_folds_active_user_memories_into_prompt(
+    db_session, monkeypatch
+):
+    """Task 7 (M-2): the durable path assembles its system prompt via the SAME
+    ContextManager as the inline path, so the user's active semantic memories
+    are present in a durable turn's prompt — not just the inline turn's."""
+    from app.models import UserMemory
+    from app.services.chat_service import run_durable_turn
+
+    run = await _seed_durable_run(db_session)
+    # Seed an ACTIVE user memory for the run's user.
+    db_session.add(
+        UserMemory(
+            user_id=_SEEDED_USER,
+            memory_type="preference",
+            content="prefers concise answers (durable)",
+            active=True,
+            confidence=0.9,
+        )
+    )
+    await db_session.commit()
+
+    captured: dict = {}
+
+    class _CaptureOrchestrator:
+        async def stream(self, ctx):
+            captured["system_prompt"] = ctx.messages[0].get("content", "")
+            from app.agents.schemas import AgentEvent
+
+            yield AgentEvent(kind="done", data={"finish_reason": "stop"})
+
+    monkeypatch.setattr(
+        "app.services.chat_service.chat_orchestrator", _CaptureOrchestrator()
+    )
+
+    async with TestSessionLocal() as session:
+        async for _evt in run_durable_turn(run.id, session):
+            pass
+
+    assert "prefers concise answers (durable)" in captured.get("system_prompt", ""), (
+        "active user memory missing from durable prompt"
+    )

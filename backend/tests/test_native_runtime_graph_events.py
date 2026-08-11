@@ -177,6 +177,79 @@ async def _collect(ctx) -> list[tuple[str, dict]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Task 7 regression: gated mid-run compaction fires inside the per-round loop
+# when the in-flight transcript crosses the soft budget threshold.
+# --------------------------------------------------------------------------- #
+async def test_midrun_compaction_fires_when_transcript_exceeds_budget(
+    db_session, monkeypatch
+):
+    """Drive a native run past the mid-run budget threshold and assert
+    compaction actually fired between rounds — without exceeding step/budget
+    limits. The gate means a normal-sized transcript does NOT compact."""
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+    # Shrink the window so a modest transcript crosses the threshold.
+    ctx.model_config.max_context_tokens = 1500
+    # Large in-flight transcript (system + many big turns) well over the budget.
+    big_messages = [{"role": "system", "content": "SYS"}]
+    for i in range(20):
+        big_messages.append({"role": "user", "content": f"ask {i} " + "a" * 400})
+        big_messages.append({"role": "assistant", "content": f"ans {i} " + "b" * 400})
+    ctx.messages = big_messages
+
+    provider = _FakeProvider(
+        [
+            [ChatDelta(content="done", finish_reason="stop"),
+             ChatDelta(usage={"prompt_tokens": 5, "completion_tokens": 1})],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: provider,
+    )
+    # Deterministic LLM-backed summarizer (no real provider.chat call).
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.summarize_prefix",
+        lambda _provider, _older: _async_return("MIDRUN SUMMARY OF OLDER TURNS"),
+    )
+
+    events = await _collect(ctx)
+
+    # Compaction fired between rounds (the gate triggered).
+    assert ctx.extra.get("midrun_compaction") is True
+    # The compacted transcript replaced the older prefix with a summary system
+    # message — far fewer messages than the original 41.
+    assert ctx.extra.get("midrun_compaction_from") == len(big_messages)
+    # The run still completed cleanly (no budget overrun).
+    assert _find_all(events, "done"), "expected a done event after compaction"
+
+
+async def test_midrun_compaction_does_not_fire_under_budget(db_session, monkeypatch):
+    """Under the soft threshold, the gate is a no-op and behavior is identical
+    to today — no summary round-trip, no midrun_compaction flag set."""
+    ctx = await _seed_native_ctx(db_session, enable_tools=False)
+    ctx.messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "small turn"},
+    ]
+    provider = _FakeProvider(
+        [
+            [ChatDelta(content="done", finish_reason="stop"),
+             ChatDelta(usage={"prompt_tokens": 5, "completion_tokens": 1})],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agents.runtime.native_runtime.get_provider_for_config",
+        lambda _cfg: provider,
+    )
+    await _collect(ctx)
+    assert ctx.extra.get("midrun_compaction") is None
+
+
+async def _async_return(value):
+    return value
+
+
 async def _durable_run(run_id):
     async with TestSessionLocal() as session:
         return await session.get(AgentRun, run_id)

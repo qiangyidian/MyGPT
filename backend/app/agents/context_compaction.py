@@ -84,38 +84,22 @@ def should_compact(
     return False
 
 
-def compact_messages(
+def _split_for_compaction(
     messages: list[dict],
     *,
-    summarize_fn: Callable[[list[dict]], str],
-    keep_recent_tokens: int = 4000,
-    prefill_baseline_tokens: int = 0,
+    keep_recent_tokens: int,
     preserve_tool_pairs: bool = True,
     protected_count: int = 0,
-) -> tuple[list[dict], str]:
-    """Compact a message list: summarize the older prefix, keep a verbatim tail.
+) -> tuple[list[dict], list[dict], list[dict], list[dict], int]:
+    """Pure split: returns ``(sys_msgs, protected_body, tail, older, used_tokens)``.
 
-    ``messages[0]`` (the system message) is ALWAYS preserved unchanged. Of the
-    rest, a newest-first tail up to ``keep_recent_tokens`` is kept verbatim; the
-    older prefix is summarized via ``summarize_fn``. Returns
-    ``(new_messages, summary)`` where summary is "" if nothing was compacted.
-
-    Mid-turn / mid-run compaction (interrupting an in-flight agent loop) is
-    supported via the same path: call this between workflow steps or agent-loop
-    iterations with the current in-flight transcript.
-
-    Tool-pair retention (``preserve_tool_pairs=True``, the default): a
-    ``(assistant tool_call, tool tool_result)`` pair is treated as an atomic
-    unit — both kept verbatim or both summarized together. Compaction NEVER
-    emits a ``tool`` role message whose matching ``assistant`` tool_call was
-    dropped, which would be an invalid transcript for the provider.
-
-    ``protected_count`` extends the always-preserved leading block past the
-    system message(s) by that many additional messages (protected fragments
-    that must survive compaction verbatim).
+    This is the planning core shared by the sync :func:`compact_messages` and
+    the async :meth:`ContextManager.compact_async` path. It does NOT summarize
+    — callers produce the summary (sync or async) and assemble the final list
+    via :func:`_assemble_compacted`.
     """
     if not messages:
-        return list(messages), ""
+        return [], [], [], [], 0
 
     # Split off the leading system message(s) (role == "system") — never compact them.
     sys_count = 0
@@ -148,22 +132,27 @@ def compact_messages(
             break
     tail.reverse()
 
-    # Tool-pair retention: if the tail contains a ``tool`` result whose issuing
-    # ``assistant`` tool_call message is NOT in the tail, pull that assistant
-    # message in (it must travel with its result). Conversely, never leave a
-    # tool_result behind in the summarized prefix while its caller is in the
-    # tail. Group an assistant-with-tool_calls together with its immediately
-    # following ``tool`` results as one atomic unit.
+    # Tool-pair retention (bidirectional atomicity): if any member of a
+    # tool-pair unit is in the tail, the whole unit travels with it.
     if preserve_tool_pairs:
         tail = _enforce_tool_pair_atomicity(body_msgs, tail)
 
     keep_ids = {id(m) for m in tail}
     older = [m for m in body_msgs if id(m) not in keep_ids]
+    return sys_msgs, protected_body, tail, older, used
 
-    if not older:
-        return list(messages), ""  # nothing to compact
 
-    summary = summarize_fn(older) or ""
+def _assemble_compacted(
+    sys_msgs: list[dict],
+    protected_body: list[dict],
+    tail: list[dict],
+    older: list[dict],
+    summary: str,
+    *,
+    prefill_baseline_tokens: int,
+    used: int,
+) -> list[dict]:
+    """Build the final compacted message list from a split + a summary string."""
     summary_msg = {
         "role": "system",
         "content": (
@@ -175,7 +164,61 @@ def compact_messages(
         "context compacted: %d older msgs -> summary (%d tokens); kept %d tail msgs (%d tokens)",
         len(older), estimate_tokens(summary), len(tail), used,
     )
-    return sys_msgs + protected_body + [summary_msg] + tail, summary
+    return sys_msgs + protected_body + [summary_msg] + tail
+
+
+def compact_messages(
+    messages: list[dict],
+    *,
+    summarize_fn: Callable[[list[dict]], str],
+    keep_recent_tokens: int = 4000,
+    prefill_baseline_tokens: int = 0,
+    preserve_tool_pairs: bool = True,
+    protected_count: int = 0,
+) -> tuple[list[dict], str]:
+    """Compact a message list: summarize the older prefix, keep a verbatim tail.
+
+    ``messages[0]`` (the system message) is ALWAYS preserved unchanged. Of the
+    rest, a newest-first tail up to ``keep_recent_tokens`` is kept verbatim; the
+    older prefix is summarized via ``summarize_fn``. Returns
+    ``(new_messages, summary)`` where summary is "" if nothing was compacted.
+
+    Mid-turn / mid-run compaction (interrupting an in-flight agent loop) is
+    supported via the same path: call this between workflow steps or agent-loop
+    iterations with the current in-flight transcript. For an LLM-backed
+    (async) summarizer inside a runtime loop, use
+    :meth:`app.agents.context_manager.ContextManager.compact_async` instead,
+    which shares the same split core.
+
+    Tool-pair retention (``preserve_tool_pairs=True``, the default): a
+    ``(assistant tool_call, tool tool_result)`` pair is treated as an atomic
+    unit — both kept verbatim or both summarized together. Compaction NEVER
+    emits a ``tool`` role message whose matching ``assistant`` tool_call was
+    dropped, which would be an invalid transcript for the provider.
+
+    ``protected_count`` extends the always-preserved leading block past the
+    system message(s) by that many additional messages (protected fragments
+    that must survive compaction verbatim).
+    """
+    if not messages:
+        return list(messages), ""
+
+    sys_msgs, protected_body, tail, older, used = _split_for_compaction(
+        messages,
+        keep_recent_tokens=keep_recent_tokens,
+        preserve_tool_pairs=preserve_tool_pairs,
+        protected_count=protected_count,
+    )
+
+    if not older:
+        return list(messages), ""  # nothing to compact
+
+    summary = summarize_fn(older) or ""
+    new_msgs = _assemble_compacted(
+        sys_msgs, protected_body, tail, older, summary,
+        prefill_baseline_tokens=prefill_baseline_tokens, used=used,
+    )
+    return new_msgs, summary
 
 
 def _enforce_tool_pair_atomicity(body_msgs: list[dict], tail: list[dict]) -> list[dict]:

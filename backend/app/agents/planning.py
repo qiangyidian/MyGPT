@@ -388,26 +388,20 @@ def should_summarize(total_tokens: int, max_tokens: int) -> bool:
     return max_tokens > 0 and total_tokens > max_tokens * 0.7
 
 
-async def summarize_history(
-    provider: ModelProvider,
-    messages: list[dict[str, Any]],
-    *,
-    keep_recent: int = 6,
+async def summarize_prefix(
+    provider: ModelProvider, older: list[dict[str, Any]]
 ) -> str:
-    """Summarize older messages into a compact string.
+    """Summarize an already-split older prefix via the provider (LLM-backed).
 
-    Keeps the ``keep_recent`` most recent messages intact; the older prefix is
-    sent to the model for summarization. Falls back to a heuristic join if the
-    provider call fails (so RAG/chat never hard-depends on summarization).
+    This is the shared summarization core: flatten, ask the model to summarize,
+    and fall back to a heuristic truncation if the provider call fails. Used by
+    :func:`summarize_history` (which splits off a recent tail first) and by the
+    ContextManager's mid-run compaction (which splits via tool-pair-aware
+    ``_split_for_compaction`` and passes the older prefix directly).
     """
-    if len(messages) <= keep_recent:
-        return ""
-
-    older = messages[:-keep_recent]
     transcript = _flatten(older)
     if not transcript.strip():
         return ""
-
     try:
         summary_messages = [
             {"role": "system", "content": _SUMMARY_SYSTEM},
@@ -432,6 +426,25 @@ async def summarize_history(
 
     # Heuristic fallback: truncate the flattened older transcript.
     return transcript[:1200] + ("…" if len(transcript) > 1200 else "")
+
+
+async def summarize_history(
+    provider: ModelProvider,
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent: int = 6,
+) -> str:
+    """Summarize older messages into a compact string.
+
+    Keeps the ``keep_recent`` most recent messages intact; the older prefix is
+    sent to the model for summarization. Falls back to a heuristic join if the
+    provider call fails (so RAG/chat never hard-depends on summarization).
+    """
+    if len(messages) <= keep_recent:
+        return ""
+
+    older = messages[:-keep_recent]
+    return await summarize_prefix(provider, older)
 
 
 def _flatten(messages: list[dict[str, Any]]) -> str:

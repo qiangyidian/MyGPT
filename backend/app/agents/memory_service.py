@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.datetime_utils import is_expired as _is_expired
 from app.models import UserMemory
 from app.rag.base import SearchHit, VectorPoint, VectorStore
 
@@ -47,18 +48,6 @@ def _user_or_id(user: Any) -> uuid.UUID:
     if uid is not None:
         return uid if isinstance(uid, uuid.UUID) else uuid.UUID(str(uid))
     return uuid.UUID(str(user))
-
-
-def _is_expired(expires_at, now: datetime) -> bool:
-    """Robust expiry check across DB dialects (SQLite returns naive datetimes;
-    Postgres returns aware). Treat naive as UTC."""
-    if expires_at is None:
-        return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    return expires_at <= now
 
 
 class MemoryService:

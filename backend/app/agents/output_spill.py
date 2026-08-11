@@ -34,16 +34,22 @@ class ArtifactHandle:
 
     Generalizes ``SpillResult.path`` into a handle the model can reference but
     cannot misuse as a raw filesystem path. ``id`` is what the model sees
-    (e.g. ``artifact:<uuid>``); ``storage_key`` is the opaque writer-returned
-    key the backend resolves to the real bytes via the artifact service.
+    (e.g. ``artifact:<uuid>``); ``storage_key`` is whatever the injected writer
+    returned — the backend resolves it to the real bytes via the artifact
+    service.
 
-    The full artifact service (auth / checksum / retention / signed retrieval)
-    lands in Task 10; this seam wires the contract today so a spilled blob
-    never reaches the model as a raw path.
+    Opaqueness of ``storage_key`` is the PRODUCTION writer's job: a real
+    artifact-service writer returns an opaque, authorized key (e.g.
+    ``stored:<hash>``) that the backend resolves with auth/checksum/retention.
+    The default writer (:func:`_default_writer`) is a storage-backed STUB that
+    returns a temp-file PATH — sufficient to satisfy the seam in dev and tests,
+    but it must be replaced by the real artifact-service writer (Task 10) before
+    handles reach a production model. The seam's contract (handle.id is opaque;
+    the model never sees a raw path as ``id``) holds either way.
     """
 
     id: str          # model-facing opaque id, e.g. "artifact:<uuid>"
-    storage_key: str # opaque writer key the artifact service resolves later
+    storage_key: str # writer-returned key (opaque in prod; temp path in the stub)
 
     def __str__(self) -> str:
         return self.id
