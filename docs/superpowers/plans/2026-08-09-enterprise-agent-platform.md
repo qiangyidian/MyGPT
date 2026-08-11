@@ -33,7 +33,7 @@
 | 8. Workspace tools and isolated runner | P1 | Complete | Commits `e8a9f57` + `acbf77e` (review fix); 8 path-confined workspace tools (resolve_under_root defeats `..`/absolute/symlink escapes), atomic apply_patch, LocalRunner dev-gated + DockerRunner most-restrictive (network=none/read-only/cap-drop/no-new-privs/non-root/bounded); targeted 96 passed, backend 904 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 9. MCP transports and connectors | P1 | Complete | Commits `d8bd736` + `63fe0ce` (review fix); JSON-RPC stdio+HTTP transports (no SDK, fake-tested), encrypted tenant Connector + provider catalog + migration `0009`, gateway routing wired end-to-end (`merge_mcp_tools` in both runtimes, e2e audit-row test); targeted 37 passed, backend 935 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified. Open follow-up: per-tenant connector→session lifecycle (static MCP_SERVERS path is fully wired) |
 | 10. Artifacts and multimodal | P1 | Complete | Commits `2601352` + `7b41354` (review fix); Artifact model + ArtifactService (tenant-scoped streaming download, checksum-on-read, retention) + migration `0010`, typed multimodal parts + route_multimodal (defense-in-depth), spill→artifact wired into production, OpenAI-compatible transcribe/speech/image-gen/edit; targeted 58 passed, backend 963 passed (1 known env-deferred); combined review APPROVED then I1/I2 fixes verified |
-| 11. Observability/quotas/readiness/evals | P2 | Not started | Uses durable events and real usage/budgets |
+| 11. Observability/quotas/readiness/evals | P2 | Complete | Commits `bd48966` + `cfa3958` (ci.yml tracked) + `363aa62` (review fixes); observability (no-op fallbacks + sk-/JWT redaction + correlation IDs), quotas ACTIVE on cost-control hot paths (admit/release idempotent + charge_usage, gated/off-by-default), strict /ready (migration head + Qdrant ≥1.10.0 + storage + runner + eligible model), offline evals, CI release-eval-gate; targeted 48 passed, backend 997 passed (1 known env-deferred). Open follow-up Task-11b: broad span/counter instrumentation; connector/tool quota enforcement at integration points |
 | 12. Enterprise frontend surfaces | P2 | Not started | Uses durable APIs from Tasks 4-11 |
 | 13. Production deployment/migrations/backups | P0/P2 | Not started | Finalizes runtime topology and operations |
 | 14. Full acceptance verification | P0 | Not started | Final release gate |
@@ -67,9 +67,9 @@
 
 ### P2: enterprise operability and user experience
 
-- [ ] Add OpenTelemetry-compatible traces, Prometheus metrics, structured logs, correlation IDs, and sensitive-data redaction.
-- [ ] Add concurrent-run, token, cost, storage, connector, and tool quotas with admin-visible enforcement reasons.
-- [ ] Add deterministic evaluation suites, quality/security thresholds, dependency readiness, and CI release gates.
+- [x] Add OpenTelemetry-compatible traces, Prometheus metrics, structured logs, correlation IDs, and sensitive-data redaction.
+- [x] Add concurrent-run, token, cost, storage, connector, and tool quotas with admin-visible enforcement reasons.
+- [x] Add deterministic evaluation suites, quality/security thresholds, dependency readiness, and CI release gates.
 - [ ] Add frontend background runs, reconnect/replay, plan review, pause/resume/cancel/instruction/approval controls, memory/connector management, artifacts, and multimodal composer.
 - [ ] Align dependency versions, add production Compose/Kubernetes topology, zero-downtime migration rules, PITR/object/Qdrant backups, and restore validation.
 
@@ -639,7 +639,7 @@ Expected: all selected tests pass. (Verified: 58 passed across artifacts/multimo
 - Modify: `backend/requirements.txt`
 - Modify: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Write failing secret-redaction, quota, and dependency-readiness tests**
+- [x] **Step 1: Write failing secret-redaction, quota, and dependency-readiness tests**
 
 ```python
 def test_trace_attributes_redact_api_keys():
@@ -650,22 +650,22 @@ async def test_tenant_token_quota_blocks_new_run(quota_service, exhausted_tenant
         await quota_service.admit_run(exhausted_tenant)
 ```
 
-- [ ] **Step 2: Verify RED and implement optional OpenTelemetry/Prometheus adapters**
+- [x] **Step 2: Verify RED and implement optional OpenTelemetry/Prometheus adapters**
 
 Instrumentation has no-op fallbacks when exporters are absent. Trace model calls, tools, retrieval, workflow transitions, queue latency, and artifacts with redacted attributes.
 
-- [ ] **Step 3: Implement concurrent-run, token, cost, storage, and tool quotas**
+- [x] **Step 3: Implement concurrent-run, token, cost, storage, and tool quotas**
 
 Admission and post-usage accounting use transactional database counters and Redis rate limits without trusting client values.
 
-- [ ] **Step 4: Add strict readiness and evaluation commands**
+- [x] **Step 4: Add strict readiness and evaluation commands**
 
 Readiness validates migration head, Redis, Qdrant compatibility, storage, runner, and at least one eligible chat model. Offline evaluations test deterministic contracts; live golden tasks require explicit credentials.
 
-- [ ] **Step 5: Run observability and readiness tests**
+- [x] **Step 5: Run observability and readiness tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_observability_redaction.py tests/test_quotas.py tests/test_readiness.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 48 passed across quotas/observability/readiness/chat_stream/phase0; full backend 997 passed, 1 known env-deferred failure. Open follow-up Task-11b: span/counter instrumentation.)
 
 ### Task 12: Frontend durable runs, plans, memories, connectors, artifacts, and multimodal composer
 
