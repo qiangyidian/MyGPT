@@ -37,14 +37,29 @@ class McpServerConfig:
     transport: str = "stdio"  # "stdio" | "sse" | "http"
 
 
+def _default_session_factory(config: "McpServerConfig") -> McpSession:
+    """Default session builder: a real :class:`McpSession` over the config."""
+    return McpSession(config)
+
+
 class McpClientRegistry:
     """Aggregates tools from all configured MCP servers into one catalog."""
 
-    def __init__(self, servers: list[McpServerConfig] | None = None) -> None:
+    def __init__(
+        self,
+        servers: list[McpServerConfig] | None = None,
+        *,
+        session_factory: "Any | None" = None,
+    ) -> None:
         self._servers = list(servers or [])
         self._catalog = McpCatalog()
         self._sessions: dict[str, McpSession] = {}  # server name -> live session
         self._connected = False
+        # Injectable so the per-tenant connector lifecycle can substitute fake
+        # sessions in tests (and so a future cache/pool can return warm
+        # sessions). Defaults to building a real McpSession per config — the
+        # static MCP_SERVERS path is byte-identical to before.
+        self._session_factory = session_factory or _default_session_factory
 
     @property
     def enabled(self) -> bool:
@@ -76,7 +91,7 @@ class McpClientRegistry:
 
     async def _connect_one(self, srv: McpServerConfig) -> None:
         """Open a real transport session and add the server's tools to the catalog."""
-        session = McpSession(srv)
+        session = self._session_factory(srv)
         await session.initialize()
         tools_raw = await session.list_tools()
         infos = [

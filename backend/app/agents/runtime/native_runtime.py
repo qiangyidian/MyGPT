@@ -86,6 +86,27 @@ class NativeChatRuntime:
     name = "native"
 
     async def stream_turn(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
+        """Thin wrapper: guarantees per-tenant connector sessions are torn down
+        at run end (graceful shutdown), regardless of how the turn exits. The
+        real loop lives in :meth:`_stream_turn_body`; connector sessions opened
+        there are stashed on ``ctx.extra`` and closed here."""
+        try:
+            async for evt in self._stream_turn_body(ctx):
+                yield evt
+        finally:
+            _conn_mgr = ctx.extra.pop("_connector_session_manager", None)
+            if _conn_mgr is not None:
+                try:
+                    await _conn_mgr.close_all()
+                except Exception:  # noqa: BLE001 — shutdown must never raise
+                    logger.warning(
+                        "connector session close failed for run %s", ctx.run_id,
+                        exc_info=True,
+                    )
+
+    async def _stream_turn_body(
+        self, ctx: AgentTurnContext
+    ) -> AsyncIterator[AgentEvent]:
         db = ctx.db
         cfg = ctx.model_config
         assistant_msg = ctx.assistant_msg
@@ -100,6 +121,37 @@ class NativeChatRuntime:
         from app.agents.mcp_client import merge_mcp_tools
 
         merge_mcp_tools(registry)
+        # Per-tenant connector→session lifecycle (Task 9 follow-up): open a live
+        # McpSession for each of THIS user's ENABLED connectors and merge their
+        # tools into the same registry through the same gateway path (no parallel
+        # execution path). Tenant-scoped (only this user's connectors load),
+        # graceful (a broken connector is isolated + skipped, never crashes the
+        # run), credentials decrypted in-memory only. Sessions are closed by the
+        # stream_turn wrapper's finally (graceful shutdown).
+        user_id = ctx.user.id if ctx.user is not None else None
+        if user_id is not None:
+            _conn_mgr = None
+            try:
+                from app.connectors.sessions import ConnectorSessionManager
+
+                _conn_mgr = ConnectorSessionManager(db)
+                _conn_registry = await _conn_mgr.open_for_user(user_id)
+                merge_mcp_tools(registry, mcp_registry=_conn_registry)
+                # Stash so stream_turn's finally tears it down at run end.
+                ctx.extra["_connector_session_manager"] = _conn_mgr
+            except Exception:  # noqa: BLE001 — connector tools must never crash the run
+                logger.warning(
+                    "connector→session merge failed for run %s; skipping",
+                    ctx.run_id, exc_info=True,
+                )
+                # Defensive: if a manager was created but not stashed (failure
+                # between open and stash), close any sessions it opened so they
+                # don't leak. stream_turn's finally only sees stashed managers.
+                if _conn_mgr is not None:
+                    try:
+                        await _conn_mgr.close_all()
+                    except Exception:  # noqa: BLE001
+                        pass
         settings = get_settings()
         guard = ctx.budget_guard
         if guard is None:

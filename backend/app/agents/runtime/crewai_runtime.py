@@ -296,6 +296,25 @@ class CrewAIRuntime:
     name = "crewai"
 
     async def stream_turn(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
+        """Thin wrapper: guarantees per-tenant connector sessions (opened in
+        :meth:`_build_tools`) are torn down at run end (graceful shutdown)."""
+        try:
+            async for evt in self._stream_turn_body(ctx):
+                yield evt
+        finally:
+            _conn_mgr = ctx.extra.pop("_connector_session_manager", None)
+            if _conn_mgr is not None:
+                try:
+                    await _conn_mgr.close_all()
+                except Exception:  # noqa: BLE001 — shutdown must never raise
+                    logger.warning(
+                        "crewai connector session close failed for run %s",
+                        ctx.run_id, exc_info=True,
+                    )
+
+    async def _stream_turn_body(
+        self, ctx: AgentTurnContext
+    ) -> AsyncIterator[AgentEvent]:
         # Coerce null assistant content on CrewAI's outgoing chat body so
         # Anthropic-strict OpenAI-compatible gateways (GLM proxy) don't 422.
         _install_chat_body_sanitizer()
@@ -343,7 +362,7 @@ class CrewAIRuntime:
         yield ev_plan_created(summary=plan_summary, steps=plan_steps)
 
         guard = _guard_for_context(ctx)
-        tools = self._build_tools(ctx, stage_ctx=None)
+        tools = await self._build_tools(ctx, stage_ctx=None)
         try:
             agent = Agent(
                 role="Assistant",
@@ -538,7 +557,7 @@ class CrewAIRuntime:
                     )
 
             stage_ctx.persist_continuation_checkpoint = persist_checkpoint_fallback
-        tools = self._build_tools(ctx, stage_ctx=stage_ctx)
+        tools = await self._build_tools(ctx, stage_ctx=stage_ctx)
 
         # The approval bridge is built after the emitter (it needs the emitter
         # to emit waiting/run_status). We attach it to the stage ctx below.
@@ -908,7 +927,7 @@ class CrewAIRuntime:
     # ====================================================================== #
     # Helpers
     # ====================================================================== #
-    def _build_tools(
+    async def _build_tools(
         self, ctx: AgentTurnContext, *, stage_ctx: StageContext | None
     ) -> list[Any]:
         if not ctx.enable_tools:
@@ -923,6 +942,37 @@ class CrewAIRuntime:
 
         merge_mcp_tools(registry)
         user_id = ctx.user.id if ctx.user else None
+        # Per-tenant connector→session lifecycle (Task 9 follow-up): merge THIS
+        # user's enabled-connector tools through the same gateway path. The
+        # manager is cached on ctx.extra so multi-stage runs open sessions once
+        # and reuse them across stages (idempotent open_for_user); stream_turn's
+        # finally closes them at run end.
+        if user_id is not None:
+            _stashed_mgr = ctx.extra.get("_connector_session_manager")
+            _local_mgr = None
+            try:
+                if _stashed_mgr is None:
+                    from app.connectors.sessions import ConnectorSessionManager
+
+                    _local_mgr = ConnectorSessionManager(ctx.db)
+                    _conn_registry = await _local_mgr.open_for_user(user_id)
+                    merge_mcp_tools(registry, mcp_registry=_conn_registry)
+                    ctx.extra["_connector_session_manager"] = _local_mgr
+                else:
+                    _conn_registry = await _stashed_mgr.open_for_user(user_id)
+                    merge_mcp_tools(registry, mcp_registry=_conn_registry)
+            except Exception:  # noqa: BLE001 — connector tools must never crash the run
+                logger.warning(
+                    "crewai connector→session merge failed for run %s; skipping",
+                    ctx.run_id, exc_info=True,
+                )
+                # Defensive: a freshly-created (uncached) manager that failed
+                # before being stashed must be closed so sessions don't leak.
+                if _local_mgr is not None and _stashed_mgr is None:
+                    try:
+                        await _local_mgr.close_all()
+                    except Exception:  # noqa: BLE001
+                        pass
         # Apply the intent route's allowlist / disable_web (search / create modes).
         route = ctx.extra.get("route")
         sources = list(registry.list())
