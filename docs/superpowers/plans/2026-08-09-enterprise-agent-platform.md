@@ -28,7 +28,7 @@
 | 3. Agent budgets and provider controls | P0 | Complete | Commits `267dfcf`–`decc619` plus gate-hardening commit; focused budget/native suites 76/76; backend 725 passed (1 known env-deferred web-search test); combined spec+quality review APPROVED (no Critical/Important) |
 | 4. Durable workflow schema/events/leases/controls | P0 | Complete | Commits `116b4e2` + `51c076f` (review fixes); migration `0007`, EventStore/CommandStore/LeaseStore, persist-first controls; targeted 45 passed, backend 753 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 5. Redis Streams worker/recovery/SSE replay | P0 | Complete | Commits `a76e4f7`+`25bc33a`+`72d26c9` (review fixes); Redis+in-memory queue, worker w/ lease-loss abort + short-lived event sessions, recovery scheduler, cursor-replay SSE, durable dispatch wired (gated), Compose worker+recovery; targeted 52 passed, backend 783 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
-| 6. Planner-executor-verifier | P1 | Not started | Awaiting durable workflow foundation |
+| 6. Planner-executor-verifier | P1 | Complete | Commits `7dd0987` + `0446ee3` (review fixes); engine + templates + StageAdapterExecutor + AttemptRepository; topology mirrors graph.py; targeted 63 passed, backend green; combined review APPROVED on engine boundary (orchestrator routing deferred to a flagged follow-up) |
 | 7. Compaction/output spill/long-term memory | P1 | Not started | Awaiting workflow state machine |
 | 8. Workspace tools and isolated runner | P1 | Not started | Awaiting workflow and policy contracts |
 | 9. MCP transports and connectors | P1 | Not started | Awaiting unified tool gateway hardening |
@@ -57,8 +57,8 @@
 
 ### P1: advanced agent capability
 
-- [ ] Implement typed planner-executor-verifier workflows with dependency-aware parallelism, retries, bounded replanning, and structured verification.
-- [ ] Express research, parallel research, debate, and tool-heavy runs as templates over the same durable state machine.
+- [x] Implement typed planner-executor-verifier workflows with dependency-aware parallelism, retries, bounded replanning, and structured verification.
+- [x] Express research, parallel research, debate, and tool-heavy runs as templates over the same durable state machine.
 - [ ] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
 - [ ] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
 - [ ] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
@@ -92,7 +92,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [ ] The web-search safe-default test is sensitive to repository `.env` loading; Tasks 11/13/14 must isolate tests from deployment secrets and verify secure defaults deterministically.
 - [x] Current in-memory pause/resume/cancel/instruction controls are not durable; closed by Task 4 (persist-first durable commands).
 - [x] Current SSE connection owns too much execution lifetime; closed by Task 5 (cursor-replay SSE is read-only; workflow runs in the worker).
-- [ ] Current multi-agent profiles are not a general typed planner-executor-verifier engine; Task 6 provides the durable generic engine.
+- [x] Current multi-agent profiles are not a general typed planner-executor-verifier engine; closed by Task 6 (durable generic engine + templates; CrewAI behind a stage adapter; orchestrator routing deferred to a flagged follow-up).
 - [ ] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; Task 7 unifies them.
 - [ ] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; Tasks 8 and 9 close it.
 - [ ] Generated files and multimodal content are not first-class authorized artifacts; Task 10 closes it.
@@ -420,7 +420,7 @@ Expected: all selected tests pass. (Verified: 52 passed across queue/recovery/re
 - Modify: `backend/app/agents/orchestrator.py`
 - Modify: `backend/app/models/agent_run.py`
 
-- [ ] **Step 1: Write failing dependency, parallelism, retry, replan, and verification tests**
+- [x] **Step 1: Write failing dependency, parallelism, retry, replan, and verification tests**
 
 ```python
 async def test_independent_ready_steps_run_in_parallel(engine, plan):
@@ -433,26 +433,26 @@ async def test_failed_verification_replans_within_budget(engine, plan):
     assert result.status == "completed"
 ```
 
-- [ ] **Step 2: Verify RED and implement strict plan schemas**
+- [x] **Step 2: Verify RED and implement strict plan schemas**
 
 Each step includes dependencies, role/model, tool allowlist, timeout, retry policy, acceptance criteria, and cost estimate. Plans reject cycles and missing dependencies.
 
-- [ ] **Step 3: Implement ready-set execution and checkpointing**
+- [x] **Step 3: Implement ready-set execution and checkpointing**
 
 Execute bounded independent steps concurrently, persist attempt transitions, retry only classified transient errors, and checkpoint observations before downstream work.
 
-- [ ] **Step 4: Implement structured verification and bounded replanning**
+- [x] **Step 4: Implement structured verification and bounded replanning**
 
 Verifier returns `pass`, `revise`, or `fail` with findings. `revise` consumes replan budget and produces a versioned plan retaining completed valid work.
 
-- [ ] **Step 5: Express research, parallel research, and debate as templates**
+- [x] **Step 5: Express research, parallel research, and debate as templates**
 
 Keep CrewAI behind a stage adapter but route new expert tasks through the durable engine.
 
-- [ ] **Step 6: Run workflow tests**
+- [x] **Step 6: Run workflow tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_workflow_engine.py tests/test_workflow_replan.py tests/test_debate.py tests/test_agent_graph_lifecycle.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 63 passed; full backend green; combined review APPROVED on engine boundary. Open follow-up: route one profile through the engine behind a flag — Task 6b.)
 
 ### Task 7: Integrated compaction, output spill, and long-term memory
 
