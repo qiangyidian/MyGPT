@@ -31,7 +31,7 @@
 | 6. Planner-executor-verifier | P1 | Complete | Commits `7dd0987` + `0446ee3` (review fixes); engine + templates + StageAdapterExecutor + AttemptRepository; topology mirrors graph.py; targeted 63 passed, backend green; combined review APPROVED on engine boundary (orchestrator routing deferred to a flagged follow-up) |
 | 7. Compaction/output spill/long-term memory | P1 | Complete | Commits `682ae73` + `c89e5df` (review fix); unified ContextManager (tool-pair atomic compaction, gated mid-run compaction wired into native runtime, opaque ArtifactHandle spill, pure system-prompt assembly) + opt-in UserMemory + migration `0008`; targeted 76 passed, backend 847 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 8. Workspace tools and isolated runner | P1 | Complete | Commits `e8a9f57` + `acbf77e` (review fix); 8 path-confined workspace tools (resolve_under_root defeats `..`/absolute/symlink escapes), atomic apply_patch, LocalRunner dev-gated + DockerRunner most-restrictive (network=none/read-only/cap-drop/no-new-privs/non-root/bounded); targeted 96 passed, backend 904 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
-| 9. MCP transports and connectors | P1 | Not started | Awaiting unified tool gateway hardening |
+| 9. MCP transports and connectors | P1 | Complete | Commits `d8bd736` + `63fe0ce` (review fix); JSON-RPC stdio+HTTP transports (no SDK, fake-tested), encrypted tenant Connector + provider catalog + migration `0009`, gateway routing wired end-to-end (`merge_mcp_tools` in both runtimes, e2e audit-row test); targeted 37 passed, backend 935 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified. Open follow-up: per-tenant connector→session lifecycle (static MCP_SERVERS path is fully wired) |
 | 10. Artifacts and multimodal | P1 | Not started | Awaiting storage/provider contracts |
 | 11. Observability/quotas/readiness/evals | P2 | Not started | Uses durable events and real usage/budgets |
 | 12. Enterprise frontend surfaces | P2 | Not started | Uses durable APIs from Tasks 4-11 |
@@ -62,7 +62,7 @@
 - [x] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
 - [x] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
 - [x] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
-- [ ] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
+- [x] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
 - [ ] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
 
 ### P2: enterprise operability and user experience
@@ -553,7 +553,7 @@ Expected: all selected tests pass. (Verified: 96 passed; full backend 904 passed
 - Modify: `backend/app/agents/mcp_catalog.py`
 - Modify: `backend/app/main.py`
 
-- [ ] **Step 1: Write failing JSON-RPC initialize/list/call/cancel tests against local fake servers**
+- [x] **Step 1: Write failing JSON-RPC initialize/list/call/cancel tests against local fake servers**
 
 ```python
 async def test_stdio_mcp_discovers_and_calls_tool(fake_stdio_server):
@@ -563,22 +563,22 @@ async def test_stdio_mcp_discovers_and_calls_tool(fake_stdio_server):
     assert await client.call_tool("echo", {"text": "ok"}) == {"text": "ok"}
 ```
 
-- [ ] **Step 2: Verify RED and implement stdio and Streamable HTTP transports**
+- [x] **Step 2: Verify RED and implement stdio and Streamable HTTP transports**
 
 Implement JSON-RPC identifiers, initialize negotiation, tools/list, tools/call, cancellation, timeout, reconnect, stderr capture limits, and graceful shutdown.
 
-- [ ] **Step 3: Route discovered MCP tools through ToolGateway**
+- [x] **Step 3: Route discovered MCP tools through ToolGateway**
 
 Namespace names, preserve server provenance, validate JSON schemas, and apply the same approvals, network policy, budgets, spill, and audit as built-ins.
 
-- [ ] **Step 4: Implement encrypted tenant connector definitions**
+- [x] **Step 4: Implement encrypted tenant connector definitions**
 
 Provide catalog entries for GitHub, Gmail/Outlook, Google/Outlook Calendar, Slack/Teams, Notion, Drive/SharePoint/Box, Atlassian, and Figma as MCP server manifests. Store credentials encrypted and require minimum OAuth scopes.
 
-- [ ] **Step 5: Run MCP and connector tests**
+- [x] **Step 5: Run MCP and connector tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_mcp_stdio_transport.py tests/test_mcp_http_transport.py tests/test_connectors.py tests/test_mcp_catalog.py -q`
-Expected: all selected tests pass without external credentials.
+Expected: all selected tests pass without external credentials. (Verified: 37 passed incl. gateway-integration e2e; full backend 935 passed, 1 known env-deferred failure.)
 
 ### Task 10: First-class artifacts and multimodal providers
 
