@@ -29,6 +29,7 @@ even if a dependency is down; readiness is the LB/k8s signal.
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import logging
 import os
 import tempfile
@@ -47,11 +48,23 @@ _PROBE_TIMEOUT = 2.0
 # have caught up before /ready returns 200).
 REPO_MIGRATION_HEAD = "0010_artifacts"
 
-# Qdrant client/server compatibility pairs. The installed client is 1.18.x; the
-# server must speak a compatible gRPC/HTTP protocol. A server older than 1.10
-# is known to break collection ops against a >=1.12 client (the repo's documented
-# version-skew warning). Pairs listed as (min_server, max_server) inclusive.
+# Qdrant client/server compatibility pairs. The server is pinned to
+# qdrant/qdrant:v1.12.x and the client to 1.12.x/1.13.x (see requirements.txt);
+# a server older than 1.10 is known to break collection ops against a >=1.12
+# client (the repo's documented version-skew warning).
 _QDRANT_MIN_SERVER = (1, 10, 0)
+# Max supported client/server minor-version skew. A client up to one minor
+# ahead/behind the server is supported; a larger gap is a version-skew failure
+# (the original warning was client 1.18 vs server 1.12 — a 6-minor gap).
+_QDRANT_MAX_SKEW = 1
+
+
+def _installed_qdrant_client_version() -> tuple[int, ...]:
+    """Installed qdrant-client version (empty tuple if metadata unavailable)."""
+    try:
+        return _parse_version(importlib.metadata.version("qdrant-client"))
+    except Exception:  # noqa: BLE001 — best-effort metadata lookup
+        return ()
 
 
 def _ok(reason: str = "ok") -> dict[str, Any]:
@@ -152,7 +165,21 @@ async def _check_qdrant() -> dict[str, Any]:
                     f"qdrant server {server_version} older than supported "
                     f"{'.'.join(map(str, _QDRANT_MIN_SERVER))} (client/server skew)"
                 )
-            return _ok(f"reachable; server={server_version}")
+            # Guard the client/server minor-version skew so a drifted client
+            # can't pass readiness silently even if the requirements pin is
+            # bypassed (the repo's known skew was client 1.18 vs server 1.12).
+            client_ver = _installed_qdrant_client_version()
+            client_label = ".".join(map(str, client_ver)) if client_ver else "unknown"
+            if client_ver and sv:
+                client_minor = client_ver[1] if len(client_ver) > 1 else 0
+                server_minor = sv[1] if len(sv) > 1 else 0
+                if abs(client_minor - server_minor) > _QDRANT_MAX_SKEW:
+                    return _fail(
+                        f"client/server version skew: client={client_label} "
+                        f"server={server_version} (max supported minor skew "
+                        f"{_QDRANT_MAX_SKEW}; pin qdrant-client to match the server)"
+                    )
+            return _ok(f"reachable; server={server_version}; client={client_label}")
         except Exception as inner:  # noqa: BLE001 — version probe failed
             # Reachable, but the compatibility probe could not run. A reachable-
             # but-unprobed Qdrant is treated as NOT ready: the operator must see

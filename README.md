@@ -134,16 +134,83 @@ ai-chat-platform/
 
 ---
 
-## 生产部署建议
+## 生产部署 (Task 13)
 
-1. 生产 `.env`：`ENV=prod`、强随机的 `JWT_SECRET` 与 `FERNET_KEY`、关闭 `AUTO_CREATE_TABLES`，用 Alembic 迁移。
-2. 前端去掉 `--reload` / `pnpm dev`，改用构建产物（`output: standalone`，见 Dockerfile 的 prod 阶段）。
-3. 后端用 `gunicorn -k uvicorn.workers.UvicornWorker` 多进程，前置 Nginx 做 TLS 终止与静态资源。
-4. 启用 MinIO/S3 替代本地存储（`STORAGE_BACKEND=minio`）。
-5. 关闭注册（环境变量控制）或改为邀请制。
-6. 定期备份 PostgreSQL（`pg_dump`）与 Qdrant（快照）。
+生产拓扑是**叠加式**的：开发用 `docker-compose.yml`（源码挂载 + `--reload`），生产用独立的 `docker-compose.prod.yml`（无挂载、无 reload、迁移先行、资源限制）+ Kubernetes 清单。
+
+### 1. 生产 Compose
+
+```bash
+cp .env.example .env.prod          # 编辑：ENV=prod、FERNET_KEY、POSTGRES_PASSWORD、ADMIN_PASSWORD…
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+```
+
+`docker-compose.prod.yml` 与开发版的区别：
+
+| 项 | 开发 | 生产 |
+|---|---|---|
+| 源码挂载 | `./backend:/app`、`./frontend:/app` | **无**（镜像内置） |
+| 后端命令 | `uvicorn … --reload` | `uvicorn …`（无 reload） |
+| 前端 | `next dev`（热重载） | `node server.js`（standalone 产物） |
+| 迁移 | `AUTO_CREATE_TABLES=true` | `migrate` 一次性服务先跑 `alembic upgrade head` |
+| Worker/Recovery | 可选 | 必启（`BACKGROUND_WORKER=durable`） |
+| 资源限制 | 无 | 每 服务 `deploy.resources.limits` |
+| 密钥 | `.env` | `.env.prod`（不入库；`FERNET_KEY` 必填非空） |
+
+### 2. 迁移头强制（Migration head mandatory）
+
+两层保障，确保落后于迁移头的镜像拿不到流量：
+
+- **部署时**：`migrate` 服务在 API/worker/recovery 启动前执行 `alembic upgrade head`（仓库 head = `0010_artifacts`）。Kubernetes 下用 initContainer/Job 等价实现。
+- **运行时**：`GET /ready`（`app/core/health.py` 的 `check_readiness`）断言 DB 的 alembic revision == 仓库 head，否则返回 **503**。这是 LB / k8s readinessProbe 的硬门。
+
+验证脚本（隔离临时库，不碰真实数据）：
+
+```bash
+./scripts/verify_migrations.sh     # 空 库 + 增量(0009→head) 两条路径都到 0010_artifacts
+```
+
+### 3. Qdrant 客户端/服务端版本对齐
+
+仓库曾存在版本偏移（未固定时安装了 client `1.18.0` 对 server `1.12.4`，差 6 个 minor）。Task 13 固定：
+
+- 服务端：`qdrant/qdrant:v1.12.4`（`docker-compose.yml` + `docker-compose.prod.yml`）
+- 客户端：`qdrant-client>=1.12,<1.14`（`backend/requirements.txt`，即 1.12.x 或 1.13.x，minor 偏移 ≤ 1）
+- 运行时断言：`health._check_qdrant` 同时校验 **服务端 ≥ 1.10.0** 且 **客户端/服务端 minor 偏移 ≤ 1**，偏移则 `/ready` → 503，不会静默通过。一起 bump，不要单边升级。
+
+### 4. Kubernetes 清单
+
+```bash
+kubectl apply -n mygpt -f deploy/k8s/
+```
+
+`deploy/k8s/` 包含：`config.yaml`（ConfigMap + uploads PVC）、`api.yaml`、`worker.yaml`、`recovery.yaml`、`sandbox-runner.yaml`、`network-policies.yaml`。要点：
+
+- `securityContext.runAsNonRoot: true`（uid 1001）、`readOnlyRootFilesystem: true`、`capabilities.drop: [ALL]`、`seccompProfile: RuntimeDefault`
+- `readinessProbe` → `/ready`（严格门）、`livenessProbe` → `/health`（宽松）
+- 每 服务 `PodDisruptionBudget`；`NetworkPolicy` 默认拒绝 ingress+egress，仅放行最小路径
+- 密钥走外部 Secret（`mygpt-secrets`，由 external-secrets / sealed-secrets / kubectl 预置），非 ConfigMap
+- **sandbox-runner**：代码执行沙箱需 DinD/特权，**不能**满足非 root/只读根fs。清单用 `nodeSelector`+`tolerations` 钉到**独立隔离节点池**，并注明可用 gVisor/Kata 或外部 microVM 替代以避免特权 pod（已写入清单注释）。
+
+> 清单为参考实现：镜像 `mygpt/backend:v1.0.0` 需先用 `backend/Dockerfile` 构建并推到你的镜像仓库；数据服务（postgres/redis/qdrant）若用托管外部服务，需把 NetworkPolicy 的 `podSelector` egress 换成对 应 ipBlock/namespaceSelector。
+
+### 5. 备份与恢复演练
+
+```bash
+./scripts/backup.sh                          # 日常备份（cron）：pg_dump + Qdrant 快照 + uploads.tar
+./scripts/restore-drill.sh ./backups/<TS>     # 恢复演练：还原到隔离容器，校验迁移头 + 校验和
+./scripts/verify_migrations.sh                # 迁移头验证
+```
+
+- **Postgres**：`pg_dump -F c`（并行恢复友好）。PITR（按时间点恢复）需额外开启 WAL 归档（`archive_mode=on` + `archive_command`）+ 基础备份，演练脚本用逻辑 dump 做一致性校验。
+- **Qdrant**：每集合快照 API 上传恢复。
+- **对象存储**：`uploads.tar`；恢复演练做 tar 往返校验和；若备份目录带 `MANIFEST.sha256` 则按清单校验。生产建议 `STORAGE_BACKEND=minio`（对象存储自带版本化）。
+- **演练目标隔离**：脚本启动一次性 postgres/qdrant 容器还原，**绝不**写真实库；校验 alembic current == `0010_artifacts` + Qdrant 集合数 + 校验和，PASS/FAIL 明确。
+
+> 脚本沿用仓库的 `.sh`（bash）约定（与 `backup.sh`/`restore.sh` 一致）；Task 13 计划提到 `.ps1`，此处按仓库惯例统一为 `.sh`。
 
 ---
+
 
 ## 常见问题排查
 

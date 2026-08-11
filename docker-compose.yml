@@ -35,6 +35,8 @@ services:
   qdrant:
     # Pinned (was :latest) for reproducibility — a drifting qdrant version can
     # silently change the API/behavior the client relies on. Bump deliberately.
+    # Compatible client pair (Task 13): qdrant-client 1.12.x or 1.13.x (minor
+    # skew <= 1). See backend/requirements.txt + health._check_qdrant.
     image: qdrant/qdrant:v1.12.4
     restart: unless-stopped
     volumes:

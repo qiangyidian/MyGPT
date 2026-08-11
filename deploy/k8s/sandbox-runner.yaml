@@ -1,0 +1,93 @@
+# Sandbox runner (Task 8) — privileged Docker-in-Docker (DinD) workload.
+#
+# TRADE-OFF (documented per Task 13): the rest of the topology is non-root,
+# read-only-rootfs, default-deny, dropped capabilities. The code-execution
+# sandbox CANNOT meet that posture: spinning up ephemeral Docker containers
+# for untrusted tool output requires either the Docker socket or a DinD daemon,
+# both of which need elevated privileges. This manifest is therefore run on a
+# DEDICATED, ISOLATED node pool (nodeSelector + tolerations) so a container
+# escape is confined to throwaway runner pods, never the API/data plane.
+#
+# Alternatives (pick one and delete the rest):
+#   * gVisor / Kata Containers as the runtime class on the runner node — keeps
+#     strong isolation without a privileged DinD daemon (set runtimeClassName).
+#   * An external, managed sandbox service (e.g. a dedicated Firecracker /
+#     microVM fleet) reached over the network — then no privileged pods here.
+#   * SANDBOX_MODE=local for dev/test ONLY (LocalRunner hard-refuses outside
+#     dev/test; never use local in production).
+#
+# This manifest is REFERENCE-ONLY: apply it only on an isolated runner node pool.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-runner
+  namespace: mygpt
+  labels:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: sandbox-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mygpt
+      app.kubernetes.io/component: sandbox-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mygpt
+        app.kubernetes.io/component: sandbox-runner
+    spec:
+      # Pin to a dedicated, tainted runner node pool so privileged pods never
+      # co-locate with the API/data plane.
+      nodeSelector:
+        mygpt/sandbox: "true"
+      tolerations:
+        - key: sandbox
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: dind
+          # A privileged DinD daemon the DockerRunner talks to over the socket.
+          # The API/worker reach this service as `sandbox-runner:2375`; set
+          # DOCKER_HOST=tcp://sandbox-runner:2375 in mygpt-secrets/config.
+          image: docker:27-dind
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # REQUIRED for DinD — this is the intentional privilege elevation
+            # documented above. Do NOT relax the rest of the fleet to match.
+            privileged: true
+            # readOnlyRootFilesystem is NOT set: DinD writes to /var/lib/docker.
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""   # disable mutual TLS on the dedicated pod network
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: dind-storage
+              mountPath: /var/lib/docker
+      volumes:
+        - name: dind-storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-runner
+  namespace: mygpt
+spec:
+  selector:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: sandbox-runner
+  ports:
+    - name: docker
+      port: 2375
+      targetPort: 2375

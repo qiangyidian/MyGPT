@@ -1,0 +1,113 @@
+# Network policies for the mygpt namespace.
+#
+# Strategy: default-deny ingress + egress, then open the minimum paths each
+# workload needs. Data services (postgres/redis/qdrant) only accept traffic from
+# api/worker/recovery; the api accepts external ingress (from the frontend or an
+# ingress controller) on 8000; egress is scoped to in-cluster data services.
+---
+# Default deny all ingress + egress for every pod in the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: mygpt
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# API: allow ingress on 8000 from anywhere (front it with an Ingress/TLS
+# terminator), and egress to postgres/redis/qdrant + DNS + egress to external
+# model providers (model endpoints live outside the cluster).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-allow
+  namespace: mygpt
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Qdrant
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: qdrant
+      ports:
+        - protocol: TCP
+          port: 6333
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    # External model/embedding providers (and web_search) over HTTPS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Worker + recovery: no ingress; egress to postgres/redis/qdrant + DNS only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-egress
+  namespace: mygpt
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [worker, recovery]
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: qdrant
+      ports:
+        - protocol: TCP
+          port: 6333
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53

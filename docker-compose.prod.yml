@@ -1,0 +1,250 @@
+# =============================================================================
+# Production overlay for MyGPT.
+#
+# Standalone production topology — run with:
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# This is ADDITIVE to the dev docker-compose.yml: the dev file is unchanged and
+# keeps its source bind mounts + --reload. Production differs on purpose:
+#   * NO source bind mounts (./backend:/app, ./frontend:/app) — image-baked only.
+#   * NO --reload / no `pnpm dev` — uvicorn serves the API; Next runs `node
+#     server.js` against the standalone build.
+#   * A one-shot `migrate` service runs `alembic upgrade head` BEFORE the API,
+#     worker, and recovery start (depends_on: service_completed_successfully).
+#     The runtime readiness gate (/ready, see app/core/health.py) additionally
+#     returns 503 if the DB revision != repo head (0010_artifacts) — so a stale
+#     image that skipped a migration can never receive traffic.
+#   * Non-root containers (backend Dockerfile runs as uid 1001).
+#   * Resource limits + reservations on every service.
+#   * External secret file: the operator supplies .env.prod (never committed);
+#     it must set ENV=prod, a stable FERNET_KEY, BACKGROUND_WORKER=durable,
+#     QUOTAS_ENABLED=true, AUTO_CREATE_TABLES=false, and a changed
+#     ADMIN_PASSWORD. See .env.example for the full production checklist.
+#   * Pinned image tags for every stateful service.
+# =============================================================================
+services:
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_chat}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ai_chat}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ------------------------------------------------------------------- redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 64M
+
+  # ------------------------------------------------------------------ qdrant
+  qdrant:
+    # Pinned client/server pair (Task 13): server v1.12.4 pairs with
+    # qdrant-client 1.12.x/1.13.x (minor skew <= 1). health._check_qdrant
+    # asserts both the server floor (>=1.10.0) and the client/server skew.
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ------------------------------------------------------- migration one-shot
+  # Runs `alembic upgrade head` to the repo head (0010_artifacts) before any app
+  # service starts. This is the DEPLOY-TIME migration gate; the API/worker
+  # additionally refuse readiness (/ready → 503) if the DB revision drifts.
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No source mount — migrations are baked into the image.
+    command: ["alembic", "upgrade", "head"]
+
+  # ----------------------------------------------------------------- backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - uploads_data:${STORAGE_DIR:-/data/uploads}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    # No --reload, no source mount. Single worker per container; scale
+    # horizontally (replicas / k8s) — BACKGROUND_WORKER=durable means the API
+    # only enqueues; the separate `worker` service consumes the run queue.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    init: true
+    healthcheck:
+      # Liveness: the app booted + DB reachable. /ready is the strict LB gate
+      # (migration head + qdrant skew + storage + runner + chat model).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ----------------------------------------------------------- durable worker
+  # Consumes the durable run queue (Redis Streams). BACKGROUND_WORKER=durable +
+  # a reachable REDIS_URL must be set in .env.prod. Drains its current run on
+  # SIGTERM (stop_grace_period).
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - uploads_data:${STORAGE_DIR:-/data/uploads}
+    command: ["python", "-m", "app.worker"]
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      # No HTTP endpoint on the worker; assert the process is alive. Real
+      # worker health is monitored via run-queue depth / lease metrics.
+      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1, 0)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ------------------------------------------------------- recovery scheduler
+  # Requeues retryable runs whose lease expired; terminally fails exhausted ones.
+  recovery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "app.recovery"]
+    init: true
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1, 0)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ---------------------------------------------------------------- frontend
+  # Production Next.js standalone server (Dockerfile `prod` stage). No source
+  # mount, no dev server. HOSTNAME=0.0.0.0 so the standalone server binds off
+  # localhost (required for reachability inside the container network).
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: prod
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    init: true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  uploads_data:

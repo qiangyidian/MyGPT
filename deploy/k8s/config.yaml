@@ -1,0 +1,65 @@
+# Kubernetes manifests for MyGPT — shared (non-secret) configuration.
+#
+# Secrets are NOT templated here: the operator provisions a Secret named
+# `mygpt-secrets` (via external-secrets / sealed-secrets / kubectl) holding at
+# least: JWT_SECRET, FERNET_KEY, POSTGRES_PASSWORD, MODEL_API_KEY,
+# EMBEDDING_API_KEY, ADMIN_PASSWORD, QDRANT_API_KEY (if used). Services pull
+# them with envFrom.secretRef.
+#
+# Apply with:  kubectl apply -n mygpt -f deploy/k8s/
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mygpt
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mygpt-config
+  namespace: mygpt
+data:
+  # ---- App ----
+  ENV: "prod"
+  AUTO_CREATE_TABLES: "false"        # prod uses Alembic (the migrate Job / initContainer)
+  BACKEND_CORS_ORIGINS: "https://chat.example.com"
+  # ---- Durable worker (Task 5) ----
+  # durable => the API only enqueues; the `worker` Deployment consumes the Redis
+  # Streams run queue, and `recovery` reclaims expired leases.
+  BACKGROUND_WORKER: "durable"
+  RUN_QUEUE_STREAM: "agent-run-queue"
+  RUN_QUEUE_GROUP: "workers"
+  # ---- Vector DB (Task 13 pin: client 1.12.x/1.13.x, server v1.12.x) ----
+  VECTOR_DB: "qdrant"
+  QDRANT_URL: "http://qdrant:6333"
+  QDRANT_EMBEDDING_DIM: "1024"
+  # ---- Storage ----
+  STORAGE_BACKEND: "minio"           # local works too; MinIO/S3 is prod-default
+  STORAGE_DIR: "/data/uploads"
+  MAX_UPLOAD_MB: "20"
+  # ---- Sandbox runner ----
+  # docker = enterprise isolation (requires the sandbox-runner DinD setup; see
+  # sandbox-runner.yaml). local = dev/test subprocess ONLY (LocalRunner refuses
+  # to exec outside dev/test).
+  SANDBOX_MODE: "docker"
+  SANDBOX_DOCKER_IMAGE: "python:3.11-slim"
+  # ---- Quotas (Task 11) ----
+  QUOTAS_ENABLED: "true"
+  # ---- Observability (Task 11) ----
+  OTEL_ENABLED: "true"
+  OTEL_SERVICE_NAME: "mygpt-backend"
+  PROMETHEUS_ENABLED: "true"
+  LOG_REDACT_SENSITIVE: "true"
+---
+# Persistent upload volume shared by api + worker (object-storage backend
+# recommended for prod; this PVC is the local-storage fallback).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads
+  namespace: mygpt
+spec:
+  accessModes: ["ReadWriteMany"]     # RWX so api + worker pods share it
+  resources:
+    requests:
+      storage: 50Gi

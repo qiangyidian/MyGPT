@@ -30,7 +30,13 @@ httpx>=0.27
 tenacity>=8.2
 
 # ---- Vector DB ----
-qdrant-client>=1.9
+# Pinned to a client/server compatible pair (Task 13). The production server is
+# qdrant/qdrant:v1.12.x; the installed client must be within one minor of the
+# server (qdrant-client 1.12.x or 1.13.x). This resolves the known version
+# skew where an unpinned install pulled client 1.18.0 against server 1.12.4.
+# health._check_qdrant asserts both the server floor (>=1.10.0) AND that the
+# client/server minor skew is <= 1, so a drifted client can't pass readiness.
+qdrant-client>=1.12,<1.14
 
 # ---- Document parsing (core) ----
 pdfplumber>=0.11          # PDF text + table extraction (table-heavy fallback)

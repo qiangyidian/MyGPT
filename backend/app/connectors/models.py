@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, false, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -64,7 +64,7 @@ class Connector(Base):
     oauth_scopes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
     enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=func.false()
+        Boolean, nullable=False, default=False, server_default=false()
     )
 
     # Optional provider-specific config (e.g. default channel, repo).

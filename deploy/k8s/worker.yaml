@@ -1,0 +1,89 @@
+# Durable worker Deployment + PodDisruptionBudget.
+#
+# Consumes the Redis Streams run queue (BACKGROUND_WORKER=durable). Claims runs,
+# acquires leases, executes each via app.agents.workflow.execution.execute_run,
+# and acks on completion. Gracefully drains on SIGTERM (stop_grace_period /
+# terminationGracePeriodSeconds). Multiple replicas share the consumer group, so
+# the queue is the unit of parallelism — scale replicas to match desired
+# concurrency (also bounded by QUOTA_MAX_CONCURRENT_RUNS).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: mygpt
+  labels:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mygpt
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mygpt
+        app.kubernetes.io/component: worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35   # let the worker drain its current run
+      containers:
+        - name: worker
+          image: mygpt/backend:v1.0.0   # same image as the API
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: mygpt-config
+            - secretRef:
+                name: mygpt-secrets
+          command: ["python", "-m", "app.worker"]
+          # No HTTP endpoint -> no httpGet probe. Pod readiness = container
+          # started; real worker health is observed via run-queue depth, lease
+          # age, and ack-rate metrics (Task 11).
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: uploads
+              mountPath: /data/uploads
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: uploads
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-pdb
+  namespace: mygpt
+spec:
+  # Allow voluntary eviction of the (single) worker: in-flight durable runs are
+  # lease-protected and requeued by `recovery` on lease expiry, so a drain
+  # never loses work. Set minAvailable: 1 only if you run >=2 replicas.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mygpt
+      app.kubernetes.io/component: worker

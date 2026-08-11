@@ -1,0 +1,115 @@
+# Backend API Deployment + Service + PodDisruptionBudget.
+#
+# image: replace `mygpt/backend:v1.0.0` with your registry tag (built from
+# backend/Dockerfile). Readiness is the STRICT /ready gate (Task 11): 200 only
+# when the DB revision == repo head (0010_artifacts), Qdrant client/server skew
+# <= 1, storage writable, a runner available, and an eligible chat model
+# configured. Liveness is the lenient /health (DB up).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: mygpt
+  labels:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mygpt
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mygpt
+        app.kubernetes.io/component: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: mygpt/backend:v1.0.0   # build & push from backend/Dockerfile
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: mygpt-config
+            - secretRef:
+                name: mygpt-secrets
+          # Migrations are run as a one-shot Job/initContainer before traffic;
+          # the runtime /ready gate is the backstop if a pod lags the head.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 4
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: uploads
+              mountPath: /data/uploads
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: uploads
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: mygpt
+spec:
+  selector:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+  namespace: mygpt
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mygpt
+      app.kubernetes.io/component: api
