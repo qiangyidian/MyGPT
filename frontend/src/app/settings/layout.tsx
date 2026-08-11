@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useSearchParams, useRouter } from "next/navigation";
 import { Suspense, useEffect, useState, type ReactNode } from "react";
-import { Boxes, Cpu } from "lucide-react";
+import { Boxes, Brain, Cpu, Plug } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { buildLoginUrl, buildReturnTo, resolveChatHome, withReturnTo } from "@/lib/navigation";
@@ -11,14 +11,28 @@ import { useAuth } from "@/hooks/useAuth";
 import { BackLink } from "@/components/navigation/back-link";
 import { CenteredLoading } from "@/components/navigation/page-loading";
 
-// Settings sections. Currently only "Models" is wired up; the rest are
-// placeholders so the nav reflects the intended structure.
+// Settings sections. Models / memory / connectors are wired up; knowledge is a
+// placeholder so the nav reflects the intended structure.
 const NAV = [
   {
     label: "模型配置",
     href: "/settings/models",
     icon: Cpu,
     description: "管理 OpenAI 兼容 / Mock 模型",
+    enabled: true,
+  },
+  {
+    label: "长期记忆",
+    href: "/settings/memory",
+    icon: Brain,
+    description: "管理跨会话的语义记忆（可选开启）",
+    enabled: true,
+  },
+  {
+    label: "连接器",
+    href: "/settings/connectors",
+    icon: Plug,
+    description: "管理第三方集成与凭证",
     enabled: true,
   },
   {

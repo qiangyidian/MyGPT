@@ -20,6 +20,8 @@ interface ComposerToolbarProps {
   knowledgeBaseIds: string[];
   onKnowledgeBaseIdsChange: (ids: string[]) => void;
   knowledgeBases?: KnowledgeBase[];
+  /** Attachment mime types — drives modality-aware model filtering. */
+  attachmentMimes?: string[];
   className?: string;
 }
 
@@ -34,6 +36,7 @@ export function ComposerToolbar({
   knowledgeBaseIds,
   onKnowledgeBaseIdsChange,
   knowledgeBases,
+  attachmentMimes,
   className,
 }: ComposerToolbarProps) {
   const hasKbs = !!knowledgeBases && knowledgeBases.length > 0;
@@ -68,7 +71,11 @@ export function ComposerToolbar({
         </DropdownMenu>
       )}
 
-      <AdvancedModelSelector value={modelId} onChange={onModelChange} />
+      <AdvancedModelSelector
+        value={modelId}
+        onChange={onModelChange}
+        mimes={attachmentMimes}
+      />
     </div>
   );
 }

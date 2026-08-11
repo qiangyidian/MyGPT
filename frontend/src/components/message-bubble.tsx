@@ -27,6 +27,7 @@ import { Markdown } from "@/components/markdown";
 import { Citations } from "@/components/citations";
 import { ResearchSteps } from "@/components/research-steps";
 import { AttachmentList } from "@/components/attachments/attachment-list";
+import { InlineArtifactHandle } from "@/components/artifacts/inline-artifact-handle";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
 import { AgentInlineStatus } from "@/components/agents/agent-inline-status";
 import { useMessageFeedback } from "@/hooks/useMessageActions";
@@ -40,6 +41,7 @@ import type {
 } from "@/lib/types";
 import { getMessageStatus } from "@/lib/types";
 import { sanitizeSourceMarkers } from "@/lib/citations";
+import { findArtifactHandles } from "@/lib/artifacts";
 
 interface MessageBubbleProps {
   message: Message;
@@ -250,6 +252,10 @@ export const MessageBubble = memo(function MessageBubble({
     : message.content;
   const citationFlagged = !isUser && meta.citation_validation_failed === true;
 
+  // Artifact references in the assistant text (`artifact:<id>` handles) render
+  // as inline artifact cards with an authenticated download link.
+  const artifactHandles = !isUser ? findArtifactHandles(message.content) : [];
+
   const commitEdit = () => {
     const next = draft.trim();
     if (next && next !== message.content && onBranch) {
@@ -340,6 +346,13 @@ export const MessageBubble = memo(function MessageBubble({
                 <p className="mt-1 text-[11px] text-muted-foreground">
                   已自动移除缺少真实引用支持的来源标记。
                 </p>
+              )}
+              {artifactHandles.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {artifactHandles.map((id) => (
+                    <InlineArtifactHandle key={id} artifactId={id} />
+                  ))}
+                </div>
               )}
             </div>
           ) : (

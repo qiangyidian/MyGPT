@@ -469,7 +469,163 @@ export interface AgentRun {
   tool_calls: ToolCallAudit[];
   /** Multi-agent graph snapshot (null for single-agent / native runs). */
   graph: Record<string, unknown> | null;
+  /** Research/agent plan + its lifecycle status (mirrors AgentRunOut). */
+  plan: Record<string, unknown> | null;
+  plan_status: string | null;
+  user_instructions: Record<string, unknown> | null;
+  paused_at: string | null;
 }
 
 // ---- Context panel ----
 export type ContextTab = "execution" | "sources" | "files" | "artifact";
+
+// ===========================================================================
+// Task 12: durable runs, artifacts, user memories, connectors, typed parts.
+// Field names mirror the backend Pydantic schemas (app/schemas/*) so the API
+// client can pass them through unchanged.
+// ===========================================================================
+
+/**
+ * A row in the durable, append-only run-event log
+ * (`GET /api/agent-runs/{run_id}/events`, cursor-replay SSE). The SSE frame's
+ * `id:` line carries the `sequence`; `event_type` is the durable event name
+ * (e.g. `run.started`, `step.completed`) or a chat-stream event name
+ * (`run_started`, `token`, `done`).
+ */
+export interface DurableRunEvent {
+  id: string;
+  run_id: string;
+  sequence: number;
+  event_type: string;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+/** Workflow status of a durable run (independent of any SSE subscription). */
+export type DurableRunStatus =
+  | "pending"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/**
+ * Connection status of a run-event subscription. Deliberately SEPARATE from
+ * `DurableRunStatus`: a client disconnect (network drop, navigation) flips
+ * this to `"disconnected"` but leaves `runStatus` untouched — the workflow
+ * keeps running server-side and a reconnect resumes from the cursor.
+ */
+export type RunSubscriptionStatus =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "disconnected";
+
+/** An artifact row (tenant-scoped; bytes fetched via `/api/artifacts/{id}`). */
+export interface ArtifactMeta {
+  id: string;
+  media_type: string;
+  size: number;
+  checksum?: string | null;
+  filename: string | null;
+  source: string;
+  created_at: string | null;
+}
+
+/** A user-level (cross-conversation, opt-in) semantic memory row. */
+export interface UserMemory {
+  id: string;
+  user_id: string;
+  memory_type: string;
+  content: string;
+  structured_value: Record<string, unknown> | null;
+  confidence: number;
+  active: boolean;
+  confirmed_by_user: boolean;
+  source_message_id: string | null;
+  source_conversation_id: string | null;
+  expires_at: string | null;
+  embedding_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Body for `POST /api/memories` (propose a candidate). Defaults to INACTIVE. */
+export interface UserMemoryProposeInput {
+  content: string;
+  memory_type?: string;
+  confidence?: number;
+  source_message_id?: string | null;
+  source_conversation_id?: string | null;
+  /** Always false on the wire — the user must opt in by activating. */
+  active?: false;
+}
+
+/** Body for `PATCH /api/memories/{id}` (edit content; re-embeds if active). */
+export interface UserMemoryEditInput {
+  content: string;
+}
+
+/** A tenant-scoped connector row (credentials NEVER included on reads). */
+export interface Connector {
+  id: string;
+  user_id: string;
+  name: string;
+  provider: string;
+  manifest: Record<string, unknown>;
+  transport: string;
+  command_or_url: string;
+  oauth_scopes: string[];
+  enabled: boolean;
+  extra: Record<string, unknown> | null;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConnectorCreateInput {
+  name: string;
+  provider: string;
+  credentials: Record<string, unknown>;
+  oauth_scopes?: string[];
+  command_or_url?: string | null;
+  transport?: string | null;
+  enabled?: boolean;
+  extra?: Record<string, unknown> | null;
+}
+
+export interface ConnectorUpdateInput {
+  name?: string;
+  oauth_scopes?: string[];
+  extra?: Record<string, unknown> | null;
+}
+
+export interface ProviderManifest {
+  name: string;
+  kind: string;
+  transport: string;
+  command_or_url: string;
+  required_scopes: string[];
+  description: string;
+}
+
+/**
+ * A typed message part. The backend persists multimodal content as typed parts;
+ * the composer emits them and the message bubble renders them. `text` is the
+ * default (existing string `content` maps to a single text part).
+ */
+export type MessagePart =
+  | { type: "text"; text: string }
+  | { type: "image"; mime_type: string; data: string; filename?: string }
+  | { type: "audio"; mime_type: string; data: string; filename?: string }
+  | { type: "file"; mime_type: string; data: string; filename?: string }
+  | { type: "artifact"; artifact_id: string };
+
+/** Result shape for the durable run-control endpoints (approve/reject/etc). */
+export interface RunActionResult {
+  ok: boolean;
+  status: string;
+  message: string | null;
+}

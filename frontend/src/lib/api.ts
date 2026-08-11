@@ -3,9 +3,13 @@
 import {
   AgentRun,
   AgentStep,
+  ArtifactMeta,
   ChatAttachment,
   ChatRequest,
   Citation,
+  Connector,
+  ConnectorCreateInput,
+  ConnectorUpdateInput,
   Conversation,
   ConversationDetail,
   DocFile,
@@ -18,9 +22,14 @@ import {
   PendingApproval,
   Project,
   ProjectInput,
+  ProviderManifest,
   ResearchPlanStep,
+  RunActionResult,
   ToolInfo,
   User,
+  UserMemory,
+  UserMemoryEditInput,
+  UserMemoryProposeInput,
 } from "./types";
 import { getAccessToken, setAccessToken } from "./auth";
 import { parseSSEStream } from "./sse-parser";
@@ -298,6 +307,25 @@ export const api = {
       "POST",
       `/api/agent-runs/${runId}/cancel`
     ),
+
+  // ---- Durable run controls (Task 12: pause/resume/cancel/instruction/plan) ----
+  pauseAgentRun: (runId: string) =>
+    request<RunActionResult>("POST", `/api/agent-runs/${runId}/pause`),
+  resumeAgentRun: (runId: string) =>
+    request<RunActionResult>("POST", `/api/agent-runs/${runId}/resume`),
+  appendRunInstruction: (runId: string, instruction: string) =>
+    request<RunActionResult>("POST", `/api/agent-runs/${runId}/instructions`, {
+      instruction,
+    }),
+  confirmPlan: (runId: string) =>
+    request<RunActionResult>("POST", `/api/agent-runs/${runId}/plan/confirm`),
+  updatePlan: (
+    runId: string,
+    body: {
+      summary?: string;
+      steps?: Array<{ id: string; title: string; description?: string; sources?: string[] }>;
+    },
+  ) => request<RunActionResult>("POST", `/api/agent-runs/${runId}/plan/update`, body),
 };
 
 // ===========================================================================
@@ -313,6 +341,77 @@ export const projectsApi = {
     request<Conversation>("POST", `/api/projects/${projectId}/conversations/${conversationId}`),
   unassignConversation: (projectId: string, conversationId: string) =>
     request<Conversation>("DELETE", `/api/projects/${projectId}/conversations/${conversationId}`),
+};
+
+// ===========================================================================
+// Artifacts (Task 12) — tenant-scoped upload + authorized streaming download.
+// ===========================================================================
+export const artifactsApi = {
+  list: () => request<ArtifactMeta[]>("GET", "/api/artifacts"),
+  create: (
+    file: File,
+    fields: { source?: string; run_id?: string } = {},
+  ): Promise<ArtifactMeta> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (fields.source) fd.append("source", fields.source);
+    if (fields.run_id) fd.append("run_id", fields.run_id);
+    return request<ArtifactMeta>("POST", "/api/artifacts", fd);
+  },
+  /** Download artifact bytes as a Blob (authenticated; owner/admin only). */
+  download: async (id: string): Promise<Blob> => {
+    const res = await request<Response>(
+      "GET",
+      `/api/artifacts/${id}`,
+      undefined,
+      { raw: true },
+    );
+    return res.blob();
+  },
+  delete: (id: string) => request("DELETE", `/api/artifacts/${id}`),
+};
+
+// ===========================================================================
+// User memories (Task 12) — opt-in cross-conversation semantic memory.
+// ===========================================================================
+export const memoriesApi = {
+  list: () => request<UserMemory[]>("GET", "/api/memories"),
+  propose: (body: UserMemoryProposeInput) =>
+    request<UserMemory>("POST", "/api/memories", body),
+  /** Bulk activate/deactivate all memories (active=false disables the feature). */
+  bulkSet: (active: boolean) =>
+    request<{ activated?: number; deactivated?: number }>(
+      "POST",
+      "/api/memories/bulk",
+      { active },
+    ),
+  activate: (id: string) =>
+    request<UserMemory>("POST", `/api/memories/${id}/activate`),
+  deactivate: (id: string) =>
+    request<UserMemory>("POST", `/api/memories/${id}/deactivate`),
+  edit: (id: string, body: UserMemoryEditInput) =>
+    request<UserMemory>("PATCH", `/api/memories/${id}`, body),
+  delete: (id: string) => request("DELETE", `/api/memories/${id}`),
+};
+
+// ===========================================================================
+// Connectors (Task 12) — tenant-scoped, audited credential management.
+// ===========================================================================
+export const connectorsApi = {
+  listProviders: () =>
+    request<ProviderManifest[]>("GET", "/api/connectors/providers"),
+  list: () => request<Connector[]>("GET", "/api/connectors"),
+  create: (body: ConnectorCreateInput) =>
+    request<Connector>("POST", "/api/connectors", body),
+  update: (id: string, body: ConnectorUpdateInput) =>
+    request<Connector>("PATCH", `/api/connectors/${id}`, body),
+  rotate: (id: string, credentials: Record<string, unknown>) =>
+    request<Connector>("POST", `/api/connectors/${id}/rotate`, { credentials }),
+  activate: (id: string) =>
+    request<Connector>("POST", `/api/connectors/${id}/activate`),
+  deactivate: (id: string) =>
+    request<Connector>("POST", `/api/connectors/${id}/deactivate`),
+  delete: (id: string) => request("DELETE", `/api/connectors/${id}`),
 };
 
 // ===========================================================================
@@ -558,5 +657,105 @@ export async function streamChat(
   // silently erase the partial reply with no error shown.
   if (!terminated && !signal?.aborted) {
     handlers.onError?.({ code: "stream_disconnected", message: "连接已中断，请重试" });
+  }
+}
+
+// ===========================================================================
+// Durable run-event SSE (Task 12)
+//   GET /api/agent-runs/{run_id}/events — cursor-replay SSE.
+//   READ-ONLY: never executes or cancels the run. A client disconnect closes
+//   only this subscription; the run keeps running on the worker. The frame's
+//   `id:` line carries the event sequence, echoed back as `Last-Event-ID` on
+//   reconnect so replay resumes exactly where it left off.
+// ===========================================================================
+export interface RunEventStreamHandlers {
+  /**
+   * Called for each durable event frame. `sequence` comes from the SSE `id:`
+   * line (falls back to `data.sequence` when the line is absent). `event_type`
+   * is the `event:` field; `data` is the parsed JSON payload.
+   */
+  onEvent?: (e: {
+    runId: string;
+    sequence: number;
+    event_type: string;
+    data: Record<string, unknown>;
+    id?: string;
+  }) => void;
+  /** Called whenever the cursor advances (the highest sequence seen so far). */
+  onCursor?: (cursor: number) => void;
+  /** Network drop (not a user abort) — the caller decides whether to reconnect. */
+  onDisconnect?: () => void;
+  /** Non-recoverable HTTP error (after the single 401 refresh retry). */
+  onError?: (e: { code: string; message: string }) => void;
+}
+
+export async function streamRunEvents(
+  runId: string,
+  handlers: RunEventStreamHandlers,
+  opts: { signal?: AbortSignal; lastEventId?: number } = {},
+  /** internal: bounds the 401 → refresh → retry path to a single attempt. */
+  _attempt = 0,
+): Promise<void> {
+  const headers: Record<string, string> = {};
+  if (getAccessToken()) headers["Authorization"] = `Bearer ${getAccessToken()}`;
+  // Last-Event-ID seeds the cursor so the server replays only events past it.
+  if (opts.lastEventId && opts.lastEventId > 0) {
+    headers["Last-Event-ID"] = String(opts.lastEventId);
+  }
+
+  const res = await fetch(`${API_BASE}/api/agent-runs/${runId}/events`, {
+    method: "GET",
+    headers,
+    credentials: "include",
+    signal: opts.signal,
+  });
+
+  if (!res.ok || !res.body) {
+    let message = res.statusText;
+    try {
+      const d = await res.json();
+      message = d.message || d.detail || message;
+    } catch {
+      /* ignore */
+    }
+    if (res.status === 401 && _attempt < 1) {
+      const ok = await refreshAccessToken();
+      if (ok) return streamRunEvents(runId, handlers, opts, _attempt + 1);
+    }
+    handlers.onError?.({ code: "http_error", message });
+    return;
+  }
+
+  let cursor = opts.lastEventId ?? 0;
+  for await (const frame of parseSSEStream(res.body, opts.signal)) {
+    if (!frame.data) continue;
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(frame.data);
+    } catch {
+      continue; // malformed JSON — drop this one frame only
+    }
+    // Prefer the SSE `id:` line (the durable sequence); fall back to a
+    // `sequence` field in the payload for streams that don't stamp `id:`.
+    let sequence = -1;
+    if (frame.id !== undefined && /^\d+$/.test(frame.id)) {
+      sequence = parseInt(frame.id, 10);
+    } else if (typeof data.sequence === "number") {
+      sequence = data.sequence;
+    }
+    if (sequence > cursor) cursor = sequence;
+    handlers.onEvent?.({
+      runId,
+      sequence,
+      event_type: frame.event || "message",
+      data,
+      ...(frame.id !== undefined ? { id: frame.id } : {}),
+    });
+    handlers.onCursor?.(cursor);
+  }
+  // Socket ended without an abort → network drop / server-side close. Signal
+  // the caller so it can decide to reconnect from the persisted cursor.
+  if (!opts.signal?.aborted) {
+    handlers.onDisconnect?.();
   }
 }

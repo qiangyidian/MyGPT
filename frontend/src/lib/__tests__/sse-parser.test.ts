@@ -103,6 +103,24 @@ describe("SSEFrameDecoder — chunk-independence", () => {
     const s = ["data:", "", ""].join("\n");
     expect(feedWhole(s)).toEqual([{ event: "", data: "" }]);
   });
+
+  it("captures the id: field for Last-Event-ID resume (Task 12 durable replay)", () => {
+    const s = [
+      "id: 7",
+      "event: run.started",
+      'data: {"run_id":"r1"}',
+      "",
+      "event: token",
+      'data: {"delta":"a"}',
+      "", // no id: here — id must stay undefined, NOT carry over.
+      "",
+    ].join("\n");
+    const frames = feedWhole(s);
+    expect(frames).toEqual([
+      { event: "run.started", data: '{"run_id":"r1"}', id: "7" },
+      { event: "token", data: '{"delta":"a"}' },
+    ]);
+  });
 });
 
 describe("parseSSEStream — byte-level + abort", () => {

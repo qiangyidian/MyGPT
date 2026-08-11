@@ -21,6 +21,13 @@ export interface SSEFrame {
   event: string;
   /** All `data:` lines joined with "\n" (per the SSE spec). */
   data: string;
+  /**
+   * The `id:` field when present (used by the durable run-event stream to
+   * carry the event sequence for `Last-Event-ID` cursor resume). Undefined
+   * when the frame had no `id:` line — kept absent so it stays invisible to
+   * `toEqual` comparisons in existing tests.
+   */
+  id?: string;
 }
 
 /**
@@ -41,6 +48,7 @@ export class SSEFrameDecoder {
   private buffer = "";
   private event = "";
   private dataLines: string[] = [];
+  private id: string | undefined = undefined;
 
   /** Feed a decoded text chunk; returns frames completed within it. */
   push(chunk: string): SSEFrame[] {
@@ -86,8 +94,12 @@ export class SSEFrameDecoder {
       this.event = value;
     } else if (field === "data") {
       this.dataLines.push(value);
+    } else if (field === "id") {
+      // Per the SSE spec, the `id:` field is the last event ID; the browser
+      // echoes it back as `Last-Event-ID` on reconnect. Empty value clears it.
+      this.id = value || undefined;
     }
-    // id / retry / unknown fields are ignored.
+    // retry / unknown fields are ignored.
     return null;
   }
 
@@ -95,9 +107,17 @@ export class SSEFrameDecoder {
     if (this.dataLines.length === 0 && this.event === "") {
       return null; // nothing accumulated (plain separator line)
     }
-    const frame: SSEFrame = { event: this.event, data: this.dataLines.join("\n") };
+    const frame: SSEFrame = {
+      event: this.event,
+      data: this.dataLines.join("\n"),
+      // `id` is captured per-frame: a frame without an `id:` line has none.
+      // (The durable run-event endpoint stamps `id:` on every frame; the chat
+      // stream never uses `id:`, so this stays out of its frames entirely.)
+      ...(this.id !== undefined ? { id: this.id } : {}),
+    };
     this.event = "";
     this.dataLines = [];
+    this.id = undefined;
     return frame;
   }
 }

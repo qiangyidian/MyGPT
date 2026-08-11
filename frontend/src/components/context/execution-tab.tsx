@@ -10,6 +10,9 @@ import { Button } from "@/components/ui/button";
 import { AgentFlowGraph } from "@/components/agents/agent-flow-graph";
 import { AgentActivityFeed } from "@/components/agents/agent-activity-feed";
 import { AgentRunHeader } from "@/components/agents/agent-run-header";
+import { PlanReview } from "@/components/agents/plan-review";
+import { RunControls } from "@/components/agents/run-controls";
+import { useDurableAgentRun } from "@/hooks/useDurableAgentRun";
 import { useAgentRunStore } from "@/stores/agent-run-store";
 
 /**
@@ -40,9 +43,64 @@ export function ExecutionTab() {
         <div className="mt-4">
           <AgentActivityFeed graph={active} />
         </div>
+        <DurableRunSurface runId={active.runId} />
         <ToolCallAudit runId={active.runId} />
       </div>
     </ScrollArea>
+  );
+}
+
+/**
+ * Durable run surface (Task 12): subscribes to the cursor-replay SSE for this
+ * run, surfaces paused/blocked/recovery/budget states + plan review, and
+ * exposes pause/resume/cancel/append-instruction controls.
+ *
+ * The subscription is INDEPENDENT of the chat SSE — closing it does NOT flip
+ * `runStatus`; the workflow keeps running server-side and a reconnect replays
+ * from the persisted cursor.
+ */
+function DurableRunSurface({ runId }: { runId: string }) {
+  const { state } = useDurableAgentRun(runId);
+
+  // The run detail feeds the plan review (acceptance criteria + status).
+  const { data: run } = useQuery({
+    queryKey: ["agent-run-detail", runId],
+    queryFn: () => api.getAgentRun(runId),
+    refetchInterval: (query) => {
+      const st = query.state.data?.status;
+      return st && ["completed", "failed", "cancelled"].includes(st) ? false : 2000;
+    },
+  });
+
+  if (!state) return null;
+
+  const plan = run?.plan as
+    | { summary?: string; steps?: Array<{ id: string; title: string; description?: string; sources?: string[] }>; acceptanceCriteria?: string[] }
+    | null;
+  const planStatus = run?.plan_status ?? undefined;
+
+  return (
+    <div className="mt-4 space-y-3">
+      <RunControls
+        state={state}
+        onPause={(id) => api.pauseAgentRun(id)}
+        onResume={(id) => api.resumeAgentRun(id)}
+        onCancel={(id) => api.cancelAgentRun(id)}
+        onInstruction={(id, instr) => api.appendRunInstruction(id, instr)}
+      />
+
+      {plan && (plan.summary || (plan.steps && plan.steps.length > 0)) && (
+        <PlanReview
+          runId={runId}
+          summary={plan.summary ?? ""}
+          steps={plan.steps ?? []}
+          acceptanceCriteria={plan.acceptanceCriteria}
+          status={planStatus}
+          onApprove={(id) => api.confirmPlan(id)}
+          onRevise={(id, rev) => api.updatePlan(id, rev)}
+        />
+      )}
+    </div>
   );
 }
 

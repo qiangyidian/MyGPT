@@ -10,24 +10,36 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useModels } from "@/hooks/useModels";
+import { filterModelsByModality } from "@/lib/multimodal";
 import { cn } from "@/lib/utils";
 
 interface ModelSelectorProps {
   value: string | null;
   onChange: (modelId: string | null) => void;
   className?: string;
+  /**
+   * Attachment mime types currently in the composer. When provided, the dropdown
+   * filters to models that support every requested modality (image → vision,
+   * audio → audio_input). Undefined / empty → all chat models (default path).
+   */
+  mimes?: string[];
 }
 
 /**
- * A dropdown that lists chat-capable (non-embedding) models.
- * If there are no models configured, shows a placeholder prompt.
+ * A dropdown that lists chat-capable (non-embedding) models. When `mimes` is
+ * provided, only models whose capability flags support every requested
+ * modality are listed (Task 12 multimodal composer).
  */
 export function ModelSelector({
   value,
   onChange,
   className,
+  mimes,
 }: ModelSelectorProps) {
   const { chatModels, isLoading } = useModels();
+
+  const filtered =
+    mimes && mimes.length > 0 ? filterModelsByModality(chatModels, mimes) : chatModels;
 
   const handleSelect = (val: string) => {
     onChange(val === "__none__" ? null : val);
@@ -57,7 +69,7 @@ export function ModelSelector({
       </SelectTrigger>
       <SelectContent>
         <SelectItem value="__none__">默认模型</SelectItem>
-        {chatModels.map((m) => (
+        {filtered.map((m) => (
           <SelectItem key={m.id} value={m.id}>
             {m.name}
           </SelectItem>
