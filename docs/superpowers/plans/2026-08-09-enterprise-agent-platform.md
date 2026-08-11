@@ -30,7 +30,7 @@
 | 5. Redis Streams worker/recovery/SSE replay | P0 | Complete | Commits `a76e4f7`+`25bc33a`+`72d26c9` (review fixes); Redis+in-memory queue, worker w/ lease-loss abort + short-lived event sessions, recovery scheduler, cursor-replay SSE, durable dispatch wired (gated), Compose worker+recovery; targeted 52 passed, backend 783 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 6. Planner-executor-verifier | P1 | Complete | Commits `7dd0987` + `0446ee3` (review fixes); engine + templates + StageAdapterExecutor + AttemptRepository; topology mirrors graph.py; targeted 63 passed, backend green; combined review APPROVED on engine boundary (orchestrator routing deferred to a flagged follow-up) |
 | 7. Compaction/output spill/long-term memory | P1 | Complete | Commits `682ae73` + `c89e5df` (review fix); unified ContextManager (tool-pair atomic compaction, gated mid-run compaction wired into native runtime, opaque ArtifactHandle spill, pure system-prompt assembly) + opt-in UserMemory + migration `0008`; targeted 76 passed, backend 847 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
-| 8. Workspace tools and isolated runner | P1 | Not started | Awaiting workflow and policy contracts |
+| 8. Workspace tools and isolated runner | P1 | Complete | Commits `e8a9f57` + `acbf77e` (review fix); 8 path-confined workspace tools (resolve_under_root defeats `..`/absolute/symlink escapes), atomic apply_patch, LocalRunner dev-gated + DockerRunner most-restrictive (network=none/read-only/cap-drop/no-new-privs/non-root/bounded); targeted 96 passed, backend 904 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 9. MCP transports and connectors | P1 | Not started | Awaiting unified tool gateway hardening |
 | 10. Artifacts and multimodal | P1 | Not started | Awaiting storage/provider contracts |
 | 11. Observability/quotas/readiness/evals | P2 | Not started | Uses durable events and real usage/budgets |
@@ -61,7 +61,7 @@
 - [x] Express research, parallel research, debate, and tool-heavy runs as templates over the same durable state machine.
 - [x] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
 - [x] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
-- [ ] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
+- [x] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
 - [ ] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
 - [ ] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
 
@@ -94,7 +94,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [x] Current SSE connection owns too much execution lifetime; closed by Task 5 (cursor-replay SSE is read-only; workflow runs in the worker).
 - [x] Current multi-agent profiles are not a general typed planner-executor-verifier engine; closed by Task 6 (durable generic engine + templates; CrewAI behind a stage adapter; orchestrator routing deferred to a flagged follow-up).
 - [x] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; closed by Task 7 (unified ContextManager).
-- [ ] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; Tasks 8 and 9 close it.
+- [x] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; workspace + shell isolation closed by Task 8 (MCP/connectors audit boundary is Task 9).
 - [ ] Generated files and multimodal content are not first-class authorized artifacts; Task 10 closes it.
 - [ ] Metrics, quotas, readiness, evaluation gates, frontend durable controls, and production operations remain incomplete; Tasks 11-14 close them.
 
@@ -509,7 +509,7 @@ Expected: all selected tests pass. (Verified: 76 passed across context/memory/co
 - Modify: `backend/app/agents/permission_profiles.py`
 - Modify: `backend/app/core/config.py`
 
-- [ ] **Step 1: Write failing path escape, command policy, timeout, output limit, and atomic patch tests**
+- [x] **Step 1: Write failing path escape, command policy, timeout, output limit, and atomic patch tests**
 
 ```python
 async def test_read_file_rejects_workspace_escape(tool, workspace):
@@ -522,22 +522,22 @@ def test_docker_runner_has_enterprise_isolation_flags(command):
     assert "--cap-drop=ALL" in command
 ```
 
-- [ ] **Step 2: Verify RED and implement canonical workspace confinement**
+- [x] **Step 2: Verify RED and implement canonical workspace confinement**
 
 Provide list, search, read, atomic write, apply patch, Git status/diff, and non-interactive shell through a common runner. Resolve every path and require it to remain below the assigned workspace root.
 
-- [ ] **Step 3: Implement production Docker isolation**
+- [x] **Step 3: Implement production Docker isolation**
 
 Run as non-root with read-only root, dropped capabilities, no-new-privileges, bounded CPU/memory/PIDs/time/output, explicit workspace mount, and default-deny network. Local runner refuses non-development environments.
 
-- [ ] **Step 4: Register tools with precise risk and approval policies**
+- [x] **Step 4: Register tools with precise risk and approval policies**
 
 Read operations are low risk; writes, patch, shell, and Git mutations require the configured approval profile. Every operation records checksums and accepted-line counts.
 
-- [ ] **Step 5: Run sandbox and tool tests**
+- [x] **Step 5: Run sandbox and tool tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_workspace_tools.py tests/test_docker_runner_policy.py tests/test_apply_patch.py tests/test_exec_policy.py tests/test_permission_profiles.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 96 passed; full backend 904 passed, 1 known env-deferred failure.)
 
 ### Task 9: MCP transports and connector registry
 
