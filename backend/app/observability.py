@@ -85,6 +85,17 @@ _FERNET_RE = re.compile(r"^gAAAAA[A-Za-z0-9_\-]{20,}={0,2}$")
 # A "Bearer <token>" / "Basic <token>" header value, even under a neutral key.
 _BEARER_RE = re.compile(r"^(bearer|basic|token)\s+\S+$", re.IGNORECASE)
 
+# Raw credential VALUES under neutral keys (defense-in-depth on top of the
+# key-name rules — a value that *looks* like a known credential shape is
+# redacted regardless of the key it sits under):
+#   * OpenAI-compatible API keys: ``sk-...`` (sk-proj-, sk-live-, sk-...).
+#     The dominant live-secret shape in the wild; 20+ chars after the prefix.
+_OPENAI_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_\-]{20,}$")
+#   * JWTs: three base64url segments; the first decodes to a ``{"..."`` JSON
+#     header, which base64-encodes to a string starting ``eyJ``. Requiring the
+#     first dot rules out ordinary ``eyJ``-prefixed strings.
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$")
+
 
 def _is_sensitive_key(key: str) -> bool:
     return bool(_SENSITIVE_KEY_RE.search(str(key)))
@@ -96,6 +107,10 @@ def _is_sensitive_value(value: Any) -> bool:
     if _FERNET_RE.match(value):
         return True
     if _BEARER_RE.match(value):
+        return True
+    if _OPENAI_KEY_RE.match(value):
+        return True
+    if _JWT_RE.match(value):
         return True
     return False
 

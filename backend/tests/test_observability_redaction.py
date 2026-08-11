@@ -62,6 +62,21 @@ def test_redacts_authorization_header_value_even_for_neutral_key():
     assert out["header"] == "[redacted]"
 
 
+def test_redacts_openai_key_value_under_neutral_key():
+    # The dominant OpenAI-compatible key shape (sk-...) is redacted even when
+    # the key name gives no hint ("config", "model", …).
+    out = sanitize_attributes({"config": "sk-proj-live-" + "x" * 30})
+    assert out["config"] == "[redacted]"
+    out2 = sanitize_attributes({"model": "sk-" + "A" * 24})
+    assert out2["model"] == "[redacted]"
+
+
+def test_redacts_jwt_value_under_neutral_key():
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4f"
+    out = sanitize_attributes({"payload": jwt})
+    assert out["payload"] == "[redacted]"
+
+
 def test_keeps_non_sensitive_values_untouched():
     out = sanitize_attributes({"model": "gpt-4o", "tokens": 42, "latency_ms": 12.5})
     assert out == {"model": "gpt-4o", "tokens": 42, "latency_ms": 12.5}

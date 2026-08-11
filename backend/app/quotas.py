@@ -42,6 +42,9 @@ class _RedisLike(Protocol):
     async def decr(self, name: str, amount: int = ...) -> int: ...
     async def incrbyfloat(self, name: str, amount: float) -> float: ...
     async def get(self, name: str) -> Any: ...
+    async def sadd(self, name: str, *values: str) -> int: ...
+    async def srem(self, name: str, *values: str) -> int: ...
+    async def scard(self, name: str) -> int: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +129,15 @@ class RunTicket:
     run_id: str
 
 
+def _ticket_run_id(ticket: RunTicket | str | None) -> str | None:
+    """Extract the run_id from a ticket (RunTicket or bare run_id string)."""
+    if ticket is None:
+        return None
+    if isinstance(ticket, RunTicket):
+        return ticket.run_id
+    return str(ticket)
+
+
 # --------------------------------------------------------------------------- #
 # In-process counter fallback (used when no Redis is injected).
 # --------------------------------------------------------------------------- #
@@ -133,6 +145,10 @@ class _MemoryCounters:
     def __init__(self) -> None:
         self._ints: dict[str, int] = defaultdict(int)
         self._floats: dict[str, float] = defaultdict(float)
+        # Active-run sets: tenant-keyed set of admitted run_ids. Source of truth
+        # for the concurrent-run count (len == concurrent). Set semantics make
+        # release idempotent (discard never underflows).
+        self._sets: dict[str, set[str]] = defaultdict(set)
         self._lock = asyncio.Lock()
 
     async def incr_int(self, key: str, amount: int = 1) -> int:
@@ -157,6 +173,25 @@ class _MemoryCounters:
     async def get_float(self, key: str) -> float:
         async with self._lock:
             return self._floats[key]
+
+    async def set_add(self, key: str, member: str) -> bool:
+        async with self._lock:
+            if member in self._sets[key]:
+                return False
+            self._sets[key].add(member)
+            return True
+
+    async def set_remove(self, key: str, member: str) -> int:
+        async with self._lock:
+            s = self._sets.get(key)
+            if not s or member not in s:
+                return 0
+            s.discard(member)
+            return 1
+
+    async def set_size(self, key: str) -> int:
+        async with self._lock:
+            return len(self._sets[key])
 
 
 # --------------------------------------------------------------------------- #
@@ -227,12 +262,46 @@ class QuotaService:
                 pass
         return await self._mem.get_float(key)
 
+    # ---- active-run set (idempotent admit/release) -------------------------
+    async def _set_add(self, key: str, member: str) -> bool:
+        """Add ``member`` to set ``key``. Returns True if newly added."""
+        if self._redis is not None:
+            try:
+                return int(await self._redis.sadd(key, member)) == 1
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.set_add(key, member)
+
+    async def _set_remove(self, key: str, member: str) -> int:
+        """Remove ``member`` from set ``key``. Returns 1 if removed, 0 if absent.
+
+        This is the idempotency primitive: a duplicate release removes nothing
+        and returns 0, so the concurrent count can never underflow.
+        """
+        if self._redis is not None:
+            try:
+                return int(await self._redis.srem(key, member))
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.set_remove(key, member)
+
+    async def _set_size(self, key: str) -> int:
+        if self._redis is not None:
+            try:
+                return int(await self._redis.scard(key))
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.set_size(key)
+
     # ---- admission: concurrent-run + token + cost --------------------------
     async def admit_run(self, tenant: str) -> RunTicket:
         """Reserve a run slot. Raises :class:`QuotaExceeded` if any axis is full.
 
         Order: token + cost are checked first (idempotent reads), then the
-        concurrent counter is incremented atomically and rolled back on a miss.
+        concurrent slot is reserved by adding a fresh run_id to the tenant's
+        active-runs SET. The set cardinality IS the concurrent count, so
+        :meth:`release_run` is idempotent (a duplicate release removes a
+        non-member and can never underflow the count).
         """
         if not self.enabled:
             return RunTicket(tenant=tenant, run_id="disabled")
@@ -257,28 +326,43 @@ class QuotaService:
                 quota_type="cost",
                 tenant=tenant,
             )
-        # Concurrent-run quota: atomic increment, rollback on over-limit.
-        conc_key = self._k("concurrent", tenant)
-        new_count = await self._incr_int(conc_key, 1)
-        if new_count > self.limits.max_concurrent_runs:
-            await self._decr_int(conc_key, 1)  # release the slot we just took
+        # Concurrent-run quota: reserve via the active-runs set. The set is the
+        # source of truth — its size is the live concurrent count — so release
+        # is an idempotent set remove (never a counter decrement).
+        runs_key = self._k("runs", tenant)
+        import uuid as _uuid
+
+        run_id = _uuid.uuid4().hex
+        await self._set_add(runs_key, run_id)
+        size = await self._set_size(runs_key)
+        if size > self.limits.max_concurrent_runs:
+            # Over cap: roll back the member we just added and refuse.
+            await self._set_remove(runs_key, run_id)
             raise QuotaExceeded(
                 f"concurrent-run limit ({self.limits.max_concurrent_runs}) reached",
                 limit=self.limits.max_concurrent_runs,
-                used=new_count - 1,
+                used=size - 1,
                 quota_type="concurrent_runs",
                 tenant=tenant,
             )
-        import uuid as _uuid
-
-        return RunTicket(tenant=tenant, run_id=_uuid.uuid4().hex)
+        return RunTicket(tenant=tenant, run_id=run_id)
 
     async def release_run(self, tenant: str, ticket: RunTicket | str | None) -> None:
-        """Return a run slot to the pool (idempotent; never raises)."""
+        """Return a run slot to the pool. Idempotent; never raises.
+
+        The ``ticket`` (a :class:`RunTicket` or a run_id string) identifies the
+        run to release. Removing a run_id from the active-runs SET is idempotent:
+        a second release of the same ticket removes a non-member (Redis ``SREM``
+        returns 0) and is a no-op, so the concurrent count can never underflow
+        and a retry/finally double-release cannot corrupt the counter.
+        """
         if not self.enabled:
             return
+        run_id = _ticket_run_id(ticket)
+        if not run_id or run_id == "disabled":
+            return
         try:
-            await self._decr_int(self._k("concurrent", tenant), 1)
+            await self._set_remove(self._k("runs", tenant), run_id)
         except Exception:  # noqa: BLE001 — release must never crash the caller
             pass
 
@@ -313,6 +397,29 @@ class QuotaService:
         if not self.enabled:
             return
 
+        # Pre-charge admission: if the tenant is ALREADY at/over a cap, further
+        # spend is refused. (The charge that pushed them over already happened
+        # on the previous call and is fully counted; this blocks the NEXT one.)
+        # This is the cost-control signal the chat-path accounting seam consults.
+        used_tok = await self._get_int(self._k("tokens", tenant))
+        if used_tok >= self.limits.max_tokens_per_period:
+            raise QuotaExceeded(
+                f"token quota ({self.limits.max_tokens_per_period}/period) exceeded",
+                limit=self.limits.max_tokens_per_period,
+                used=used_tok,
+                quota_type="tokens",
+                tenant=tenant,
+            )
+        used_cost = await self._get_float(self._k("cost", tenant))
+        if used_cost >= self.limits.max_cost_usd_per_period:
+            raise QuotaExceeded(
+                f"cost quota (${self.limits.max_cost_usd_per_period:g}/period) exceeded",
+                limit=self.limits.max_cost_usd_per_period,
+                used=used_cost,
+                quota_type="cost",
+                tenant=tenant,
+            )
+
         total = prompt_tokens + completion_tokens  # server-recomputed; never trusted
         await self._incr_int(self._k("tokens", tenant), total)
         await self._incr_float(self._k("cost", tenant), float(cost_usd))
@@ -322,7 +429,7 @@ class QuotaService:
         return {
             "total_tokens": await self._get_int(self._k("tokens", tenant)),
             "cost_usd": await self._get_float(self._k("cost", tenant)),
-            "concurrent_runs": await self._get_int(self._k("concurrent", tenant)),
+            "concurrent_runs": await self._set_size(self._k("runs", tenant)),
             "storage_bytes": await self._get_int(self._k("storage", tenant)),
             "connectors": await self._get_int(self._k("connectors", tenant)),
         }
@@ -385,4 +492,40 @@ class QuotaService:
         return
 
 
-__all__ = ["QuotaExceeded", "QuotaLimits", "QuotaService", "RunTicket"]
+__all__ = [
+    "QuotaExceeded",
+    "QuotaLimits",
+    "QuotaService",
+    "RunTicket",
+    "get_quota_service",
+    "set_quota_service",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Process-wide singleton + test injection.
+# --------------------------------------------------------------------------- #
+# Lazily built from settings on first access. In test / default deployments
+# QUOTAS_ENABLED is False (and ENV=test forces disabled), so the service is a
+# no-op and the chat-path wiring around it never blocks. Production opts in via
+# QUOTAS_ENABLED=true; the Redis client is injected best-effort (the in-memory
+# fallback handles the no-Redis case, mirroring rate_limit).
+_quota_service_singleton: QuotaService | None = None
+
+
+def get_quota_service() -> QuotaService:
+    """Return the process-wide :class:`QuotaService`, building it on first use."""
+    global _quota_service_singleton
+    if _quota_service_singleton is None:
+        _quota_service_singleton = QuotaService()
+    return _quota_service_singleton
+
+
+def set_quota_service(svc: QuotaService | None) -> None:
+    """Test injection: override (or reset with ``None``) the process singleton.
+
+    The chat-path wiring consults :func:`get_quota_service`, so a test can swap
+    in an enabled service to exercise enforcement end-to-end and reset it after.
+    """
+    global _quota_service_singleton
+    _quota_service_singleton = svc

@@ -153,9 +153,12 @@ async def _check_qdrant() -> dict[str, Any]:
                     f"{'.'.join(map(str, _QDRANT_MIN_SERVER))} (client/server skew)"
                 )
             return _ok(f"reachable; server={server_version}")
-        except Exception as inner:  # noqa: BLE001 — info() not critical for liveness
-            # Reachable but version probe failed: report ok (reachable) with a note.
-            return _ok("reachable; server version probe skipped")
+        except Exception as inner:  # noqa: BLE001 — version probe failed
+            # Reachable, but the compatibility probe could not run. A reachable-
+            # but-unprobed Qdrant is treated as NOT ready: the operator must see
+            # that the client/server pair couldn't be validated (the repo carries
+            # a known version-skew warning), rather than a silent "ok".
+            return _fail(f"reachable but version probe failed: {inner}")
     except Exception as exc:  # noqa: BLE001
         return _fail(f"unreachable: {exc}")
 

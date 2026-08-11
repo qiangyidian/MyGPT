@@ -68,6 +68,7 @@ from app.agents.token_budget import (
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.db import AsyncSessionLocal
+from app.quotas import QuotaExceeded, get_quota_service
 from app.models import AgentRun, Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.model_capabilities import capabilities_from_config
 from app.providers.registry import get_provider_for_config
@@ -152,6 +153,38 @@ def _apply_usage_accounting(
         **(message.metadata_ or {}),
         "usage": dict(usage or {}),
     }
+
+
+async def _charge_quota_if_enabled(tenant_id: str, message: Message) -> None:
+    """Charge the tenant's quota counters from the just-persisted message usage.
+
+    Reads the authoritative ``Message`` token/cost fields written by
+    :func:`_apply_usage_accounting` (server-computed; never client-supplied) and
+    forwards them to the quota service. No-op when quotas are disabled (the
+    default + test env), so this call site is inert unless an operator opts in
+    via ``QUOTAS_ENABLED=true``.
+    """
+    svc = get_quota_service()
+    if not svc.enabled:
+        return
+    prompt = int(message.prompt_tokens or 0)
+    completion = int(message.completion_tokens or 0)
+    if prompt == 0 and completion == 0:
+        return  # nothing to charge (e.g. a no-usage mock turn)
+    try:
+        await svc.charge_usage(
+            tenant_id,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cost_usd=float(message.cost_usd or 0.0),
+        )
+    except QuotaExceeded:
+        # Post-usage overage (tenant crossed the cap mid-period). Surface the
+        # admin-visible reason via the turn's metadata so the operator sees it;
+        # we do not fail the turn that already produced this output.
+        logger.warning(
+            "quota overage for tenant %s after turn usage charge", tenant_id
+        )
 
 
 def _log_turn_outcome(
@@ -757,8 +790,30 @@ class ChatService:
         Always yields at least one event. On any unrecoverable failure inside
         the pipeline an ``error`` event is emitted and the generator stops, so a
         router can rely on the stream terminating cleanly.
+
+        Quota admission: when ``QUOTAS_ENABLED`` is on, a run slot is reserved
+        here (admit_run) and returned in a ``finally`` (release_run). A tenant
+        over the concurrent/token/cost cap receives a ``quota_exceeded`` error
+        event carrying the admin-visible reason + the quota details. Disabled by
+        default + in test, so this is inert unless an operator opts in.
         """
+        tenant = str(user.id)
+        quota_svc = get_quota_service()
+        quota_ticket = None
         try:
+            if quota_svc.enabled:
+                try:
+                    quota_ticket = await quota_svc.admit_run(tenant)
+                except QuotaExceeded as exc:
+                    yield _event(
+                        "error",
+                        {
+                            "code": "quota_exceeded",
+                            "message": exc.reason,
+                            "quota": exc.to_dict(),
+                        },
+                    )
+                    return
             async for evt in self._run(db, user, request):
                 yield evt
         except asyncio.CancelledError:
@@ -770,6 +825,14 @@ class ChatService:
         except Exception as exc:  # pragma: no cover - defensive last resort
             logger.exception("unexpected error during chat: %s", exc)
             yield _event("error", {"code": "internal", "message": "Internal error"})
+        finally:
+            # release_run is idempotent (set-remove), so a retry/cancellation
+            # double-release here is a safe no-op.
+            if quota_ticket is not None:
+                try:
+                    await quota_svc.release_run(tenant, quota_ticket)
+                except Exception:  # noqa: BLE001 — release must never break shutdown
+                    pass
 
     async def _run(
         self, db: AsyncSession, user: User, request: ChatRequest
@@ -1264,6 +1327,9 @@ class ChatService:
                     _apply_usage_accounting(
                         assistant_msg, cfg.model_name, evt.data.get("usage")
                     )
+                    # Quota charge (Task 11): forward the SERVER-computed usage
+                    # to the tenant's quota counters. No-op unless QUOTAS_ENABLED.
+                    await _charge_quota_if_enabled(str(user.id), assistant_msg)
                     assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                     _log_turn_outcome(
                         "complete",
@@ -1779,6 +1845,9 @@ async def run_durable_turn(
                 _apply_usage_accounting(
                     assistant_msg, cfg.model_name, evt.data.get("usage")
                 )
+                # Quota charge (Task 11): forward SERVER-computed usage to the
+                # tenant's counters. No-op unless QUOTAS_ENABLED.
+                await _charge_quota_if_enabled(str(user.id), assistant_msg)
                 assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                 conversation.last_message_preview = (assistant_msg.content or "")[:280]
                 await commit_with_rollback(db)
@@ -1809,6 +1878,8 @@ async def run_durable_turn(
         _apply_usage_accounting(
             assistant_msg, cfg.model_name, ctx.extra.get("usage")
         )
+        # Quota charge (Task 11): even a partial turn consumed tokens.
+        await _charge_quota_if_enabled(str(user.id), assistant_msg)
         await _persist_partial(db, assistant_msg)
         raise
 
