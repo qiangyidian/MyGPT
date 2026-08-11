@@ -124,10 +124,13 @@ class DockerRunner:
     ) -> RunResult:
         if not shutil.which("docker"):
             raise RunnerError("docker binary not found on PATH")
-        # ``cwd`` for a containerised run is the CONTAINER cwd (set via -w on
-        # the builder); a per-call cwd override is ignored to keep confinement
-        # simple — callers mount the workspace and the builder sets -w.
-        host_workspace = cwd or "."
+        # ``cwd`` here is the HOST workspace path (mounted into the container);
+        # the container cwd is set via ``-w`` on the builder. Require it
+        # explicitly — falling back to ``"."`` would silently mount the docker
+        # daemon's CWD, which is not a confinement boundary the caller intends.
+        if not cwd:
+            raise RunnerError("DockerRunner.run requires an explicit cwd (host workspace)")
+        host_workspace = cwd
         limit = output_limit if output_limit is not None else self._cfg.output_limit
         to = timeout if timeout is not None else self._cfg.timeout_s
         argv = build_docker_command(self._cfg, command, host_workspace)

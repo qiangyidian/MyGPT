@@ -94,6 +94,19 @@ def test_resolve_accepts_absolute_path_inside_root(workspace):
     assert p == abs_inside
 
 
+def test_register_workspace_tools_rejects_empty_root():
+    # An empty/whitespace workspace_root must be rejected up front: Path(""),
+    # Path(".") are truthy and would silently bind the workspace to the process
+    # CWD (the application source tree in production).
+    from app.tools.base import ToolRegistry
+    from app.tools.registry_init import register_workspace_tools
+
+    for bad in ("", "   ", None, 0):
+        reg = ToolRegistry()
+        with pytest.raises(ToolError):
+            register_workspace_tools(reg, bad)  # type: ignore[arg-type]
+
+
 # --------------------------------------------------------------------------- #
 # Read / List / Search (low-risk reads)
 # --------------------------------------------------------------------------- #

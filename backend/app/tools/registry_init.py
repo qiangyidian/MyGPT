@@ -67,9 +67,13 @@ def register_workspace_tools(
         WorkspaceWriteTool,
     )
 
-    root = Path(workspace_root)
-    if not str(root):
+    # Validate the RAW input BEFORE Path() coercion: ``Path("")`` becomes
+    # ``Path(".")`` (truthy), which would silently bind the workspace to the
+    # process CWD — in production that is the application source tree. Reject
+    # empty / whitespace-only / non-path-like roots up front.
+    if not isinstance(workspace_root, (str, Path)) or not str(workspace_root).strip():
         raise ToolError("workspace_root must be a non-empty path")
+    root = Path(workspace_root).resolve()
     r = runner if isinstance(runner, Runner) else LocalRunner()
     from app.core.config import get_settings
 
