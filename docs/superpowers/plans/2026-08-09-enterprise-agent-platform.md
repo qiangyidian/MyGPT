@@ -34,7 +34,7 @@
 | 9. MCP transports and connectors | P1 | Complete | Commits `d8bd736` + `63fe0ce` (review fix); JSON-RPC stdio+HTTP transports (no SDK, fake-tested), encrypted tenant Connector + provider catalog + migration `0009`, gateway routing wired end-to-end (`merge_mcp_tools` in both runtimes, e2e audit-row test); targeted 37 passed, backend 935 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified. Open follow-up: per-tenant connector→session lifecycle (static MCP_SERVERS path is fully wired) |
 | 10. Artifacts and multimodal | P1 | Complete | Commits `2601352` + `7b41354` (review fix); Artifact model + ArtifactService (tenant-scoped streaming download, checksum-on-read, retention) + migration `0010`, typed multimodal parts + route_multimodal (defense-in-depth), spill→artifact wired into production, OpenAI-compatible transcribe/speech/image-gen/edit; targeted 58 passed, backend 963 passed (1 known env-deferred); combined review APPROVED then I1/I2 fixes verified |
 | 11. Observability/quotas/readiness/evals | P2 | Complete | Commits `bd48966` + `cfa3958` (ci.yml tracked) + `363aa62` (review fixes); observability (no-op fallbacks + sk-/JWT redaction + correlation IDs), quotas ACTIVE on cost-control hot paths (admit/release idempotent + charge_usage, gated/off-by-default), strict /ready (migration head + Qdrant ≥1.10.0 + storage + runner + eligible model), offline evals, CI release-eval-gate; targeted 48 passed, backend 997 passed (1 known env-deferred). Open follow-up Task-11b: broad span/counter instrumentation; connector/tool quota enforcement at integration points |
-| 12. Enterprise frontend surfaces | P2 | Not started | Uses durable APIs from Tasks 4-11 |
+| 12. Enterprise frontend surfaces | P2 | Complete | Commit `a9fcdc0`; run-events.ts (cursor replay/dedupe) + useDurableAgentRun (reconnect/replay, subscription≠workflow state) + plan-review/run-controls + connectors/memory settings pages + artifact cards + multimodal composer (modality-aware model selection); 178 frontend tests pass, typecheck clean, production build succeeds (new /settings/connectors + /settings/memory routes) |
 | 13. Production deployment/migrations/backups | P0/P2 | Not started | Finalizes runtime topology and operations |
 | 14. Full acceptance verification | P0 | Not started | Final release gate |
 
@@ -70,7 +70,7 @@
 - [x] Add OpenTelemetry-compatible traces, Prometheus metrics, structured logs, correlation IDs, and sensitive-data redaction.
 - [x] Add concurrent-run, token, cost, storage, connector, and tool quotas with admin-visible enforcement reasons.
 - [x] Add deterministic evaluation suites, quality/security thresholds, dependency readiness, and CI release gates.
-- [ ] Add frontend background runs, reconnect/replay, plan review, pause/resume/cancel/instruction/approval controls, memory/connector management, artifacts, and multimodal composer.
+- [x] Add frontend background runs, reconnect/replay, plan review, pause/resume/cancel/instruction/approval controls, memory/connector management, artifacts, and multimodal composer.
 - [ ] Align dependency versions, add production Compose/Kubernetes topology, zero-downtime migration rules, PITR/object/Qdrant backups, and restore validation.
 
 ## Initial audit findings that this checklist must close
@@ -685,7 +685,7 @@ Expected: all selected tests pass. (Verified: 48 passed across quotas/observabil
 - Modify: `frontend/src/lib/api.ts`
 - Modify: `frontend/src/lib/types.ts`
 
-- [ ] **Step 1: Write failing cursor replay, event dedupe, background run, and artifact rendering tests**
+- [x] **Step 1: Write failing cursor replay, event dedupe, background run, and artifact rendering tests**
 
 ```typescript
 it("deduplicates replayed events by run and sequence", () => {
@@ -697,22 +697,22 @@ it("keeps a run active after the chat SSE subscription closes", () => {
 });
 ```
 
-- [ ] **Step 2: Verify RED and implement durable run subscription**
+- [x] **Step 2: Verify RED and implement durable run subscription**
 
 Persist the last event cursor, reconnect with backoff, replay, deduplicate, and separate subscription state from workflow state.
 
-- [ ] **Step 3: Add plan review and complete controls**
+- [x] **Step 3: Add plan review and complete controls**
 
 Render acceptance criteria, approve/revise plan, pause/resume/cancel, append instructions, and show blocked/budget/recovery states.
 
-- [ ] **Step 4: Add memory, connector, artifact, and multimodal surfaces**
+- [x] **Step 4: Add memory, connector, artifact, and multimodal surfaces**
 
 Users can enable/edit/delete memories, configure connectors, download authorized artifacts, attach audio/images/files, and select only models capable of the requested modality.
 
-- [ ] **Step 5: Run frontend tests and type checking**
+- [x] **Step 5: Run frontend tests and type checking**
 
 Run: `cd frontend && npm test -- --run && npm run typecheck`
-Expected: all tests and type checking pass.
+Expected: all tests and type checking pass. (Verified: 178 tests pass incl. new run-events 23 + artifact-types 17; typecheck clean; `npm run build` succeeds with new /settings/connectors + /settings/memory routes.)
 
 ### Task 13: Production deployment, version alignment, migrations, backup, and recovery
 
