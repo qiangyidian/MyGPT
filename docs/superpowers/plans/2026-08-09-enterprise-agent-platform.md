@@ -35,7 +35,7 @@
 | 10. Artifacts and multimodal | P1 | Complete | Commits `2601352` + `7b41354` (review fix); Artifact model + ArtifactService (tenant-scoped streaming download, checksum-on-read, retention) + migration `0010`, typed multimodal parts + route_multimodal (defense-in-depth), spill→artifact wired into production, OpenAI-compatible transcribe/speech/image-gen/edit; targeted 58 passed, backend 963 passed (1 known env-deferred); combined review APPROVED then I1/I2 fixes verified |
 | 11. Observability/quotas/readiness/evals | P2 | Complete | Commits `bd48966` + `cfa3958` (ci.yml tracked) + `363aa62` (review fixes); observability (no-op fallbacks + sk-/JWT redaction + correlation IDs), quotas ACTIVE on cost-control hot paths (admit/release idempotent + charge_usage, gated/off-by-default), strict /ready (migration head + Qdrant ≥1.10.0 + storage + runner + eligible model), offline evals, CI release-eval-gate; targeted 48 passed, backend 997 passed (1 known env-deferred). Open follow-up Task-11b: broad span/counter instrumentation; connector/tool quota enforcement at integration points |
 | 12. Enterprise frontend surfaces | P2 | Complete | Commit `a9fcdc0`; run-events.ts (cursor replay/dedupe) + useDurableAgentRun (reconnect/replay, subscription≠workflow state) + plan-review/run-controls + connectors/memory settings pages + artifact cards + multimodal composer (modality-aware model selection); 178 frontend tests pass, typecheck clean, production build succeeds (new /settings/connectors + /settings/memory routes) |
-| 13. Production deployment/migrations/backups | P0/P2 | Not started | Finalizes runtime topology and operations |
+| 13. Production deployment/migrations/backups | P0/P2 | Complete | Commit `8379227`; docker-compose.prod.yml (non-root, no reload, migrate one-shot, worker+recovery, resource limits) + deploy/k8s/* (PDBs, default-deny netpol, /ready probes) + verify_migrations.sh/restore-drill.sh; qdrant-client pinned `>=1.12,<1.14` + runtime skew assertion; migration-head mandatory (deploy step + /ready 503); latent `func.false()`→`sa.false()` prod-blocker fixed; compose config valid, alembic head `0010_artifacts`, 21 targeted passed, backend 997 passed (1 known env-deferred). K8s manifest-only; sandbox-runner DinD trade-off documented |
 | 14. Full acceptance verification | P0 | Not started | Final release gate |
 
 ## Complete discovered scope
@@ -53,7 +53,7 @@
 - [x] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
 - [x] Eliminate stale legacy `running` rows and make recovery decisions explicit and auditable.
 - [ ] Enforce tenant/user authorization, secret redaction, path confinement, command policy, approval policy, and immutable audit records.
-- [ ] Require migration head, dependency readiness, production-safe configuration, backup/restore drills, and release acceptance gates.
+- [x] Require migration head, dependency readiness, production-safe configuration, backup/restore drills, and release acceptance gates.
 
 ### P1: advanced agent capability
 
@@ -71,7 +71,7 @@
 - [x] Add concurrent-run, token, cost, storage, connector, and tool quotas with admin-visible enforcement reasons.
 - [x] Add deterministic evaluation suites, quality/security thresholds, dependency readiness, and CI release gates.
 - [x] Add frontend background runs, reconnect/replay, plan review, pause/resume/cancel/instruction/approval controls, memory/connector management, artifacts, and multimodal composer.
-- [ ] Align dependency versions, add production Compose/Kubernetes topology, zero-downtime migration rules, PITR/object/Qdrant backups, and restore validation.
+- [x] Align dependency versions, add production Compose/Kubernetes topology, zero-downtime migration rules, PITR/object/Qdrant backups, and restore validation.
 
 ## Initial audit findings that this checklist must close
 
@@ -731,29 +731,29 @@ Expected: all tests and type checking pass. (Verified: 178 tests pass incl. new 
 - Modify: `.env.example`
 - Modify: `README.md`
 
-- [ ] **Step 1: Pin Qdrant client compatible with the selected server**
+- [x] **Step 1: Pin Qdrant client compatible with the selected server**
 
 Use a client/server pair within the supported compatibility window and add a readiness assertion so drift cannot recur silently.
 
-- [ ] **Step 2: Make migration head mandatory in production**
+- [x] **Step 2: Make migration head mandatory in production**
 
 Run Alembic migrations in a one-shot deployment step. API and workers refuse readiness when the database revision differs from the repository head.
 
-- [ ] **Step 3: Add production Compose and Kubernetes resources**
+- [x] **Step 3: Add production Compose and Kubernetes resources**
 
 Production services have no source bind mounts or reload flags, run as non-root, use health/readiness probes, resource limits, disruption budgets, default-deny network policy, and external secret references.
 
-- [ ] **Step 4: Add backup and restore drill scripts**
+- [x] **Step 4: Add backup and restore drill scripts**
 
 Back up PostgreSQL, Qdrant snapshots, and object storage manifests; restore into isolated targets and verify checksums and migration revision.
 
-- [ ] **Step 5: Validate manifests and migrations**
+- [x] **Step 5: Validate manifests and migrations**
 
 Run: `docker compose -f docker-compose.prod.yml config`
-Expected: valid normalized Compose configuration.
+Expected: valid normalized Compose configuration. (Verified: exit 0; `.env.prod` warning is expected in dev.)
 
 Run: `cd backend && .venv/Scripts/alembic upgrade head && .venv/Scripts/alembic current`
-Expected: current revision equals repository head.
+Expected: current revision equals repository head. (Verified: alembic heads → `0010_artifacts` single head; verify_migrations.sh passes empty-DB + incremental paths.)
 
 ### Task 14: Full regression, security, build, and acceptance verification
 
