@@ -160,5 +160,3 @@ bash.exe.stackdump
 # openai/codex) must never be committed: they bloat the repo and vendor
 # third-party code under a different license. Keep such clones OUTSIDE the repo.
 codex/
-
-.github/workflows/ci.yml
