@@ -111,6 +111,17 @@ def test_file_part_accepted_on_text_only_model():
     assert len(parts) == 1
 
 
+def test_unknown_part_type_rejected():
+    """Defense-in-depth: an unrecognized part type must not slip past the gate."""
+    class VideoPart:
+        type = "video"
+
+    with pytest.raises(ModelCapabilityError) as exc:
+        route_multimodal([VideoPart()], VISION)  # type: ignore[list-item]
+    assert exc.value.code == "unsupported_modality"
+    assert exc.value.modality == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Provider-side multimodal routes: capability-gated BEFORE any HTTP dispatch.
 # Defense-in-depth: even if route_multimodal let a part through, the provider

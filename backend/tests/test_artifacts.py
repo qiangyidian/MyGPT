@@ -23,12 +23,13 @@ SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 async def _other_user(db_session) -> uuid.UUID:
-    """A second tenant that owns nothing in this test."""
+    """A second tenant that owns nothing in this test (unique per call)."""
     from app.models import User
 
+    suffix = uuid.uuid4().hex[:8]
     other = User(
-        email="other-art@example.com",
-        username="other-art",
+        email=f"other-art-{suffix}@example.com",
+        username=f"other-art-{suffix}",
         password_hash="x",
         role="user",
         is_active=True,
@@ -260,6 +261,109 @@ async def test_artifact_for_generated_returns_opaque_id(db_session):
         assert art.generator == {"tool": "screenshot"}
     finally:
         await get_storage().delete(art.storage_key)
+
+
+# ---------------------------------------------------------------------------
+# I1: chunked streaming download — a large artifact streams in chunks (memory
+# bounded), NOT buffered whole into RAM.
+# ---------------------------------------------------------------------------
+async def test_open_stream_yields_chunks_not_whole_buffer(db_session):
+    svc = ArtifactService(db_session)
+    # Larger than the default 64KB chunk so we get multiple chunks.
+    data = b"A" * (200 * 1024)
+    art = await svc.create_from_bytes(
+        owner_id=SEEDED, data=data, media_type="application/octet-stream",
+        filename="big.bin", source="generation",
+    )
+    try:
+        gen = await svc.open_stream(art.id, _user_with_id(SEEDED), chunk_size=64 * 1024)
+        chunks = list(gen)
+        # Multiple chunks ⇒ the file was NOT buffered whole.
+        assert len(chunks) > 1
+        assert b"".join(chunks) == data
+        # Each chunk (except possibly the last) is bounded to chunk_size.
+        assert all(len(c) <= 64 * 1024 for c in chunks)
+    finally:
+        await get_storage().delete(art.storage_key)
+
+
+async def test_open_stream_tenant_scoped_404_on_foreign(db_session):
+    svc = ArtifactService(db_session)
+    art = await svc.create_from_bytes(
+        owner_id=SEEDED, data=b"private stream", media_type="text/plain",
+        filename="p.txt", source="upload",
+    )
+    other_id = await _other_user(db_session)
+    try:
+        with pytest.raises(AppException) as exc:
+            await svc.open_stream(art.id, _user_with_id(other_id))
+        assert exc.value.status_code == 404
+    finally:
+        await get_storage().delete(art.storage_key)
+
+
+# ---------------------------------------------------------------------------
+# I2: production spill wiring — ContextManager.spill_tool_result persists a
+# real, tenant-scoped Artifact whose opaque handle resolves to a downloadable
+# row (owner 200 via API, foreign 404). This is the dead-code fix.
+# ---------------------------------------------------------------------------
+async def test_production_spill_wiring_creates_downloadable_artifact(client, db_session):
+    """End-to-end: an oversized tool result spilled through the production
+    ContextManager becomes a real Artifact; GET /api/artifacts/{id} downloads
+    it for the owner and 404s for a foreign user."""
+    from app.agents.context_manager import ContextManager
+    from app.agents.output_spill import production_spill_writer
+    from app.artifacts.context import (
+        reset_artifact_spill_context,
+        set_artifact_spill_context,
+    )
+    from tests.conftest import TestSessionLocal, auth_headers, get_access_token
+
+    big = "tool output line\n" * 4000  # well over a small spill budget
+    # Bind the artifact auth context to the seeded user + the test session
+    # factory (same engine the API client under test reads from).
+    token = set_artifact_spill_context(
+        owner_id=SEEDED, db_factory=TestSessionLocal, run_id=None,
+    )
+    try:
+        mgr = ContextManager(
+            summarize_fn=lambda older: "",
+            spill_writer=production_spill_writer,
+        )
+        # spill_tool_result is sync; its writer spawns a worker thread that
+        # persists the blob as a real Artifact via the bound db_factory.
+        preview, handle = mgr.spill_tool_result(big, budget_tokens=100, key="scan")
+    finally:
+        reset_artifact_spill_context(token)
+
+    assert handle is not None
+    # The handle id is the REAL artifact row id (not the placeholder uuid the
+    # pure spill seam mints before the writer runs).
+    assert handle.id.startswith("artifact:")
+    art_uuid = uuid.UUID(handle.id.split(":", 1)[1])
+    try:
+        # The artifact row exists + is owned by the seeded user.
+        svc = ArtifactService(db_session)
+        art = await svc._get_owned(art_uuid, _user_with_id(SEEDED))
+        assert art.owner_id == SEEDED
+        assert art.source == "spill"
+
+        # GET /api/artifacts/{id} downloads it for the owner (200, full bytes).
+        resp = await client.get(
+            f"/api/artifacts/{art_uuid}", headers=auth_headers(get_access_token())
+        )
+        assert resp.status_code == 200
+        assert resp.content == big.encode("utf-8")
+
+        # Foreign user → 404 (no existence leak).
+        other_id = await _other_user(db_session)
+        other_token = get_access_token(str(other_id))
+        resp2 = await client.get(
+            f"/api/artifacts/{art_uuid}", headers=auth_headers(other_token)
+        )
+        assert resp2.status_code == 404
+    finally:
+        await get_storage().delete(handle.storage_key)
 
 
 # ---------------------------------------------------------------------------

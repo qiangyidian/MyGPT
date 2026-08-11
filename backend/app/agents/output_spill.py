@@ -104,6 +104,101 @@ def _default_writer(name: str, content: str) -> str:
     return p
 
 
+def _run_async_sync(coro_factory):
+    """Run an async coroutine factory to completion from sync code.
+
+    Always runs in a fresh daemon thread with its own event loop, so it is safe
+    to call from inside an already-running loop (e.g. an async chat turn that
+    reaches the sync spill seam). The spill path is bounded I/O, so blocking the
+    caller thread briefly is acceptable and never blocks the model stream.
+    """
+    import asyncio
+    import threading
+
+    box: dict = {}
+
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            box["result"] = loop.run_until_complete(coro_factory())
+        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+            box["error"] = exc
+        finally:
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    t = threading.Thread(target=_runner, name="artifact-spill", daemon=True)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def production_spill_writer(name: str, content: str) -> str:
+    """Production ``write_fn`` for :func:`spill`/:func:`maybe_spill`.
+
+    When an artifact auth context is bound for the current turn
+    (see :mod:`app.artifacts.context`), persists the blob as a first-class,
+    tenant-scoped :class:`Artifact` (source=``spill``) and returns its opaque
+    ``storage_key``. The created artifact id is stashed on
+    ``production_spill_writer.last_artifact_id`` so the caller can adopt it as
+    the handle id (``artifact:<id>``) — this is what makes a spilled blob a
+    downloadable row rather than a temp file.
+
+    When no context is bound (no active turn — pure unit tests), falls through
+    to :func:`_default_writer` so spill remains best-effort and never blocks.
+    """
+    import hashlib
+
+    from app.artifacts.context import get_artifact_spill_context
+
+    ctx = get_artifact_spill_context()
+    production_spill_writer.last_artifact_id = None  # type: ignore[attr-defined]
+    if ctx is None:
+        return _default_writer(name, content)
+
+    owner_id = ctx["owner_id"]
+    run_id = ctx.get("run_id")
+    db_factory = ctx["db_factory"]
+    data = content.encode("utf-8")
+
+    async def _create():
+        async with db_factory() as db:
+            from app.artifacts.service import ArtifactService
+
+            svc = ArtifactService(db)
+            gen = {
+                "spill_key": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "source_writer": "production_spill_writer",
+            }
+            art = await svc.create_from_bytes(
+                owner_id=owner_id,
+                data=data,
+                media_type="text/plain",
+                filename=f"{name}.txt" if not name.endswith(".txt") else name,
+                source="spill",
+                run_id=run_id,
+                generator=gen,
+            )
+            return art
+
+    try:
+        art = _run_async_sync(_create)
+    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+        return _default_writer(name, content)
+
+    production_spill_writer.last_artifact_id = str(art.id)  # type: ignore[attr-defined]
+    return art.storage_key
+
+
+production_spill_writer.last_artifact_id = None  # type: ignore[attr-defined]
+
+
 def spill(
     text: str,
     *,

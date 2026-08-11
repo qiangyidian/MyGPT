@@ -57,6 +57,7 @@ from app.agents.schemas import (
     ExecutionMode,
 )
 from app.agents.context_manager import ContextManager
+from app.agents.output_spill import production_spill_writer
 from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.agents.token_budget import (
     PROMPT_TOO_LARGE,
@@ -261,7 +262,15 @@ def _default_summarize_for_compaction(older: list[dict]) -> str:
     return "Earlier turns summarized:\n" + "\n".join(parts)
 
 
-_CONTEXT_MANAGER = ContextManager(summarize_fn=_default_summarize_for_compaction)
+_CONTEXT_MANAGER = ContextManager(
+    summarize_fn=_default_summarize_for_compaction,
+    # Production spill writer: a spilled tool result becomes a first-class,
+    # tenant-scoped Artifact (source="spill") whose opaque `artifact:<id>`
+    # handle resolves to a downloadable row. The owner_id/run_id are resolved
+    # per-turn from the artifact auth context (bound in ChatService._run).
+    # Falls through to the temp-file default when no turn is bound (unit tests).
+    spill_writer=production_spill_writer,
+)
 
 
 async def _load_active_user_memories(
@@ -763,6 +772,30 @@ class ChatService:
             yield _event("error", {"code": "internal", "message": "Internal error"})
 
     async def _run(
+        self, db: AsyncSession, user: User, request: ChatRequest
+    ) -> AsyncIterator[dict[str, Any]]:
+        turn_started = time.monotonic()  # for per-message latency accounting
+        # Bind the artifact auth context for this turn so any spill
+        # (ContextManager.spill_tool_result) persists the blob as a real,
+        # tenant-scoped Artifact owned by this user, attributed to the run.
+        # Reset in finally so the context never leaks across turns / tasks.
+        from app.artifacts.context import (
+            reset_artifact_spill_context,
+            set_artifact_spill_context,
+        )
+
+        _art_ctx_token = set_artifact_spill_context(
+            owner_id=user.id,
+            db_factory=self._persistence_session_factory,
+            run_id=None,
+        )
+        try:
+            async for evt in self._run_with_artifact_ctx(db, user, request):
+                yield evt
+        finally:
+            reset_artifact_spill_context(_art_ctx_token)
+
+    async def _run_with_artifact_ctx(
         self, db: AsyncSession, user: User, request: ChatRequest
     ) -> AsyncIterator[dict[str, Any]]:
         turn_started = time.monotonic()  # for per-message latency accounting

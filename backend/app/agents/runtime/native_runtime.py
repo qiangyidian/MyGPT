@@ -38,6 +38,7 @@ from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.graph import build_single_agent_graph
 from app.agents.planning import build_plan, classify_intent, summarize_prefix
 from app.agents.context_manager import ContextManager
+from app.agents.output_spill import production_spill_writer
 from app.agents.runtime.stage_executor import safe_positive_int
 from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.model_capabilities import capabilities_from_config
@@ -189,7 +190,13 @@ class NativeChatRuntime:
         # (NOT the heuristic chat_service stub — that stays a unit-test double).
         # ``_midrun_manager._summarize_fn`` is never invoked because the runtime
         # path goes through ``compact_async`` + ``summarize_fn_async``.
-        _midrun_manager = ContextManager(summarize_fn=lambda older: "")
+        _midrun_manager = ContextManager(
+            summarize_fn=lambda older: "",
+            # Production spill writer (Task 10): a mid-run spill persists as a
+            # real tenant-scoped Artifact using the auth context bound by the
+            # chat turn. Falls through to temp-file when no turn is bound.
+            spill_writer=production_spill_writer,
+        )
 
         async def _summarize_older_for_midrun(older_msgs: list[dict[str, Any]]) -> str:
             return await summarize_prefix(provider, older_msgs)

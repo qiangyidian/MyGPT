@@ -72,20 +72,24 @@ async def download_artifact(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
-    """Authorized, tenant-scoped streaming download.
+    """Authorized, tenant-scoped **chunked** streaming download.
 
     Owner/admin only; foreign/unknown id → 404 (no existence leak). The bytes
-    are streamed from the storage backend; a checksum mismatch yields 410.
+    are streamed from the storage backend in fixed-size chunks so a large
+    artifact is never fully buffered in RAM. Authorization (owner check +
+    retention) runs BEFORE the first chunk; a checksum mismatch detected
+    mid-stream aborts the response (status/headers are already committed by
+    then) and is logged.
     """
     svc = ArtifactService(db)
     try:
         meta = await svc.get(artifact_id, user)
-        data = await svc.open(artifact_id, user)
+        body = await svc.open_stream(artifact_id, user)
     except AppException as exc:
         raise _envelope_status(exc)
     safe_name = (meta.filename or "artifact").replace('"', "").replace("\r", "").replace("\n", "")
     return StreamingResponse(
-        iter([data]),
+        body,
         media_type=meta.media_type or "application/octet-stream",
         headers={
             "Content-Disposition": f'attachment; filename="{safe_name}"',

@@ -262,13 +262,25 @@ class ContextManager:
         Returns ``(in_context_preview, handle)``. ``handle`` is None when the
         text fits the budget or the writer failed (best-effort — never blocks).
         The handle is opaque (``artifact:<id>`` + storage key), NOT a raw path.
+
+        When the production writer (:func:`output_spill.production_spill_writer`)
+        backed this manager, it persisted the blob as a real Artifact and stashed
+        the row id; adopt it as the handle id so ``artifact:<id>`` resolves to a
+        downloadable, tenant-scoped row (instead of the placeholder uuid the
+        pure spill seam mints before the writer runs).
         """
-        return _spill_text(
+        in_context, handle = _spill_text(
             text,
             budget_tokens=budget_tokens,
             write_fn=self._spill_writer,
             key=key,
         )
+        if handle is not None and self._spill_writer is not None:
+            real_id_getter = getattr(self._spill_writer, "last_artifact_id", None)
+            real_id = real_id_getter() if callable(real_id_getter) else real_id_getter
+            if real_id:
+                handle = ArtifactHandle(id=f"artifact:{real_id}", storage_key=handle.storage_key)
+        return in_context, handle
 
     # ------------------------------------------------------------------ #
     # Complete effective system prompt (pure — no process-local world state)

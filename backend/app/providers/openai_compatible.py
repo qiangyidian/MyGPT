@@ -148,6 +148,36 @@ class OpenAICompatibleProvider(ModelProvider):
         # Unreachable: AsyncRetrying either returns or reraises.
         raise ProviderError("model endpoint retry failed")
 
+    async def _request_form(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Multipart POST with the SAME transient-retry policy as :meth:`_request`.
+
+        Used by the multimodal routes (transcription, image-edit) that send
+        multipart bodies, so a 429/5xx on transcription retries just like a
+        chat completion would.
+        """
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            retry=retry_if_exception_type(_RETRYABLE_EXC),
+            reraise=True,
+        ):
+            with attempt:
+                resp = await client.post(url, data=data, files=files, headers=headers or {})
+                if _is_retryable_response(resp):
+                    raise httpx.TransportError(
+                        f"transient HTTP {resp.status_code} from {url}"
+                    )
+                return resp
+        raise ProviderError("model endpoint retry failed")
+
     @staticmethod
     def _raise_for_status(resp: httpx.Response, _url: str) -> None:
         if resp.status_code >= 400:
@@ -507,7 +537,7 @@ class OpenAICompatibleProvider(ModelProvider):
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, data=data, files=files, headers=headers)
+                resp = await self._request_form(client, url, data=data, files=files, headers=headers)
         except _RETRYABLE_EXC as exc:
             raise _to_provider_error(exc, where="transcribe") from exc
         self._raise_for_status(resp, url)
@@ -538,7 +568,9 @@ class OpenAICompatibleProvider(ModelProvider):
         url = self._speech_url()
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=self._headers())
+                # Route through _request so a transient 429/5xx retries (the
+                # speech endpoint is the same transport as chat completions).
+                resp = await self._request(client, url, payload)
         except _RETRYABLE_EXC as exc:
             raise _to_provider_error(exc, where="speak") from exc
         self._raise_for_status(resp, url)
@@ -613,7 +645,7 @@ class OpenAICompatibleProvider(ModelProvider):
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, data=data, files=files, headers=headers)
+                resp = await self._request_form(client, url, data=data, files=files, headers=headers)
         except _RETRYABLE_EXC as exc:
             raise _to_provider_error(exc, where="edit_image") from exc
         self._raise_for_status(resp, url)

@@ -107,6 +107,10 @@ def route_multimodal(
     if capabilities is None:
         raise ModelCapabilityError("model capabilities are unknown", modality="unknown")
     for part in parts or []:
+        if isinstance(part, TextPart):
+            continue  # universal
+        if isinstance(part, FilePart):
+            continue  # opaque metadata; never raw bytes for an unsupported modality
         if isinstance(part, ImagePart):
             if not capabilities.supports_vision:
                 raise ModelCapabilityError(
@@ -119,8 +123,14 @@ def route_multimodal(
                     "model does not support audio input",
                     modality="audio",
                 )
-        # TextPart / FilePart / unknown shapes are accepted — a file is opaque
-        # metadata; text is universal.
+        else:
+            # Defense-in-depth: reject unrecognized part types so a future
+            # ``VideoPart`` (or any other shape) cannot slip past the gate
+            # unvalidated — it must be added here with its capability mapping.
+            raise ModelCapabilityError(
+                f"unrecognized multimodal part type: {type(part).__name__}",
+                modality="unknown",
+            )
     return list(parts or [])
 
 
