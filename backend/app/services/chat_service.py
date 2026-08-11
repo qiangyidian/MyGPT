@@ -1371,5 +1371,219 @@ async def maybe_enqueue_durable_run(run_id: uuid.UUID | str) -> bool:
         return False
 
 
+async def _resolve_model_for_durable_run(
+    db: AsyncSession, conversation: Conversation
+) -> ModelConfig | None:
+    """Resolve the ModelConfig for a durable run.
+
+    Prefers the conversation's bound model; falls back to the first available
+    chat config so a durable run never dead-ends on model resolution.
+    """
+    cfg_id = getattr(conversation, "model_id", None)
+    if cfg_id is not None:
+        cfg = await db.get(ModelConfig, cfg_id)
+        if cfg is not None:
+            return cfg
+    result = await db.execute(
+        select(ModelConfig)
+        .where(ModelConfig.is_embedding.is_(False))
+        .order_by(ModelConfig.created_at.asc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def run_durable_turn(
+    run_id: uuid.UUID | str, session: AsyncSession
+) -> AsyncIterator[AgentEvent]:
+    """Reconstruct and execute a persisted run's turn; yield each AgentEvent.
+
+    This is the production executor body the durable worker drives. It loads the
+    persisted run (+ conversation / user / assistant message / model config),
+    rebuilds the turn context using the SAME module-level helpers as
+    :meth:`ChatService._run` (system prompt, history load+trim, message list),
+    and delegates to :meth:`chat_orchestrator.stream`. Terminal ``done`` /
+    ``error`` events are intercepted to finalize the assistant message exactly
+    as the inline path does (metadata + usage accounting + sidebar preview).
+
+    Intentionally deferred vs. the inline ``stream`` (these are app-level
+    enhancements that require a live request / per-turn inputs the durable path
+    does not re-hydrate; a native single-agent turn still executes end-to-end):
+
+      * Intent recognition (extra model call; the route is derived from the
+        run's stored ``execution_mode`` instead).
+      * Context-enrichment fragments (behavior / project instructions / skills).
+      * RAG retrieval + citations (no per-turn KB binding on the durable path).
+      * Attachment binding / inline image parts.
+      * Cross-turn rolling-summary write-back (``_maybe_summarize``).
+      * Goal upsert.
+
+    The orchestrator reuses the EXISTING AgentRun (the durable worker created +
+    leased it before calling us) via ``ctx.extra["durable_run_id"]``.
+    """
+    from app.agents.schemas import ConversationFlowState
+
+    db = session
+    run = await db.get(AgentRun, run_id)
+    if run is None:
+        yield AgentEvent(kind="error", data={"code": "run_not_found", "run_id": str(run_id)})
+        return
+
+    conversation = await db.get(Conversation, run.conversation_id)
+    if conversation is None:
+        yield AgentEvent(
+            kind="error",
+            data={"code": "conversation_not_found", "run_id": str(run_id)},
+        )
+        return
+
+    user = await db.get(User, run.user_id) if run.user_id else None
+    if user is None:
+        yield AgentEvent(
+            kind="error", data={"code": "user_not_found", "run_id": str(run_id)}
+        )
+        return
+
+    assistant_msg = await db.get(Message, run.message_id) if run.message_id else None
+    if assistant_msg is None:
+        yield AgentEvent(
+            kind="error",
+            data={"code": "assistant_message_not_found", "run_id": str(run_id)},
+        )
+        return
+
+    cfg = await _resolve_model_for_durable_run(db, conversation)
+    if cfg is None:
+        yield AgentEvent(
+            kind="error", data={"code": "model_config_not_found", "run_id": str(run_id)}
+        )
+        return
+
+    # Reconstruct the turn inputs from the persisted run input + route helper.
+    run_input = run.input or {}
+    user_content = run_input.get("content") or ""
+    enable_tools = bool(run_input.get("enable_tools", False))
+    try:
+        execution_mode = ExecutionMode(run_input.get("execution_mode", "auto"))
+    except ValueError:
+        execution_mode = ExecutionMode.auto
+    agent_profile = run_input.get("agent_profile") or "general"
+
+    # Derive a native single-agent route. Durable execution is additive and
+    # currently scoped to native turns; the route's ``use_multi_agent=False``
+    # guarantees the orchestrator selects the native runtime.
+    route = decide_route(
+        "speed",
+        has_knowledge_base=False,
+        has_attachment=False,
+        user_content=user_content,
+    )
+    route = replace(route, use_multi_agent=False)
+
+    # Rebuild the system prompt + trimmed history using the shared helpers.
+    history = await _load_history(db, conversation.id)
+    system_prompt = _build_system_prompt(conversation, rag_context="")
+    system_prompt = system_prompt + "\n\n" + _MULTI_AGENT_HONESTY
+    messages = _messages_to_dicts(system_prompt, history)
+    messages = _admit_and_trim_history(
+        messages,
+        cfg,
+        model_name=cfg.model_name,
+        tool_schema_tokens=0,
+    )
+
+    db_mutation_lock = asyncio.Lock()
+    persistence_lock = asyncio.Lock()
+    request = ChatRequest(content=user_content, model_id=cfg.id)
+    ctx = AgentTurnContext(
+        db=db,
+        user=user,
+        conversation=conversation,
+        model_config=cfg,
+        request=request,
+        user_content=user_content,
+        system_prompt=system_prompt,
+        messages=messages,
+        rag_context="",
+        citations=[],
+        assistant_msg=assistant_msg,
+        run_id=run.id,
+        execution_mode=execution_mode,
+        agent_profile=agent_profile,
+        enable_tools=enable_tools,
+        knowledge_base_id=None,
+        mode=route.mode,
+        extra={
+            "state": ConversationFlowState(
+                conversation_id=str(conversation.id), user_id=str(user.id)
+            ),
+            "route": route,
+            "db_mutation_lock": db_mutation_lock,
+            "persistence_session_factory": chat_service._persistence_session_factory,
+            "persistence_lock": persistence_lock,
+            # Tell the orchestrator to reuse this run instead of creating one.
+            "durable_run_id": run.id,
+        },
+    )
+
+    turn_started = time.monotonic()
+    try:
+        async for evt in chat_orchestrator.stream(ctx):
+            if evt.kind == "done":
+                finish = evt.data.get("finish_reason", "stop")
+                assistant_msg.metadata_ = ChatService._meta(
+                    cfg, [], finish, assistant_msg.metadata_
+                )
+                # Drop live tool_calls trace (same rationale as the inline path).
+                assistant_msg.metadata_.pop("tool_calls", None)
+                sel = ctx.extra.get("runtime_selection")
+                if sel is not None:
+                    assistant_msg.metadata_["requested_mode"] = sel.requested_mode
+                    assistant_msg.metadata_["effective_mode"] = sel.effective_mode
+                    assistant_msg.metadata_["requested_runtime"] = sel.requested_runtime
+                    assistant_msg.metadata_["effective_runtime"] = sel.selected_runtime
+                    assistant_msg.metadata_["multi_agent_executed"] = (
+                        sel.multi_agent_executed
+                    )
+                assistant_msg.metadata_["is_demo"] = bool(
+                    ctx.extra.get("is_demo")
+                ) or bool(getattr(sel, "is_demo", False))
+                _apply_usage_accounting(
+                    assistant_msg, cfg.model_name, evt.data.get("usage")
+                )
+                assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
+                conversation.last_message_preview = (assistant_msg.content or "")[:280]
+                await commit_with_rollback(db)
+                yield evt
+                return
+            if evt.kind == "error":
+                err_code = evt.data.get("code")
+                err_finish = evt.data.get("finish_reason") or _finish_for_error_code(
+                    err_code
+                )
+                await ChatService()._finalize_error(
+                    db,
+                    assistant_msg,
+                    evt.data.get("message", "error"),
+                    finish_reason=err_finish,
+                    code=err_code,
+                    usage=evt.data.get("usage"),
+                    model_name=cfg.model_name,
+                )
+                yield evt
+                return
+            yield evt
+    except asyncio.CancelledError:
+        # Persist partial output so a cancelled durable run is recoverable.
+        assistant_msg.metadata_ = ChatService._meta(
+            cfg, [], "stream_disconnected", assistant_msg.metadata_
+        )
+        _apply_usage_accounting(
+            assistant_msg, cfg.model_name, ctx.extra.get("usage")
+        )
+        await _persist_partial(db, assistant_msg)
+        raise
+
+
 # Module-level singleton — the service is stateless, so one shared instance.
 chat_service = ChatService()

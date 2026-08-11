@@ -86,9 +86,17 @@ class ChatOrchestrator:
     async def stream(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
         db_lock = ctx.extra.get("db_mutation_lock")
         persistence_session_factory = ctx.extra.get("persistence_session_factory")
+        # Durable path: when the durable worker calls the executor, the AgentRun
+        # already exists (created + enqueued by the chat API) and the worker has
+        # already appended ``run.started`` when it acquired the lease. Reuse that
+        # run instead of creating a duplicate, and skip the redundant event.
+        durable_run_id = ctx.extra.get("durable_run_id")
         async with db_mutation_scope(db_lock):
             try:
-                run = await self._create_run(ctx)
+                if durable_run_id is not None:
+                    run = await self._load_durable_run(ctx, durable_run_id)
+                else:
+                    run = await self._create_run(ctx)
                 # Register cooperative pause/instruction controls for this run.
                 ctx.extra["run_control"] = get_run_control(run.id)
 
@@ -100,17 +108,20 @@ class ChatOrchestrator:
                 run.status = "running"
                 # Append the durable run.started event (Task 4) in the same
                 # transaction as the status flip. Best-effort: an event-store
-                # failure must never block a run from starting.
-                await append_event_safe(
-                    ctx.db,
-                    run.id,
-                    "run.started",
-                    {
-                        "runtime": runtime.name,
-                        "conversation_id": str(ctx.conversation.id),
-                        "message_id": str(ctx.assistant_msg.id),
-                    },
-                )
+                # failure must never block a run from starting. The durable
+                # worker already appended ``run.started`` when it acquired the
+                # lease, so skip it here to avoid a duplicate.
+                if durable_run_id is None:
+                    await append_event_safe(
+                        ctx.db,
+                        run.id,
+                        "run.started",
+                        {
+                            "runtime": runtime.name,
+                            "conversation_id": str(ctx.conversation.id),
+                            "message_id": str(ctx.assistant_msg.id),
+                        },
+                    )
                 await ctx.db.commit()
             except BaseException:
                 await rollback_safely(ctx.db)
@@ -347,6 +358,23 @@ class ChatOrchestrator:
         )
         ctx.db.add(run)
         await ctx.db.flush()
+        ctx.run_id = run.id
+        ctx.extra["run_id"] = run.id
+        return run
+
+    async def _load_durable_run(
+        self, ctx: AgentTurnContext, run_id: uuid.UUID | str
+    ) -> AgentRun:
+        """Load an existing durable run instead of creating a new one.
+
+        The durable worker creates the AgentRun (and acquires a lease) before
+        calling the executor. The orchestrator reuses that run row instead of
+        creating a duplicate, and wires ``ctx.run_id`` to it. Falls back to
+        :meth:`_create_run` defensively if the run vanished mid-flight.
+        """
+        run = await ctx.db.get(AgentRun, run_id)
+        if run is None:
+            return await self._create_run(ctx)
         ctx.run_id = run.id
         ctx.extra["run_id"] = run.id
         return run

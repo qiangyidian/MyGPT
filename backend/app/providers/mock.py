@@ -108,7 +108,23 @@ class MockProvider(ModelProvider):
             sep = " " if i > 0 else ""
             await asyncio.sleep(0.05)  # observable cadence
             yield ChatDelta(content=f"{sep}{tok}", tool_calls=None, finish_reason=None)
-        yield ChatDelta(content="", tool_calls=None, finish_reason="stop")
+        # Final usage-only chunk (mirrors OpenAI include_usage). Without this the
+        # streaming path's token accounting is never exercised, so downstream
+        # persistence of usage metadata was untestable.
+        yield ChatDelta(
+            content="",
+            tool_calls=None,
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": sum(
+                    len(str(m.get("content", "")).split()) for m in messages
+                ),
+                "completion_tokens": len(content.split()),
+                "total_tokens": sum(
+                    len(str(m.get("content", "")).split()) for m in messages
+                ) + len(content.split()),
+            },
+        )
 
     async def embeddings(self, texts: list[str], model: str | None = None) -> list[list[float]]:
         """Deterministic fake vectors of dim QDRANT_EMBEDDING_DIM.
