@@ -161,8 +161,14 @@ function ChatPanel({
   const messages = detail.data?.messages ?? [];
   // Only render the live stream for the conversation it belongs to — otherwise
   // switching conversations mid-stream paints the other conversation's reply.
+  // The `activeConversationId == null` clause covers a brand-new chat whose
+  // conversation id hasn't resolved yet (the stream starts before the backend
+  // mints the id); without it the bubble flickers off for a frame when onMeta
+  // sets currentConversationId ahead of the active-id state update.
   const isThisConvStreaming =
-    chat.isStreaming && chat.currentConversationId === activeConversationId;
+    chat.isStreaming &&
+    (chat.currentConversationId === activeConversationId ||
+      activeConversationId == null);
 
   const handleSend = (content: string, opts: { mode: typeof mode; attachmentIds: string[] }) => {
     void chat.send(content, {

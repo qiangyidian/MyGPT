@@ -163,6 +163,13 @@ export function useChatStream(): ChatStreamState {
 
       const initialConversationId =
         opts.conversationId ?? currentConversationId ?? null;
+      // Mark the stream as belonging to this conversation IMMEDIATELY (not on
+      // onMeta). The page gates the streaming bubble on
+      // `currentConversationId === activeConversationId`; without this the
+      // bubble stayed hidden until the backend's meta frame arrived, so the
+      // user saw nothing (no sent-message echo, no streaming animation) for a
+      // beat after pressing send.
+      setCurrentConversationId(initialConversationId);
 
       // Mutable locals tracked across stream events.
       let resolvedConversationId = initialConversationId;

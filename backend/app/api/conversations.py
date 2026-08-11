@@ -122,7 +122,7 @@ async def get_conversation(
         await db.execute(
             select(Message)
             .where(Message.conversation_id == conv.id)
-            .order_by(Message.created_at.desc())
+            .order_by(Message.created_at.desc(), Message.id.desc())
             .limit(_DETAIL_MESSAGE_WINDOW)
         )
     ).scalars().all()

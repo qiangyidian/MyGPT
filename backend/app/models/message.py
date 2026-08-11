@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Float, ForeignKey, String, Text
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,6 +17,20 @@ class Message(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Override the mixin's created_at with a PER-ROW Python default. The mixin
+    # uses server_default=func.now(), which on Postgres resolves to the
+    # TRANSACTION start time — identical for every row inserted in one
+    # transaction. A chat turn persists the user message + the assistant
+    # placeholder in a single commit (ChatService._run), so they shared one
+    # created_at and ORDER BY created_at was non-deterministic (the assistant
+    # reply could sort ahead of the user's question). A per-row Python
+    # timestamp (microsecond precision) is distinct and keeps chronological
+    # order stable.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
     role: Mapped[str] = mapped_column(String(32), nullable=False)  # system | user | assistant | tool
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
