@@ -288,6 +288,31 @@ class Settings(BaseSettings):
     SEMANTIC_CACHE_TTL_SECONDS: int = 0
     SEMANTIC_CACHE_ENABLED: bool = False
 
+    # ---- Workspace tools + sandbox runner (Task 8) ----
+    # Master switch for the workspace-confined tool set. OFF by default so the
+    # default registry is byte-identical to the pre-Task-8 behaviour; turn on to
+    # expose list/read/search/write/apply_patch/shell/git tools confined to
+    # WORKSPACE_ROOT. See app.tools.workspace + app.tools.registry_init.
+    WORKSPACE_TOOLS_ENABLED: bool = False
+    # Root directory the workspace tools confine to. Empty = the caller must pass
+    # an explicit root to get_workspace_registry(); the tools refuse to run with
+    # no root bound.
+    WORKSPACE_ROOT: str = ""
+    # Sandbox runner mode: "local" (dev/test subprocess, NOT a real sandbox) or
+    # "docker" (enterprise isolation, production-safe). LocalRunner hard-refuses
+    # to exec outside dev/test regardless of this setting.
+    SANDBOX_MODE: str = "local"
+    # Docker isolation knobs (read by app.agents.sandbox.docker.DockerRunnerConfig).
+    SANDBOX_DOCKER_IMAGE: str = "python:3.11-slim"
+    SANDBOX_CPU_QUOTA: float = Field(default=1.0, gt=0)
+    SANDBOX_MEMORY_MB: int = Field(default=512, gt=0)
+    SANDBOX_PIDS_LIMIT: int = Field(default=64, gt=0)
+    SANDBOX_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    # Hard per-command output cap (chars of stdout/stderr the runner returns).
+    # The ToolGateway's AGENT_MAX_TOOL_OUTPUT_CHARS budget is enforced separately
+    # and is NOT duplicated here.
+    SANDBOX_OUTPUT_LIMIT: int = Field(default=8192, ge=16)
+
     # ---- Derived ----
     @property
     def cors_origins(self) -> List[str]:

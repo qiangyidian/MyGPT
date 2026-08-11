@@ -7,7 +7,11 @@ from app.agents.permission_profiles import (
     PermissionProfileError,
     ProfileDecl,
     catalog,
+    recommended_profile_for,
     resolve_profile,
+    workspace_requires_approval,
+    workspace_requires_write_capability,
+    workspace_risk_level,
 )
 from app.agents.environments import (
     Environment,
@@ -61,6 +65,46 @@ def test_catalog_allowlist_gate():
     assert by_name[":read-only"].allowed is True
     assert by_name["strict"].allowed is True
     assert by_name[":danger-full-access"].allowed is False
+
+
+# ---- workspace operation -> risk/approval mapping (Task 8) ----
+@pytest.mark.parametrize(
+    "op",
+    ["workspace_read", "workspace_list", "workspace_search", "workspace_git_status", "workspace_git_diff"],
+)
+def test_workspace_reads_are_low_risk_and_unapproved(op):
+    assert workspace_risk_level(op) == "low"
+    assert workspace_requires_approval(op) is False
+    assert workspace_requires_write_capability(op) is False
+    assert recommended_profile_for(op) == ":read-only"
+
+
+@pytest.mark.parametrize(
+    "op",
+    ["workspace_write", "workspace_apply_patch", "workspace_shell", "git_commit", "git_push"],
+)
+def test_workspace_writes_are_high_risk_and_require_approval(op):
+    assert workspace_risk_level(op) == "high"
+    assert workspace_requires_approval(op) is True
+    assert workspace_requires_write_capability(op) is True
+    # Writes/patch/shell reuse the existing :workspace-write built-in (no network).
+    assert recommended_profile_for(op) == ":workspace-write"
+
+
+def test_workspace_write_profile_grants_fs_write_and_shell_but_not_network():
+    """The recommended write profile must NOT grant network (only danger-full does)."""
+    from app.agents.permission_profiles import _BUILTINS
+
+    pol = _BUILTINS[":workspace-write"]
+    assert pol.fs_read and pol.fs_write and pol.shell
+    assert pol.network is False
+    assert pol.danger_full_access is False
+
+
+def test_unknown_workspace_operation_fails_closed_high_risk():
+    """An unmapped operation is treated as high-risk so it must be audited."""
+    assert workspace_risk_level("workspace_nope") == "high"
+    assert workspace_requires_approval("workspace_nope") is True
 
 
 # ---- environments ----

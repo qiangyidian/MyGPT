@@ -115,3 +115,68 @@ def catalog(
     for name, decl in decls.items():
         out.append(ProfileCatalogEntry(name, resolve_profile(name, decls), _gate(name)))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Workspace operation -> risk/approval mapping (Task 8)
+# --------------------------------------------------------------------------- #
+# Reads/list/search (and read-only git) are low-risk and need no approval: they
+# run under the ``:read-only`` capability set (fs_read only).
+WORKSPACE_READ_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "workspace_read",
+        "workspace_list",
+        "workspace_search",
+        "workspace_git_status",
+        "workspace_git_diff",
+    }
+)
+# Writes/patch/shell and any git mutation require the configured approval
+# profile — they run under ``:workspace-write`` (fs_write + shell).
+WORKSPACE_WRITE_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "workspace_write",
+        "workspace_apply_patch",
+        "workspace_shell",
+        "git_commit",
+        "git_add",
+        "git_push",
+        "git_reset",
+        "git_rebase",
+    }
+)
+
+
+def workspace_requires_write_capability(operation: str) -> bool:
+    """True when ``operation`` needs fs_write/shell (i.e. is not a pure read)."""
+    return operation in WORKSPACE_WRITE_OPERATIONS
+
+
+def workspace_risk_level(operation: str) -> str:
+    """Classify a workspace operation's risk: ``"low"`` for reads, ``"high"`` for
+    writes/patch/shell/git-mutations. Medium is not used — there is no half-
+    trusted workspace mutation."""
+    if operation in WORKSPACE_READ_OPERATIONS:
+        return "low"
+    if operation in WORKSPACE_WRITE_OPERATIONS:
+        return "high"
+    # Unknown operation: fail closed (treat as high-risk so it must be audited).
+    return "high"
+
+
+def workspace_requires_approval(operation: str) -> bool:
+    """Whether ``operation`` must be gated behind a human approval.
+
+    Reads never require approval; writes/patch/shell/git-mutations always do.
+    """
+    return workspace_risk_level(operation) == "high"
+
+
+def recommended_profile_for(operation: str) -> str:
+    """The built-in profile name that grants EXACTLY the caps this operation needs.
+
+    Reads -> ``:read-only`` (fs_read); writes/patch/shell/git -> ``:workspace-write``
+    (fs_read + fs_write + shell, still no network). Network egress requires the
+    explicit ``:danger-full-access`` profile, which the catalog can forbid.
+    """
+    return ":workspace-write" if workspace_requires_write_capability(operation) else ":read-only"
