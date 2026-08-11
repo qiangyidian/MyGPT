@@ -29,7 +29,7 @@
 | 4. Durable workflow schema/events/leases/controls | P0 | Complete | Commits `116b4e2` + `51c076f` (review fixes); migration `0007`, EventStore/CommandStore/LeaseStore, persist-first controls; targeted 45 passed, backend 753 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 5. Redis Streams worker/recovery/SSE replay | P0 | Complete | Commits `a76e4f7`+`25bc33a`+`72d26c9` (review fixes); Redis+in-memory queue, worker w/ lease-loss abort + short-lived event sessions, recovery scheduler, cursor-replay SSE, durable dispatch wired (gated), Compose worker+recovery; targeted 52 passed, backend 783 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 6. Planner-executor-verifier | P1 | Complete | Commits `7dd0987` + `0446ee3` (review fixes); engine + templates + StageAdapterExecutor + AttemptRepository; topology mirrors graph.py; targeted 63 passed, backend green; combined review APPROVED on engine boundary (orchestrator routing deferred to a flagged follow-up) |
-| 7. Compaction/output spill/long-term memory | P1 | Not started | Awaiting workflow state machine |
+| 7. Compaction/output spill/long-term memory | P1 | Complete | Commits `682ae73` + `c89e5df` (review fix); unified ContextManager (tool-pair atomic compaction, gated mid-run compaction wired into native runtime, opaque ArtifactHandle spill, pure system-prompt assembly) + opt-in UserMemory + migration `0008`; targeted 76 passed, backend 847 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 8. Workspace tools and isolated runner | P1 | Not started | Awaiting workflow and policy contracts |
 | 9. MCP transports and connectors | P1 | Not started | Awaiting unified tool gateway hardening |
 | 10. Artifacts and multimodal | P1 | Not started | Awaiting storage/provider contracts |
@@ -59,8 +59,8 @@
 
 - [x] Implement typed planner-executor-verifier workflows with dependency-aware parallelism, retries, bounded replanning, and structured verification.
 - [x] Express research, parallel research, debate, and tool-heavy runs as templates over the same durable state machine.
-- [ ] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
-- [ ] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
+- [x] Use one context manager for prompt partitioning, tool-pair retention, mid-run compaction, attachment retrieval, and output spill.
+- [x] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
 - [ ] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
 - [ ] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
 - [ ] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
@@ -93,7 +93,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [x] Current in-memory pause/resume/cancel/instruction controls are not durable; closed by Task 4 (persist-first durable commands).
 - [x] Current SSE connection owns too much execution lifetime; closed by Task 5 (cursor-replay SSE is read-only; workflow runs in the worker).
 - [x] Current multi-agent profiles are not a general typed planner-executor-verifier engine; closed by Task 6 (durable generic engine + templates; CrewAI behind a stage adapter; orchestrator routing deferred to a flagged follow-up).
-- [ ] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; Task 7 unifies them.
+- [x] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; closed by Task 7 (unified ContextManager).
 - [ ] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; Tasks 8 and 9 close it.
 - [ ] Generated files and multimodal content are not first-class authorized artifacts; Task 10 closes it.
 - [ ] Metrics, quotas, readiness, evaluation gates, frontend durable controls, and production operations remain incomplete; Tasks 11-14 close them.
@@ -467,7 +467,7 @@ Expected: all selected tests pass. (Verified: 63 passed; full backend green; com
 - Modify: `backend/app/services/chat_service.py`
 - Modify: `backend/app/api/memories.py`
 
-- [ ] **Step 1: Write failing budget partition, tool-pair retention, mid-run compaction, spill, and memory-consent tests**
+- [x] **Step 1: Write failing budget partition, tool-pair retention, mid-run compaction, spill, and memory-consent tests**
 
 ```python
 def test_compaction_keeps_tool_call_and_result_together():
@@ -479,22 +479,22 @@ async def test_memory_candidate_is_inactive_without_opt_in(service, user):
     assert not memory.active
 ```
 
-- [ ] **Step 2: Verify RED and implement one context manager used by chat and workflow**
+- [x] **Step 2: Verify RED and implement one context manager used by chat and workflow**
 
 Partition budgets, preserve protected fragments, run between steps, compact on model downshift, and replace large tool results with authorized artifact handles.
 
-- [ ] **Step 3: Implement opt-in semantic user memory**
+- [x] **Step 3: Implement opt-in semantic user memory**
 
 Extract candidates, score confidence, deduplicate, expire, activate under user policy, embed active memories in Qdrant, and expose edit/delete/disable APIs.
 
-- [ ] **Step 4: Remove process-local world-state correctness dependency**
+- [x] **Step 4: Remove process-local world-state correctness dependency**
 
 Persist fragment fingerprints and always assemble a complete effective system prompt for each provider request.
 
-- [ ] **Step 5: Run context and memory tests**
+- [x] **Step 5: Run context and memory tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_context_manager.py tests/test_long_term_memory.py tests/test_context_compaction.py tests/test_model_switch.py tests/test_output_spill.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 76 passed across context/memory/compaction/switch/spill/chat_stream/native-runtime/phase0; full backend 847 passed, 1 known env-deferred failure.)
 
 ### Task 8: Workspace tools and isolated runner
 
