@@ -27,7 +27,7 @@
 | 2. Automatic continuation and usage accounting | P0 | Complete | Commits `0deeb3e` through `8375635`; backend 668/668; final spec PASS and quality APPROVED |
 | 3. Agent budgets and provider controls | P0 | Complete | Commits `267dfcf`–`decc619` plus gate-hardening commit; focused budget/native suites 76/76; backend 725 passed (1 known env-deferred web-search test); combined spec+quality review APPROVED (no Critical/Important) |
 | 4. Durable workflow schema/events/leases/controls | P0 | Complete | Commits `116b4e2` + `51c076f` (review fixes); migration `0007`, EventStore/CommandStore/LeaseStore, persist-first controls; targeted 45 passed, backend 753 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
-| 5. Redis Streams worker/recovery/SSE replay | P0 | Not started | Awaiting Task 4 |
+| 5. Redis Streams worker/recovery/SSE replay | P0 | Complete | Commits `a76e4f7`+`25bc33a`+`72d26c9` (review fixes); Redis+in-memory queue, worker w/ lease-loss abort + short-lived event sessions, recovery scheduler, cursor-replay SSE, durable dispatch wired (gated), Compose worker+recovery; targeted 52 passed, backend 783 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 6. Planner-executor-verifier | P1 | Not started | Awaiting durable workflow foundation |
 | 7. Compaction/output spill/long-term memory | P1 | Not started | Awaiting workflow state machine |
 | 8. Workspace tools and isolated runner | P1 | Not started | Awaiting workflow and policy contracts |
@@ -49,9 +49,9 @@
 - [x] Isolate checkpoint, graph, plan, and terminal persistence into short-lived ID-based sessions so rollback cannot expire request-owned ORM objects.
 - [x] Enforce real per-run step, tool, replan, wall-clock, token, output-size, and monetary budgets across every external await and dispatch.
 - [x] Persist authoritative workflow events, attempts, commands, approvals, leases, checkpoints, and terminal states in PostgreSQL.
-- [ ] Move background execution to Redis Streams workers with idempotent enqueue, consumer groups, lease fencing, graceful shutdown, and stale-run recovery.
-- [ ] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
-- [ ] Eliminate stale legacy `running` rows and make recovery decisions explicit and auditable.
+- [x] Move background execution to Redis Streams workers with idempotent enqueue, consumer groups, lease fencing, graceful shutdown, and stale-run recovery.
+- [x] Make SSE cursor replay reconnect-safe; disconnecting a client must never cancel a durable workflow.
+- [x] Eliminate stale legacy `running` rows and make recovery decisions explicit and auditable.
 - [ ] Enforce tenant/user authorization, secret redaction, path confinement, command policy, approval policy, and immutable audit records.
 - [ ] Require migration head, dependency readiness, production-safe configuration, backup/restore drills, and release acceptance gates.
 
@@ -84,14 +84,14 @@ The following is the observed baseline from the initial repository/runtime audit
 - [x] Only a small fraction of historical assistant messages had token accounting populated; new execution paths now persist complete aggregate usage/cost. Historical backfill/reporting remains part of Task 11.
 - [x] Existing continuation/checkpoint code was not safe under shared CrewAI LLM counters, cancellation races, concurrent AsyncSession use, rollback expiry, or checkpoint commit failures. Closed by Task 2.
 - [x] Budget settings existed but were not authoritative across Native/CrewAI/Writer/tool dispatches; closed by Task 3.
-- [ ] At audit time 11 of 66 AgentRun rows were stale `running`; Tasks 4 and 5 must reconcile them and prevent recurrence through leases/recovery.
+- [x] At audit time 11 of 66 AgentRun rows were stale `running`; closed by Tasks 4 and 5 (durable leases + recovery scheduler reconcile and requeue/fail them).
 - [ ] At audit time only PostgreSQL and Qdrant services were up; backend, frontend, Redis, worker, and recovery topology must become health-checked production services in Tasks 5 and 13.
 - [ ] `BACKGROUND_WORKER=inprocess` and development configuration were active; production must use isolated worker/recovery processes with no reload in Task 13.
 - [ ] Database revision state lagged code migration head; Task 13 must enforce migration head at startup/deploy and test upgrades from both empty and current databases.
 - [ ] Qdrant client/server compatibility warning was present; Task 13 must pin and verify a compatible pair.
 - [ ] The web-search safe-default test is sensitive to repository `.env` loading; Tasks 11/13/14 must isolate tests from deployment secrets and verify secure defaults deterministically.
 - [x] Current in-memory pause/resume/cancel/instruction controls are not durable; closed by Task 4 (persist-first durable commands).
-- [ ] Current SSE connection owns too much execution lifetime; Task 5 separates subscription lifetime from workflow lifetime and adds replay.
+- [x] Current SSE connection owns too much execution lifetime; closed by Task 5 (cursor-replay SSE is read-only; workflow runs in the worker).
 - [ ] Current multi-agent profiles are not a general typed planner-executor-verifier engine; Task 6 provides the durable generic engine.
 - [ ] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; Task 7 unifies them.
 - [ ] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; Tasks 8 and 9 close it.
@@ -369,7 +369,7 @@ Expected: all selected tests pass. (Verified: 45 passed across durable + phase3 
 - Modify: `backend/app/services/chat_service.py`
 - Modify: `docker-compose.yml`
 
-- [ ] **Step 1: Write failing queue idempotency, lease fencing, recovery, and replay tests**
+- [x] **Step 1: Write failing queue idempotency, lease fencing, recovery, and replay tests**
 
 ```python
 async def test_enqueue_same_run_is_idempotent(queue, run_id):
@@ -382,30 +382,30 @@ async def test_expired_lease_is_requeued_once(recovery, expired_run):
     assert await recovery.scan() == []
 ```
 
-- [ ] **Step 2: Verify RED and implement queue interfaces**
+- [x] **Step 2: Verify RED and implement queue interfaces**
 
 Provide Redis Streams production transport and deterministic in-memory test transport. Use consumer groups, explicit acknowledgement, idempotent run keys, and database lease fencing.
 
-- [ ] **Step 3: Implement API enqueue and worker execution**
+- [x] **Step 3: Implement API enqueue and worker execution**
 
 The API persists a run and returns/streams its durable events. The worker claims a lease, executes, checkpoints, renews, and acknowledges only after a terminal or safely persisted retry state.
 
-- [ ] **Step 4: Implement stale-run recovery**
+- [x] **Step 4: Implement stale-run recovery**
 
 On startup and on a schedule, reconcile legacy `running` rows, expire dead leases, requeue retryable runs, and terminally fail exhausted runs with an explicit recovery reason.
 
-- [ ] **Step 5: Implement cursor replay SSE**
+- [x] **Step 5: Implement cursor replay SSE**
 
 Replay events after `Last-Event-ID`, then follow Redis notification or database polling. Client disconnect closes only the subscription, never the workflow.
 
-- [ ] **Step 6: Add worker and recovery services to Compose**
+- [x] **Step 6: Add worker and recovery services to Compose**
 
 Use separate commands, health checks, graceful stop periods, and no development reload in production targets.
 
-- [ ] **Step 7: Run workflow durability tests**
+- [x] **Step 7: Run workflow durability tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_workflow_queue.py tests/test_run_recovery.py tests/test_event_replay.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 52 passed across queue/recovery/replay/durable-execution/durable-dispatch + chat_stream/phase0/phase3; full backend 783 passed, 1 known env-deferred failure.)
 
 ### Task 6: Planner–executor–verifier state machine
 
