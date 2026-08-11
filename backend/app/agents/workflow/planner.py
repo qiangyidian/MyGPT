@@ -227,6 +227,14 @@ def revise_plan(
     plan is validated before being returned.
     """
     revise_set = set(revise_step_ids or [])
+    # Reject verifier bugs early: an unknown revise id would otherwise mark every
+    # step ``skip`` and silently loop verify→revise until max_replans exhausts.
+    step_ids = {s.id for s in plan.steps}
+    unknown = revise_set - step_ids
+    if unknown:
+        raise PlanValidationError(
+            f"revise_step_ids reference unknown step(s): {sorted(unknown)}"
+        )
     carried: dict[str, StepObservation] = {}
     new_steps: list[Step] = []
     for s in plan.steps:

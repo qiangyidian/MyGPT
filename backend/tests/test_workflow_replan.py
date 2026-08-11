@@ -15,6 +15,7 @@ from app.agents.workflow.engine import WorkflowEngine
 from app.agents.workflow.planner import revise_plan
 from app.agents.workflow.schemas import (
     Plan,
+    PlanValidationError,
     RetryPolicy,
     Step,
     StepObservation,
@@ -118,6 +119,14 @@ async def test_zero_replans_revise_terminates_failed():
 # --------------------------------------------------------------------------- #
 # Replan retains completed valid work
 # --------------------------------------------------------------------------- #
+def test_revise_plan_rejects_unknown_step_ids():
+    # A buggy/scripted verifier returning an unknown revise id must fail loudly
+    # instead of silently marking every step skip and looping to max_replans.
+    plan = _seq_plan("a", "b")
+    with pytest.raises(PlanValidationError):
+        revise_plan(plan, revise_step_ids=["nonexistent"], observations={})
+
+
 def test_revise_plan_retains_done_steps_and_reworks_flagged():
     plan = _seq_plan("a", "b", "c")
     observations = {

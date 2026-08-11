@@ -209,13 +209,24 @@ class WorkflowEngine:
 
         events: dict[str, asyncio.Event] = {s.id: asyncio.Event() for s in plan.steps}
         state = _RunState()
+        # Step ids that failed permanently. A downstream step whose dependency
+        # failed is NOT ready — it would run with a missing upstream observation
+        # and emit a misleading secondary error — so it is short-circuited.
+        failed: set[str] = set()
 
         semaphore = asyncio.Semaphore(self._max_concurrency)
 
         async def run_step(step: Step) -> tuple[str, StepObservation | None]:
-            # Wait for all dependencies to have produced an observation.
+            # Wait for all dependencies to finish (success OR failure).
             for dep in step.dependencies:
                 await events[dep].wait()
+            if any(dep in failed for dep in step.dependencies):
+                # A dependency failed permanently; do not execute this step.
+                # (The dep adds itself to ``failed`` before setting its event, so
+                # by the time we pass ``wait()`` the membership check is sound.)
+                failed.add(step.id)
+                events[step.id].set()
+                return step.id, None
             if step.skip:
                 # Already-done retained work: nothing to execute.
                 events[step.id].set()
@@ -223,6 +234,7 @@ class WorkflowEngine:
             obs = await self._run_with_retries(step, observations, semaphore, state)
             if obs is None:
                 # Step failed permanently; unblock waiters and surface failure.
+                failed.add(step.id)
                 events[step.id].set()
                 return step.id, None
             observations[step.id] = obs

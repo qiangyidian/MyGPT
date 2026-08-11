@@ -260,6 +260,19 @@ async def test_permanent_error_fails_step_immediately():
     assert exec_.calls["bad"] == 1
 
 
+async def test_downstream_step_not_run_when_dependency_fails():
+    # a -> b; 'a' fails permanently. 'b' depends on 'a', so it must NOT execute
+    # (it would otherwise run with an empty upstream and emit a misleading
+    # secondary error). The run terminates failed with only 'a' attempted.
+    plan = _seq_plan("a", "b")
+    exec_ = FailingExecutor(permanent={"a"})
+    engine = WorkflowEngine(executor=exec_)
+    result = await engine.run(plan)
+    assert result.status == "failed"
+    assert exec_.calls.get("a") == 1
+    assert "b" not in exec_.calls  # downstream short-circuited, never executed
+
+
 # --------------------------------------------------------------------------- #
 # Verification (pass / fail)
 # --------------------------------------------------------------------------- #
