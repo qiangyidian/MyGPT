@@ -55,6 +55,7 @@ from app.agents.run_controls import drop as drop_run_control, get_or_create as g
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
+    BudgetExceeded,
     ExecutionMode,
     RuntimeKind,
     ev_done,
@@ -186,6 +187,41 @@ class ChatOrchestrator:
             )
 
         try:
+            # Task 6b: route deep_research through the durable workflow engine
+            # when the flag is on. The engine emits the SAME event vocabulary
+            # the CrewAI path emits (agent_graph / agent_status / step_* /
+            # token / done) so the UI works unchanged. On ANY exception the
+            # engine path logs and falls through to the proven CrewAI path
+            # below — the user never loses the answer.
+            if self._should_route_to_engine(selection):
+                try:
+                    async for evt in self._run_engine_path(ctx, run):
+                        if evt.kind in ("done", "error"):
+                            await self._finalize_run(
+                                ctx.db,
+                                run,
+                                evt,
+                                lock=db_lock,
+                                session_factory=persistence_session_factory,
+                            )
+                        yield evt
+                        if evt.kind in ("done", "error"):
+                            return
+                    return  # engine handled the whole turn
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — mandatory fallback
+                    logger.warning(
+                        "workflow engine routing failed for run %s, "
+                        "falling back to %s: %s",
+                        run.id, runtime.name, exc,
+                    )
+                    # Reset any partial assistant content the engine attempt
+                    # wrote before failing; the fallback produces its own answer.
+                    try:
+                        ctx.assistant_msg.content = ""
+                    except Exception:  # pragma: no cover - best effort
+                        pass
             async for evt in runtime.stream_turn(ctx):
                 if evt.kind in ("done", "error"):
                     await self._finalize_run(
@@ -317,6 +353,220 @@ class ChatOrchestrator:
             is_demo=False,
         )
         return self._native, selection
+
+    # ------------------------------------------------------------------ #
+    # Task 6b: workflow-engine routing for deep_research
+    # ------------------------------------------------------------------ #
+    def _should_route_to_engine(self, selection: RuntimeSelection) -> bool:
+        """True only when the engine flag is truthy AND this is a genuine
+        deep_research multi-agent turn.
+
+        Scoped to ``deep_research`` (the simplest sequential profile) so the
+        engine proves itself on one profile before generalizing.
+        ``parallel_research`` / ``debate`` can be added later behind the same
+        flag. When this returns False the existing path runs unchanged.
+        """
+        if not _truthy(getattr(get_settings(), "AGENT_WORKFLOW_ENGINE", "")):
+            return False
+        return (
+            selection.multi_agent_requested
+            and selection.agent_profile == "deep_research"
+        )
+
+    async def _run_engine_path(
+        self, ctx: AgentTurnContext, run: AgentRun
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one deep_research turn through the durable WorkflowEngine.
+
+        Emits the SAME event vocabulary the CrewAI multi-agent path emits
+        (``agent_graph`` once, then ``agent_status`` / ``step_started`` /
+        ``step_completed`` per step, then ``token`` + ``done``) so the frontend
+        works unchanged. Reuses :class:`StageAdapterExecutor` so each step
+        delegates to the existing :class:`CrewAIStageExecutor` — no CrewAI
+        reimplementation.
+
+        Raises on ANY failure (engine exception or non-completed result) so the
+        caller falls back to the proven CrewAI path. Engine events already
+        emitted are kept (the fallback re-emits its own ``agent_graph`` which
+        resets the panel).
+
+        A test (or any caller) may inject an executor via
+        ``ctx.extra["workflow_executor"]`` to bypass the real CrewAI stages
+        (mirrors the CrewAI runtime's ``ctx.extra["stage_executor"]`` seam).
+        """
+        # Late imports: keep crewai/workflow out of the module-load path.
+        from app.agents.graph import build_deep_research_graph
+        from app.agents.schemas import (
+            ev_agent_graph,
+            ev_agent_status,
+            ev_done,
+            ev_run_status,
+            ev_step_completed,
+            ev_step_started,
+            ev_token,
+        )
+        from app.agents.token_budget import PromptAdmissionError
+        from app.agents.workflow.engine import WorkflowEngine
+        from app.agents.workflow.planner import build_deep_research_plan
+        from app.agents.workflow.schemas import StepError
+        from app.agents.workflow.verifier import RuleBasedVerifier
+
+        question = ctx.user_content or ""
+        plan = build_deep_research_plan(question)
+        # Reuse the static deep_research topology for the agent_graph event
+        # (the SAME graph build_research_stages would produce). This does not
+        # import crewai, so the engine path is unit-testable without it.
+        graph = build_deep_research_graph(question)
+        graph.run_id = str(run.id)
+
+        yield ev_agent_graph(run_id=run.id, graph=graph.to_public_dict())
+        yield ev_run_status(run_id=run.id, status="running", current_agent_ids=[])
+
+        # Resolve the per-step executor. An injected executor (tests / future
+        # wiring) wins; otherwise build the real StageAdapterExecutor from the
+        # existing crew's stage specs so each step runs via CrewAIStageExecutor.
+        injected = ctx.extra.get("workflow_executor")
+        if injected is not None:
+            inner = injected
+        else:
+            inner = self._build_stage_adapter(ctx, run)
+
+        # The engine calls executor.execute(step, upstream) for each ready step.
+        # Wrap it to (a) surface the lifecycle as SSE events the frontend
+        # already understands, and (b) map Budget/PromptAdmission errors to
+        # StepError(transient=False) so the engine fails the step immediately
+        # instead of retrying a hard budget exhaustion.
+        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+
+        class _EmittingExecutor:
+            async def execute(self, step: Any, upstream: dict) -> Any:
+                title = (step.task_description or step.name or step.id)[:80]
+                await queue.put(
+                    ev_step_started(
+                        step_id=step.id, title=title, step_type="llm",
+                        agent=step.role or step.id,
+                    )
+                )
+                await queue.put(
+                    ev_agent_status(
+                        run_id=run.id, agent_id=step.id, status="running",
+                        task_title=title,
+                    )
+                )
+                try:
+                    obs = await inner.execute(step, upstream)
+                except (BudgetExceeded, PromptAdmissionError) as exc:
+                    # Hard budget/admission exhaustion — never retry.
+                    await queue.put(
+                        ev_agent_status(
+                            run_id=run.id, agent_id=step.id, status="failed",
+                            error=str(exc),
+                        )
+                    )
+                    raise StepError(str(exc), transient=False) from exc
+                except Exception as exc:
+                    await queue.put(
+                        ev_agent_status(
+                            run_id=run.id, agent_id=step.id, status="failed",
+                            error=str(exc),
+                        )
+                    )
+                    raise
+                await queue.put(ev_step_completed(step_id=step.id, status="done"))
+                await queue.put(
+                    ev_agent_status(
+                        run_id=run.id, agent_id=step.id, status="completed",
+                        output_summary=(obs.output or "")[:160] or None,
+                    )
+                )
+                return obs
+
+        engine = WorkflowEngine(
+            executor=_EmittingExecutor(),
+            verifier=RuleBasedVerifier(),
+            run_id=run.id,
+            session_factory=ctx.extra.get("persistence_session_factory"),
+        )
+
+        # Drive the engine in a task; concurrently drain its lifecycle events
+        # so the UI updates in real time (same pattern as CrewAIRuntime's
+        # run_flow + queue drain).
+        result_holder: dict[str, Any] = {}
+        engine_exc: list[BaseException] = []
+
+        async def _run_engine() -> None:
+            try:
+                result_holder["result"] = await engine.run(plan)
+            except BaseException as exc:  # noqa: BLE001 — re-raised after drain
+                engine_exc.append(exc)
+            finally:
+                await queue.put(None)
+
+        engine_task = asyncio.create_task(_run_engine())
+        try:
+            while True:
+                evt = await queue.get()
+                if evt is None:
+                    break
+                yield evt
+        finally:
+            if not engine_task.done():
+                engine_task.cancel()
+            try:
+                await engine_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if engine_exc:
+            raise engine_exc[0]
+
+        result = result_holder.get("result")
+        if result is None or result.status != "completed":
+            # A non-completed result (e.g. a step failed permanently) MUST
+            # trigger the fallback so the user still gets the CrewAI answer.
+            raise RuntimeError(
+                f"workflow engine did not complete (status="
+                f"{getattr(result, 'status', 'missing')}, "
+                f"error={getattr(result, 'error', None)})"
+            )
+
+        yield ev_run_status(
+            run_id=run.id, status="completed", current_agent_ids=[]
+        )
+
+        # The writer step holds the final cited answer.
+        writer_obs = result.observations.get("writer")
+        final_text = (writer_obs.output if writer_obs else "") or ""
+        ctx.assistant_msg.content = final_text
+        if final_text:
+            yield ev_token(delta=final_text)
+        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason="stop")
+
+    def _build_stage_adapter(self, ctx: AgentTurnContext, run: AgentRun):
+        """Build the real StageAdapterExecutor from the existing crew stages.
+
+        Imports crewai lazily (via the crew builder) and reuses the runtime's
+        LLM/tool/stage-context construction so each engine step runs through
+        the SAME CrewAIStageExecutor the live CrewAI path uses.
+        """
+        from app.agents.adapters.llm_adapter import CrewAILLMFactory
+        from app.agents.crews import build_research_stages
+        from app.agents.runtime.crewai_runtime import _guard_for_context
+        from app.agents.runtime.stage_executor import CrewAIStageExecutor
+        from app.agents.stage_context import make_stage_context
+        from app.agents.workflow.executor import StageAdapterExecutor
+
+        guard = _guard_for_context(ctx)
+        llm = CrewAILLMFactory.from_model_config(ctx.model_config, budget_guard=guard)
+        stage_ctx = make_stage_context(str(run.id), budget_guard=guard)
+        # tools are not strictly needed by the adapter contract (CrewAIStageExecutor
+        # receives agent+task from the StageSpec, which already embed tools); pass
+        # an empty list to satisfy the builder signature.
+        _, stages = build_research_stages(
+            llm=llm, tools=[], question=ctx.user_content or ""
+        )
+        stages_by_id = {spec.agent_id: spec for spec in stages}
+        return StageAdapterExecutor(stages_by_id, stage_ctx)
 
     def _crewai_status(self, demo_requested: bool = False) -> tuple[bool, str | None]:
         """Return (available, fallback_reason). Cached after the first check.
@@ -520,3 +770,10 @@ class ChatOrchestrator:
 
 # Module-level singleton — stateless aside from the lazy crewai cache.
 chat_orchestrator = ChatOrchestrator()
+
+
+def _truthy(value: str | None) -> bool:
+    """Interpret a settings flag string as a boolean (1/true/yes/on -> True)."""
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")

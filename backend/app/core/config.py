@@ -167,6 +167,13 @@ class Settings(BaseSettings):
     # canned, non-real answers) and enable CREWAI_ENABLED with a real
     # MODEL_API_BASE_URL / MODEL_API_KEY instead.
     AGENT_DEMO_MODE: bool = False
+    # Workflow engine routing (Task 6b): when set to a truthy value ("1" / "true")
+    # AND the route's agent_profile is "deep_research", that turn runs through the
+    # durable WorkflowEngine (plan -> execute -> verify -> bounded replan) instead
+    # of the static CrewAI crew walker. OFF by default: the proven CrewAI path is
+    # the only deep_research executor. On ANY engine exception the turn falls back
+    # to the existing CrewAI path, so enabling this can never make a turn worse.
+    AGENT_WORKFLOW_ENGINE: str = ""
 
     # ---- Chat attachments (Phase 1) ----
     # Broader than KB uploads: includes images for multimodal chat.
