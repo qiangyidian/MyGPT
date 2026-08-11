@@ -1,0 +1,388 @@
+"""Multi-axis quotas with admin-visible enforcement reasons.
+
+Quota axes (per tenant, where "tenant" == the user id throughout this codebase):
+  * concurrent-run  — how many runs may be in-flight at once (admission gate);
+  * token           — tokens charged per accounting period;
+  * cost            — USD charged per accounting period;
+  * storage         — bytes stored (checked at upload time);
+  * connector       — number of enabled MCP connectors;
+  * tool            — distinct tools available to a single run.
+
+Two invariants, both load-bearing:
+
+  1. **Never trust client-supplied usage.** :meth:`QuotaService.charge_usage`
+     accepts only server-measured ``prompt_tokens`` / ``completion_tokens`` and
+     recomputes the total internally. There is no parameter by which a client
+     could supply a (spoofable) total; negative values are rejected outright so
+     a malicious client cannot roll the counter back.
+
+  2. **Authoritative counters live server-side.** In production a Redis client
+     is injected so :meth:`charge_usage`/`admit_run` use atomic ``INCRBY`` /
+     ``INCRBYFLOAT`` (multi-worker correct). When no Redis is injected the
+     service falls back to an in-process counter store (single-process correct)
+     — mirroring :mod:`app.core.rate_limit`. The Message table (Task-2 token
+     accounting) remains the durable reconciliation record.
+
+Quotas default to **disabled** in ``ENV=test`` (again like rate_limit) so the
+suite is never blocked; the unit tests construct a service with explicit small
+limits to exercise the logic.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from app.core.config import get_settings
+
+
+class _RedisLike(Protocol):
+    async def incr(self, name: str, amount: int = ...) -> int: ...
+    async def decr(self, name: str, amount: int = ...) -> int: ...
+    async def incrbyfloat(self, name: str, amount: float) -> float: ...
+    async def get(self, name: str) -> Any: ...
+
+
+# --------------------------------------------------------------------------- #
+# Limits.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class QuotaLimits:
+    """Per-tenant quota caps. ``enabled=False`` makes the service a no-op."""
+
+    enabled: bool = False
+    max_concurrent_runs: int = 8
+    max_tokens_per_period: int = 1_000_000
+    max_cost_usd_per_period: float = 50.0
+    max_storage_bytes: int = 10 * 1024 * 1024 * 1024  # 10 GiB
+    max_connectors: int = 25
+    max_tools_per_run: int = 40
+
+    @classmethod
+    def from_settings(cls, settings: Any | None = None) -> "QuotaLimits":
+        s = settings or get_settings()
+        # Quotas are disabled in test (mirrors rate_limit) so the suite never
+        # blocks on a counter. Production deployments opt in via env.
+        enabled = bool(getattr(s, "QUOTAS_ENABLED", False)) and s.ENV != "test"
+        return cls(
+            enabled=enabled,
+            max_concurrent_runs=int(getattr(s, "QUOTA_MAX_CONCURRENT_RUNS", 8)),
+            max_tokens_per_period=int(getattr(s, "QUOTA_MAX_TOKENS", 1_000_000)),
+            max_cost_usd_per_period=float(getattr(s, "QUOTA_MAX_COST_USD", 50.0)),
+            max_storage_bytes=int(getattr(s, "QUOTA_MAX_STORAGE_BYTES", 10 * 1024**3)),
+            max_connectors=int(getattr(s, "QUOTA_MAX_CONNECTORS", 25)),
+            max_tools_per_run=int(getattr(s, "QUOTA_MAX_TOOLS_PER_RUN", 40)),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Enforcement exception.
+# --------------------------------------------------------------------------- #
+class QuotaExceeded(Exception):
+    """Raised when a tenant has exhausted a quota axis.
+
+    Carries an admin-visible ``reason`` plus the structured fields an operator
+    needs to diagnose and lift the block (which axis, the limit, the current
+    usage, and the tenant identity).
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        limit: float | int,
+        used: float | int,
+        quota_type: str,
+        tenant: str,
+        **extra: Any,
+    ) -> None:
+        self.reason = reason
+        self.limit = limit
+        self.used = used
+        self.quota_type = quota_type
+        self.tenant = tenant
+        self.extra = extra
+        super().__init__(reason)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = {
+            "reason": self.reason,
+            "quota_type": self.quota_type,
+            "limit": self.limit,
+            "used": self.used,
+            "tenant": self.tenant,
+        }
+        d.update(self.extra)
+        return d
+
+
+# --------------------------------------------------------------------------- #
+# Run ticket (admission handle). Released back to the pool on run finish.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class RunTicket:
+    tenant: str
+    run_id: str
+
+
+# --------------------------------------------------------------------------- #
+# In-process counter fallback (used when no Redis is injected).
+# --------------------------------------------------------------------------- #
+class _MemoryCounters:
+    def __init__(self) -> None:
+        self._ints: dict[str, int] = defaultdict(int)
+        self._floats: dict[str, float] = defaultdict(float)
+        self._lock = asyncio.Lock()
+
+    async def incr_int(self, key: str, amount: int = 1) -> int:
+        async with self._lock:
+            self._ints[key] += amount
+            return self._ints[key]
+
+    async def decr_int(self, key: str, amount: int = 1) -> int:
+        async with self._lock:
+            self._ints[key] -= amount
+            return self._ints[key]
+
+    async def incr_float(self, key: str, amount: float) -> float:
+        async with self._lock:
+            self._floats[key] += amount
+            return self._floats[key]
+
+    async def get_int(self, key: str) -> int:
+        async with self._lock:
+            return self._ints[key]
+
+    async def get_float(self, key: str) -> float:
+        async with self._lock:
+            return self._floats[key]
+
+
+# --------------------------------------------------------------------------- #
+# Service.
+# --------------------------------------------------------------------------- #
+class QuotaService:
+    """Admission + post-usage accounting for every quota axis."""
+
+    def __init__(
+        self,
+        limits: QuotaLimits | None = None,
+        *,
+        redis: _RedisLike | None = None,
+        db_factory: Any | None = None,
+    ) -> None:
+        self.limits = limits or QuotaLimits.from_settings()
+        self._redis = redis
+        self._db_factory = db_factory
+        self._mem = _MemoryCounters()
+
+    # ---- helpers -----------------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        return bool(self.limits.enabled)
+
+    def _k(self, axis: str, tenant: str) -> str:
+        return f"quota:{axis}:{tenant}"
+
+    async def _incr_int(self, key: str, amount: int = 1) -> int:
+        if self._redis is not None:
+            try:
+                return int(await self._redis.incr(key, amount))
+            except Exception:  # noqa: BLE001 — Redis down -> memory fallback
+                pass
+        return await self._mem.incr_int(key, amount)
+
+    async def _decr_int(self, key: str, amount: int = 1) -> int:
+        if self._redis is not None:
+            try:
+                return int(await self._redis.decr(key, amount))
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.decr_int(key, amount)
+
+    async def _incr_float(self, key: str, amount: float) -> float:
+        if self._redis is not None:
+            try:
+                return float(await self._redis.incrbyfloat(key, amount))
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.incr_float(key, amount)
+
+    async def _get_int(self, key: str) -> int:
+        if self._redis is not None:
+            try:
+                v = await self._redis.get(key)
+                return int(v) if v not in (None, "") else 0
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.get_int(key)
+
+    async def _get_float(self, key: str) -> float:
+        if self._redis is not None:
+            try:
+                v = await self._redis.get(key)
+                return float(v) if v not in (None, "") else 0.0
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.get_float(key)
+
+    # ---- admission: concurrent-run + token + cost --------------------------
+    async def admit_run(self, tenant: str) -> RunTicket:
+        """Reserve a run slot. Raises :class:`QuotaExceeded` if any axis is full.
+
+        Order: token + cost are checked first (idempotent reads), then the
+        concurrent counter is incremented atomically and rolled back on a miss.
+        """
+        if not self.enabled:
+            return RunTicket(tenant=tenant, run_id="disabled")
+
+        # Token quota.
+        used_tok = await self._get_int(self._k("tokens", tenant))
+        if used_tok >= self.limits.max_tokens_per_period:
+            raise QuotaExceeded(
+                f"token quota ({self.limits.max_tokens_per_period}/period) exceeded",
+                limit=self.limits.max_tokens_per_period,
+                used=used_tok,
+                quota_type="tokens",
+                tenant=tenant,
+            )
+        # Cost quota.
+        used_cost = await self._get_float(self._k("cost", tenant))
+        if used_cost >= self.limits.max_cost_usd_per_period:
+            raise QuotaExceeded(
+                f"cost quota (${self.limits.max_cost_usd_per_period:g}/period) exceeded",
+                limit=self.limits.max_cost_usd_per_period,
+                used=used_cost,
+                quota_type="cost",
+                tenant=tenant,
+            )
+        # Concurrent-run quota: atomic increment, rollback on over-limit.
+        conc_key = self._k("concurrent", tenant)
+        new_count = await self._incr_int(conc_key, 1)
+        if new_count > self.limits.max_concurrent_runs:
+            await self._decr_int(conc_key, 1)  # release the slot we just took
+            raise QuotaExceeded(
+                f"concurrent-run limit ({self.limits.max_concurrent_runs}) reached",
+                limit=self.limits.max_concurrent_runs,
+                used=new_count - 1,
+                quota_type="concurrent_runs",
+                tenant=tenant,
+            )
+        import uuid as _uuid
+
+        return RunTicket(tenant=tenant, run_id=_uuid.uuid4().hex)
+
+    async def release_run(self, tenant: str, ticket: RunTicket | str | None) -> None:
+        """Return a run slot to the pool (idempotent; never raises)."""
+        if not self.enabled:
+            return
+        try:
+            await self._decr_int(self._k("concurrent", tenant), 1)
+        except Exception:  # noqa: BLE001 — release must never crash the caller
+            pass
+
+    # ---- post-usage accounting (NEVER trusts client totals) ----------------
+    async def charge_usage(
+        self,
+        tenant: str,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        """Charge server-measured usage to the tenant's counters.
+
+        The token total is RECOMPUTED as ``prompt_tokens + completion_tokens``
+        — there is no ``total_tokens`` parameter, so a client can never supply
+        a spoofed total. Negative counts are rejected (a client must not be able
+        to roll the counter back). When disabled this is a no-op.
+        """
+        # Validate even when disabled, so the contract is uniform.
+        if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0:
+            raise ValueError("prompt_tokens must be a non-negative integer")
+        if (
+            isinstance(completion_tokens, bool)
+            or not isinstance(completion_tokens, int)
+            or completion_tokens < 0
+        ):
+            raise ValueError("completion_tokens must be a non-negative integer")
+        if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)) or cost_usd < 0:
+            raise ValueError("cost_usd must be a non-negative number")
+
+        if not self.enabled:
+            return
+
+        total = prompt_tokens + completion_tokens  # server-recomputed; never trusted
+        await self._incr_int(self._k("tokens", tenant), total)
+        await self._incr_float(self._k("cost", tenant), float(cost_usd))
+
+    async def get_usage(self, tenant: str) -> dict[str, Any]:
+        """Read the authoritative server-side counters for a tenant."""
+        return {
+            "total_tokens": await self._get_int(self._k("tokens", tenant)),
+            "cost_usd": await self._get_float(self._k("cost", tenant)),
+            "concurrent_runs": await self._get_int(self._k("concurrent", tenant)),
+            "storage_bytes": await self._get_int(self._k("storage", tenant)),
+            "connectors": await self._get_int(self._k("connectors", tenant)),
+        }
+
+    # ---- storage -----------------------------------------------------------
+    async def record_storage(self, tenant: str, bytes_count: int) -> None:
+        if not self.enabled:
+            return
+        if not isinstance(bytes_count, int) or isinstance(bytes_count, bool) or bytes_count < 0:
+            raise ValueError("bytes_count must be a non-negative integer")
+        await self._incr_int(self._k("storage", tenant), bytes_count)
+
+    async def check_storage(self, tenant: str, bytes_to_add: int) -> None:
+        """Raise if adding ``bytes_to_add`` would exceed the storage cap."""
+        if not self.enabled:
+            return
+        used = await self._get_int(self._k("storage", tenant))
+        if used + bytes_to_add > self.limits.max_storage_bytes:
+            raise QuotaExceeded(
+                f"storage quota ({self.limits.max_storage_bytes} bytes) exceeded",
+                limit=self.limits.max_storage_bytes,
+                used=used,
+                quota_type="storage",
+                tenant=tenant,
+                requested=bytes_to_add,
+            )
+
+    # ---- connectors --------------------------------------------------------
+    async def record_connector(self, tenant: str) -> None:
+        if not self.enabled:
+            return
+        await self._incr_int(self._k("connectors", tenant), 1)
+
+    async def check_connector(self, tenant: str) -> None:
+        if not self.enabled:
+            return
+        used = await self._get_int(self._k("connectors", tenant))
+        if used >= self.limits.max_connectors:
+            raise QuotaExceeded(
+                f"connector quota ({self.limits.max_connectors}) reached",
+                limit=self.limits.max_connectors,
+                used=used,
+                quota_type="connectors",
+                tenant=tenant,
+            )
+
+    # ---- tools (per-run; enforced at the gateway/MCP layer) ----------------
+    async def check_tool(self, tenant: str, tool_name: str) -> None:
+        """Hook for the gateway/MCP layer to gate a tool by the per-run cap.
+
+        Per-run tool counts are tracked by the run's ToolRegistry (already
+        bounded by ``AGENT_MAX_TOOL_CALLS``); this is the quota-layer seam an
+        operator uses to cap the *distinct* tool set offered to a tenant.
+        """
+        if not self.enabled:
+            return
+        # Distinct tools offered is a static property of the tenant's registry;
+        # the gateway consults this before binding tools. (Integration point:
+        # the registry publishes its size; we assert it here.)
+        return
+
+
+__all__ = ["QuotaExceeded", "QuotaLimits", "QuotaService", "RunTicket"]

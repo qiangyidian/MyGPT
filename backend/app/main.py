@@ -48,6 +48,12 @@ from app.core.bootstrap import init_db
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
+from app.observability import (
+    bind_correlation_id,
+    clear_correlation_id,
+    get_correlation_id,
+    new_correlation_id,
+)
 
 
 @asynccontextmanager
@@ -121,6 +127,11 @@ def create_app() -> FastAPI:
     # Baseline security response headers (CSP/HSTS/X-Frame-Options/…).
     from app.core.middleware import SecurityHeadersMiddleware
     app.add_middleware(SecurityHeadersMiddleware)
+    # Correlation-ID middleware: mint (or accept an inbound X-Correlation-Id),
+    # bind it into the observability contextvar so it propagates into every
+    # structured log line + trace span for the request, and echo it back on the
+    # response so a client/operator can correlate across the stack.
+    app.add_middleware(CorrelationIdMiddleware)
 
     register_exception_handlers(app)
 
@@ -147,15 +158,71 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["health"])
     async def health() -> JSONResponse:
-        # Real readiness probe: pings DB (hard dep) + Redis + Qdrant concurrently.
-        # 200 when healthy, 503 when the DB (or all deps) are down so a
-        # load-balancer / k8s readiness gate can pull the instance out.
+        # Lenient liveness probe: pings DB (hard dep) + Redis + Qdrant
+        # concurrently. 200 when the DB is up (the app can serve degraded
+        # without Redis/Qdrant); 503 only when the DB itself is down.
         from app.core.health import check_health
         result = await check_health()
         status_code = 200 if result["status"] == "ok" else 503
         return JSONResponse(result, status_code=status_code)
 
+    @app.get("/ready", tags=["health"])
+    async def ready() -> JSONResponse:
+        # STRICT readiness gate (Task 11): 200 only when ALL components pass
+        # (DB + migration head + Redis + Qdrant version compat + storage
+        # writable + runner available + eligible chat model). 503 otherwise,
+        # with a structured per-component body. This is the LB/k8s signal;
+        # boot itself never requires readiness.
+        from app.core.health import check_readiness
+        result = await check_readiness()
+        status_code = 200 if result["status"] == "ready" else 503
+        return JSONResponse(result, status_code=status_code)
+
     return app
+
+
+class CorrelationIdMiddleware:
+    """ASGI middleware that mints/propagates a per-request correlation id.
+
+    Reads an inbound ``X-Correlation-Id`` (or mints one), binds it into the
+    observability contextvar (so it lands in every structured log + span), and
+    echoes it back on the response as ``X-Correlation-Id``. Implemented as raw
+    ASGI (not BaseHTTPMiddleware) so it stays cheap on the hot path and survives
+    SSE / streaming responses without buffering.
+    """
+
+    _HEADER = "x-correlation-id"
+
+    def __init__(self, app):  # noqa: ANN001
+        self.app = app
+
+    async def __call__(self, scope, receive, send):  # noqa: ANN001
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        inbound = None
+        for k, v in scope.get("headers", []):
+            if k.decode("latin-1").lower() == self._HEADER:
+                inbound = v.decode("latin-1")
+                break
+        cid = inbound or new_correlation_id()
+        bind_correlation_id(cid)
+
+        async def _send(message):  # noqa: ANN202
+            # Echo the correlation id on the response headers.
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append(
+                    (self._HEADER.encode("latin-1"), cid.encode("latin-1"))
+                )
+                message["headers"] = headers
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        finally:
+            clear_correlation_id()
 
 
 app = create_app()

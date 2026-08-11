@@ -322,6 +322,29 @@ class Settings(BaseSettings):
     #   [{"name":"echo","command":"python","args":["-m","echo_server"],"transport":"stdio"}]
     MCP_SERVERS: str = ""
 
+    # ---- Observability (Task 11) ----
+    # OpenTelemetry-compatible traces + Prometheus metrics are ALWAYS probed via
+    # the no-op fallback (app.observability); these knobs only take effect when
+    # the respective package is importable. Sampling 1.0 = every span, 0 = none.
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "mygpt-backend"
+    OTEL_TRACES_SAMPLER_RATE: float = 1.0
+    PROMETHEUS_ENABLED: bool = False
+    # Structured-log redaction is ALWAYS on (sanitize_attributes runs
+    # unconditionally); this flag is reserved for a future verbose-trace mode.
+    LOG_REDACT_SENSITIVE: bool = True
+
+    # ---- Quotas (Task 11) ----
+    # Multi-axis per-tenant caps. Disabled in test (see QuotaLimits.from_settings)
+    # so the suite is never blocked; production opts in via QUOTAS_ENABLED=true.
+    QUOTAS_ENABLED: bool = False
+    QUOTA_MAX_CONCURRENT_RUNS: int = 8
+    QUOTA_MAX_TOKENS: int = 1_000_000
+    QUOTA_MAX_COST_USD: float = 50.0
+    QUOTA_MAX_STORAGE_BYTES: int = 10 * 1024 * 1024 * 1024  # 10 GiB
+    QUOTA_MAX_CONNECTORS: int = 25
+    QUOTA_MAX_TOOLS_PER_RUN: int = 40
+
     # ---- Derived ----
     @property
     def cors_origins(self) -> List[str]:

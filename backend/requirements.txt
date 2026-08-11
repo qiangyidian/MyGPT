@@ -68,6 +68,14 @@ crewai==1.15.3
 # ---- Logging ----
 structlog>=24.1
 
+# ---- Observability (Task 11) ----
+# OPTIONAL: the app boots and traces/metrics identically without these (the
+# observability module probes for them at import and falls back to no-ops). Listed
+# here so a production install gets real exporters; a dev/test install may omit.
+opentelemetry-api>=1.24
+opentelemetry-sdk>=1.24
+prometheus-client>=0.20
+
 # ---- Testing ----
 pytest>=8.1
 pytest-asyncio>=0.23
