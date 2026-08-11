@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import AppException
 from app.core.storage import get_storage
 from app.models.artifact import SOURCES, Artifact
+from app.observability import observe_counter, observe_histogram, observe_span
 
 logger = logging.getLogger(__name__)
 
@@ -72,34 +73,44 @@ class ArtifactService:
             raise ValueError(f"unknown artifact source: {source!r}")
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
-        storage = get_storage()
-        ext = _ext_of(filename)
-        # Artifacts accept any blob the producer emits; allow exactly this
-        # extension (or none) rather than the chat-upload allow-list.
-        allow = {ext} if ext else set()
-        from fastapi import UploadFile
+        import time as _time
 
-        upload = UploadFile(filename=filename or "artifact", file=io.BytesIO(data))
-        storage_key = await storage.save(upload, owner_id, allowed_extensions=allow)
+        _t0 = _time.monotonic()
+        with observe_span(
+            "artifact.create", source=source, media_type=media_type or "",
+        ):
+            storage = get_storage()
+            ext = _ext_of(filename)
+            # Artifacts accept any blob the producer emits; allow exactly this
+            # extension (or none) rather than the chat-upload allow-list.
+            allow = {ext} if ext else set()
+            from fastapi import UploadFile
 
-        checksum = hashlib.sha256(data).hexdigest()
-        artifact = Artifact(
-            owner_id=owner_id,
-            checksum=checksum,
-            size=len(data),
-            media_type=media_type or "application/octet-stream",
-            storage_key=storage_key,
-            filename=_sanitize_filename(filename or "artifact"),
-            source=source,
-            expires_at=expires_at,
-            retention_policy=retention_policy,
-            run_id=run_id,
-            step_id=step_id,
-            generator=generator,
+            upload = UploadFile(filename=filename or "artifact", file=io.BytesIO(data))
+            storage_key = await storage.save(upload, owner_id, allowed_extensions=allow)
+
+            checksum = hashlib.sha256(data).hexdigest()
+            artifact = Artifact(
+                owner_id=owner_id,
+                checksum=checksum,
+                size=len(data),
+                media_type=media_type or "application/octet-stream",
+                storage_key=storage_key,
+                filename=_sanitize_filename(filename or "artifact"),
+                source=source,
+                expires_at=expires_at,
+                retention_policy=retention_policy,
+                run_id=run_id,
+                step_id=step_id,
+                generator=generator,
+            )
+            self._db.add(artifact)
+            await self._db.commit()
+            await self._db.refresh(artifact)
+        observe_counter("artifact.ops", 1, operation="create", status="ok")
+        observe_histogram(
+            "artifact.latency_ms", int((_time.monotonic() - _t0) * 1000), operation="create",
         )
-        self._db.add(artifact)
-        await self._db.commit()
-        await self._db.refresh(artifact)
         return artifact
 
     async def create_from_upload(
@@ -171,25 +182,34 @@ class ArtifactService:
         leak); an expired artifact yields 404; a checksum mismatch yields 410
         (the content is unavailable due to a detected integrity failure).
         """
-        artifact = await self._get_owned(artifact_id, user)
-        storage = get_storage()
+        import time as _time
 
-        def _read() -> bytes:
-            with storage.open(artifact.storage_key) as fh:
-                return fh.read()
+        _t0 = _time.monotonic()
+        with observe_span("artifact.open", status="ok"):
+            artifact = await self._get_owned(artifact_id, user)
+            storage = get_storage()
 
-        data = await asyncio.to_thread(_read)
-        actual = hashlib.sha256(data).hexdigest()
-        if actual != artifact.checksum:
-            logger.warning(
-                "artifact %s checksum mismatch (expected %s, got %s)",
-                artifact_id, artifact.checksum, actual,
-            )
-            raise AppException(
-                410,
-                "artifact_checksum_mismatch",
-                "artifact content failed integrity verification",
-            )
+            def _read() -> bytes:
+                with storage.open(artifact.storage_key) as fh:
+                    return fh.read()
+
+            data = await asyncio.to_thread(_read)
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != artifact.checksum:
+                logger.warning(
+                    "artifact %s checksum mismatch (expected %s, got %s)",
+                    artifact_id, artifact.checksum, actual,
+                )
+                observe_counter("artifact.ops", 1, operation="open", status="integrity_fail")
+                raise AppException(
+                    410,
+                    "artifact_checksum_mismatch",
+                    "artifact content failed integrity verification",
+                )
+        observe_counter("artifact.ops", 1, operation="open", status="ok")
+        observe_histogram(
+            "artifact.latency_ms", int((_time.monotonic() - _t0) * 1000), operation="open",
+        )
         return data
 
     async def open_stream(

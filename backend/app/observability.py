@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextvars
 import re
+import time
 import uuid
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -43,6 +44,57 @@ try:  # pragma: no cover
     _PROM_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _PROM_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------- #
+# Emission gates. Package presence is necessary but NOT sufficient: the
+# ``OTEL_ENABLED`` / ``PROMETHEUS_ENABLED`` flags are the real switches so an
+# operator can fully disable export without uninstalling the SDK. ``get_settings``
+# is imported lazily (and failures degrade to no-emit) so this module stays
+# import-safe before config is loaded.
+# --------------------------------------------------------------------------- #
+def _emit_traces() -> bool:
+    """True only when OTel is importable AND ``OTEL_ENABLED`` is on."""
+    if not _OTEL_AVAILABLE:
+        return False
+    try:
+        from app.core.config import get_settings
+
+        return bool(get_settings().OTEL_ENABLED)
+    except Exception:  # noqa: BLE001 — never let config access crash a span call
+        return False
+
+
+def _emit_metrics() -> bool:
+    """True only when prometheus_client is importable AND ``PROMETHEUS_ENABLED``."""
+    if not _PROM_AVAILABLE:
+        return False
+    try:
+        from app.core.config import get_settings
+
+        return bool(get_settings().PROMETHEUS_ENABLED)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# A FIXED, low-cardinality label schema for the Prometheus counters/histograms.
+# Only these keys (when present in a counter/histogram attributes dict) become
+# Prom labels; the full (still redacted) attributes survive in traces/logs and
+# the test recorder. This bounds the series count by the product of distinct
+# values per label (each drawn from a small domain: model names, tool names,
+# outcomes) — the Task-11 review flagged the previous ``_attr_hash`` (a hash of
+# the WHOLE attributes dict) as an unbounded-cardinality risk.
+_METRIC_LABEL_KEYS = ("model", "tool", "outcome", "provider", "status", "operation")
+
+
+def _extract_labels(attributes: dict[str, Any] | None) -> dict[str, str]:
+    """Project a (redacted) attributes dict onto the fixed Prom label schema.
+
+    Missing keys default to ``""`` so every series has the full label set
+    (Prometheus requires all registered labelnames on every ``labels()`` call).
+    """
+    a = attributes or {}
+    return {k: str(a.get(k, "")) for k in _METRIC_LABEL_KEYS}
 
 
 REDACTED = "[redacted]"
@@ -225,8 +277,10 @@ def span(
     """Open a trace span (OTel when available + enabled, no-op otherwise).
 
     Attributes are redacted at the boundary. Safe to use unconditionally.
+    Emission is gated on :func:`_emit_traces` (``OTEL_ENABLED`` + package
+    presence), so an operator can disable export without uninstalling the SDK.
     """
-    s = _OtelSpan(name, attributes) if _OTEL_AVAILABLE else _NoopSpan(name, attributes)
+    s = _OtelSpan(name, attributes) if _emit_traces() else _NoopSpan(name, attributes)
     with s as sp:
         yield sp
 
@@ -245,15 +299,14 @@ class _PromCounter(_NoopCounter):
         super().__init__(name, description)
         from prometheus_client import Counter as _Counter  # type: ignore
 
-        # labelnames kept generic; attributes are passed per-inc.
-        self._c = _Counter(name, description or name, labelnames=("_attr_hash",))
+        # Fixed labelnames: bounded cardinality (see _METRIC_LABEL_KEYS). The
+        # full attributes dict survives in traces/logs + the test recorder; only
+        # the small fixed schema becomes Prom labels.
+        self._c = _Counter(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
 
     def inc(self, amount: float | int = 1, attributes: dict[str, Any] | None = None) -> None:
         try:
-            # Collapsing attrs into a stable hash keeps the label cardinality
-            # bounded while still letting rich attrs survive in traces/logs.
-            key = str(sorted((sanitize_attributes(attributes or {})).items()))
-            self._c.labels(_attr_hash=key).inc(amount)
+            self._c.labels(**_extract_labels(sanitize_attributes(attributes))).inc(amount)
         except Exception:  # noqa: BLE001 — metrics must never break the call
             pass
 
@@ -272,28 +325,186 @@ class _PromHistogram(_NoopHistogram):
         super().__init__(name, description)
         from prometheus_client import Histogram as _Histogram  # type: ignore
 
-        self._h = _Histogram(name, description or name, labelnames=("_attr_hash",))
+        self._h = _Histogram(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
 
     def record(self, amount: float | int = 0, attributes: dict[str, Any] | None = None) -> None:
         try:
-            key = str(sorted((sanitize_attributes(attributes or {})).items()))
-            self._h.labels(_attr_hash=key).observe(amount)
+            self._h.labels(**_extract_labels(sanitize_attributes(attributes))).observe(amount)
         except Exception:  # noqa: BLE001
             pass
 
 
 def counter(name: str, description: str = "") -> Any:
-    """Return a counter handle (Prometheus when present, no-op otherwise)."""
-    return _PromCounter(name, description) if _PROM_AVAILABLE else _NoopCounter(name, description)
+    """Return a counter handle (Prometheus when enabled, no-op otherwise).
+
+    Emission is gated on :func:`_emit_metrics` (``PROMETHEUS_ENABLED`` + package
+    presence). The returned handle's ``inc()`` is always safe to call.
+    """
+    return _PromCounter(name, description) if _emit_metrics() else _NoopCounter(name, description)
 
 
 def histogram(name: str, description: str = "") -> Any:
-    """Return a histogram handle (Prometheus when present, no-op otherwise)."""
+    """Return a histogram handle (Prometheus when enabled, no-op otherwise)."""
     return (
         _PromHistogram(name, description)
-        if _PROM_AVAILABLE
+        if _emit_metrics()
         else _NoopHistogram(name, description)
     )
+
+
+# --------------------------------------------------------------------------- #
+# One-liner instrumentation helpers + test recorders.
+#
+# ``observe_span`` / ``observe_counter`` / ``observe_histogram`` are the
+# call-site conveniences: they sanitize attributes, route to the gated exporter,
+# and (when a test recorder is set) record the observation so tests can assert
+# instrumentation wiring without a real exporter. The recorders are independent
+# of the emission flags — they observe the *call site*; the flags control the
+# *exporter*. In production both recorders stay ``None`` so the helpers add only
+# the (already cheap, no-op when off) exporter call.
+# --------------------------------------------------------------------------- #
+_span_recorder: "list[dict[str, Any]] | None" = None
+_metric_recorder: "list[dict[str, Any]] | None" = None
+
+# Module-level handle caches so a hot path does not rebuild the Prom handle per
+# call (Prometheus clients dedupe by name internally too, but caching avoids the
+# import + lookup entirely).
+_counter_handles: dict[str, Any] = {}
+_histogram_handles: dict[str, Any] = {}
+
+
+def set_span_recorder(recorder: "list[dict[str, Any]] | None") -> None:
+    """Test injection: capture every ``observe_span`` open/close into ``recorder``.
+
+    Pass ``None`` to clear (production path — zero overhead).
+    """
+    global _span_recorder
+    _span_recorder = recorder
+
+
+def set_metric_recorder(recorder: "list[dict[str, Any]] | None") -> None:
+    """Test injection: capture every ``observe_counter`` / ``observe_histogram``
+    call into ``recorder``. Pass ``None`` to clear."""
+    global _metric_recorder
+    _metric_recorder = recorder
+
+
+def get_span_recorder() -> "list[dict[str, Any]] | None":
+    return _span_recorder
+
+
+def get_metric_recorder() -> "list[dict[str, Any]] | None":
+    return _metric_recorder
+
+
+def _cached_counter(name: str, description: str = "") -> Any:
+    h = _counter_handles.get(name)
+    if h is None:
+        h = counter(name, description)
+        _counter_handles[name] = h
+    return h
+
+
+def _cached_histogram(name: str, description: str = "") -> Any:
+    h = _histogram_handles.get(name)
+    if h is None:
+        h = histogram(name, description)
+        _histogram_handles[name] = h
+    return h
+
+
+@contextmanager
+def observe_span(name: str, **attributes: Any) -> Iterator[Any]:
+    """Open a span named ``name`` with redacted attributes; one-liner call site.
+
+    Records (name, attributes, duration_ms, error) into the span recorder when
+    one is set, so tests can assert instrumentation wiring without a real
+    exporter. Always closes the span (even on exception) and re-raises.
+
+    Fast path: when neither traces are emitted NOR a recorder is set (the
+    production default + the whole test suite without a recorder), this opens a
+    bare no-op span with no timing/attribute work — the hot path pays only two
+    boolean checks plus the (already cheap) no-op span open/close.
+    """
+    if not _emit_traces() and _span_recorder is None:
+        # Fully inert: open a bare no-op span; the span still redacts internally
+        # so passing raw attributes is safe.
+        with span(name, attributes) as inert_sp:
+            yield inert_sp
+        return
+    clean = sanitize_attributes(attributes)
+    started = time.monotonic()
+    rec_entry: dict[str, Any] | None = None
+    if _span_recorder is not None:
+        rec_entry = {
+            "name": name,
+            "attributes": dict(clean),
+            "duration_ms": None,
+            "error": None,
+        }
+        _span_recorder.append(rec_entry)
+    err: BaseException | None = None
+    sp: Any = None
+    try:
+        with span(name, clean) as opened:
+            sp = opened
+            yield opened
+    except BaseException as exc:  # noqa: BLE001 — record + re-raise
+        err = exc
+        try:
+            if sp is not None:
+                sp.record_exception(exc)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    finally:
+        if rec_entry is not None:
+            # Refresh from the span's accumulated attributes so set_attribute
+            # calls inside the with-block survive into the recording (callers
+            # set the outcome/error attributes after open).
+            acc = getattr(sp, "_attributes", None)
+            if isinstance(acc, dict):
+                rec_entry["attributes"] = dict(acc)
+            rec_entry["duration_ms"] = int((time.monotonic() - started) * 1000)
+            rec_entry["error"] = type(err).__name__ if err is not None else None
+
+
+def observe_counter(name: str, value: float | int = 1, **attributes: Any) -> None:
+    """Increment counter ``name`` by ``value`` with redacted attributes.
+
+    Routes to the gated exporter (no-op when ``PROMETHEUS_ENABLED`` is off) and
+    records the call when a metric recorder is set. When BOTH are off (the
+    production default + the whole test suite), this short-circuits before any
+    attribute work so the hot path pays only the cost of two boolean checks.
+    """
+    if not _emit_metrics() and _metric_recorder is None:
+        return
+    clean = sanitize_attributes(attributes)
+    if _emit_metrics():
+        try:
+            _cached_counter(name).inc(value, clean)
+        except Exception:  # noqa: BLE001 — metrics must never break the call
+            pass
+    if _metric_recorder is not None:
+        _metric_recorder.append(
+            {"kind": "counter", "name": name, "value": value, "attributes": dict(clean)}
+        )
+
+
+def observe_histogram(name: str, value: float | int, **attributes: Any) -> None:
+    """Record ``value`` into histogram ``name`` with redacted attributes."""
+    if not _emit_metrics() and _metric_recorder is None:
+        return
+    clean = sanitize_attributes(attributes)
+    if _emit_metrics():
+        try:
+            _cached_histogram(name).record(value, clean)
+        except Exception:  # noqa: BLE001
+            pass
+    if _metric_recorder is not None:
+        _metric_recorder.append(
+            {"kind": "histogram", "name": name, "value": value, "attributes": dict(clean)}
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -339,12 +550,20 @@ def get_correlation_id() -> str | None:
 
 __all__ = [
     "REDACTED",
+    "_METRIC_LABEL_KEYS",
     "bind_correlation_id",
     "clear_correlation_id",
     "counter",
     "get_correlation_id",
+    "get_metric_recorder",
+    "get_span_recorder",
     "histogram",
     "new_correlation_id",
+    "observe_counter",
+    "observe_histogram",
+    "observe_span",
     "sanitize_attributes",
+    "set_metric_recorder",
+    "set_span_recorder",
     "span",
 ]

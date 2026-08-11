@@ -51,6 +51,7 @@ from app.agents.workflow.schemas import (
     WorkflowResult,
 )
 from app.agents.workflow.verifier import RuleBasedVerifier, ScriptedVerifier, Verifier
+from app.observability import observe_counter, observe_span
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ class WorkflowEngine:
                 observations=observations,
             )
             replans += 1
+            observe_counter("workflow.replans", 1, version=current.version)
             await self._emit("plan.revised", {
                 "version": current.version,
                 "revise_step_ids": list(verdict.revise_step_ids),
@@ -269,6 +271,9 @@ class WorkflowEngine:
         Returns the observation on success, or ``None`` when the step failed
         permanently / exhausted its retries.
         """
+        # Observability (Task 11b): one span per step attempt. The span captures
+        # the step id + attempt (NOT step input, which may carry prompt text).
+        # Inert when exporters are off.
         policy = step.retry_policy
         attempt_number_base = await self._next_attempt_number(step.id)
         attempt = 0
@@ -276,30 +281,36 @@ class WorkflowEngine:
             attempt += 1
             attempt_number = attempt_number_base + attempt - 1
             try:
-                await self._open_attempt(step.id, attempt_number)
-                async with semaphore:
-                    state.in_flight += 1
-                    if state.in_flight > state.peak:
-                        state.peak = state.in_flight
-                    try:
-                        obs = await self._executor.execute(step, dict(observations))
-                    finally:
-                        state.in_flight -= 1
-                if obs.usage is None:
-                    obs.usage = {"attempts": attempt}
-                else:
-                    obs.usage = {**dict(obs.usage), "attempts": attempt}
-                obs.attempts = attempt
-                await self._close_attempt(step.id, attempt_number, obs)
+                with observe_span(
+                    "workflow.step", step_id=step.id, attempt=attempt_number
+                ) as _sp:
+                    await self._open_attempt(step.id, attempt_number)
+                    async with semaphore:
+                        state.in_flight += 1
+                        if state.in_flight > state.peak:
+                            state.peak = state.in_flight
+                        try:
+                            obs = await self._executor.execute(step, dict(observations))
+                        finally:
+                            state.in_flight -= 1
+                    if obs.usage is None:
+                        obs.usage = {"attempts": attempt}
+                    else:
+                        obs.usage = {**dict(obs.usage), "attempts": attempt}
+                    obs.attempts = attempt
+                    await self._close_attempt(step.id, attempt_number, obs)
+                observe_counter("workflow.steps", 1, outcome="done")
                 return obs
             except BaseException as exc:  # noqa: BLE001 — executor may raise anything
                 transient = policy.is_transient(exc) and attempt <= policy.max_retries
                 await self._error_attempt(step.id, attempt_number, exc, transient)
                 if transient:
+                    observe_counter("workflow.steps", 1, outcome="retry")
                     continue
                 logger.warning(
                     "workflow step %s failed permanently: %s", step.id, exc
                 )
+                observe_counter("workflow.steps", 1, outcome="failed")
                 return None
 
     # ------------------------------------------------------------------ #

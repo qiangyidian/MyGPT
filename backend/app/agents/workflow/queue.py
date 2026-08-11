@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models.run_lease import RunLease
+from app.observability import observe_counter, observe_histogram
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,8 @@ class InMemoryQueue:
     """
 
     def __init__(self) -> None:
-        self._pending: OrderedDict[uuid.UUID, None] = OrderedDict()
+        # value = enqueue timestamp (monotonic) so dequeue can observe wait time.
+        self._pending: OrderedDict[uuid.UUID, float] = OrderedDict()
         self._in_flight: dict[uuid.UUID, str] = {}  # run_id -> owner
         self._cond = asyncio.Condition()
 
@@ -99,6 +101,8 @@ class InMemoryQueue:
         *,
         db_session_factory: Callable[[], AsyncSession] | None = None,
     ) -> None:
+        import time as _time
+
         uid = _as_uuid(run_id)
         async with self._cond:
             if uid in self._pending or uid in self._in_flight:
@@ -110,20 +114,29 @@ class InMemoryQueue:
             return
         async with self._cond:
             if uid not in self._pending and uid not in self._in_flight:
-                self._pending[uid] = None
+                self._pending[uid] = _time.monotonic()
                 self._cond.notify_all()
+        observe_counter("queue.enqueues", 1)
 
     async def pending_ids(self) -> list[uuid.UUID]:
         async with self._cond:
             return list(self._pending.keys())
 
     async def dequeue(self, owner: str, timeout: float = 0.0) -> uuid.UUID | None:
+        import time as _time
+
         async with self._cond:
             if not self._pending:
                 return None
-            uid, _ = self._pending.popitem(last=False)
+            uid, enqueued_at = self._pending.popitem(last=False)
             self._in_flight[uid] = owner
-            return uid
+        # Observability (Task 11b): record the enqueue→dequeue wait time. Inert
+        # when exporters are off; the test recorder captures it regardless.
+        observe_histogram(
+            "queue.wait_ms", int((_time.monotonic() - enqueued_at) * 1000),
+        )
+        observe_counter("queue.dequeues", 1)
+        return uid
 
     async def ack(self, run_id: uuid.UUID | str, owner: str) -> bool:
         uid = _as_uuid(run_id)
@@ -131,16 +144,20 @@ class InMemoryQueue:
             if self._in_flight.get(uid) == owner:
                 del self._in_flight[uid]
                 self._cond.notify_all()
+                observe_counter("queue.acks", 1, outcome="owned")
                 return True
+            observe_counter("queue.acks", 1, outcome="not_owner")
             return False
 
     async def requeue(self, run_id: uuid.UUID | str) -> None:
+        import time as _time
+
         uid = _as_uuid(run_id)
         async with self._cond:
             # Clear any stale in-flight entry from the dead worker.
             self._in_flight.pop(uid, None)
             if uid not in self._pending:
-                self._pending[uid] = None
+                self._pending[uid] = _time.monotonic()
                 self._cond.notify_all()
 
 

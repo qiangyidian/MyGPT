@@ -37,7 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.catalog import get_manifest
 from app.connectors.models import Connector
+from app.core.exceptions import AppException
 from app.core.security import encrypt_secret, decrypt_secret
+from app.observability import observe_counter, observe_span
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,9 @@ class ConnectorService:
 
         if enabled:
             self._check_scopes(oauth_scopes, manifest.required_scopes)
+            # Connector quota gate (Task 11b): creating an enabled connector
+            # consumes a slot, same as enable(). Gated on QUOTAS_ENABLED.
+            await self._check_connector_quota(user_id)
 
         conn = Connector(
             user_id=user_id,
@@ -106,6 +111,16 @@ class ConnectorService:
         )
         self._db.add(conn)
         await self._db.flush()
+        # Record the enabled connector against the quota counter (best-effort).
+        if enabled:
+            from app.quotas import get_quota_service
+
+            svc = get_quota_service()
+            if svc.enabled:
+                try:
+                    await svc.record_connector(str(user_id))
+                except Exception:  # noqa: BLE001
+                    logger.debug("record_connector failed for %s", user_id, exc_info=True)
         return conn
 
     # ------------------------------------------------------------------ #
@@ -178,20 +193,65 @@ class ConnectorService:
         return conn
 
     # ------------------------------------------------------------------ #
-    # Enable / disable (minimum-scope gate on enable)
+    # Enable / disable (minimum-scope gate on enable + connector quota)
     # ------------------------------------------------------------------ #
+    async def _check_connector_quota(self, user_id: uuid.UUID) -> None:
+        """Refuse if the tenant is at/over their connector cap (Task 11b).
+
+        Gated on ``QUOTAS_ENABLED`` (the quota service is a no-op when disabled,
+        which is the default + the test env), so existing tests are unaffected.
+        Maps the admin-visible :class:`QuotaExceeded` to an ``AppException(429)``
+        carrying the quota dict so the operator sees the reason + limit + usage.
+        """
+        from app.quotas import QuotaExceeded, get_quota_service
+
+        svc = get_quota_service()
+        if not svc.enabled:
+            return
+        try:
+            await svc.check_connector(str(user_id))
+        except QuotaExceeded as exc:
+            raise AppException(
+                429,
+                "quota_exceeded",
+                exc.reason,
+                {"quota": exc.to_dict()},
+            ) from exc
+
     async def enable(self, user_id: uuid.UUID, connector_id: uuid.UUID) -> Connector:
-        conn = await self._get_owned_or_raise(user_id, connector_id)
-        required = conn.manifest.get("required_scopes") or []
-        self._check_scopes(conn.oauth_scopes or [], required)
-        conn.enabled = True
-        await self._db.flush()
+        # Observability (Task 11b): one span per enable op (redacted attrs).
+        with observe_span("connector.enable", tenant=str(user_id)):
+            conn = await self._get_owned_or_raise(user_id, connector_id)
+            required = conn.manifest.get("required_scopes") or []
+            self._check_scopes(conn.oauth_scopes or [], required)
+            # Quota gate: only when flipping disabled→enabled (idempotent enable
+            # of an already-enabled connector is a no-op and must not double-count).
+            was_enabled = bool(conn.enabled)
+            if not was_enabled:
+                await self._check_connector_quota(user_id)
+            conn.enabled = True
+            await self._db.flush()
+        # Best-effort: record the newly-enabled connector against the quota
+        # counter so subsequent enables see an accurate count. Only on the
+        # disabled→enabled transition.
+        if not was_enabled:
+            from app.quotas import get_quota_service
+
+            svc = get_quota_service()
+            if svc.enabled:
+                try:
+                    await svc.record_connector(str(user_id))
+                except Exception:  # noqa: BLE001 — quota accounting must never block enable
+                    logger.debug("record_connector failed for %s", user_id, exc_info=True)
+        observe_counter("connector.enables", 1, outcome="ok")
         return conn
 
     async def disable(self, user_id: uuid.UUID, connector_id: uuid.UUID) -> Connector:
-        conn = await self._get_owned_or_raise(user_id, connector_id)
-        conn.enabled = False
-        await self._db.flush()
+        with observe_span("connector.disable", tenant=str(user_id)):
+            conn = await self._get_owned_or_raise(user_id, connector_id)
+            conn.enabled = False
+            await self._db.flush()
+        observe_counter("connector.enables", 1, outcome="disabled")
         return conn
 
     async def delete(self, user_id: uuid.UUID, connector_id: uuid.UUID) -> None:

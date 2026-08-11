@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Literal
 
 import httpx
@@ -20,6 +21,7 @@ from tenacity import (
 )
 
 from app.core.config import get_settings
+from app.observability import observe_counter, observe_histogram, observe_span
 from app.providers.base import (
     ChatDelta,
     ChatOptions,
@@ -242,32 +244,49 @@ class OpenAICompatibleProvider(ModelProvider):
     async def chat(
         self, messages: list[dict[str, Any]], options: ChatOptions | None = None
     ) -> ChatResult:
-        admitted_options = admit_provider_payload(self, messages, options)
-        payload = self._build_chat_payload(
-            self.model, messages, admitted_options, stream=False
+        # Observability (Task 11b): one span per model call; attributes are
+        # redacted by observe_span (the api_key never appears). Inert no-op when
+        # exporters are absent / OTEL_ENABLED is off.
+        started = time.monotonic()
+        with observe_span("model.call", model=self.model, provider=self.provider_name):
+            admitted_options = admit_provider_payload(self, messages, options)
+            payload = self._build_chat_payload(
+                self.model, messages, admitted_options, stream=False
+            )
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    resp = await self._request(client, self._chat_url(), payload)
+            except _RETRYABLE_EXC as exc:
+                observe_counter(
+                    "model.calls", 1, model=self.model, outcome="error",
+                )
+                raise _to_provider_error(exc, where="chat") from exc
+
+            self._raise_for_status(resp, self._chat_url())
+
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise ProviderError("model endpoint returned invalid JSON") from exc
+
+            try:
+                choice = (data.get("choices") or [{}])[0]
+            except IndexError:
+                choice = {}
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            tool_calls = self._parse_tool_calls(message.get("tool_calls"))
+            finish_reason = choice.get("finish_reason") or "stop"
+            usage = data.get("usage")
+        observe_counter(
+            "model.calls", 1, model=self.model, outcome=str(finish_reason or "ok"),
         )
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await self._request(client, self._chat_url(), payload)
-        except _RETRYABLE_EXC as exc:
-            raise _to_provider_error(exc, where="chat") from exc
-
-        self._raise_for_status(resp, self._chat_url())
-
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise ProviderError("model endpoint returned invalid JSON") from exc
-
-        try:
-            choice = (data.get("choices") or [{}])[0]
-        except IndexError:
-            choice = {}
-        message = choice.get("message") or {}
-        content = message.get("content") or ""
-        tool_calls = self._parse_tool_calls(message.get("tool_calls"))
-        finish_reason = choice.get("finish_reason") or "stop"
-        usage = data.get("usage")
+        observe_histogram(
+            "model.latency_ms",
+            int((time.monotonic() - started) * 1000),
+            model=self.model,
+            operation="chat",
+        )
         return ChatResult(
             content=content,
             tool_calls=tool_calls or None,
@@ -285,67 +304,88 @@ class OpenAICompatibleProvider(ModelProvider):
         generator (the natural shape for an SSE stream) — callers iterate it
         with `async for`, which is compatible with the AsyncIterator contract.
         """
-        admitted_options = admit_provider_payload(self, messages, options)
-        payload = self._build_chat_payload(
-            self.model, messages, admitted_options, stream=True
-        )
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                # Retry the INITIAL response on transient errors (502/503/429/...)
-                # AND transient transport errors (connect/read timeout) — both are
-                # safe because no tokens have been emitted yet. Once the stream
-                # starts iterating, we do NOT retry (would duplicate tokens).
-                for attempt in range(1, 6):
-                    started_iter = False
-                    try:
-                        async with client.stream(
-                            "POST", self._chat_url(), json=payload, headers=self._headers()
-                        ) as resp:
-                            if resp.status_code in _RETRYABLE_STATUS:
-                                await resp.aread()  # drain the error body before retrying
-                                if attempt < 5:
-                                    await self._sleep_before_retry(
-                                        admitted_options,
-                                        attempt + 1,
-                                        min(2 ** attempt, 10),
-                                    )
-                                    continue
-                                raise ProviderError(
-                                    f"model endpoint returned HTTP {resp.status_code} after retries"
-                                )
-                            if resp.status_code >= 400:
-                                await resp.aread()
-                                logger.warning(
-                                    "model endpoint returned HTTP %s",
-                                    resp.status_code,
-                                )
-                                if resp.status_code in (401, 403):
+        started = time.monotonic()
+        # Observability (Task 11b): span wraps the whole stream dispatch. We
+        # can't wrap the yielding loop in a single `with` (it spans awaits that
+        # yield to the caller), so the span opens here and the counter/histogram
+        # fire at the end. Inert when exporters are off.
+        with observe_span("model.stream", model=self.model, provider=self.provider_name):
+            admitted_options = admit_provider_payload(self, messages, options)
+            payload = self._build_chat_payload(
+                self.model, messages, admitted_options, stream=True
+            )
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    # Retry the INITIAL response on transient errors (502/503/429/...)
+                    # AND transient transport errors (connect/read timeout) — both are
+                    # safe because no tokens have been emitted yet. Once the stream
+                    # starts iterating, we do NOT retry (would duplicate tokens).
+                    for attempt in range(1, 6):
+                        started_iter = False
+                        try:
+                            async with client.stream(
+                                "POST", self._chat_url(), json=payload, headers=self._headers()
+                            ) as resp:
+                                if resp.status_code in _RETRYABLE_STATUS:
+                                    await resp.aread()  # drain the error body before retrying
+                                    if attempt < 5:
+                                        await self._sleep_before_retry(
+                                            admitted_options,
+                                            attempt + 1,
+                                            min(2 ** attempt, 10),
+                                        )
+                                        continue
                                     raise ProviderError(
-                                        "model endpoint authentication failed"
+                                        f"model endpoint returned HTTP {resp.status_code} after retries"
                                     )
-                                raise ProviderError(
-                                    f"model endpoint returned HTTP {resp.status_code}"
+                                if resp.status_code >= 400:
+                                    await resp.aread()
+                                    logger.warning(
+                                        "model endpoint returned HTTP %s",
+                                        resp.status_code,
+                                    )
+                                    if resp.status_code in (401, 403):
+                                        raise ProviderError(
+                                            "model endpoint authentication failed"
+                                        )
+                                    raise ProviderError(
+                                        f"model endpoint returned HTTP {resp.status_code}"
+                                    )
+                                started_iter = True
+                                async for chunk in self._iter_sse(resp):
+                                    yield chunk
+                                return
+                        except _RETRYABLE_EXC as exc:
+                            # Transport error before the first token → retry (matches
+                            # the comment). A mid-stream error (started_iter) is NOT
+                            # retried — resending would duplicate emitted tokens.
+                            if not started_iter and attempt < 5:
+                                await self._sleep_before_retry(
+                                    admitted_options,
+                                    attempt + 1,
+                                    min(2 ** attempt, 10),
                                 )
-                            started_iter = True
-                            async for chunk in self._iter_sse(resp):
-                                yield chunk
-                            return
-                    except _RETRYABLE_EXC as exc:
-                        # Transport error before the first token → retry (matches
-                        # the comment). A mid-stream error (started_iter) is NOT
-                        # retried — resending would duplicate emitted tokens.
-                        if not started_iter and attempt < 5:
-                            await self._sleep_before_retry(
-                                admitted_options,
-                                attempt + 1,
-                                min(2 ** attempt, 10),
-                            )
-                            continue
-                        raise _to_provider_error(exc, where="stream") from exc
-        except ProviderError:
-            raise
-        except _RETRYABLE_EXC as exc:
-            raise _to_provider_error(exc, where="stream") from exc
+                                continue
+                            raise _to_provider_error(exc, where="stream") from exc
+            except ProviderError:
+                observe_counter(
+                    "model.calls", 1, model=self.model, outcome="error",
+                )
+                raise
+            except _RETRYABLE_EXC as exc:
+                observe_counter(
+                    "model.calls", 1, model=self.model, outcome="error",
+                )
+                raise _to_provider_error(exc, where="stream") from exc
+        observe_counter(
+            "model.calls", 1, model=self.model, outcome="streamed",
+        )
+        observe_histogram(
+            "model.latency_ms",
+            int((time.monotonic() - started) * 1000),
+            model=self.model,
+            operation="stream",
+        )
 
     async def _iter_sse(self, resp: httpx.Response) -> AsyncIterator[ChatDelta]:
         """Parse OpenAI-style SSE: lines `data: {json}`, terminator `data: [DONE]`.

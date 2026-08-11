@@ -477,19 +477,41 @@ class QuotaService:
             )
 
     # ---- tools (per-run; enforced at the gateway/MCP layer) ----------------
-    async def check_tool(self, tenant: str, tool_name: str) -> None:
-        """Hook for the gateway/MCP layer to gate a tool by the per-run cap.
+    async def check_tool(
+        self, tenant: str, tool_name: str, *, run_id: str | None = None
+    ) -> None:
+        """Gate one tool call against the per-run distinct-tool cap.
 
-        Per-run tool counts are tracked by the run's ToolRegistry (already
-        bounded by ``AGENT_MAX_TOOL_CALLS``); this is the quota-layer seam an
-        operator uses to cap the *distinct* tool set offered to a tenant.
+        Called from :meth:`ToolGateway.execute` on every tool invocation (gated
+        on ``QUOTAS_ENABLED``). Tracks the distinct set of tools used in a run
+        via the same set primitive as the concurrent-run counter; the set's
+        cardinality IS the distinct-tool count. The first call for a given
+        (tenant, run_id, tool_name) adds the member; a repeat call for the same
+        tool is a no-op (a tool already used this run is always allowed again).
+
+        Raises :class:`QuotaExceeded` when adding a NEW distinct tool would
+        exceed ``max_tools_per_run``. When ``run_id`` is None the scope falls
+        back to a per-tenant global (the historic seam contract).
         """
         if not self.enabled:
             return
-        # Distinct tools offered is a static property of the tenant's registry;
-        # the gateway consults this before binding tools. (Integration point:
-        # the registry publishes its size; we assert it here.)
-        return
+        scope = run_id or "global"
+        key = self._k("tools", f"{tenant}:{scope}")
+        added = await self._set_add(key, tool_name)
+        if added:
+            size = await self._set_size(key)
+            if size > self.limits.max_tools_per_run:
+                # Roll back the member we just added and refuse.
+                await self._set_remove(key, tool_name)
+                raise QuotaExceeded(
+                    f"tool quota ({self.limits.max_tools_per_run} distinct/run) reached",
+                    limit=self.limits.max_tools_per_run,
+                    used=size - 1,
+                    quota_type="tools",
+                    tenant=tenant,
+                    tool=tool_name,
+                    run_id=run_id,
+                )
 
 
 __all__ = [

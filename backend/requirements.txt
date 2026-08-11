@@ -82,6 +82,21 @@ opentelemetry-api>=1.24
 opentelemetry-sdk>=1.24
 prometheus-client>=0.20
 
+# ---- Protobuf / grpcio-tools version reconciliation (Task 11b) ----
+# The stack has two transitive protobuf consumers with conflicting bounds:
+#   * crewai==1.15.3 -> opentelemetry-exporter-otlp-proto-http~=1.42.0
+#     -> opentelemetry-proto==1.42.1 -> protobuf<7.0,>=5.0
+#   * qdrant-client -> grpcio-tools>=1.41.0 (latest 1.83.x) -> protobuf>=7.35.1,<8
+# These are mutually exclusive on protobuf. The crewai pin is fixed (1.15.3 is
+# the chosen version), so we resolve by pinning protobuf<7 AND constraining
+# grpcio-tools to <1.83 (1.82.x still accepts protobuf<7 and satisfies
+# qdrant-client's >=1.41.0 floor). With these two pins ``pip install -r
+# requirements.txt`` resolves cleanly with no protobuf/otel conflict warning.
+# The no-op fallback in app.observability is unaffected (it probes for package
+# presence, not version).
+protobuf>=5,<7
+grpcio-tools>=1.41,<1.83
+
 # ---- Testing ----
 pytest>=8.1
 pytest-asyncio>=0.23

@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.observability import observe_histogram, observe_span
 from app.models import KnowledgeBase, ModelConfig
 from app.providers.registry import get_provider_for_config
 from app.rag.embedder import ProviderEmbedder
@@ -87,6 +88,32 @@ class RagService:
         citations name where a chunk came from. Best-effort: any failure
         (no KB, no collection yet, store error) returns ("", []).
         """
+        # Observability (Task 11b): one span per retrieval operation. Inert when
+        # exporters are off; the question text is NEVER placed in attributes
+        # (only the kb count + outcome) so a prompt can't leak into a span.
+        import time as _time
+
+        _started = _time.monotonic()
+        with observe_span(
+            "rag.retrieve",
+            kb_count=len(kb_ids) if kb_ids else 0,
+            top_k=top_k or 0,
+        ):
+            ctx, citations = await self._retrieve_impl(db, question, kb_ids, top_k)
+        observe_histogram(
+                "rag.latency_ms",
+                int((_time.monotonic() - _started) * 1000),
+                outcome="ok" if ctx else "empty",
+            )
+        return ctx, citations
+
+    async def _retrieve_impl(
+        self,
+        db: AsyncSession,
+        question: str,
+        kb_ids: list[uuid.UUID | str],
+        top_k: int | None = None,
+    ) -> tuple[str, list[Citation]]:
         if not question or not str(question).strip() or not kb_ids:
             return "", []
         settings = get_settings()

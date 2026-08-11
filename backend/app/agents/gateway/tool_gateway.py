@@ -50,6 +50,8 @@ from app.agents.schemas import (
 )
 from app.models import AgentStep, ToolApproval, ToolCall
 from app.models.user import User
+from app.observability import observe_counter, observe_histogram, observe_span
+from app.quotas import QuotaExceeded, get_quota_service
 from app.tools.base import BaseTool, ToolError, ToolRegistry
 from app.tools.registry_init import get_default_registry
 
@@ -137,6 +139,49 @@ class ToolGateway:
         self._agent_id = aid
         self._task_id = tid
 
+        # 0. Quota gate (Task 11b): a tenant over their per-run distinct-tool cap
+        # is refused with an admin-visible reason. Gated on QUOTAS_ENABLED (off
+        # in test + off by default) so existing tests are unaffected.
+        quota_svc = get_quota_service()
+        if quota_svc.enabled and self.user is not None:
+            tenant = str(getattr(self.user, "id", self.user))
+            try:
+                await quota_svc.check_tool(
+                    tenant,
+                    tool_name,
+                    run_id=str(self.run_id) if self.run_id is not None else None,
+                )
+            except QuotaExceeded as exc:
+                return await self._finalize(
+                    tool_call_id, tool_name, args, started,
+                    ok=False, status="quota_exceeded", error=exc.reason,
+                )
+
+        # Observability (Task 11b): one span per tool execution; the outcome
+        # attribute is set from the final status. Inert when exporters are off.
+        with observe_span("tool.execute", tool=tool_name, run_id=str(self.run_id or "")) as sp:
+            result = await self._execute_inner(
+                tool_call_id, tool_name, args, started,
+                strict=strict, agent_id=aid, task_id=tid,
+            )
+            try:
+                sp.set_attribute("outcome", result.status)
+            except Exception:  # noqa: BLE001 — never let tracing break the call
+                pass
+            return result
+
+    async def _execute_inner(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        started: float,
+        *,
+        strict: bool | None,
+        agent_id: str | None,
+        task_id: str | None,
+    ) -> ToolExecution:
+        """Resolve → permission → approval → execute → audit (the original body)."""
         # 1. Resolve.
         try:
             tool = self._registry.get(tool_name)
@@ -352,6 +397,12 @@ class ToolGateway:
         step_status: str | None = None,
     ) -> ToolExecution:
         latency_ms = int((time.monotonic() - started) * 1000)
+
+        # Observability (Task 11b): every finalize path records a tool.calls
+        # counter (outcome = the status) + a tool.latency_ms histogram. Inert
+        # when exporters are off; the test recorder captures both regardless.
+        observe_counter("tool.calls", 1, tool=tool_name, outcome=status)
+        observe_histogram("tool.latency_ms", latency_ms, tool=tool_name, outcome=status)
 
         # ToolCall row (always persisted — the historical audit trail).
         result_json: dict | None
