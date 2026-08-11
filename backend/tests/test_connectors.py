@@ -256,3 +256,62 @@ async def test_create_snapshots_manifest(db_session, two_users):
     assert conn.manifest["kind"] == "github"
     assert conn.manifest["transport"] in {"stdio", "http"}
     assert conn.command_or_url
+
+
+@pytest.mark.asyncio
+async def test_update_scopes_below_minimum_auto_disables(db_session, two_users):
+    """M4: dropping scopes below the manifest minimum auto-disables an enabled
+    connector rather than leaving it enabled with insufficient scopes."""
+    a, _ = two_users
+    svc = ConnectorService(db_session)
+    conn = await svc.create(
+        user_id=a.id,
+        name="gh",
+        provider="github",
+        credentials={"access_token": "tok"},
+        oauth_scopes=list(get_manifest("github").required_scopes),
+        enabled=True,
+    )
+    await db_session.commit()
+    assert conn.enabled is True
+
+    # PATCH scopes down to [] (below the minimum) on an enabled connector.
+    conn = await svc.update(a.id, conn.id, oauth_scopes=[])
+    await db_session.commit()
+    assert conn.enabled is False, "connector should auto-disable when scopes drop below minimum"
+
+    # Re-granting the minimum lets enable() succeed again.
+    conn.oauth_scopes = list(get_manifest("github").required_scopes)
+    await db_session.commit()
+    conn = await svc.enable(a.id, conn.id)
+    await db_session.commit()
+    assert conn.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_build_server_config_materializes_decrypted_creds(db_session, two_users):
+    """The connector→session seam: build_server_config produces an
+    McpServerConfig whose env carries the decrypted credentials, ready to hand
+    to an McpSession (per-tenant wiring follow-up)."""
+    from app.agents.mcp_client import McpServerConfig as _Cfg
+
+    a, _ = two_users
+    svc = ConnectorService(db_session)
+    conn = await svc.create(
+        user_id=a.id,
+        name="gh",
+        provider="github",
+        credentials={"access_token": "tok-123", "refresh_token": "r-456"},
+        oauth_scopes=list(get_manifest("github").required_scopes),
+    )
+    await db_session.commit()
+
+    cfg = svc.build_server_config(conn)
+    assert isinstance(cfg, _Cfg)
+    assert cfg.transport == conn.transport
+    assert cfg.command == conn.command_or_url
+    # Plaintext credentials appear in the config env (in-memory only), never
+    # stored on the row.
+    assert cfg.env["ACCESS_TOKEN"] == "tok-123"
+    assert cfg.env["REFRESH_TOKEN"] == "r-456"
+    assert "tok-123" not in conn.credentials_enc

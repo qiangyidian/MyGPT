@@ -916,6 +916,12 @@ class CrewAIRuntime:
         from app.agents.intent_router import filter_tool_names
 
         registry = __import__("app.tools.registry_init", fromlist=["get_default_registry"]).get_default_registry()
+        # Merge statically-configured MCP server tools so the CrewAI runtime also
+        # offers them; each wrapper routes through ToolGateway (via the shared
+        # budget/audit path) like a builtin. No-op when MCP is unconfigured.
+        from app.agents.mcp_client import merge_mcp_tools
+
+        merge_mcp_tools(registry)
         user_id = ctx.user.id if ctx.user else None
         # Apply the intent route's allowlist / disable_web (search / create modes).
         route = ctx.extra.get("route")

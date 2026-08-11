@@ -12,11 +12,18 @@ This is the single entry point for managing connector definitions. It enforces:
     owned by user A is invisible (and unoperable) by user B.
   * **Minimum OAuth scopes** — :meth:`enable` refuses to enable a connector
     whose ``oauth_scopes`` don't cover the catalog manifest's
-    ``required_scopes``.
+    ``required_scopes``, and :meth:`update` re-runs that gate when scopes
+    change (auto-disabling a connector that drops below the minimum).
 
-The service does NOT itself open MCP sessions; it owns definitions. Wiring a
-definition into the live MCP tool gateway happens in the connector router /
-agent startup (Task 9 step 3).
+Scope of wiring (Task 9): this service owns connector *definitions* only. The
+live static-MCP path (``MCP_SERVERS``) is fully wired into both agent
+runtimes via :func:`app.agents.mcp_client.merge_mcp_tools`. Per-tenant
+connector→session wiring (opening a live :class:`McpSession` for each enabled
+connector row, scoped to that user, at turn time) is a **follow-up**: the
+``build_server_config`` helper below is the documented seam — it materializes
+an :class:`McpServerConfig` (transport + command/URL + decrypted credentials
+as env) ready to hand to :class:`McpSession`, but the per-user session
+lifecycle manager that calls it is not yet implemented.
 """
 from __future__ import annotations
 
@@ -193,6 +200,77 @@ class ConnectorService:
         if conn is not None:
             await self._db.delete(conn)
             await self._db.flush()
+
+    # ------------------------------------------------------------------ #
+    # Update (mutable non-credential fields; scope change re-validates)
+    # ------------------------------------------------------------------ #
+    async def update(
+        self,
+        user_id: uuid.UUID,
+        connector_id: uuid.UUID,
+        *,
+        name: str | None = None,
+        oauth_scopes: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Connector:
+        """Update mutable fields. When ``oauth_scopes`` is changed AND the
+        connector is currently enabled, the minimum-scope gate is re-run: if
+        the new scopes no longer cover the manifest's required scopes, the
+        connector is auto-disabled (rather than silently left enabled with
+        insufficient scopes). Returns the updated row.
+        """
+        conn = await self._get_owned_or_raise(user_id, connector_id)
+        if name is not None:
+            conn.name = name
+        if oauth_scopes is not None:
+            conn.oauth_scopes = list(oauth_scopes)
+            if conn.enabled:
+                required = conn.manifest.get("required_scopes") or []
+                missing = [
+                    s for s in required if s not in set(conn.oauth_scopes or [])
+                ]
+                if missing:
+                    # M4: never leave an enabled connector below the scope floor.
+                    conn.enabled = False
+                    logger.info(
+                        "connector %s auto-disabled: scopes dropped below minimum (missing %s)",
+                        conn.id, missing,
+                    )
+        if extra is not None:
+            conn.extra = extra
+        await self._db.flush()
+        return conn
+
+    # ------------------------------------------------------------------ #
+    # Connector → McpServerConfig seam (per-tenant session wiring hook)
+    # ------------------------------------------------------------------ #
+    def build_server_config(self, connector: Connector) -> Any:
+        """Materialize an :class:`McpServerConfig` for this connector row.
+
+        The decrypted credentials are placed in the ``env`` under
+        ``MCP_CREDENTIALS`` (a JSON string) plus flattened top-level, so an MCP
+        server subprocess can read them via env. This is the documented seam
+        for per-tenant connector→session wiring (a follow-up): a session
+        manager would call this, hand the result to :class:`McpSession`, and
+        register the discovered tools into that user's run-scoped registry via
+        :func:`merge_mcp_tools`.
+        """
+        from app.agents.mcp_client import McpServerConfig  # local: avoid import cycle
+
+        creds = self.decrypted_credentials(connector)
+        env: dict[str, str] = {"MCP_CREDENTIALS": json.dumps(creds, sort_keys=True)}
+        # Flatten top-level string credentials into env too (common case: a
+        # single ``access_token`` / ``api_key``).
+        for k, v in creds.items():
+            if isinstance(v, str):
+                env[str(k).upper()] = v
+        return McpServerConfig(
+            name=f"{connector.provider}:{connector.id}",
+            command=connector.command_or_url,
+            args=[],
+            env=env,
+            transport=connector.transport,
+        )
 
     # ------------------------------------------------------------------ #
     # Scope validation

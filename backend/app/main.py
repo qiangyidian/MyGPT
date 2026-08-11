@@ -59,26 +59,36 @@ async def lifespan(app: FastAPI):
     from app.agents.approval_bus import approval_bus
     await approval_bus.start_subscriber()
     # Lazily connect configured MCP servers (failure-isolated: never crashes
-    # boot; no-op when no servers are configured). The registry is attached to
-    # app.state so the agent layer can route MCP tool calls through it.
-    from app.agents.mcp_client import McpClientRegistry
-    app.state.mcp_registry = McpClientRegistry(settings.mcp_servers if hasattr(settings, "mcp_servers") else [])
+    # boot; no-op when no servers are configured). The static servers come from
+    # the MCP_SERVERS setting (a JSON array); the live registry is published as
+    # a process singleton so both runtimes merge its tools into their per-run
+    # ToolRegistry via merge_mcp_tools().
+    from app.agents.mcp_client import (
+        McpClientRegistry,
+        build_static_configs,
+        set_live_mcp_registry,
+    )
+    mcp_registry = McpClientRegistry(build_static_configs(settings.MCP_SERVERS))
+    app.state.mcp_registry = mcp_registry
     try:
-        await app.state.mcp_registry.connect_all()
+        await mcp_registry.connect_all()
     except Exception:  # noqa: BLE001 — MCP must never block app boot
-        import logging
-        logging.getLogger(__name__).warning("mcp connect_all failed at boot; continuing", exc_info=True)
+        logging.getLogger(__name__).warning(
+            "mcp connect_all failed at boot; continuing", exc_info=True
+        )
+    # Publish the singleton regardless of connect outcome: merge_mcp_tools is a
+    # no-op when the registry is empty/disconnected, so this never breaks a turn.
+    set_live_mcp_registry(mcp_registry)
     try:
         yield
     finally:
         await approval_bus.stop()
         # Close MCP sessions so their subprocesses/HTTP pools don't leak.
-        registry = getattr(app.state, "mcp_registry", None)
-        if registry is not None:
-            try:
-                await registry.disconnect_all()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            await mcp_registry.disconnect_all()
+        except Exception:  # noqa: BLE001
+            pass
+        set_live_mcp_registry(None)
         # Close shared clients so their connection pools don't leak on reload /
         # graceful shutdown (each used to live for the process with no close).
         from app.rag.qdrant_store import close_vector_store

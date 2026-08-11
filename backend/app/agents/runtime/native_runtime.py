@@ -92,6 +92,13 @@ class NativeChatRuntime:
 
         provider = get_provider_for_config(cfg)
         registry = get_default_registry()
+        # Merge statically-configured MCP server tools into this run's registry
+        # so the model is offered them and calls route through ToolGateway
+        # (approval/audit/truncation/budget) like builtins. No-op when MCP is
+        # unconfigured or disconnected (boot guard holds).
+        from app.agents.mcp_client import merge_mcp_tools
+
+        merge_mcp_tools(registry)
         settings = get_settings()
         guard = ctx.budget_guard
         if guard is None:

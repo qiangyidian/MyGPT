@@ -123,22 +123,29 @@ class McpClientRegistry:
 # Gateway routing: wrap each catalogued MCP tool as a BaseTool so it flows
 # through ToolGateway (approval, audit, truncation, budget) like a builtin.
 # --------------------------------------------------------------------------- #
-class McpToolWrapper:
+from app.tools.base import BaseTool as _BaseTool  # noqa: E402  (late to keep the cycle clean)
+
+
+class McpToolWrapper(_BaseTool):
     """A :class:`~app.tools.base.BaseTool` adapter over one MCP tool.
 
-    ``run(**kwargs)`` delegates to the owning :class:`McpSession` via a
-    caller-supplied async callable (so the wrapper is decoupled from the
-    registry and unit-testable with a fake). The tool surfaces under its
-    namespaced name (``mcp__<server>__<tool>``) and carries the server's
-    validated JSON schema, so it routes through :class:`ToolGateway` with the
-    same approval / audit / truncation / budget treatment as builtins.
+    Subclasses ``BaseTool`` so it satisfies ``isinstance(tool, BaseTool)`` and
+    the registry's type checks. ``run(**kwargs)`` delegates to the owning
+    :class:`McpSession` via a caller-supplied async callable (so the wrapper is
+    decoupled from the registry and unit-testable with a fake). The tool
+    surfaces under its namespaced name (``mcp__<server>__<tool>``) and carries
+    the server's validated JSON schema, so it routes through
+    :class:`ToolGateway` with the same approval / audit / truncation / budget
+    treatment as builtins.
 
     ``dangerous`` defaults to False (the gateway still audits + truncates every
     call); callers may flip it on for write-side tools that should require
     human approval.
     """
 
-    # Declared as class attributes to satisfy the BaseTool structural contract.
+    # BaseTool class attributes; overridden per-instance in __init__.
+    name: str = ""
+    description: str = ""
     category: str = "mcp"
     dangerous: bool = False
 
@@ -191,8 +198,8 @@ def build_gateway_tools(
     """
     wrappers: list[McpToolWrapper] = []
     for info in registry.catalog.all():
-        def _make(tool_name: str, namespaced: str) -> Any:
-            async def _caller(args_name: str, arguments: dict[str, Any]) -> Any:
+        def _make(namespaced: str) -> Any:
+            async def _caller(tool_name: str, arguments: dict[str, Any]) -> Any:
                 return await registry.call_tool(namespaced, arguments)
 
             return _caller
@@ -204,7 +211,90 @@ def build_gateway_tools(
                 tool_name=info.name,
                 description=info.description,
                 input_schema=info.input_schema,
-                caller=_make(info.name, info.namespaced_name),
+                caller=_make(info.namespaced_name),
             )
         )
     return wrappers
+
+
+def merge_mcp_tools(
+    target: Any,
+    mcp_registry: "McpClientRegistry | None" = None,
+) -> int:
+    """Register every catalogued MCP tool into ``target`` (a ToolRegistry).
+
+    The merge seam called by both runtimes at turn start: it takes the live MCP
+    registry (defaults to the process singleton), builds gateway wrappers for
+    each connected tool, and registers them into ``target`` so the model is
+    offered them and calls flow through :class:`ToolGateway`. Returns the number
+    of tools merged. A no-op (returns 0) when MCP is unconfigured or
+    disconnected — the boot guard holds.
+    """
+    if mcp_registry is None:
+        mcp_registry = _live_mcp_registry()
+    if mcp_registry is None or not mcp_registry.enabled:
+        return 0
+    count = 0
+    for wrapper in build_gateway_tools(mcp_registry):
+        try:
+            target.register(wrapper)
+            count += 1
+        except Exception:  # noqa: BLE001 — registration must not break the turn
+            logger.warning("failed to register mcp tool %s", getattr(wrapper, "name", "?"), exc_info=True)
+    return count
+
+
+# --------------------------------------------------------------------------- #
+# Process singleton for the live (static) MCP registry, populated by main.py
+# lifespan and read by the runtimes. Mirrors the approval_bus singleton pattern.
+# --------------------------------------------------------------------------- #
+_LIVE_MCP_REGISTRY: "McpClientRegistry | None" = None
+
+
+def set_live_mcp_registry(registry: "McpClientRegistry | None") -> None:
+    """Populate the process-wide live MCP registry (called from main lifespan)."""
+    global _LIVE_MCP_REGISTRY
+    _LIVE_MCP_REGISTRY = registry
+
+
+def get_live_mcp_registry() -> "McpClientRegistry | None":
+    """Return the live MCP registry set by main.py, or None (no-op guard)."""
+    return _LIVE_MCP_REGISTRY
+
+
+def _live_mcp_registry() -> "McpClientRegistry | None":
+    return _LIVE_MCP_REGISTRY
+
+
+def build_static_configs(raw: str) -> list[McpServerConfig]:
+    """Parse the ``MCP_SERVERS`` JSON string into config objects.
+
+    Tolerant: a blank/malformed value yields an empty list (the boot guard
+    holds — the app never crashes on a bad MCP config). Each entry may carry
+    name, command, args, env, transport.
+    """
+    if not raw or not raw.strip():
+        return []
+    import json as _json
+
+    try:
+        data = _json.loads(raw)
+    except _json.JSONDecodeError:
+        logger.warning("MCP_SERVERS is not valid JSON; ignoring static MCP servers")
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[McpServerConfig] = []
+    for entry in data:
+        if not isinstance(entry, dict) or not entry.get("name") or not entry.get("command"):
+            continue
+        out.append(
+            McpServerConfig(
+                name=str(entry["name"]),
+                command=str(entry["command"]),
+                args=list(entry.get("args") or []),
+                env=dict(entry.get("env") or {}),
+                transport=str(entry.get("transport") or "stdio"),
+            )
+        )
+    return out

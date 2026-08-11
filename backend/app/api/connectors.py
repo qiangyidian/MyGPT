@@ -111,19 +111,23 @@ async def update_connector(
     db: AsyncSession = Depends(get_db),
 ) -> ConnectorOut:
     svc = ConnectorService(db)
-    conn = await svc.get_for_user(user.id, connector_id)
-    if conn is None:
+    try:
+        conn = await svc.update(
+            user.id,
+            connector_id,
+            name=payload.name,
+            oauth_scopes=payload.oauth_scopes,
+            extra=payload.extra,
+        )
+    except ConnectorNotFoundError:
         raise HTTPException(NOT_FOUND, "Connector not found")
-    data = payload.model_dump(exclude_unset=True)
-    for field, value in data.items():
-        setattr(conn, field, value)
     await db.commit()
     await db.refresh(conn)
     await audit_service.log(
         actor_id=user.id,
         action="connector:update",
         target=str(conn.id),
-        detail={"fields": list(data.keys())},
+        detail={"fields": list(payload.model_dump(exclude_unset=True).keys())},
     )
     return ConnectorOut.model_validate(conn)
 

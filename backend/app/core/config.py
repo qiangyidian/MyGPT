@@ -313,6 +313,15 @@ class Settings(BaseSettings):
     # and is NOT duplicated here.
     SANDBOX_OUTPUT_LIMIT: int = Field(default=8192, ge=16)
 
+    # ---- MCP servers (Task 9) ----
+    # Statically-configured MCP servers offered to every run (in addition to
+    # per-tenant connectors). A JSON array of objects with: name, command (the
+    # subprocess command for stdio OR the server URL for http), args, env,
+    # transport ("stdio" | "http" | "sse"). Empty => no static MCP servers (the
+    # boot guard holds; the app runs unchanged). Example:
+    #   [{"name":"echo","command":"python","args":["-m","echo_server"],"transport":"stdio"}]
+    MCP_SERVERS: str = ""
+
     # ---- Derived ----
     @property
     def cors_origins(self) -> List[str]:

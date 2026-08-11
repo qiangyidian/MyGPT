@@ -370,8 +370,6 @@ class HttpTransport:
         self._client = client
         self._timeout = float(timeout)
         self._closed = False
-        # Track in-flight requests so cancel() can abort them.
-        self._inflight: dict[int, httpx.Response | None] = {}
 
     @property
     def closed(self) -> bool:
