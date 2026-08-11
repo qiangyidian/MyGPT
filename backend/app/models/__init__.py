@@ -1,6 +1,7 @@
 """Import every model so SQLAlchemy registers them on Base.metadata
 (matters for create_all and alembic autogenerate)."""
 from app.models.agent_attempt import AgentAttempt
+from app.models.artifact import Artifact
 from app.models.audit_event import AuditEvent
 from app.models.agent_run import AgentRun
 from app.models.agent_step import AgentStep
@@ -56,4 +57,6 @@ __all__ = [
     "AgentAttempt",
     # ---- Task 9: MCP connectors ----
     "Connector",
+    # ---- Task 10: first-class artifacts ----
+    "Artifact",
 ]

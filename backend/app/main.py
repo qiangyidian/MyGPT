@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 from app.api import (
     admin,
     agent_runs,
+    artifacts,
     auth,
     background_tasks,
     chat,
@@ -142,6 +143,7 @@ def create_app() -> FastAPI:
     app.include_router(connectors.router)
     app.include_router(background_tasks.router)
     app.include_router(usage.router)
+    app.include_router(artifacts.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> JSONResponse:

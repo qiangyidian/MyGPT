@@ -625,3 +625,45 @@ async def _index_document_safe(document_id: uuid.UUID) -> None:
             await document_service.index_document(db, document_id)
     except Exception:  # noqa: BLE001
         logger.exception("save-to-kb indexing failed for document %s", document_id)
+
+
+# ---------------------------------------------------------------------------
+# Task 10: turn generated files (tool outputs, code bundles, screenshots,
+# audio, images, Office/PDFs) into first-class authorized artifacts. Generated
+# content becomes an Artifact the user can download/share/audit instead of a
+# temp file the platform loses track of. See app.artifacts.service.ArtifactService.
+# ---------------------------------------------------------------------------
+async def artifact_for_generated(
+    db: AsyncSession,
+    *,
+    user: User,
+    data: bytes,
+    media_type: str,
+    filename: str,
+    source: str = "generation",
+    run_id: uuid.UUID | None = None,
+    step_id: uuid.UUID | None = None,
+    generator: dict[str, Any] | None = None,
+    expires_at=None,
+) -> uuid.UUID:
+    """Persist a generated blob as a first-class Artifact; return its id.
+
+    ``source`` is typically ``generation`` (model/tool output) or
+    ``tool_output`` (a tool's raw return). The opaque id is what the frontend
+    references; the storage key is never handed out.
+    """
+    from app.artifacts.service import ArtifactService
+
+    svc = ArtifactService(db)
+    art = await svc.create_from_bytes(
+        owner_id=user.id,
+        data=data,
+        media_type=media_type,
+        filename=filename,
+        source=source,
+        run_id=run_id,
+        step_id=step_id,
+        generator=generator,
+        expires_at=expires_at,
+    )
+    return art.id

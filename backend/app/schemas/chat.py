@@ -24,6 +24,38 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
 
 
+# ---- Task 10: typed multimodal message parts (additive) -------------------
+# These let a request carry text/image/audio/file parts. They are validated
+# against the model's ModelCapabilities by app.providers.multimodal.route_multimodal
+# before dispatch. ``parts`` is optional and additive: existing requests with a
+# plain string ``content`` keep working unchanged.
+class TextPart(BaseModel):
+    type: str = "text"
+    text: str
+
+
+class ImagePart(BaseModel):
+    """An image input part (base64 data URL or opaque artifact reference)."""
+    type: str = "image"
+    data_url: str
+    media_type: str = "image/png"
+
+
+class AudioPart(BaseModel):
+    """An audio input part (base64 data URL or opaque artifact reference)."""
+    type: str = "audio"
+    data_url: str
+    media_type: str = "audio/wav"
+
+
+class FilePart(BaseModel):
+    """An opaque file reference (metadata only; never raw bytes inline)."""
+    type: str = "file"
+    filename: str
+    media_type: str = "application/octet-stream"
+    size: int = 0
+
+
 class Citation(BaseModel):
     """A source backing an assistant answer.
 

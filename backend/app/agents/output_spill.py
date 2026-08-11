@@ -142,3 +142,139 @@ def spill(
     handle = ArtifactHandle(id=artifact_id, storage_key=storage_key)
     in_context = f"{preview}\n\n[完整内容已溢出，句柄：{handle.id}]"
     return in_context, handle
+
+
+def build_artifact_writer(
+    db_factory,
+    *,
+    owner_id,
+    media_type: str = "text/plain",
+    filename: str = "spill.txt",
+    source: str = "spill",
+    retention_policy: str | None = None,
+    expires_at=None,
+    run_id=None,
+    step_id=None,
+    generator: dict | None = None,
+) -> Callable[[str, str], str]:
+    """Build a sync ``write_fn(name, content) -> storage_key`` backed by the
+    real :class:`ArtifactService`.
+
+    This is the production writer for :func:`spill` / :func:`maybe_spill`: it
+    persists the blob as a first-class Artifact (source=``spill``) and returns
+    the opaque ``storage_key``. The model only ever sees ``artifact:<id>``
+    (assembled by the caller from the returned Artifact); the storage key never
+    reaches the model or client.
+
+    ``db_factory`` is a zero-arg callable returning an AsyncSession context
+    manager (e.g. ``AsyncSessionLocal``). The writer runs the async create in a
+    dedicated event loop so it works from the sync spill seam; callers that are
+    already inside an event loop should prefer :func:`spill_to_artifact`.
+
+    The created artifact id is cached on the returned closure under
+    ``writer.last_artifact_id`` so the caller can publish the opaque handle.
+    """
+    import asyncio
+    import hashlib
+
+    state = {"artifact_id": None}
+
+    def _writer(name: str, content: str) -> str:
+        data = content.encode("utf-8")
+        # Run the async create outside any existing loop.
+        async def _create():
+            async with db_factory() as db:
+                from app.artifacts.service import ArtifactService
+
+                svc = ArtifactService(db)
+                gen = dict(generator or {})
+                # Record the logical spill key + content hash for audit.
+                gen.setdefault("spill_key", name)
+                gen.setdefault("sha256", hashlib.sha256(data).hexdigest())
+                art = await svc.create_from_bytes(
+                    owner_id=owner_id,
+                    data=data,
+                    media_type=media_type,
+                    filename=filename or name,
+                    source=source,
+                    retention_policy=retention_policy,
+                    expires_at=expires_at,
+                    run_id=run_id,
+                    step_id=step_id,
+                    generator=gen,
+                )
+                return art
+
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                art = loop.run_until_complete(_create())
+            finally:
+                loop.close()
+        except Exception:  # noqa: BLE001 — spill is best-effort
+            raise
+        state["artifact_id"] = str(art.id)
+        return art.storage_key
+
+    _writer.last_artifact_id = lambda: state["artifact_id"]  # type: ignore[attr-defined]
+    return _writer
+
+
+async def spill_to_artifact(
+    db,
+    *,
+    owner_id,
+    text: str,
+    budget_tokens: int,
+    media_type: str = "text/plain",
+    filename: str = "spill.txt",
+    key: str = "blob",
+    source: str = "spill",
+    retention_policy: str | None = None,
+    expires_at=None,
+    run_id=None,
+    step_id=None,
+    generator: dict | None = None,
+) -> tuple[str, "ArtifactHandle | None"]:
+    """Async spill that persists the blob via :class:`ArtifactService`.
+
+    The Task-10 backing for the Task-7 ``ArtifactHandle`` seam: when ``text``
+    exceeds ``budget_tokens``, the full content is stored as a first-class
+    Artifact (source=``spill``) and the model sees only the head/tail preview +
+    an opaque ``artifact:<id>`` handle. Returns ``(in_context_preview, handle)``;
+    ``handle is None`` when the text fit the budget (no spill).
+    """
+    if budget_tokens <= 0 or not text:
+        return text, None
+    if estimate_tokens(text) <= budget_tokens:
+        return text, None
+
+    import hashlib
+
+    from app.artifacts.service import ArtifactService
+
+    data = text.encode("utf-8")
+    gen = dict(generator or {})
+    gen.setdefault("spill_key", f"{key}.txt")
+    gen.setdefault("sha256", hashlib.sha256(data).hexdigest())
+    svc = ArtifactService(db)
+    try:
+        art = await svc.create_from_bytes(
+            owner_id=owner_id,
+            data=data,
+            media_type=media_type,
+            filename=filename,
+            source=source,
+            retention_policy=retention_policy,
+            expires_at=expires_at,
+            run_id=run_id,
+            step_id=step_id,
+            generator=gen,
+        )
+    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+        return text, None
+
+    preview = _preview(text)
+    handle = ArtifactHandle(id=f"artifact:{art.id}", storage_key=art.storage_key)
+    in_context = f"{preview}\n\n[完整内容已溢出，句柄：{handle.id}]"
+    return in_context, handle

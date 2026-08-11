@@ -452,3 +452,174 @@ class OpenAICompatibleProvider(ModelProvider):
             indexed.append((idx, [float(x) for x in vec]))
         indexed.sort(key=lambda t: t[0])
         return [vec for _, vec in indexed]
+
+    # ------------------------------------------------------------------ #
+    # Multimodal routes (Task 10) — gated by capability checks.
+    # ------------------------------------------------------------------ #
+    # Each method re-checks the relevant ModelCapabilities flag BEFORE any HTTP
+    # dispatch (defense-in-depth: route_multimodal already validated input
+    # parts, but a misconfigured caller must never send audio to a text-only
+    # endpoint). The endpoint paths follow the OpenAI shape (/audio/transcriptions,
+    # /audio/speech, /images/generations, /images/edits).
+    def _require_capability(self, flag: str, modality: str, label: str) -> None:
+        from app.providers.multimodal import ModelCapabilityError
+
+        if not bool(getattr(self.capabilities, flag, False)):
+            raise ModelCapabilityError(
+                f"model does not support {label}",
+                modality=modality,
+            )
+
+    def _transcription_url(self) -> str:
+        return f"{self.base_url}/audio/transcriptions"
+
+    def _speech_url(self) -> str:
+        return f"{self.base_url}/audio/speech"
+
+    def _images_url(self) -> str:
+        return f"{self.base_url}/images/generations"
+
+    def _images_edits_url(self) -> str:
+        return f"{self.base_url}/images/edits"
+
+    async def transcribe(
+        self,
+        audio: bytes,
+        *,
+        mime_type: str = "audio/wav",
+        filename: str = "audio.wav",
+        language: str | None = None,
+        prompt: str | None = None,
+    ) -> str:
+        """Audio → text (OpenAI-compatible /audio/transcriptions).
+
+        Requires ``supports_audio_input``. Returns the transcribed text.
+        """
+        self._require_capability("supports_audio_input", "audio", "audio input (transcription)")
+        # Multipart form per the OpenAI shape.
+        files = {"file": (filename, audio, mime_type)}
+        data: dict[str, str] = {"model": self.model}
+        if language:
+            data["language"] = language
+        if prompt:
+            data["prompt"] = prompt
+        url = self._transcription_url()
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(url, data=data, files=files, headers=headers)
+        except _RETRYABLE_EXC as exc:
+            raise _to_provider_error(exc, where="transcribe") from exc
+        self._raise_for_status(resp, url)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise ProviderError("transcription endpoint returned invalid JSON") from exc
+        return payload.get("text") or ""
+
+    async def speak(
+        self,
+        text: str,
+        *,
+        voice: str = "alloy",
+        response_format: str = "mp3",
+    ) -> bytes:
+        """Text → audio (OpenAI-compatible /audio/speech).
+
+        Requires ``supports_audio_output``. Returns the raw audio bytes.
+        """
+        self._require_capability("supports_audio_output", "audio_output", "audio output (speech)")
+        payload = {
+            "model": self.model,
+            "input": text,
+            "voice": voice,
+            "response_format": response_format,
+        }
+        url = self._speech_url()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(url, json=payload, headers=self._headers())
+        except _RETRYABLE_EXC as exc:
+            raise _to_provider_error(exc, where="speak") from exc
+        self._raise_for_status(resp, url)
+        return resp.content
+
+    async def generate_image(
+        self,
+        prompt: str,
+        *,
+        size: str = "1024x1024",
+        n: int = 1,
+        response_format: str = "url",
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Text → image(s) (OpenAI-compatible /images/generations).
+
+        Requires ``supports_image_generation``. Returns a list of
+        ``{url|b64_json}`` dicts in input order.
+        """
+        self._require_capability("supports_image_generation", "image_generation", "image generation")
+        payload: dict[str, Any] = {
+            "model": model or self.model,
+            "prompt": prompt,
+            "size": size,
+            "n": n,
+            "response_format": response_format,
+        }
+        url = self._images_url()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await self._request(client, url, payload)
+        except _RETRYABLE_EXC as exc:
+            raise _to_provider_error(exc, where="generate_image") from exc
+        self._raise_for_status(resp, url)
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError("image endpoint returned invalid JSON") from exc
+        return list(data.get("data") or [])
+
+    async def edit_image(
+        self,
+        image: bytes,
+        *,
+        prompt: str,
+        mask: bytes | None = None,
+        mime_type: str = "image/png",
+        size: str = "1024x1024",
+        n: int = 1,
+        response_format: str = "url",
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Image + prompt → edited image(s) (OpenAI-compatible /images/edits).
+
+        Requires ``supports_image_generation``. ``image`` (and optional ``mask``)
+        are uploaded as multipart form parts.
+        """
+        self._require_capability("supports_image_generation", "image_generation", "image editing")
+        files: dict[str, tuple[str, bytes, str]] = {
+            "image": ("image.png", image, mime_type),
+        }
+        if mask is not None:
+            files["mask"] = ("mask.png", mask, mime_type)
+        data: dict[str, str] = {
+            "model": model or self.model,
+            "prompt": prompt,
+            "size": size,
+            "n": str(n),
+            "response_format": response_format,
+        }
+        url = self._images_edits_url()
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(url, data=data, files=files, headers=headers)
+        except _RETRYABLE_EXC as exc:
+            raise _to_provider_error(exc, where="edit_image") from exc
+        self._raise_for_status(resp, url)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise ProviderError("image-edit endpoint returned invalid JSON") from exc
+        return list(payload.get("data") or [])
+
