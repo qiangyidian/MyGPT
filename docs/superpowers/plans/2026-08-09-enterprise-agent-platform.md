@@ -32,7 +32,7 @@
 | 7. Compaction/output spill/long-term memory | P1 | Complete | Commits `682ae73` + `c89e5df` (review fix); unified ContextManager (tool-pair atomic compaction, gated mid-run compaction wired into native runtime, opaque ArtifactHandle spill, pure system-prompt assembly) + opt-in UserMemory + migration `0008`; targeted 76 passed, backend 847 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 8. Workspace tools and isolated runner | P1 | Complete | Commits `e8a9f57` + `acbf77e` (review fix); 8 path-confined workspace tools (resolve_under_root defeats `..`/absolute/symlink escapes), atomic apply_patch, LocalRunner dev-gated + DockerRunner most-restrictive (network=none/read-only/cap-drop/no-new-privs/non-root/bounded); targeted 96 passed, backend 904 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified |
 | 9. MCP transports and connectors | P1 | Complete | Commits `d8bd736` + `63fe0ce` (review fix); JSON-RPC stdio+HTTP transports (no SDK, fake-tested), encrypted tenant Connector + provider catalog + migration `0009`, gateway routing wired end-to-end (`merge_mcp_tools` in both runtimes, e2e audit-row test); targeted 37 passed, backend 935 passed (1 known env-deferred); combined review CHANGES_REQUESTED then fixes verified. Open follow-up: per-tenant connector→session lifecycle (static MCP_SERVERS path is fully wired) |
-| 10. Artifacts and multimodal | P1 | Not started | Awaiting storage/provider contracts |
+| 10. Artifacts and multimodal | P1 | Complete | Commits `2601352` + `7b41354` (review fix); Artifact model + ArtifactService (tenant-scoped streaming download, checksum-on-read, retention) + migration `0010`, typed multimodal parts + route_multimodal (defense-in-depth), spill→artifact wired into production, OpenAI-compatible transcribe/speech/image-gen/edit; targeted 58 passed, backend 963 passed (1 known env-deferred); combined review APPROVED then I1/I2 fixes verified |
 | 11. Observability/quotas/readiness/evals | P2 | Not started | Uses durable events and real usage/budgets |
 | 12. Enterprise frontend surfaces | P2 | Not started | Uses durable APIs from Tasks 4-11 |
 | 13. Production deployment/migrations/backups | P0/P2 | Not started | Finalizes runtime topology and operations |
@@ -63,7 +63,7 @@
 - [x] Add opt-in semantic long-term memory with consent, provenance, tenant isolation, correction, deletion, and retrieval controls.
 - [x] Add workspace-confined read/search/patch/shell/Git tools and a production isolated runner with resource/network/output limits.
 - [x] Add MCP stdio and Streamable HTTP JSON-RPC transports, cancellation, discovery, encrypted tenant connectors, and audited gateway routing.
-- [ ] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
+- [x] Add first-class artifacts, object storage, authorization, checksums, retention, typed message parts, and image/audio/document provider routing.
 
 ### P2: enterprise operability and user experience
 
@@ -95,7 +95,7 @@ The following is the observed baseline from the initial repository/runtime audit
 - [x] Current multi-agent profiles are not a general typed planner-executor-verifier engine; closed by Task 6 (durable generic engine + templates; CrewAI behind a stage adapter; orchestrator routing deferred to a flagged follow-up).
 - [x] Context trimming, summaries, attachments, memory, and long output are not governed by one partition manager; closed by Task 7 (unified ContextManager).
 - [x] Workspace/shell/browser/MCP/connectors lack one production isolation and audit boundary; workspace + shell isolation closed by Task 8 (MCP/connectors audit boundary is Task 9).
-- [ ] Generated files and multimodal content are not first-class authorized artifacts; Task 10 closes it.
+- [x] Generated files and multimodal content are not first-class authorized artifacts; closed by Task 10.
 - [ ] Metrics, quotas, readiness, evaluation gates, frontend durable controls, and production operations remain incomplete; Tasks 11-14 close them.
 
 ## Definition of enterprise completion
@@ -594,7 +594,7 @@ Expected: all selected tests pass without external credentials. (Verified: 37 pa
 - Modify: `backend/app/services/attachment_service.py`
 - Modify: `backend/app/main.py`
 
-- [ ] **Step 1: Write failing authorization, checksum, retention, and modality-routing tests**
+- [x] **Step 1: Write failing authorization, checksum, retention, and modality-routing tests**
 
 ```python
 async def test_artifact_download_is_tenant_scoped(service, artifact, other_user):
@@ -607,22 +607,22 @@ def test_audio_request_rejects_text_only_model():
         route_multimodal([AudioPart(...)], text_only_caps)
 ```
 
-- [ ] **Step 2: Verify RED and implement artifact metadata/storage**
+- [x] **Step 2: Verify RED and implement artifact metadata/storage**
 
 Persist owner, run, step, checksum, media type, size, storage key, provenance, and retention. Use opaque download authorization and never expose local paths.
 
-- [ ] **Step 3: Implement typed message parts and provider routes**
+- [x] **Step 3: Implement typed message parts and provider routes**
 
 Support text, image, audio, and file parts. Add OpenAI-compatible transcription, speech, image generation, and image edit operations behind capability checks.
 
-- [ ] **Step 4: Turn spills and generated files into artifacts**
+- [x] **Step 4: Turn spills and generated files into artifacts**
 
 Tool outputs, code bundles, screenshots, audio, images, Office documents, and PDFs use the same artifact service.
 
-- [ ] **Step 5: Run artifact and multimodal tests**
+- [x] **Step 5: Run artifact and multimodal tests**
 
 Run: `cd backend && .venv/Scripts/python -m pytest tests/test_artifacts.py tests/test_multimodal_routing.py tests/test_attachment_multimodal.py -q`
-Expected: all selected tests pass.
+Expected: all selected tests pass. (Verified: 58 passed across artifacts/multimodal/spill/chat_stream/native-runtime; full backend 963 passed, 1 known env-deferred failure.)
 
 ### Task 11: Observability, quotas, readiness, and evaluation gates
 
