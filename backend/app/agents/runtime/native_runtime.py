@@ -52,6 +52,8 @@ from app.agents.schemas import (
     ev_done,
     ev_error,
     ev_plan_created,
+    ev_run_paused,
+    ev_run_resumed,
     ev_run_status,
     ev_step_completed,
     ev_step_started,
@@ -60,6 +62,7 @@ from app.agents.schemas import (
     ev_tool_result,
     bounded_json_observation,
 )
+from app.agents.events import append_event_safe
 from app.models import AgentRun
 from app.core.config import get_settings
 from app.core.pricing import usage_cost
@@ -192,6 +195,25 @@ class NativeChatRuntime:
             tool_names = list(filter_tool_names(tool_names, route))
         tool_schemas = registry.openai_schemas(only=tool_names) if tools_enabled else None
 
+        # Capability-driven provider parameters (B6): the ModelConfig switches
+        # now map to real request parameters.
+        #   - supports_parallel_tools → OpenAI parallel_tool_calls
+        #   - supports_reasoning_effort → reasoning_effort (per-request
+        #     override via request extra; default "medium")
+        #   - supports_structured_output → response_format json_object when a
+        #     caller opts in via ctx.extra["structured_output"]
+        _extra: dict[str, Any] = {}
+        if tool_schemas and getattr(cfg, "supports_parallel_tools", False):
+            _extra["parallel_tool_calls"] = True
+        if getattr(cfg, "supports_reasoning_effort", False):
+            _extra["reasoning_effort"] = (
+                ctx.extra.get("reasoning_effort") or "medium"
+            )
+        if getattr(cfg, "supports_structured_output", False) and ctx.extra.get(
+            "structured_output"
+        ):
+            _extra["response_format"] = {"type": "json_object"}
+
         options = ChatOptions(
             temperature=cfg.temperature,
             top_p=cfg.top_p,
@@ -199,6 +221,7 @@ class NativeChatRuntime:
             output_token_parameter=provider_output_token_parameter(provider),
             tools=tool_schemas,
             tool_choice="auto",
+            extra=_extra,
             retry_gate=lambda _attempt: _gate_model_retry(guard),
         )
 
@@ -430,15 +453,52 @@ class NativeChatRuntime:
                     async with asyncio.timeout(guard.remaining_seconds):
                         await limiter.acquire()
                         limiter_acquired = True
-                        async for delta in provider.stream_chat(working, options):
+                        # supports_stream=False (B6): the model config declares
+                        # this endpoint can't stream → one buffered chat call,
+                        # surfaced to the UI as a single delta. The chat SSE
+                        # contract toward the frontend is unchanged.
+                        if not getattr(cfg, "supports_stream", True):
+                            buffered = await provider.chat(working, options)
+                            async def _one_delta():
+                                yield buffered
+                            _delta_iter = _one_delta()
+                        else:
+                            _delta_iter = provider.stream_chat(working, options)
+                        async for delta in _delta_iter:
                             ctl = ctx.extra.get("run_control")
                             if ctl is not None and ctl.cancel.is_set():
                                 finish_reason = "cancelled"
                                 _node_terminal = "cancelled"
                                 break
                             if ctl is not None:
-                                while ctl.is_paused() and not ctl.cancel.is_set():
-                                    await asyncio.sleep(0.1)
+                                # Drain appended user instructions into the
+                                # working context (single-agent parity with the
+                                # CrewAI path's between-stage injection).
+                                for instr in ctl.drain_instructions():
+                                    await append_event_safe(
+                                        ctx.db, ctx.run_id,
+                                        "run_instruction_received",
+                                        {"instruction": instr},
+                                    )
+                                    working = working + [
+                                        {
+                                            "role": "user",
+                                            "content": f"[追加指引] {instr}",
+                                        }
+                                    ]
+                                if ctl.is_paused():
+                                    await append_event_safe(
+                                        ctx.db, ctx.run_id, "run_paused",
+                                        {"reason": "user"},
+                                    )
+                                    yield ev_run_paused(run_id=ctx.run_id, reason="user")
+                                    while ctl.is_paused() and not ctl.cancel.is_set():
+                                        await asyncio.sleep(0.1)
+                                    if not ctl.cancel.is_set():
+                                        await append_event_safe(
+                                            ctx.db, ctx.run_id, "run_resumed", {}
+                                        )
+                                        yield ev_run_resumed(run_id=ctx.run_id)
                                 if ctl.cancel.is_set():
                                     finish_reason = "cancelled"
                                     _node_terminal = "cancelled"
@@ -968,10 +1028,20 @@ class NativeChatRuntime:
         ctx.extra["finish_reason"] = finish_reason
         budget_snapshot = guard.snapshot()
         ctx.extra["budget"] = budget_snapshot
-        assistant_msg.metadata_ = {
+        _meta = {
             **(assistant_msg.metadata_ or {}),
             "budget": budget_snapshot,
         }
+        # Persist any spilled artifact handles from this run's tool calls so
+        # the frontend renders downloadable chips (Task-10 artifact wiring).
+        # getattr guard: test fakes may subclass/replace the gateway without
+        # the spill-tracking API.
+        _drain = getattr(gateway, "drain_spilled_handles", None)
+        _handles = _drain() if callable(_drain) else []
+        if _handles:
+            _meta["artifacts"] = _handles
+            ctx.extra["spilled_artifacts"] = _handles
+        assistant_msg.metadata_ = _meta
         if finish_reason == "budget":
             reason = (
                 ctx.extra.get("budget_exceeded_reason")

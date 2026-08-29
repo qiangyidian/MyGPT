@@ -89,6 +89,10 @@ class ToolGateway:
         self.user = user
         self._registry = registry or get_default_registry()
         self._step_seq = 0
+        # Opaque artifact handles produced by oversized tool-result spills this
+        # run (Task-10 wiring). The chat layer drains these after the turn and
+        # renders them as downloadable chips in the assistant message.
+        self._spilled_handles: list[str] = []
         # Current agent attribution (set per-stage by the CrewAI runtime via
         # :meth:`set_attribution`; native runtime leaves it blank). Persisted on
         # every AgentStep row so tools map back to the graph node that ran them.
@@ -113,6 +117,12 @@ class ToolGateway:
         """Set the agent/task id for subsequent tool executions in this run."""
         self._agent_id = agent_id or ""
         self._task_id = task_id or ""
+
+    def drain_spilled_handles(self) -> list[str]:
+        """Return and clear the artifact handles spilled during this run."""
+        handles = list(self._spilled_handles)
+        self._spilled_handles.clear()
+        return handles
 
     # ------------------------------------------------------------------ #
     async def execute(
@@ -326,6 +336,43 @@ class ToolGateway:
         full_text, content, truncated = _stringify_and_truncate(
             rendered_result, self._max_result_chars
         )
+
+        # 6b. Oversized tool output → real Artifact (Task-10 spill wiring).
+        # When the rendered result was truncated, the model only sees the head;
+        # spill the FULL text as a tenant-scoped Artifact and hand the model an
+        # opaque ``artifact:<id>`` handle. The chat layer collects the handles
+        # and renders download chips in the assistant message. Best-effort:
+        # spill never blocks or fails the tool call.
+        spilled_handle: str | None = None
+        if truncated and full_text and self.user is not None:
+            try:
+                from app.agents.output_spill import spill_to_artifact
+
+                _budget = self._max_result_chars // 4  # chars ≈ tokens×4
+                _in_ctx, _handle = await spill_to_artifact(
+                    self.db,
+                    owner_id=self.user.id,
+                    text=full_text,
+                    budget_tokens=_budget,
+                    media_type="application/json"
+                    if isinstance(rendered_result, dict)
+                    else "text/plain",
+                    filename=f"{tool_name}-result.txt",
+                    key=f"{tool_name}-{tool_call_id[:8]}",
+                    source="spill",
+                    run_id=self.run_id,
+                    generator={"tool_name": tool_name, "tool_call_id": tool_call_id},
+                )
+                if _handle is not None:
+                    spilled_handle = _handle.id
+                    content = (
+                        f"{content}\n\n[完整工具输出已保存为附件 {spilled_handle}，"
+                        f"用户可下载查看全文]"
+                    )
+                    self._spilled_handles.append(spilled_handle)
+            except Exception:  # noqa: BLE001 — spill is best-effort
+                logger.debug("tool-result spill failed for %s", tool_name, exc_info=True)
+
         return await self._finalize(
             tool_call_id, tool_name, args, started,
             ok=True, status="success",

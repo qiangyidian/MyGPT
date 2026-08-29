@@ -12,6 +12,8 @@ export interface BuildChatBodyOpts {
   regenerate?: boolean;
   mode?: UserChatMode;
   attachmentIds?: string[];
+  /** Reasoning-effort hint; honored when the model supports it. */
+  reasoningEffort?: "low" | "medium" | "high";
 }
 
 /**
@@ -30,5 +32,6 @@ export function buildChatBody(o: BuildChatBodyOpts): ChatRequest {
     regenerate: o.regenerate ?? false,
     mode: o.mode ?? "speed",
     attachment_ids: o.attachmentIds ?? [],
+    reasoning_effort: o.reasoningEffort,
   };
 }

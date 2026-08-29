@@ -143,6 +143,26 @@ class ConnectorSessionManager:
                 "connector connect_all failed for user %s; partial tools",
                 user_id, exc_info=True,
             )
+        # Record real usage (B8): stamp last_used_at on the connectors whose
+        # sessions actually opened, so the settings page's "最近使用" reflects
+        # reality. Best-effort — a stamp failure never breaks the run.
+        try:
+            from datetime import datetime, timezone
+
+            from sqlalchemy import update
+
+            from app.connectors.models import Connector
+
+            used_ids = [c.id for c in enabled]
+            if used_ids:
+                await self._db.execute(
+                    update(Connector)
+                    .where(Connector.id.in_(used_ids))
+                    .values(last_used_at=datetime.now(timezone.utc))
+                )
+                await self._db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("last_used_at stamp failed", exc_info=True)
         logger.info(
             "connector sessions opened for user %s: %d server(s), %d tool(s)",
             user_id, len(configs), registry.catalog.count(),

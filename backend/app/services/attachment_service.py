@@ -314,6 +314,18 @@ async def _extract(storage_key: str, filename: str) -> tuple[str, dict[str, Any]
                 "chars": len(text),
             }
             return text, preview
+        if ext in _AUDIO_EXTS:
+            # Audio has no offline text extraction. Audio-input models get the
+            # raw bytes via collect_audio_parts at send time; for text-only
+            # models we try an async transcription AFTER the parse step (the
+            # sync parser can't call the provider). Here we only mark the kind
+            # so the UI and send-path know this is audio.
+            return "", {
+                "kind": "audio",
+                "parser_used": "none",
+                "format": ext.lstrip("."),
+                "chars": 0,
+            }
         parsed = default_parser.parse(tmp_path, ext)
         return parsed.text, _preview_for_parsed(parsed, ext)
 
@@ -464,6 +476,91 @@ async def collect_image_parts(
         if part:
             parts.append(part)
     return parts
+
+
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".webm", ".flac", ".aac"}
+
+# OpenAI input_audio accepts "mp3" | "wav"; other containers must be signaled
+# honestly — we map to the closest accepted value and let the endpoint reject
+# if it disagrees (the error is visible, not silent).
+_AUDIO_FORMAT_BY_EXT = {
+    ".mp3": "mp3",
+    ".wav": "wav",
+    ".m4a": "mp3",
+    ".ogg": "wav",
+    ".webm": "wav",
+    ".flac": "wav",
+    ".aac": "mp3",
+}
+
+# Hard ceiling for inline audio parts (base64 inflates by ~4/3). Audio beyond
+# this is skipped with a warning rather than blowing the request budget.
+AUDIO_PART_MAX_BYTES = 20 * 1024 * 1024
+
+
+async def collect_audio_parts(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    attachment_ids: list[uuid.UUID],
+) -> list[dict[str, Any]]:
+    """Return OpenAI ``input_audio`` content parts for the audio attachments.
+
+    Called by the chat layer ONLY when the configured model declares
+    ``supports_audio_input``. Ownership-checked like
+    :func:`resolve_and_bind_attachments`; non-audio ids are silently skipped.
+    Non-audio-input models instead get the transcription via the text path.
+    """
+    if not attachment_ids:
+        return []
+    res = await db.execute(
+        select(ChatAttachment).where(ChatAttachment.id.in_(list(attachment_ids)))
+    )
+    rows = {r.id: r for r in res.scalars().all()}
+    parts: list[dict[str, Any]] = []
+    for aid in attachment_ids:
+        att = rows.get(aid)
+        if att is None or att.user_id != user_id or att.conversation_id != conversation_id:
+            continue
+        if _ext_of(att.original_filename) not in _AUDIO_EXTS:
+            continue
+        part = await asyncio.to_thread(_load_audio_part, att)
+        if part:
+            parts.append(part)
+        else:
+            logger.warning(
+                "audio attachment %s skipped (unreadable or over %d bytes)",
+                att.id, AUDIO_PART_MAX_BYTES,
+            )
+    return parts
+
+
+def _load_audio_part(att: ChatAttachment) -> dict[str, Any] | None:
+    """Read one audio attachment into an OpenAI ``input_audio`` part payload.
+
+    Returns ``None`` on read failure or when the file exceeds the inline
+    ceiling so one bad audio file never breaks the whole turn.
+    """
+    import base64
+
+    fmt = _AUDIO_FORMAT_BY_EXT.get(_ext_of(att.original_filename))
+    if fmt is None:
+        return None
+    storage = get_storage()
+    try:
+        with storage.open(att.storage_key) as fh:
+            data = fh.read()
+    except Exception:  # noqa: BLE001 — unreadable audio must not break the turn
+        logger.warning("could not read audio attachment %s", att.id)
+        return None
+    if len(data) > AUDIO_PART_MAX_BYTES:
+        return None
+    b64 = base64.b64encode(data).decode("ascii")
+    return {
+        "filename": att.original_filename,
+        "format": fmt,
+        "b64": b64,
+    }
 
 
 def _load_image_part(att: ChatAttachment) -> dict[str, Any] | None:

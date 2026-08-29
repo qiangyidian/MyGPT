@@ -41,7 +41,7 @@ import type {
 } from "@/lib/types";
 import { getMessageStatus } from "@/lib/types";
 import { sanitizeSourceMarkers } from "@/lib/citations";
-import { findArtifactHandles } from "@/lib/artifacts";
+import { collectArtifactIds } from "@/lib/artifacts";
 
 interface MessageBubbleProps {
   message: Message;
@@ -252,9 +252,15 @@ export const MessageBubble = memo(function MessageBubble({
     : message.content;
   const citationFlagged = !isUser && meta.citation_validation_failed === true;
 
-  // Artifact references in the assistant text (`artifact:<id>` handles) render
-  // as inline artifact cards with an authenticated download link.
-  const artifactHandles = !isUser ? findArtifactHandles(message.content) : [];
+  // Artifact references — from the assistant text (`artifact:<id>` handles)
+  // AND the persisted metadata list (written when a tool result spilled).
+  // Both render as inline artifact cards with an authenticated download link.
+  const artifactHandles = !isUser
+    ? collectArtifactIds(
+        message.content,
+        (message.metadata as { artifacts?: unknown } | undefined)?.artifacts,
+      )
+    : [];
 
   const commitEdit = () => {
     const next = draft.trim();

@@ -34,11 +34,14 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
+from sqlalchemy import select
+
 from app.agents.approval_bridge import ApprovalBridge
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.continuation import aggregate_usage
 from app.agents.db_mutation import db_mutation_scope
+from app.agents.events import append_event_safe
 from app.agents.persistence import persist_graph_snapshot, persist_research_plan
 from app.agents.crews import (
     build_debate_stages,
@@ -77,10 +80,31 @@ from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
 from app.core.pricing import usage_cost
 from app.db import AsyncSessionLocal
+from app.models import AgentRun
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
 from app.providers.registry import get_provider_for_config
 
 logger = logging.getLogger(__name__)
+
+
+def _acceptance_criteria_for(question: str, plan_steps: list[dict[str, Any]]) -> list[str]:
+    """Deterministic, reviewable acceptance criteria for a research plan.
+
+    Derived from the plan steps (not the free-form question) so the criteria
+    always match what will actually run; the frontend renders these in the
+    PlanReview card before the user confirms.
+    """
+    criteria = [
+        "回答直接针对用户问题，不偏题",
+        "关键结论附带可核实的来源引用",
+    ]
+    n_steps = len(plan_steps or [])
+    if n_steps:
+        criteria.append(f"完成全部 {n_steps} 个计划步骤（检索、交叉核对、撰写）")
+    if question and len(question) > 30:
+        criteria.append("对问题中的多个子点分别作答，不遗漏")
+    criteria.append("明确区分事实与推断；无法核实的结论标注不确定性")
+    return criteria
 
 # Profiles that use the multi-agent graph + right-side panel.
 _MULTI_AGENT_PROFILES = {"deep_research", "parallel_research", "debate"}
@@ -613,10 +637,15 @@ class CrewAIRuntime:
 
         # ---- Phase 2: publish a draft research plan (deep_research) ----
         # Built deterministically from the question; the UI shows it in the
-        # Context Panel and the user may confirm/adjust. requires_confirmation
-        # is False so the run proceeds (the plan/confirm endpoint still records
-        # the decision on the run row).
+        # Context Panel and the user may confirm/adjust. When
+        # PLAN_REQUIRE_CONFIRMATION is enabled the run GATES here (bounded by
+        # PLAN_CONFIRM_TIMEOUT_S) until the user confirms/revises — making the
+        # plan/confirm endpoints a true approval gate. When disabled (default)
+        # the plan is advisory: published for review while the run proceeds.
         try:
+            from app.core.config import get_settings
+
+            _plan_gate = bool(getattr(get_settings(), "PLAN_REQUIRE_CONFIRMATION", False))
             intent_lbl = ctx.extra.get("intent") or "chat"
             plan_summary, plan_steps = build_plan(intent_lbl, ctx.user_content)
             plan = {
@@ -625,7 +654,8 @@ class CrewAIRuntime:
                     {"id": s["id"], "title": s["title"], "sources": ["knowledge_base", "web"]}
                     for s in plan_steps
                 ],
-                "requires_confirmation": False,
+                "acceptanceCriteria": _acceptance_criteria_for(ctx.user_content, plan_steps),
+                "requires_confirmation": _plan_gate,
             }
             async with db_mutation_scope(stage_ctx.persistence_lock):
                 await persist_research_plan(
@@ -638,8 +668,16 @@ class CrewAIRuntime:
                 status="draft",
                 summary=plan_summary,
                 steps=plan["steps"],
-                requires_confirmation=False,
+                requires_confirmation=_plan_gate,
             ))
+            if _plan_gate:
+                gated = await self._await_plan_confirmation(ctx, stage_ctx)
+                if not gated:
+                    # Timed out waiting: proceed anyway (bounded wait beats a
+                    # stuck run) but mark the plan so the audit trail knows.
+                    logger.warning(
+                        "plan confirmation timed out for run %s; proceeding", ctx.run_id
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — plan is best-effort
@@ -676,6 +714,16 @@ class CrewAIRuntime:
                 # Persist live graph_state on structural events (cheap; few).
                 if evt.kind in ("agent_graph", "agent_status", "agent_edge", "run_status"):
                     await self._persist_graph(ctx, emitter, definition=False)
+                # Durable control-state events (user pause/resume/instruction):
+                # persist to run_events so the cursor-replay SSE
+                # (/api/agent-runs/{id}/events) — which RunControls subscribes
+                # to — sees the paused state and can show the 恢复 button.
+                # Without this the execution truly pauses but the /events
+                # stream never reports it (the chat SSE is a separate feed).
+                if evt.kind in ("run_paused", "run_resumed", "run_instruction_received"):
+                    await append_event_safe(
+                        ctx.db, ctx.run_id, evt.kind, dict(evt.data or {})
+                    )
                 yield evt
         finally:
             # If the stream is cancelled/closed while a tool is paused on
@@ -767,8 +815,48 @@ class CrewAIRuntime:
             budget=snapshot,
         )
 
+    async def _await_plan_confirmation(self, ctx, stage_ctx) -> bool:
+        """Block until the user confirms/revises the plan, or the timeout hits.
+
+        Polls the durable run row (an isolated short session per poll — the
+        request-side plan/confirm endpoint writes plan_status there). Honors
+        cancel via the run control. Returns True when confirmed/updated, False
+        on timeout.
+        """
+        from app.core.config import get_settings
+
+        timeout_s = int(getattr(get_settings(), "PLAN_CONFIRM_TIMEOUT_S", 300))
+        ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            if ctl is not None and ctl.cancel.is_set():
+                raise asyncio.CancelledError()
+            try:
+                async with db_mutation_scope(stage_ctx.persistence_lock):
+                    factory = stage_ctx.persistence_session_factory
+                    async with factory() as session:
+                        row = await session.execute(
+                            select(AgentRun.plan_status).where(AgentRun.id == ctx.run_id)
+                        )
+                        status = row.scalar_one_or_none()
+                if status in ("confirmed", "updated"):
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — poll is best-effort
+                logger.debug("plan-status poll failed", exc_info=True)
+            await asyncio.sleep(1.0)
+        return False
+
     async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:
-        """Honor user pause/resume + drain appended instructions between stages."""
+        """Honor user pause/resume + drain appended instructions between stages.
+
+        Also consumes DURABLE commands (``run_commands`` rows) here (B8): the
+        API persists pause/resume/cancel/instruction as RunCommands before the
+        in-process signal; claiming+applying them here makes those rows real
+        (exactly-once) and covers the case where the live signal missed (e.g.
+        a different worker process held the run).
+        """
         ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
         if ctl is None:
             return
@@ -778,6 +866,8 @@ class CrewAIRuntime:
         # Honor a user-initiated cancel between stages.
         if ctl.cancel.is_set():
             raise asyncio.CancelledError()
+        # Durable command drain (exactly-once claim → apply → mark).
+        await self._drain_durable_commands(ctx, stage_ctx, ctl)
         pending = ctl.drain_instructions()
         for instr in pending:
             stage_ctx.emit(ev_run_instruction_received(run_id=ctx.run_id, instruction=instr))
@@ -799,6 +889,53 @@ class CrewAIRuntime:
                         ) from exc
                     guard.check()
             stage_ctx.emit(ev_run_resumed(run_id=ctx.run_id))
+
+    async def _drain_durable_commands(self, ctx, stage_ctx, ctl) -> None:
+        """Claim + apply pending durable RunCommands for this run (B8).
+
+        Maps command types onto the in-process RunControl (pause/resume/cancel/
+        instruction). Each command is marked applied/failed exactly once. Best-
+        effort: a store failure never breaks the stage walk.
+        """
+        try:
+            from app.agents.workflow.repository import CommandStore
+
+            async with db_mutation_scope(stage_ctx.persistence_lock):
+                factory = stage_ctx.persistence_session_factory
+                async with factory() as session:
+                    store = CommandStore(session)
+                    commands = await store.claim_pending(ctx.run_id)
+                    for cmd in commands or []:
+                        ctype = cmd.command_type
+                        payload = dict(cmd.payload or {})
+                        try:
+                            if ctype == "pause":
+                                ctl.pause()
+                            elif ctype == "resume":
+                                ctl.resume()
+                            elif ctype == "cancel":
+                                ctl.cancel.set()
+                            elif ctype == "instruction":
+                                text = str(payload.get("text") or "").strip()
+                                if text:
+                                    ctl.add_instruction(text)
+                            elif ctype in ("approve", "reject"):
+                                # Consumed by the approval bus coordinator, not
+                                # here. Revert the claim so its dedicated
+                                # consumer still finds the row pending.
+                                cmd.status = "pending"
+                                cmd.claimed_at = None
+                                cmd.claimed_by = None
+                                await session.flush()
+                                continue
+                            await store.mark_applied(cmd.id)
+                        except Exception as exc:  # noqa: BLE001
+                            await store.mark_failed(cmd.id, str(exc)[:500])
+                    await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — durable drain is best-effort
+            logger.debug("durable command drain failed", exc_info=True)
 
     async def _walk_stages(
         self,

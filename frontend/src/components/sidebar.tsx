@@ -256,18 +256,23 @@ export function Sidebar({
                 {conv.is_archived ? <ArchiveRestore className="h-4 w-4" /> : <Archive className="h-4 w-4" />}
                 {conv.is_archived ? "取消归档" : "归档"}
               </DropdownMenuItem>
-              {projects && projects.length > 0 && onAssignToProject && (
+              {onAssignToProject && (
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger className="gap-2 text-xs">
                     <FolderInput className="h-4 w-4" /> 移入项目
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent>
-                    {projects.map((p) => (
+                    {projects?.map((p) => (
                       <DropdownMenuItem key={p.id} className="gap-2" onClick={() => onAssignToProject(conv.id, p.id)}>
                         <span className="h-2 w-2 rounded-full" style={{ background: p.color }} />
                         {p.name}
                       </DropdownMenuItem>
                     ))}
+                    {(!projects || projects.length === 0) && (
+                      <p className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                        暂无项目，先创建一个：
+                      </p>
+                    )}
                     {onCreateProject && (
                       <DropdownMenuItem
                         className="gap-2"

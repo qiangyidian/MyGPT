@@ -12,6 +12,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ChatModeSelector } from "@/components/chat/chat-mode-selector";
 import { AdvancedModelSelector } from "@/components/chat/advanced-model-selector";
+import { ReasoningEffortSelector } from "@/components/chat/reasoning-effort-selector";
+import { useChatUiStore } from "@/stores/chat-ui-store";
 import type { KnowledgeBase } from "@/lib/types";
 
 interface ComposerToolbarProps {
@@ -76,6 +78,23 @@ export function ComposerToolbar({
         onChange={onModelChange}
         mimes={attachmentMimes}
       />
+
+      <ReasoningEffortSelectorStoreBridge modelId={modelId} />
     </div>
+  );
+}
+
+/** Reads/writes reasoning effort from the shared chat-ui store (B6). Only
+ *  renders when the selected (or any default) model supports it. */
+function ReasoningEffortSelectorStoreBridge({ modelId }: { modelId: string | null }) {
+  const effort = useChatUiStore((s) => s.reasoningEffort);
+  const setEffort = useChatUiStore((s) => s.setReasoningEffort);
+  return (
+    <ReasoningEffortSelector
+      modelId={modelId}
+      value={effort}
+      onChange={setEffort}
+      className="h-9 gap-1.5 text-sm font-medium"
+    />
   );
 }

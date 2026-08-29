@@ -57,6 +57,32 @@ export function findArtifactHandles(text: string): string[] {
   return out;
 }
 
+/**
+ * Union of handles from the message TEXT plus the persisted metadata list
+ * (`metadata.artifacts`, written by the backend when a tool result spilled).
+ * Deduped, first-seen order. Guards against a model that paraphrases away the
+ * handle in its prose while the metadata still lists the spilled artifact.
+ */
+export function collectArtifactIds(
+  text: string,
+  metadataArtifacts: unknown,
+): string[] {
+  const out = findArtifactHandles(text);
+  const seen = new Set(out);
+  if (Array.isArray(metadataArtifacts)) {
+    for (const v of metadataArtifacts) {
+      if (typeof v === "string") {
+        const id = v.startsWith("artifact:") ? v.slice("artifact:".length) : v;
+        if (UUID_RE.test(id) && !seen.has(id)) {
+          seen.add(id);
+          out.push(id);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /** Human-readable byte size (B / KB / MB / GB). */
 export function formatArtifactSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { Plus, Pencil, Plug, Trash2, RefreshCw, Power, PowerOff } from "lucide-react";
 
 import { connectorsApi, ApiError } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import type {
   Connector,
   ConnectorCreateInput,
@@ -83,8 +84,8 @@ export default function ConnectorsPage() {
   });
 
   const updateMut = useMutation({
-    mutationFn: ({ id, name }: { id: string; name: string }) =>
-      connectorsApi.update(id, { name }),
+    mutationFn: ({ id, body }: { id: string; body: { name: string; oauth_scopes?: string[] } }) =>
+      connectorsApi.update(id, body),
     onSuccess: () => {
       toast.success("已保存");
       invalidate();
@@ -109,6 +110,35 @@ export default function ConnectorsPage() {
     },
     onError: (e: ApiError) => toast.error(e.message),
   });
+
+  // Credential rotation (B: rotate API now wired): prompts for a new JSON
+  // credential blob and swaps it server-side (Fernet-encrypted as usual).
+  const rotateMut = useMutation({
+    mutationFn: ({ id, credentials }: { id: string; credentials: Record<string, string> }) =>
+      connectorsApi.rotate(id, credentials),
+    onSuccess: () => {
+      toast.success("凭证已轮换");
+      invalidate();
+    },
+    onError: (e: ApiError) => toast.error(e.message),
+  });
+
+  function rotateCredentials(c: Connector) {
+    const raw = window.prompt(
+      `轮换「${c.name}」的凭证 — 输入新的凭证 JSON（如 {"api_key": "..."}）：`,
+    );
+    if (!raw?.trim()) return;
+    try {
+      const credentials = JSON.parse(raw);
+      if (typeof credentials !== "object" || credentials === null || Array.isArray(credentials)) {
+        toast.error("凭证必须是 JSON 对象");
+        return;
+      }
+      rotateMut.mutate({ id: c.id, credentials });
+    } catch {
+      toast.error("凭证 JSON 解析失败");
+    }
+  }
 
   function openCreate() {
     const first = providers[0];
@@ -155,8 +185,13 @@ export default function ConnectorsPage() {
       }
     }
     if (editing) {
-      // Only name is editable post-create on the mutable form.
-      updateMut.mutate({ id: editing.id, name: form.name.trim() });
+      const scopes = (form.oauth_scopes ?? [])
+        .map((s) => s.trim())
+        .filter(Boolean);
+      updateMut.mutate({
+        id: editing.id,
+        body: { name: form.name.trim(), oauth_scopes: scopes },
+      });
     } else {
       createMut.mutate({ ...form, credentials });
     }
@@ -240,8 +275,17 @@ export default function ConnectorsPage() {
                       <Power className="h-3.5 w-3.5" />
                     )}
                   </Button>
-                  <Button variant="ghost" size="sm" onClick={() => openEdit(c)}>
+                  <Button variant="ghost" size="sm" onClick={() => openEdit(c)} title="编辑名称/授权范围">
                     <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => rotateCredentials(c)}
+                    disabled={rotateMut.isPending}
+                    title="轮换凭证"
+                  >
+                    <RefreshCw className={cn("h-3.5 w-3.5", rotateMut.isPending && "animate-spin")} />
                   </Button>
                   <Button
                     variant="ghost"
@@ -335,6 +379,36 @@ export default function ConnectorsPage() {
                   setForm({ ...form, command_or_url: e.target.value })
                 }
               />
+            </div>
+            <div className="grid gap-1.5">
+              <Label className="text-xs text-muted-foreground">
+                OAuth 授权范围（逗号分隔；预填 provider 必需项，可按需增删）
+              </Label>
+              <Input
+                value={(form.oauth_scopes ?? []).join(", ")}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    oauth_scopes: e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  })
+                }
+                placeholder="repo, read:org"
+              />
+              {(() => {
+                const m = providerByName.get(form.provider);
+                if (!m?.required_scopes?.length) return null;
+                const missing = m.required_scopes.filter(
+                  (s) => !(form.oauth_scopes ?? []).includes(s),
+                );
+                return missing.length ? (
+                  <p className="text-[11px] text-amber-600">
+                    缺少该 provider 的必需范围：{missing.join(", ")}（启用时会被拒绝）
+                  </p>
+                ) : null;
+              })()}
             </div>
             <label className="flex items-center gap-2 text-sm">
               <Switch

@@ -590,11 +590,12 @@ def _finalize_prompt_messages(
     enable_tools: bool,
     route: Any,
     image_parts: list[dict[str, Any]],
+    audio_parts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Authoritatively admit the complete prompt immediately before dispatch."""
 
-    if image_parts:
-        _attach_image_parts(messages, image_parts)
+    if image_parts or audio_parts:
+        _attach_multimodal_parts(messages, image_parts, audio_parts or [])
     tool_schema_tokens = _estimate_available_tool_schema_tokens(
         cfg,
         enable_tools=enable_tools,
@@ -669,6 +670,53 @@ def _inline_attachment_budget(cfg: ModelConfig) -> int:
     return max(2000, min(from_fraction, s.ATTACHMENT_INLINE_MAX_CHARS))
 
 
+async def propose_user_memory(
+    db: AsyncSession,
+    user: Any,
+    content: str,
+    *,
+    memory_type: str = "fact",
+    confidence: float = 0.5,
+    source_message_id: uuid.UUID | None = None,
+    source_conversation_id: uuid.UUID | None = None,
+) -> None:
+    """Insert an INACTIVE candidate user memory (B7 auto-proposal).
+
+    Thin direct-DB twin of the /api/memories propose endpoint so the chat turn
+    doesn't need a MemoryService (embedder/Qdrant): candidates are inert rows
+    until the user activates them (activation embeds them via the endpoint).
+    Exact-content dedup keeps repeat mentions from piling up.
+    """
+    from app.models import UserMemory
+
+    user_id = getattr(user, "id", user)
+    content = (content or "").strip()
+    if not content:
+        return
+    existing = (
+        await db.execute(
+            select(UserMemory).where(
+                UserMemory.user_id == user_id,
+                UserMemory.content == content,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    db.add(
+        UserMemory(
+            user_id=user_id,
+            memory_type=memory_type,
+            content=content,
+            confidence=confidence,
+            source_message_id=source_message_id,
+            source_conversation_id=source_conversation_id,
+            active=False,  # opt-in: never active on creation
+        )
+    )
+    await db.flush()
+
+
 def _augment_with_attachments(
     user_content: str, attachment_text: str, max_chars: int = 8000
 ) -> str:
@@ -689,14 +737,24 @@ def _augment_with_attachments(
 
 
 def _attach_image_parts(messages: list[dict[str, Any]], image_parts: list[dict[str, Any]]) -> None:
-    """Convert the latest user message to multimodal content with image parts.
+    """Back-compat wrapper: attach image parts only."""
+    _attach_multimodal_parts(messages, image_parts, [])
 
-    OpenAI vision format: ``content`` becomes a list of ``{type: text|image_url}``
-    parts. The text part preserves whatever the user typed + inline attachment
-    text; each image part carries a base64 data URL. We mutate the LAST user
+
+def _attach_multimodal_parts(
+    messages: list[dict[str, Any]],
+    image_parts: list[dict[str, Any]],
+    audio_parts: list[dict[str, Any]],
+) -> None:
+    """Convert the latest user message to multimodal content with image/audio parts.
+
+    OpenAI multimodal format: ``content`` becomes a list of parts —
+    ``{type: text}``, ``{type: image_url}`` (base64 data URL), and
+    ``{type: input_audio}`` (base64 + format). The text part preserves
+    whatever the user typed + inline attachment text. We mutate the LAST user
     message in-place (the current turn). History turns keep plain-string
-    content — old image turns are reconstructed from OCR text only, matching
-    the common pattern of not re-sending images from prior turns.
+    content — old media turns are reconstructed from extracted text only,
+    matching the common pattern of not re-sending media from prior turns.
     """
     for msg in reversed(messages):
         if msg.get("role") != "user":
@@ -706,6 +764,13 @@ def _attach_image_parts(messages: list[dict[str, Any]], image_parts: list[dict[s
         parts: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
         for ip in image_parts:
             parts.append({"type": "image_url", "image_url": {"url": ip["data_url"]}})
+        for ap in audio_parts:
+            parts.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": ap["b64"], "format": ap["format"]},
+                }
+            )
         msg["content"] = parts
         return
 
@@ -838,10 +903,10 @@ class ChatService:
         self, db: AsyncSession, user: User, request: ChatRequest
     ) -> AsyncIterator[dict[str, Any]]:
         turn_started = time.monotonic()  # for per-message latency accounting
-        # Bind the artifact auth context for this turn so any spill
-        # (ContextManager.spill_tool_result) persists the blob as a real,
-        # tenant-scoped Artifact owned by this user, attributed to the run.
-        # Reset in finally so the context never leaks across turns / tasks.
+        # Bind the artifact auth context for this turn so any spill (oversized
+        # tool results spilled by the ToolGateway, Task-10 wiring) persists the
+        # blob as a real, tenant-scoped Artifact owned by this user, attributed
+        # to the run. Reset in finally so the context never leaks across turns.
         from app.artifacts.context import (
             reset_artifact_spill_context,
             set_artifact_spill_context,
@@ -927,10 +992,23 @@ class ChatService:
             user_content = await _delete_last_assistant_message(db, conversation.id)
         else:
             if user_content.strip():
+                # Persist the send parameters on the user message so the client
+                # can rebuild its "last send" state after a page refresh
+                # (regenerate / continue-generation replay). Without this the
+                # frontend's in-memory lastSendRef is lost and those buttons
+                # silently no-op after a reload.
                 user_msg = Message(
                     conversation_id=conversation.id,
                     role="user",
                     content=user_content,
+                    metadata_={
+                        "send_params": {
+                            "mode": request.mode or "speed",
+                            "model_id": str(request.model_id) if request.model_id else None,
+                            "knowledge_base_ids": [str(k) for k in (kb_ids or [])],
+                            "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
+                        }
+                    },
                 )
                 db.add(user_msg)
                 await db.flush()
@@ -957,6 +1035,29 @@ class ChatService:
                         logger.warning("attachment binding failed: %s", exc)
                 # Cheap sidebar preview (last user message text).
                 conversation.last_message_preview = (user_content or "").strip()[:280]
+
+                # Auto memory proposal (B7): extract 0-3 candidate memories
+                # (rule-based, no model calls) and persist them INACTIVE for
+                # review in settings. Best-effort — never blocks the turn.
+                if get_settings().MEMORY_AUTO_PROPOSE:
+                    try:
+                        from app.agents.memory_auto_propose import extract_memory_candidates
+
+                        for cand in extract_memory_candidates(request.content or ""):
+                            try:
+                                await propose_user_memory(
+                                    db,
+                                    user,
+                                    cand.content,
+                                    memory_type=cand.memory_type,
+                                    confidence=cand.confidence,
+                                    source_message_id=user_msg.id,
+                                    source_conversation_id=conversation.id,
+                                )
+                            except Exception:  # noqa: BLE001 — per-candidate
+                                logger.debug("memory candidate rejected", exc_info=True)
+                    except Exception:  # noqa: BLE001 — feature is optional
+                        logger.debug("auto memory proposal skipped", exc_info=True)
 
         # 3. System prompt + optional RAG retrieval.
         # RAG is SKIPPED for social/capability chit-chat ("你好", "你是谁",
@@ -1054,6 +1155,21 @@ class ChatService:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("collect_image_parts failed: %s", exc)
                 _image_parts = []
+
+        # 4b'. Gather audio parts for audio-input models (OpenAI input_audio
+        # format). Text-only / non-audio models keep the transcription path
+        # (audio parsing extracts text when a transcript is available).
+        _audio_parts: list[dict[str, Any]] = []
+        if getattr(cfg, "supports_audio_input", False) and request.attachment_ids:
+            try:
+                from app.services.attachment_service import collect_audio_parts
+
+                _audio_parts = await collect_audio_parts(
+                    db, user.id, conversation.id, request.attachment_ids
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("collect_audio_parts failed: %s", exc)
+                _audio_parts = []
 
         # 6a. Intent recognition (engineering-grade, model-driven). Assemble typed
         # context fragments, run the classifier, and let a trusted judgment steer
@@ -1184,6 +1300,7 @@ class ChatService:
             enable_tools=enable_tools,
             route=route,
             image_parts=_image_parts,
+            audio_parts=_audio_parts,
         )
 
         # 7. Create the pending assistant only after admission succeeds, so a
@@ -1236,6 +1353,14 @@ class ChatService:
                 "db_mutation_lock": db_mutation_lock,
                 "persistence_session_factory": self._persistence_session_factory,
                 "persistence_lock": persistence_lock,
+                # Reasoning-effort hint (B6): validated, passed through to the
+                # native runtime's provider params when the model supports it.
+                "reasoning_effort": (
+                    request.reasoning_effort
+                    if (request.reasoning_effort or "").lower()
+                    in ("low", "medium", "high")
+                    else None
+                ),
             },
         )
 
@@ -1281,6 +1406,13 @@ class ChatService:
                         assistant_msg.metadata_["budget"] = ctx.extra["budget"]
                     if ctx.extra.get("intent"):
                         assistant_msg.metadata_["intent"] = ctx.extra["intent"]
+                    # Spilled artifact handles (oversized tool outputs persisted
+                    # as downloadable Artifacts this turn) — the UI renders
+                    # inline download chips from this list.
+                    if ctx.extra.get("spilled_artifacts"):
+                        assistant_msg.metadata_["artifacts"] = ctx.extra[
+                            "spilled_artifacts"
+                        ]
                     if ctx.extra.get("multi_agent"):
                         # Mark multi-agent runs so the UI shows the compact
                         # "查看执行过程" entry (single-agent runs keep ResearchSteps).

@@ -11,7 +11,7 @@ import type { Citation, Message, ResearchStep } from "@/lib/types";
 const SUGGESTIONS = [
   { icon: FileSearch, title: "总结文档", prompt: "请帮我总结一份文档的主要观点。" },
   { icon: Search, title: "搜索最新资料", prompt: "帮我搜索某个主题的最新资料并给出带来源的汇总。" },
-  { icon: BarChart3, title: "分析数据", prompt: "我上传了一份表格，请帮我分析其中的趋势与异常。" },
+  { icon: BarChart3, title: "分析数据", prompt: "我想分析一份表格数据（可先上传文件），请告诉我你需要哪些信息。" },
   { icon: PenLine, title: "编写方案", prompt: "请帮我起草一份项目方案的初稿。" },
 ];
 

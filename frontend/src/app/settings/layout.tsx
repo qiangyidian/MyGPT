@@ -11,36 +11,32 @@ import { useAuth } from "@/hooks/useAuth";
 import { BackLink } from "@/components/navigation/back-link";
 import { CenteredLoading } from "@/components/navigation/page-loading";
 
-// Settings sections. Models / memory / connectors are wired up; knowledge is a
-// placeholder so the nav reflects the intended structure.
+// Settings sections. All wired to real pages: models / memory / connectors
+// live under /settings, knowledge bases have their own top-level app page.
 const NAV = [
   {
     label: "模型配置",
     href: "/settings/models",
     icon: Cpu,
     description: "管理 OpenAI 兼容 / Mock 模型",
-    enabled: true,
   },
   {
     label: "长期记忆",
     href: "/settings/memory",
     icon: Brain,
     description: "管理跨会话的语义记忆（可选开启）",
-    enabled: true,
   },
   {
     label: "连接器",
     href: "/settings/connectors",
     icon: Plug,
     description: "管理第三方集成与凭证",
-    enabled: true,
   },
   {
     label: "知识库",
-    href: "/settings/knowledge",
+    href: "/knowledge-bases",
     icon: Boxes,
     description: "管理向量知识库与文档",
-    enabled: false,
   },
 ] as const;
 
@@ -115,31 +111,23 @@ function SettingsSidebar({
         {NAV.map((item) => {
           const active = pathname === item.href || pathname.startsWith(item.href + "/");
           const Icon = item.icon;
-          const inner = (
-            <span
-              className={cn(
-                "flex items-start gap-3 rounded-md border px-3 py-2.5 text-sm transition-colors",
-                active
-                  ? "border-border bg-background text-foreground shadow-sm"
-                  : "border-transparent text-muted-foreground hover:bg-background/60 hover:text-foreground",
-                !item.enabled && "pointer-events-none opacity-50"
-              )}
-            >
-              <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="flex flex-col">
-                <span className="font-medium">{item.label}</span>
-                <span className="text-xs text-muted-foreground">{item.description}</span>
-              </span>
-            </span>
-          );
-          return item.enabled ? (
+          return (
             <Link key={item.href} href={withReturnTo(item.href, returnTo)}>
-              {inner}
+              <span
+                className={cn(
+                  "flex items-start gap-3 rounded-md border px-3 py-2.5 text-sm transition-colors",
+                  active
+                    ? "border-border bg-background text-foreground shadow-sm"
+                    : "border-transparent text-muted-foreground hover:bg-background/60 hover:text-foreground"
+                )}
+              >
+                <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+                <span className="flex flex-col">
+                  <span className="font-medium">{item.label}</span>
+                  <span className="text-xs text-muted-foreground">{item.description}</span>
+                </span>
+              </span>
             </Link>
-          ) : (
-            <div key={item.href} title="即将上线" aria-disabled="true">
-              {inner}
-            </div>
           );
         })}
       </nav>

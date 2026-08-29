@@ -366,6 +366,9 @@ export interface ChatRequest {
   mode?: UserChatMode;
   /** Attachment ids bound to this user message. */
   attachment_ids?: string[];
+  /** Reasoning-effort hint (low|medium|high); honored when the selected model
+   *  declares supports_reasoning_effort. */
+  reasoning_effort?: "low" | "medium" | "high";
   // ---- legacy fields (still accepted by the backend; not exposed in the UI) ----
   enable_tools?: boolean;
   execution_mode?: "auto" | "chat" | "agent";

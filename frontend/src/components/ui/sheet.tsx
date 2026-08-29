@@ -1,8 +1,8 @@
 "use client";
 
-// Sheet: a Radix Dialog-based side panel. Used for the multi-agent panel's
+// Sheet: a Radix Dialog-based side panel. Used for the context panel's
 // mobile/narrow-screen overlay (below xl). The desktop dock is a plain flex
-// column rendered by MultiAgentPanel directly (no Dialog), so the chat area
+// column rendered by ContextPanel directly (no Dialog), so the chat area
 // shrinks instead of being covered.
 
 import * as React from "react";

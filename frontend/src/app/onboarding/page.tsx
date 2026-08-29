@@ -50,7 +50,9 @@ export default function OnboardingPage() {
     }
     setBusy(true);
     try {
-      await api.createModel({
+      // Create first, then run the REAL connectivity test — a bad key fails
+      // here (with a clear message) instead of on the first chat turn.
+      const created = await api.createModel({
         name: chatModel,
         provider: "openai-compatible",
         api_base_url: baseUrl.trim(),
@@ -59,6 +61,16 @@ export default function OnboardingPage() {
         supports_stream: true,
         supports_tools: true,
       });
+      // Real connectivity probe: fail loudly on a bad key/URL/model name.
+      const test = await api.testModel(created.id);
+      if (!test.ok) {
+        toast.error("连接测试失败", {
+          description: `${test.error ?? "未知错误"}。模型配置已保存，可稍后在「设置 → 模型配置」中修正。`,
+          duration: 8000,
+        });
+      } else {
+        toast.success(`连接成功 · ${test.latency_ms}ms`);
+      }
       if (embedModel.trim()) {
         await api.createModel({
           name: `${embedModel} (embedding)`,

@@ -74,6 +74,19 @@ function DurableRunSurface({ runId }: { runId: string }) {
 
   if (!state) return null;
 
+  // Reconcile paused state from the authoritative run row: the /events SSE
+  // may not carry run_paused on older backend builds, but `paused_at` on the
+  // polled run detail is always correct. A paused run whose SSE still says
+  // "running" must show the 恢复 button.
+  const terminalRun =
+    run?.status && ["completed", "failed", "cancelled"].includes(run.status);
+  const reconciled =
+    run && !terminalRun && run.paused_at && state.runStatus === "running"
+      ? { ...state, runStatus: "paused" as const, paused: true }
+      : run && !terminalRun && !run.paused_at && state.paused
+        ? { ...state, runStatus: "running" as const, paused: false }
+        : state;
+
   const plan = run?.plan as
     | { summary?: string; steps?: Array<{ id: string; title: string; description?: string; sources?: string[] }>; acceptanceCriteria?: string[] }
     | null;
@@ -82,7 +95,7 @@ function DurableRunSurface({ runId }: { runId: string }) {
   return (
     <div className="mt-4 space-y-3">
       <RunControls
-        state={state}
+        state={reconciled}
         onPause={(id) => api.pauseAgentRun(id)}
         onResume={(id) => api.resumeAgentRun(id)}
         onCancel={(id) => api.cancelAgentRun(id)}

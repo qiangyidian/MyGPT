@@ -1,17 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Download, FileText, Loader2 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { artifactsApi } from "@/lib/api";
+import { formatArtifactSize } from "@/lib/artifacts";
 
 /**
- * Inline card for an `artifact:<id>` handle found in message text. Unlike
- * `ArtifactCard` (which shows full metadata), this only knows the id — it
- * renders a compact reference with an authenticated download. The filename is
- * recovered from the download's Content-Disposition header when available.
+ * Inline card for an `artifact:<id>` handle found in message text (or listed in
+ * the message's persisted `metadata.artifacts`). Fetches lightweight metadata
+ * (`GET /api/artifacts/{id}/meta`) so the filename + size render immediately;
+ * the download button streams the bytes with auth on click.
  */
 export function InlineArtifactHandle({
   artifactId,
@@ -21,19 +23,34 @@ export function InlineArtifactHandle({
   className?: string;
 }) {
   const [downloading, setDownloading] = useState(false);
+
+  // Metadata for the label; stale-forever cache (artifact rows are immutable).
+  const { data: meta } = useQuery({
+    queryKey: ["artifact-meta", artifactId],
+    queryFn: () => artifactsApi.getMeta(artifactId),
+    staleTime: Infinity,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  // Resolve the label once metadata arrives (filename + size).
   const [label, setLabel] = useState<string | null>(null);
+  useEffect(() => {
+    if (meta?.filename) {
+      setLabel(meta.size ? `${meta.filename} · ${formatArtifactSize(meta.size)}` : meta.filename);
+    }
+  }, [meta?.filename, meta?.size]);
 
   const handleDownload = async () => {
     setDownloading(true);
     try {
       const blob = await artifactsApi.download(artifactId);
-      // Recover a filename from the blob's type or fall back to the id.
-      const ext = blob.type.startsWith("image/")
-        ? blob.type.slice("image/".length)
-        : blob.type.startsWith("audio/")
-          ? blob.type.slice("audio/".length)
-          : "bin";
-      const name = label ?? `artifact-${artifactId.slice(0, 8)}.${ext}`;
+      const name =
+        meta?.filename ||
+        (blob.type.startsWith("image/")
+          ? `artifact.${blob.type.slice("image/".length)}`
+          : blob.type.startsWith("audio/")
+            ? `artifact.${blob.type.slice("audio/".length)}`
+            : "artifact.bin");
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -56,7 +73,10 @@ export function InlineArtifactHandle({
       data-artifact-id={artifactId}
     >
       <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
-      <span className="max-w-[160px] truncate text-muted-foreground">
+      <span
+        className="max-w-[220px] truncate text-muted-foreground"
+        title={label ?? undefined}
+      >
         {label ?? `附件 ${artifactId.slice(0, 8)}`}
       </span>
       <Button

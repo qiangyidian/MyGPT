@@ -21,6 +21,7 @@ import { api } from "@/lib/api";
 import { useChatUiStore } from "@/stores/chat-ui-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import { useAgentRunStore, selectIsDemo } from "@/stores/agent-run-store";
+import { BranchHistory } from "@/components/branch-history";
 import type { Citation, KnowledgeBase } from "@/lib/types";
 
 export default function HomePage() {
@@ -115,6 +116,13 @@ function ChatPanel({
       lastRestoredRunRef.current = null;
     }
   }, [detail.data?.messages, chat.isStreaming]);
+
+  // Rebuild the replayable last-send from persisted send_params once the
+  // conversation detail has loaded (covers the post-refresh case where the
+  // in-memory lastSendRef was lost and regenerate/continue went silent).
+  useEffect(() => {
+    if (detail.data && !chat.isStreaming) chat.rebuildLastSend(activeConversationId);
+  }, [detail.data, chat.isStreaming, activeConversationId]);
 
   // ---- Context Panel auto-open rules (respect per-run suppression) ----
   // Waiting on a dangerous-tool approval -> open Execution.
@@ -220,6 +228,14 @@ function ChatPanel({
     <div className="flex min-h-0 flex-1">
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="flex shrink-0 items-center justify-end gap-2 px-4 py-2">
+          {activeConversationId && (
+            <BranchHistory
+              conversationId={activeConversationId}
+              activeConversationId={activeConversationId}
+              onNavigate={setActiveConversationId}
+              className="h-8 gap-1 text-xs text-muted-foreground"
+            />
+          )}
           <AgentPanelTrigger />
           <ContextPanelTrigger
             conversationId={activeConversationId}

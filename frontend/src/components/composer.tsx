@@ -88,8 +88,6 @@ export function Composer({
     requiredModalities.length > 0 && !modelCapable && capableModels.length === 0;
 
   // Both modes accept optional attachments; neither requires a file.
-  const needsFile = false;
-
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Enter to send, Shift+Enter for newline. Ignore during IME composition.
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -100,7 +98,7 @@ export function Composer({
 
   const handleSend = () => {
     const trimmed = value.trim();
-    if (!trimmed || isStreaming || !allReady || needsFile) return;
+    if (!trimmed || isStreaming || !allReady) return;
     onSend(trimmed, {
       mode,
       attachmentIds: drafts.map((d) => d.id),
@@ -118,7 +116,7 @@ export function Composer({
   };
 
   const canSend =
-    !!value.trim() && !isStreaming && allReady && !needsFile && !modalityBlocked;
+    !!value.trim() && !isStreaming && allReady && !modalityBlocked;
 
   return (
     <div className={cn("border-t bg-background", className)}>
@@ -189,9 +187,7 @@ export function Composer({
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
           {modalityBlocked
             ? "当前模型不支持所附附件的模态（图片需视觉模型，音频需音频输入模型），请更换模型或移除附件。"
-            : needsFile
-              ? "数据分析需要至少一个文件，请先上传。"
-              : "AI 生成的内容可能存在错误，请核实重要信息。可拖拽或粘贴添加附件。"}
+            : "AI 生成的内容可能存在错误，请核实重要信息。可拖拽或粘贴添加附件。"}
         </p>
       </div>
     </div>

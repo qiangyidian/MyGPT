@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { useAttachmentStore, EMPTY_DRAFTS, type AttachmentDraft } from "@/stores/attachment-store";
 
@@ -123,6 +123,38 @@ export function useChatAttachments(
   const allReady =
     drafts.length === 0 ||
     drafts.every((d) => !d.uploading && d.status !== "failed" && d.status !== "uploading");
+
+  // Status polling (B: comment now true): after upload the server parses the
+  // file in the background (parsing → ready/failed). Poll drafts that are
+  // still mid-parse every 2.5s so the tray shows the terminal state.
+  const convId = conversationId ?? "";
+  useEffect(() => {
+    const pendingIds = drafts
+      .filter((d) => !d.id.startsWith("tmp-") && (d.parse_status === "parsing" || d.status === "parsing"))
+      .map((d) => d.id);
+    if (pendingIds.length === 0) return;
+    const t = setInterval(() => {
+      void (async () => {
+        try {
+          const all = await api.listChatAttachments(convId);
+          const byId = new Map(all.map((a) => [a.id, a]));
+          for (const id of pendingIds) {
+            const row = byId.get(id);
+            if (row && row.parse_status !== "parsing" && row.status !== "parsing") {
+              updateDraft(convId, id, {
+                status: row.status,
+                parse_status: row.parse_status,
+                error: row.error_message,
+              });
+            }
+          }
+        } catch {
+          /* polling is best-effort */
+        }
+      })();
+    }, 2500);
+    return () => clearInterval(t);
+  }, [convId, drafts, updateDraft]);
 
   return { drafts, upload, remove, isUploading, allReady };
 }

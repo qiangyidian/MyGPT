@@ -6,6 +6,7 @@ rather than raising, so the status endpoint itself never 500s.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -16,6 +17,9 @@ from app.models import Conversation, Document, Message, User
 from app.schemas import SystemStatus, UsageStat
 
 logger = logging.getLogger(__name__)
+
+# Process start (monotonic) for the real uptime_s in system_status.
+_PROCESS_START = time.monotonic()
 
 
 async def list_users(db: AsyncSession) -> list[User]:
@@ -110,7 +114,7 @@ async def system_status(db: AsyncSession) -> SystemStatus:
         users=await _count(db, User),
         conversations=await _count(db, Conversation),
         documents=await _count(db, Document),
-        uptime_s=0.0,  # populated by router from a process start time if desired
+        uptime_s=round(time.monotonic() - _PROCESS_START, 1),
     )
 
 

@@ -1,8 +1,10 @@
 "use client";
 
 import { FileText, Loader2, UsersRound } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -11,7 +13,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAgentRunStore } from "@/stores/agent-run-store";
-import { useAttachmentStore, EMPTY_DRAFTS } from "@/stores/attachment-store";
+import { useAttachmentStore } from "@/stores/attachment-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import type { ContextTab } from "@/lib/types";
 
@@ -31,9 +33,6 @@ export function ContextPanelTrigger({
 }) {
   const active = useAgentRunStore((s) => s.active);
   const sourcesCount = useContextPanelStore((s) => s.sources.length);
-  const drafts = useAttachmentStore((s) =>
-    conversationId ? s.drafts[conversationId] ?? EMPTY_DRAFTS : EMPTY_DRAFTS
-  );
   const open = useContextPanelStore((s) => s.open);
   const currentTab = useContextPanelStore((s) => s.tab);
   const openWith = useContextPanelStore((s) => s.openWith);
@@ -41,7 +40,19 @@ export function ContextPanelTrigger({
 
   const running = active.activeAgentIds.length;
   const hasGraph = !!active.runId && active.nodes.length >= 1;
-  const filesCount = drafts.length;
+  // Count the CONVERSATION's attachments (what the Files tab actually lists),
+  // plus any in-composer drafts the user is about to send — the badge and the
+  // panel now agree on what "文件 N" means.
+  const draftsCount = useAttachmentStore((s) =>
+    conversationId ? s.drafts[conversationId]?.length ?? 0 : 0
+  );
+  const { data: convAttachments } = useQuery({
+    queryKey: ["chat-attachments", conversationId ?? ""],
+    queryFn: () =>
+      conversationId ? api.listChatAttachments(conversationId) : Promise.resolve([]),
+    enabled: !!conversationId,
+  });
+  const filesCount = draftsCount + (convAttachments?.length ?? 0);
 
   // Priority: live execution/approval > citations > files.
   let tab: ContextTab | null = null;

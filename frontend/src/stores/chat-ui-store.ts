@@ -14,7 +14,7 @@ import { isUserChatMode } from "@/lib/user-modes";
 //                             Legacy v3 values are mapped onto these (see mapLegacyMode).
 const MODE_KEY = "mygpt.chat.mode.v4";
 const LEGACY_MODE_KEY_V3 = "mygpt.chat.mode.v3";
-const ADV_MODEL_KEY = "mygpt.chat.advancedModel";
+const EFFORT_KEY = "mygpt.chat.reasoningEffort";
 
 /**
  * Default chat mode. 极速 (speed) = single-agent native answer, no multi-agent,
@@ -52,30 +52,31 @@ function readMode(): UserChatMode {
   return migrateMode();
 }
 
-function readAdv(): boolean {
-  if (typeof window === "undefined") return false;
-  return window.localStorage.getItem(ADV_MODEL_KEY) === "1";
-}
-
 interface ChatUiState {
   /** User-facing capability mode (persisted; default speed — see DEFAULT_MODE). */
   mode: UserChatMode;
-  /** Show the model selector in the composer (admin / advanced users). */
-  showAdvancedModel: boolean;
+  /** Reasoning-effort hint (B6); honored only by models that support it. */
+  reasoningEffort: "low" | "medium" | "high";
   setMode: (m: UserChatMode) => void;
-  setShowAdvancedModel: (b: boolean) => void;
+  setReasoningEffort: (v: "low" | "medium" | "high") => void;
+}
+
+function readEffort(): "low" | "medium" | "high" {
+  if (typeof window === "undefined") return "medium";
+  const v = window.localStorage.getItem(EFFORT_KEY);
+  return v === "low" || v === "high" ? v : "medium";
 }
 
 export const useChatUiStore = create<ChatUiState>((set) => ({
   mode: readMode(),
-  showAdvancedModel: readAdv(),
+  reasoningEffort: readEffort(),
   setMode: (m) => {
     if (typeof window !== "undefined") window.localStorage.setItem(MODE_KEY, m);
     set({ mode: m });
   },
-  setShowAdvancedModel: (b) => {
-    if (typeof window !== "undefined") window.localStorage.setItem(ADV_MODEL_KEY, b ? "1" : "0");
-    set({ showAdvancedModel: b });
+  setReasoningEffort: (v) => {
+    if (typeof window !== "undefined") window.localStorage.setItem(EFFORT_KEY, v);
+    set({ reasoningEffort: v });
   },
 }));
 

@@ -22,6 +22,7 @@ import { finishReasonToStatus } from "@/lib/types";
 import type { AgentEdgeStatus, AgentGraphNode } from "@/lib/agent-graph-types";
 import { coerceGraph } from "@/hooks/useAgentRunGraph";
 import { useAgentRunStore } from "@/stores/agent-run-store";
+import { useChatUiStore } from "@/stores/chat-ui-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import { useAttachmentStore } from "@/stores/attachment-store";
 import type { UserChatMode } from "@/lib/types";
@@ -67,6 +68,8 @@ export interface ChatStreamState {
   approveTool: (approvalId: string) => Promise<void>;
   /** Reject a pending dangerous-tool call (run continues without it). */
   rejectTool: (approvalId: string, reason?: string) => Promise<void>;
+  /** Rebuild the replayable last-send state from persisted send_params. */
+  rebuildLastSend: (conversationId: string | null) => void;
 }
 
 /**
@@ -86,6 +89,10 @@ export interface ChatStreamState {
 export function useChatStream(): ChatStreamState {
   const queryClient = useQueryClient();
   const abortRef = useRef<AbortController | null>(null);
+  const lastSendRef = useRef<{
+    content: string;
+    opts: SendOptions;
+  } | null>(null);
 
   // Abort any in-flight stream when the consumer unmounts, so navigating away
   // mid-stream doesn't leak the SSE connection and let the backend run to
@@ -110,10 +117,40 @@ export function useChatStream(): ChatStreamState {
   const [finishReason, setFinishReason] = useState<FinishReason | null>(null);
 
   // Remember the last send so regenerate() can replay it.
-  const lastSendRef = useRef<{
-    content: string;
-    opts: SendOptions;
-  } | null>(null);
+  // REBUILD AFTER REFRESH: the backend persists `send_params` on each user
+  // message (mode/model/kb/attachments); when the in-memory ref is empty —
+  // e.g. after a page reload — we reconstruct it from the newest user message
+  // in the given conversation's detail cache, so regenerate()/continue()
+  // never become silent no-ops across a reload.
+  const rebuildLastSend = useCallback(
+    (conversationId: string | null) => {
+      if (!conversationId || lastSendRef.current) return;
+      const detail = queryClient.getQueryData(
+        CONVERSATION_DETAIL_QUERY_KEY(conversationId)
+      ) as { messages?: Message[] } | undefined;
+      const msgs = detail?.messages ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.role !== "user") continue;
+        const meta = m.metadata as
+          | { send_params?: { mode?: string; model_id?: string | null; knowledge_base_ids?: string[]; attachment_ids?: string[] } }
+          | undefined;
+        const sp = meta?.send_params;
+        lastSendRef.current = {
+          content: m.content,
+          opts: {
+            conversationId,
+            mode: (sp?.mode as SendOptions["mode"]) ?? undefined,
+            modelId: sp?.model_id ?? null,
+            knowledgeBaseIds: sp?.knowledge_base_ids,
+            attachmentIds: sp?.attachment_ids,
+          },
+        };
+        return;
+      }
+    },
+    [queryClient]
+  );
 
   /**
    * Append a message into the conversation detail cache.
@@ -376,6 +413,47 @@ export function useChatStream(): ChatStreamState {
           });
           upsertStep(stepById.get(e.steps[0]?.id ?? "") as AgentStep);
         },
+        // Research-plan lifecycle surfaced as steps too (durable runs).
+        onResearchPlan: (e) => {
+          e.steps.forEach((p) => {
+            stepSeq += 1;
+            stepById.set(p.id, {
+              id: p.id,
+              sequence: stepSeq,
+              type: "plan",
+              title: p.title,
+              summary: p.id === e.steps[0]?.id ? e.summary : undefined,
+              status: "pending",
+            });
+          });
+          upsertStep(stepById.get(e.steps[0]?.id ?? "") as AgentStep);
+        },
+        onRunPaused: (e) => {
+          useAgentRunStore.getState().dispatch({
+            type: "RUN_STATUS",
+            runId: e.runId,
+            status: "waiting_approval",
+          });
+        },
+        onRunResumed: (e) => {
+          useAgentRunStore.getState().dispatch({
+            type: "RUN_STATUS",
+            runId: e.runId,
+            status: "running",
+          });
+        },
+        onRunInstructionReceived: (e) => {
+          stepSeq += 1;
+          const step: AgentStep = {
+            id: `instr-${stepSeq}`,
+            sequence: stepSeq,
+            type: "approval",
+            title: `已接收追加指引：${e.instruction}`,
+            status: "done",
+          };
+          stepById.set(step.id, step);
+          upsertStep(step);
+        },
         onStepStarted: (e) => {
           // If the step id was already announced (plan), flip to running;
           // otherwise create a new step of the given type.
@@ -532,6 +610,8 @@ export function useChatStream(): ChatStreamState {
             // backend IntentRouter derives the runtime/profile/tools.
             mode: opts.mode ?? "speed",
             attachmentIds: opts.attachmentIds,
+            // B6: reasoning-effort hint (honored only by capable models).
+            reasoningEffort: useChatUiStore.getState().reasoningEffort,
           }),
           handlers,
           controller.signal
@@ -603,7 +683,12 @@ export function useChatStream(): ChatStreamState {
 
   const regenerate = useCallback(async () => {
     const last = lastSendRef.current;
-    if (!last) return;
+    if (!last) {
+      // Older messages (pre send_params) can't be replayed — say so instead
+      // of silently doing nothing.
+      toast.error("无法重新生成：缺少该消息的原始发送参数");
+      return;
+    }
     await run(last.content, last.opts, true);
   }, [run]);
 
@@ -615,7 +700,10 @@ export function useChatStream(): ChatStreamState {
   const continueGeneration = useCallback(async () => {
     const last = lastSendRef.current;
     const convId = currentConversationId;
-    if (!last || !convId) return;
+    if (!last || !convId) {
+      toast.error("无法继续生成：缺少上一条消息的上下文");
+      return;
+    }
     await run("请继续上面的生成，不要重复已有内容。", { ...last.opts, conversationId: convId }, false);
   }, [run, currentConversationId]);
 
@@ -666,5 +754,8 @@ export function useChatStream(): ChatStreamState {
     continueGeneration,
     approveTool,
     rejectTool,
+    /** Rebuild the replayable last-send from persisted send_params (call on
+     *  conversation load / refresh so regenerate & continue keep working). */
+    rebuildLastSend,
   };
 }

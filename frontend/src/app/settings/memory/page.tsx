@@ -153,7 +153,8 @@ export default function MemoryPage() {
         <p className="text-sm text-muted-foreground">加载中…</p>
       ) : memories.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          还没有记忆。Agent 在对话中会自动提议候选记忆，也可手动新增。
+          还没有记忆。对话中会自动从你的消息提取候选记忆（默认未启用，需在此开启），
+          也可手动新增。
         </p>
       ) : (
         <div className="grid gap-2">

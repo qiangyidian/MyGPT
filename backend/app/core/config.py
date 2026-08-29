@@ -167,6 +167,18 @@ class Settings(BaseSettings):
     # canned, non-real answers) and enable CREWAI_ENABLED with a real
     # MODEL_API_BASE_URL / MODEL_API_KEY instead.
     AGENT_DEMO_MODE: bool = False
+    # Plan-approval gate (B5): when truthy, a multi-agent deep_research run
+    # publishes its draft plan and WAITS (bounded by PLAN_CONFIRM_TIMEOUT_S)
+    # for the user to confirm/revise via /api/agent-runs/{id}/plan/confirm
+    # before executing. When falsy (default) the plan is advisory-only —
+    # published for review while the run proceeds immediately.
+    PLAN_REQUIRE_CONFIRMATION: bool = False
+    PLAN_CONFIRM_TIMEOUT_S: int = 300
+    # Auto memory proposal (B7): after each chat turn, extract 0-3 candidate
+    # memories (rule-based, no extra model calls) from the user's message and
+    # store them INACTIVE for the user to review/enable in settings. Dedup is
+    # content-exact; candidates never enter the prompt until manually enabled.
+    MEMORY_AUTO_PROPOSE: bool = True
     # Workflow engine routing (Task 6b): when set to a truthy value ("1" / "true")
     # AND the route's agent_profile is "deep_research", that turn runs through the
     # durable WorkflowEngine (plan -> execute -> verify -> bounded replan) instead
@@ -176,10 +188,12 @@ class Settings(BaseSettings):
     AGENT_WORKFLOW_ENGINE: str = ""
 
     # ---- Chat attachments (Phase 1) ----
-    # Broader than KB uploads: includes images for multimodal chat.
+    # Broader than KB uploads: includes images for multimodal chat and audio
+    # for audio-input models (input_audio parts) / transcription fallback.
     ATTACHMENT_ALLOWED_EXT: str = (
         ".pdf,.docx,.txt,.md,.markdown,.csv,.xlsx,.xls,.json,"
         ".png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,"
+        ".mp3,.wav,.m4a,.ogg,.webm,.flac,.aac,"
         ".pptx,.ppt,.html,.htm,.epub,.rtf,.doc,"
         ".odt,.ods,.odp"
     )

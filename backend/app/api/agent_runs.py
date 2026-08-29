@@ -242,6 +242,12 @@ async def confirm_plan(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Confirm the run's plan.
+
+    When PLAN_REQUIRE_CONFIRMATION is enabled the run is gated on this status
+    (it polls plan_status before executing); when disabled the decision is
+    still recorded on the run row for audit.
+    """
     run = await _load_run(db, run_id)
     await _assert_owned(run, user)
     run.plan_status = "confirmed"
@@ -260,12 +266,29 @@ async def update_plan(
     run = await _load_run(db, run_id)
     await _assert_owned(run, user)
     plan = dict(run.plan or {})
-    if body.summary is not None:
+    revision_notes: list[str] = []
+    if body.summary is not None and body.summary != plan.get("summary"):
         plan["summary"] = body.summary
+        revision_notes.append(f"计划修订：{body.summary[:160]}")
     if body.steps is not None:
-        plan["steps"] = [s.model_dump() for s in body.steps]
+        new_steps = [s.model_dump() for s in body.steps]
+        if new_steps != plan.get("steps"):
+            plan["steps"] = new_steps
+            revision_notes.append(
+                f"计划步骤已更新（{len(new_steps)} 步）"
+            )
     run.plan = plan
     run.plan_status = "updated"
+    await db.commit()
+    # A revision on a LIVE run must reach the executor: hand each change to the
+    # in-process run control as an appended instruction (the runtimes drain
+    # these between stages / tokens) AND persist a durable command so a worker
+    # restart can replay it.
+    ctl = get_run_control(run.id)
+    for note in revision_notes:
+        if ctl is not None:
+            ctl.add_instruction(note)
+        await durable_controls.record_instruction(db, run.id, note)
     await db.commit()
     return ActionResult(ok=True, status="updated")
 

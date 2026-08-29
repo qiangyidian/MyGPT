@@ -192,6 +192,12 @@ export const api = {
       message_id: messageId,
       new_content: newContent,
     }),
+  /** Parent + child branches of a conversation (branch tree navigation). */
+  listConversationBranches: (conversationId: string) =>
+    request<{ parent: Conversation | null; children: Conversation[] }>(
+      "GET",
+      `/api/conversations/${conversationId}/branches`,
+    ),
 
   // ---- Chat attachments ----
   uploadChatAttachment: (conversationId: string, file: File) => {
@@ -282,6 +288,18 @@ export const api = {
     request<User>("PATCH", `/api/admin/users/${id}`, body),
   adminStats: () =>
     request<{ usage: unknown[]; status: unknown }>("GET", "/api/admin/stats"),
+  /** Most recent audit events (tool calls, approvals, auth). */
+  adminAuditLog: (limit = 200) =>
+    request<
+      Array<{
+        id: string;
+        actor_id: string | null;
+        action: string;
+        target: string | null;
+        detail: Record<string, unknown> | null;
+        created_at: string | null;
+      }>
+    >("GET", `/api/admin/audit?limit=${limit}`),
 
   // ---- Agent runs (Phase 3) ----
   listAgentRuns: (conversationId?: string) =>
@@ -368,6 +386,9 @@ export const artifactsApi = {
     );
     return res.blob();
   },
+  /** Lightweight metadata (filename/size/media type) — no bytes transferred. */
+  getMeta: (id: string) =>
+    request<ArtifactMeta>("GET", `/api/artifacts/${id}/meta`),
   delete: (id: string) => request("DELETE", `/api/artifacts/${id}`),
 };
 

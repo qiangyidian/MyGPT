@@ -99,6 +99,29 @@ async def download_artifact(
     )
 
 
+@router.get("/{artifact_id}/meta")
+async def get_artifact_meta(
+    artifact_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Lightweight metadata (no bytes) for one artifact — powers the inline
+    handle chips' filename/size display without downloading the blob."""
+    svc = ArtifactService(db)
+    try:
+        meta = await svc.get(artifact_id, user)
+    except AppException as exc:
+        raise _envelope_status(exc)
+    return {
+        "id": str(meta.id),
+        "media_type": meta.media_type,
+        "size": meta.size,
+        "filename": meta.filename,
+        "source": meta.source,
+        "created_at": meta.created_at.isoformat() if meta.created_at else None,
+    }
+
+
 @router.get("", response_model=None)
 async def list_artifacts(
     user: User = Depends(get_current_user),

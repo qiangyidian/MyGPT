@@ -46,8 +46,8 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
 
   // Shared fields
-  const [email, setEmail] = useState("admin@example.com");
-  const [password, setPassword] = useState("changeme123");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
 
   // Register-only fields
   const [username, setUsername] = useState("");
@@ -92,8 +92,18 @@ function LoginForm() {
       setError("请填写邮箱、用户名和密码");
       return;
     }
-    if (password.length < 6) {
-      setError("密码至少 6 位");
+    // Mirror the backend policy (PASSWORD_MIN_LENGTH=8 + upper/lower/digit)
+    // so a weak password is caught client-side instead of as a 400.
+    if (password.length < 8) {
+      setError("密码至少 8 位");
+      return;
+    }
+    if (
+      !/[a-z]/.test(password) ||
+      !/[A-Z]/.test(password) ||
+      !/\d/.test(password)
+    ) {
+      setError("密码需包含大写字母、小写字母和数字");
       return;
     }
     if (password !== confirm) {
@@ -265,10 +275,7 @@ function LoginForm() {
           </CardContent>
           <CardFooter className="flex flex-col gap-2 border-t bg-muted/30 py-3">
             <p className="text-center text-xs text-muted-foreground">
-              演示管理员账号：{" "}
-              <span className="font-medium text-foreground">
-                admin@example.com / changeme123
-              </span>
+              首次部署请联系管理员创建账号，或在注册页注册新账号。
             </p>
           </CardFooter>
         </Card>

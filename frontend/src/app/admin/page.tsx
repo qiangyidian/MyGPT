@@ -25,6 +25,7 @@ interface SystemStatus {
   users?: number;
   conversations?: number;
   documents?: number;
+  uptime_s?: number;
 }
 interface UsageRow {
   date: string;
@@ -33,6 +34,19 @@ interface UsageRow {
   user_messages?: number;
   assistant_messages?: number;
   tool_calls?: number;
+}
+interface AuditRow {
+  id: string;
+  actor_id: string | null;
+  action: string;
+  target: string | null;
+  detail: Record<string, unknown> | null;
+  created_at: string | null;
+}
+interface ToolInfoRow {
+  name: string;
+  description: string;
+  dangerous?: boolean;
 }
 
 /**
@@ -62,6 +76,16 @@ function AdminContent() {
     queryKey: ["admin-stats"],
     queryFn: api.adminStats,
   });
+  // Audit log (real backend: /api/admin/audit → AuditEvent rows).
+  const auditQ = useQuery({
+    queryKey: ["admin-audit"],
+    queryFn: () => api.adminAuditLog(200),
+  });
+  // Registered tool catalog (real backend: /api/tools).
+  const toolsQ = useQuery({
+    queryKey: ["admin-tools"],
+    queryFn: () => api.listTools(),
+  });
 
   const updateMut = useMutation({
     mutationFn: ({ id, body }: { id: string; body: { role?: string; is_active?: boolean } }) =>
@@ -82,6 +106,8 @@ function AdminContent() {
         <TabsTrigger value="users">用户</TabsTrigger>
         <TabsTrigger value="status">系统状态</TabsTrigger>
         <TabsTrigger value="usage">用量</TabsTrigger>
+        <TabsTrigger value="audit">审计日志</TabsTrigger>
+        <TabsTrigger value="tools">工具</TabsTrigger>
       </TabsList>
 
       {/* Users */}
@@ -169,6 +195,19 @@ function AdminContent() {
             <Stat label="用户数" value={String(status.users ?? "-")} raw />
             <Stat label="会话数" value={String(status.conversations ?? "-")} raw />
             <Stat label="文档数" value={String(status.documents ?? "-")} raw />
+            <Stat
+              label="运行时长"
+              value={
+                status.uptime_s != null
+                  ? status.uptime_s >= 3600
+                    ? `${Math.floor(status.uptime_s / 3600)} 时 ${Math.floor((status.uptime_s % 3600) / 60)} 分`
+                    : status.uptime_s >= 60
+                      ? `${Math.floor(status.uptime_s / 60)} 分`
+                      : `${status.uptime_s} 秒`
+                  : "—"
+              }
+              raw
+            />
           </div>
         )}
       </TabsContent>
@@ -210,6 +249,71 @@ function AdminContent() {
                 )}
               </tbody>
             </table>
+          </div>
+        )}
+      </TabsContent>
+
+      {/* Audit log — real AuditEvent rows (tool calls, approvals, auth). */}
+      <TabsContent value="audit" className="space-y-3">
+        {auditQ.isError ? (
+          <ErrorState onRetry={() => auditQ.refetch()} />
+        ) : auditQ.isLoading ? (
+          <p className="text-sm text-muted-foreground">加载中…</p>
+        ) : !auditQ.data?.length ? (
+          <p className="text-sm text-muted-foreground">暂无审计事件。</p>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead className="bg-secondary/50 text-left text-xs text-muted-foreground">
+                <tr>
+                  <th className="p-3">时间</th>
+                  <th className="p-3">操作</th>
+                  <th className="hidden p-3 sm:table-cell">目标</th>
+                  <th className="hidden p-3 md:table-cell">详情</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditQ.data.map((a: AuditRow) => (
+                  <tr key={a.id} className="border-t border-border">
+                    <td className="whitespace-nowrap p-3 text-muted-foreground">
+                      {a.created_at ? new Date(a.created_at).toLocaleString() : "—"}
+                    </td>
+                    <td className="p-3 font-medium">{a.action}</td>
+                    <td className="hidden max-w-[160px] truncate p-3 text-muted-foreground sm:table-cell">
+                      {a.target ?? "—"}
+                    </td>
+                    <td className="hidden max-w-[280px] truncate p-3 text-muted-foreground md:table-cell">
+                      {a.detail ? JSON.stringify(a.detail) : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </TabsContent>
+
+      {/* Tool catalog — the registry the agent runtimes actually use. */}
+      <TabsContent value="tools" className="space-y-3">
+        {toolsQ.isError ? (
+          <ErrorState onRetry={() => toolsQ.refetch()} />
+        ) : toolsQ.isLoading ? (
+          <p className="text-sm text-muted-foreground">加载中…</p>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(toolsQ.data ?? []).map((t: ToolInfoRow) => (
+              <div key={t.name} className="rounded-lg border border-border bg-card p-3">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-sm font-medium">{t.name}</span>
+                  {t.dangerous && (
+                    <Badge variant="destructive" className="text-[10px]">危险</Badge>
+                  )}
+                </div>
+                <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                  {t.description || "（无描述）"}
+                </p>
+              </div>
+            ))}
           </div>
         )}
       </TabsContent>

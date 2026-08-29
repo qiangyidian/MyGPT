@@ -105,6 +105,9 @@ class ChatRequest(BaseModel):
     # ---- Phase 1: user-facing mode + attachments ----
     mode: str = "speed"               # speed | expert (UI picker); legacy: auto|search|deep_research|create|data_analysis|debate
     attachment_ids: list[uuid.UUID] = []
+    # Reasoning-effort hint (B6). Honored only when the selected model config
+    # declares supports_reasoning_effort; ignored otherwise (never an error).
+    reasoning_effort: str | None = None   # low | medium | high
     # ---- Agent platform: legacy fields (still accepted) ----
     execution_mode: str = "auto"      # auto | chat | agent
     agent_profile: str = "general"    # general | research | analyst | ...

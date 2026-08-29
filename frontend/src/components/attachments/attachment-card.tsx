@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { AlertCircle, FileText, FileSpreadsheet, Image as ImageIcon, Loader2, X } from "lucide-react";
+import { AlertCircle, BookMarked, Check, FileText, FileSpreadsheet, Image as ImageIcon, Loader2, X } from "lucide-react";
 
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -85,11 +85,17 @@ export function AttachmentCard({
   attachment,
   onRemove,
   onPreview,
+  onSaveToKb,
+  saveToKbState,
   className,
 }: {
   attachment: AttachmentCardData;
   onRemove?: (id: string) => void;
   onPreview?: (id: string) => void;
+  /** Save the parsed attachment into a knowledge base (server-side pipeline). */
+  onSaveToKb?: (id: string) => void;
+  /** Per-card save state ("saving" | "saved" | "error" | undefined). */
+  saveToKbState?: "saving" | "saved" | "error";
   className?: string;
 }) {
   const Icon = iconFor(attachment);
@@ -146,6 +152,28 @@ export function AttachmentCard({
           </span>
         </span>
       </button>
+      {onSaveToKb && !busy && !isFailed && !attachment.id.startsWith("tmp-") && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6 shrink-0 text-muted-foreground opacity-60 hover:opacity-100"
+          onClick={() => onSaveToKb(attachment.id)}
+          disabled={saveToKbState === "saving" || saveToKbState === "saved"}
+          title={saveToKbState === "saved" ? "已存入知识库" : "存入知识库"}
+          aria-label={`存入知识库 ${attachment.filename}`}
+        >
+          {saveToKbState === "saving" ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : saveToKbState === "saved" ? (
+            <Check className="h-3.5 w-3.5 text-green-600" />
+          ) : saveToKbState === "error" ? (
+            <AlertCircle className="h-3.5 w-3.5 text-destructive" />
+          ) : (
+            <BookMarked className="h-3.5 w-3.5" />
+          )}
+        </Button>
+      )}
       {onRemove && (
         <Button
           type="button"
