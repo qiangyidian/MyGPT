@@ -271,13 +271,28 @@ export default function ModelsPage() {
               <Field label="Provider">
                 <Select
                   value={form.provider}
-                  onValueChange={(v) => setForm({ ...form, provider: v })}
+                  onValueChange={(v) => {
+                    // 切换 provider 时带入各家默认端点，减少手填出错。
+                    const defaults: Record<string, { url: string; model: string }> = {
+                      "openai-compatible": { url: "https://api.openai.com/v1", model: "gpt-4o" },
+                      anthropic: { url: "https://api.anthropic.com", model: "claude-sonnet-4-6" },
+                      mock: { url: "", model: "mock-model" },
+                    };
+                    const d = defaults[v];
+                    setForm({
+                      ...form,
+                      provider: v,
+                      api_base_url: d?.url ?? form.api_base_url,
+                      model_name: form.model_name || d?.model || "",
+                    });
+                  }}
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="openai-compatible">openai-compatible</SelectItem>
+                    <SelectItem value="anthropic">anthropic (Claude 原生)</SelectItem>
                     <SelectItem value="mock">mock</SelectItem>
                   </SelectContent>
                 </Select>
@@ -294,7 +309,11 @@ export default function ModelsPage() {
               <Input
                 value={form.api_base_url}
                 onChange={(e) => setForm({ ...form, api_base_url: e.target.value })}
-                placeholder="https://api.openai.com/v1"
+                placeholder={
+                  form.provider === "anthropic"
+                    ? "https://api.anthropic.com"
+                    : "https://api.openai.com/v1"
+                }
               />
             </Field>
             <Field

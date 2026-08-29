@@ -11,7 +11,9 @@ from app.schemas.common import ORMModel
 
 class ModelConfigBase(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider: str = "openai-compatible"            # openai-compatible | mock
+    provider: str = "openai-compatible"            # openai-compatible | anthropic | mock
+    # anthropic 的原生 Messages API 端点；api_base_url 可留空默认 https://api.anthropic.com，
+    # 但 schema 校验要求非空 —— 创建时前端会自动填入默认值。
     api_base_url: str = Field(min_length=1, max_length=512)
     api_key: str | None = None                      # write-only; stored encrypted
     model_name: str = Field(min_length=1, max_length=128)

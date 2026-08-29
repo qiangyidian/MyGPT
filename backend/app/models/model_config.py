@@ -19,7 +19,7 @@ class ModelConfig(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    provider: Mapped[str] = mapped_column(String(64), nullable=False)  # openai-compatible | mock
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)  # openai-compatible | anthropic | mock
     api_base_url: Mapped[str] = mapped_column(String(512), nullable=False)
     api_key_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
