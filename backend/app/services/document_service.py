@@ -81,7 +81,10 @@ async def _clear_existing(db: AsyncSession, doc: Document, collection: str) -> N
         await store.delete_by_filter(collection, {"document_id": str(doc.id)})
     except Exception as exc:  # noqa: BLE001
         logger.debug("delete_by_filter failed (ok on first index): %s", exc)
-    await db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
+    # NB: must use the SQLAlchemy construct, not this module's own `delete()`
+    # service function below — the module-level def shadows the import.
+    from sqlalchemy import delete as _sa_delete
+    await db.execute(_sa_delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
 
 
 async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
