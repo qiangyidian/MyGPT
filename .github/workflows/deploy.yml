@@ -1,0 +1,48 @@
+name: Deploy Signal
+
+# CI (ci.yml) 全绿后才允许部署。这个工作流提供两个触发方式：
+#
+#   1. push 一个「部署信号」到 deploy 分支 —— 服务器上的 systemd timer
+#      每 2 分钟轮询 origin/main 与 deploy 信号，检测到新信号即自动执行
+#      部署脚本（拉代码 → 构建 → 迁移 → 重启 → 健康检查 → 失败回滚）。
+#      适合服务器无公网入站（无法接 webhook）的场景 —— 本项目正是如此。
+#
+#   2. workflow_dispatch 手动触发（跳过 CI 门禁，紧急修复用）。
+#
+# 服务器侧组件（已在本机部署）：
+#   /usr/local/bin/mychat-deploy.sh          部署+回滚脚本
+#   mychat-deploy.timer / .service           systemd 轮询单元
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  signal:
+    # 只有 CI 成功才发部署信号
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push deploy signal
+        run: |
+          # deploy 分支只是一个信号载体：内容为时间戳 + 触发 commit。
+          # 服务器轮询脚本用 git fetch 检测 main 的新 commit（信号分支
+          # 只作为「CI 已通过」的门禁标志）。
+          SIGNAL="deploy-requested-$(date -u +%Y%m%dT%H%M%SZ)"
+          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          git checkout -b deploy || git checkout deploy
+          echo "${SIGNAL}" > SIGNAL
+          echo "commit: ${{ github.event.workflow_run.head_sha || github.sha }}" >> SIGNAL
+          echo "actor:  ${{ github.actor }}" >> SIGNAL
+          git config user.name "deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git add SIGNAL
+          git commit -m "deploy: ${{ github.event.workflow_run.head_sha || github.sha }}" --allow-empty
+          git push origin deploy
