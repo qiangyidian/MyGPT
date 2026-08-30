@@ -2,14 +2,15 @@ import { describe, it, expect } from "vitest";
 import { USER_MODES, getModeMeta, isUserChatMode, isSpecialMode } from "@/lib/user-modes";
 
 describe("user-modes", () => {
-  it("exposes exactly the two user-facing modes (speed | expert)", () => {
+  it("exposes exactly the three user-facing modes (speed | expert | hermes)", () => {
     const values = USER_MODES.map((m) => m.value);
-    expect(values).toEqual(["speed", "expert"]);
+    expect(values).toEqual(["speed", "expert", "hermes"]);
   });
 
-  it("expert mode is the multi-agent one; speed is not", () => {
+  it("expert mode is the multi-agent one; speed/hermes are not", () => {
     expect(isSpecialMode("expert")).toBe(true);
     expect(isSpecialMode("speed")).toBe(false);
+    expect(isSpecialMode("hermes")).toBe(false);
   });
 
   it("each mode has friendly copy and hides internal runtime names", () => {
