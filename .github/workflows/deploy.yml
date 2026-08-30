@@ -34,10 +34,17 @@ jobs:
           # deploy 分支只是一个信号载体：内容为时间戳 + 触发 commit。
           # 服务器轮询脚本用 git fetch 检测 main 的新 commit（信号分支
           # 只作为「CI 已通过」的门禁标志）。
+          #
+          # ⚠ 必须基于远端 deploy 的最新信号提交（fetch + reset），否则
+          # push 是 non-fast-forward 被拒 —— 这正是 v1 的 bug：浅 clone 只有
+          # main 历史，checkout -b deploy 与远端 deploy 无共同祖先，第二次
+          # 运行起每次 push 都 rejected，部署信号永远发不出去。
           SIGNAL="deploy-requested-$(date -u +%Y%m%dT%H%M%SZ)"
-          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo
+          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 "$REPO_URL" repo
           cd repo
-          git checkout -b deploy || git checkout deploy
+          git fetch origin deploy --depth 1
+          git checkout -B deploy FETCH_HEAD
           echo "${SIGNAL}" > SIGNAL
           echo "commit: ${{ github.event.workflow_run.head_sha || github.sha }}" >> SIGNAL
           echo "actor:  ${{ github.actor }}" >> SIGNAL
@@ -45,4 +52,6 @@ jobs:
           git config user.email "deploy-bot@users.noreply.github.com"
           git add SIGNAL
           git commit -m "deploy: ${{ github.event.workflow_run.head_sha || github.sha }}" --allow-empty
-          git push origin deploy
+          # force-with-lease：信号分支是单向追加，远端若在我们 fetch 后又
+          # 更新（并发信号），以远端为准放弃本次（下一个 commit 会再触发）。
+          git push --force-with-lease=deploy:FETCH_HEAD origin deploy
