@@ -242,6 +242,13 @@ class NativeChatRuntime:
         _graph.run_id = str(ctx.run_id)
         _assistant_started = _now_iso()
         _node_terminal = "completed"
+        # Hermes server-side activity ledger (tool progress + subagent
+        # delegation), collected across ALL stream rounds and persisted into
+        # the assistant message metadata so the frontend's step timeline
+        # survives a page reload (the frontend only writes it optimistically
+        # for the live stream).
+        hermes_steps: list[dict[str, Any]] = []
+        hermes_mode = getattr(ctx, "mode", None) == "hermes"
         yield ev_agent_graph(run_id=ctx.run_id, graph=_graph.to_public_dict())
         yield ev_agent_status(
             run_id=ctx.run_id, agent_id="assistant", status="running",
@@ -480,6 +487,16 @@ class NativeChatRuntime:
                             if ctl is not None and ctl.cancel.is_set():
                                 finish_reason = "cancelled"
                                 _node_terminal = "cancelled"
+                                # Hermes Runs transport: propagate the stop
+                                # upstream so the server-side agent actually
+                                # halts (fire-and-forget — never block the
+                                # local cancel on the round-trip).
+                                _stop_run = getattr(provider, "stop_run", None)
+                                if callable(_stop_run):
+                                    _task = asyncio.create_task(_stop_run())
+                                    _task.add_done_callback(
+                                        lambda t: t.exception() if not t.cancelled() else None
+                                    )
                                 break
                             if ctl is not None:
                                 # Drain appended user instructions into the
@@ -530,6 +547,16 @@ class NativeChatRuntime:
                                 # existing progress UI renders them.
                                 prog = delta.meta["hermes_tool"]
                                 _hid = str(prog.get("toolCallId") or prog.get("tool") or "")
+                                _record_hermes_step(
+                                    hermes_steps,
+                                    id=_hid,
+                                    type_="tool",
+                                    name=str(prog.get("tool") or "tool"),
+                                    label=str(prog.get("label") or ""),
+                                    emoji=str(prog.get("emoji") or ""),
+                                    running=prog.get("status") == "running",
+                                    ok=prog.get("status") != "error",
+                                )
                                 if prog.get("status") == "running":
                                     yield ev_tool_call(
                                         id=_hid,
@@ -542,6 +569,54 @@ class NativeChatRuntime:
                                         id=_hid,
                                         name=str(prog.get("tool") or "tool"),
                                         ok=prog.get("status") != "error",
+                                        agent_id="assistant",
+                                    )
+                            if delta.meta and "hermes_subagent" in delta.meta:
+                                # Runs-transport subagent delegation — surfaced
+                                # through the same tool_call/tool_result channel
+                                # (name="subagent") so the frontend needs no new
+                                # event type; arguments carry the human summary.
+                                sub = delta.meta["hermes_subagent"]
+                                _sid = str(sub.get("subagentId") or "")
+                                _running = str(sub.get("status") or "running") not in (
+                                    "completed",
+                                    "failed",
+                                    "cancelled",
+                                    "timeout",
+                                    "error",
+                                )
+                                _sub_args = {
+                                    "label": sub.get("label") or "",
+                                    "summary": sub.get("summary") or "",
+                                    "duration": sub.get("duration"),
+                                    "tokens": sub.get("tokens"),
+                                    "emoji": "🧠",
+                                }
+                                _record_hermes_step(
+                                    hermes_steps,
+                                    id=_sid,
+                                    type_="agent",
+                                    name="subagent",
+                                    label=str(sub.get("label") or "子代理任务"),
+                                    emoji="🧠",
+                                    running=_running,
+                                    ok=str(sub.get("status")) != "failed",
+                                    summary=str(sub.get("summary") or ""),
+                                    duration=sub.get("duration"),
+                                )
+                                if _running:
+                                    yield ev_tool_call(
+                                        id=_sid,
+                                        name="subagent",
+                                        arguments=_sub_args,
+                                        agent_id="assistant",
+                                    )
+                                else:
+                                    yield ev_tool_result(
+                                        id=_sid,
+                                        name="subagent",
+                                        ok=str(sub.get("status")) != "failed",
+                                        result=_sub_args.get("summary") or None,
                                         agent_id="assistant",
                                     )
                             if delta.tool_calls:
@@ -1072,6 +1147,20 @@ class NativeChatRuntime:
         if _handles:
             _meta["artifacts"] = _handles
             ctx.extra["spilled_artifacts"] = _handles
+        # Hermes turn epilogue: persist the server-side activity ledger so the
+        # step timeline survives a reload (the frontend only holds it for the
+        # live stream), and flag the message as a Hermes turn (专属头部/记忆
+        # 徽章 render off these flags).
+        if hermes_mode:
+            if hermes_steps:
+                _meta["steps"] = hermes_steps
+            _meta["hermes"] = True
+            # Session-scoped memory is active whenever the provider carried a
+            # session header (per-conversation or cross-conversation key).
+            _meta["hermes_memory"] = bool(
+                getattr(provider, "hermes_session_id", "")
+                or getattr(provider, "hermes_session_key", "")
+            )
         assistant_msg.metadata_ = _meta
         if finish_reason == "budget":
             reason = (
@@ -1180,6 +1269,58 @@ def _approval_summary(tool_name: str, args: dict[str, Any]) -> str:
 def _now_iso() -> str:
     """UTC now as an ISO-8601 string (for started_at / finished_at fields)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _record_hermes_step(
+    steps: list[dict[str, Any]],
+    *,
+    id: str,
+    type_: str,
+    name: str,
+    label: str,
+    emoji: str = "",
+    running: bool = True,
+    ok: bool = True,
+    summary: str = "",
+    duration: Any = None,
+) -> None:
+    """Append/update one Hermes server-side step in the turn's ledger.
+
+    Mirrors the frontend ``AgentStep`` shape (``tool`` steps carry a
+    ``tool.argumentsPreview`` with Hermes' human-readable label/emoji) so the
+    persisted ``metadata.steps`` renders through the same ResearchSteps
+    component after a reload. Idempotent per id: a completion event updates
+    the row its start event created.
+    """
+    now = _now_iso()
+    for existing in steps:
+        if existing.get("id") == id:
+            if not running:
+                existing["status"] = "done" if ok else "error"
+                existing["finishedAt"] = now
+                if summary:
+                    existing["summary"] = summary
+                if duration is not None:
+                    existing["duration"] = duration
+            return
+    entry: dict[str, Any] = {
+        "id": id,
+        "sequence": len(steps),
+        "type": type_,
+        "title": label or name,
+        "status": "running" if running else ("done" if ok else "error"),
+        "startedAt": now,
+    }
+    if summary:
+        entry["summary"] = summary
+    if duration is not None:
+        entry["duration"] = duration
+    if type_ == "tool":
+        entry["tool"] = {
+            "name": name,
+            "argumentsPreview": {"label": label, "emoji": emoji},
+        }
+    steps.append(entry)
 
 
 def _elapsed_ms(start_iso: str) -> int:

@@ -16,6 +16,7 @@ import {
   UsersRound,
   WifiOff,
   X,
+  Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -31,6 +32,7 @@ import { InlineArtifactHandle } from "@/components/artifacts/inline-artifact-han
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
 import { AgentInlineStatus } from "@/components/agents/agent-inline-status";
 import { useMessageFeedback } from "@/hooks/useMessageActions";
+import { useChatUiStore } from "@/stores/chat-ui-store";
 import type {
   AgentStep,
   AttachmentRef,
@@ -42,6 +44,46 @@ import type {
 import { getMessageStatus } from "@/lib/types";
 import { sanitizeSourceMarkers } from "@/lib/citations";
 import { collectArtifactIds } from "@/lib/artifacts";
+
+/** Hermes-mode assistant header: ⚡ badge + live status dot + memory chip.
+ *  Rendered for the live stream (mode === "hermes") and for reloaded
+ *  messages (metadata.hermes === true, written by the backend epilogue). */
+function HermesHeader({
+  streaming,
+  memory,
+  error,
+}: {
+  streaming: boolean;
+  memory: boolean;
+  error: boolean;
+}) {
+  return (
+    <div className="mb-2 flex items-center gap-2">
+      <span className="inline-flex items-center gap-1.5 rounded-lg border border-violet-500/30 bg-gradient-to-r from-violet-500/10 via-fuchsia-500/10 to-amber-500/10 px-2.5 py-1 text-xs font-medium text-violet-700 dark:text-violet-300">
+        <span aria-hidden>⚡</span>
+        Hermes Agent
+        {streaming ? (
+          <span className="relative ml-1 flex h-2 w-2" aria-label="运行中">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-75" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-violet-500" />
+          </span>
+        ) : error ? (
+          <span className="ml-1 h-2 w-2 rounded-full bg-destructive" aria-label="出错" />
+        ) : (
+          <span className="ml-1 h-2 w-2 rounded-full bg-emerald-500" aria-label="已完成" />
+        )}
+      </span>
+      {memory && (
+        <span
+          className="inline-flex items-center gap-1 rounded-md border border-border bg-background/60 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+          title="Hermes 服务端会话记忆已连接（跨对话长期记忆生效）"
+        >
+          <span aria-hidden>🧠</span> 记忆已连接
+        </span>
+      )}
+    </div>
+  );
+}
 
 interface MessageBubbleProps {
   message: Message;
@@ -238,9 +280,18 @@ export const MessageBubble = memo(function MessageBubble({
     run_id?: string;
     attachments?: AttachmentRef[];
     citation_validation_failed?: boolean;
+    hermes?: boolean;
+    hermes_memory?: boolean;
   };
   const isMultiAgent = !isUser && meta.multi_agent === true && !!meta.run_id;
   const attachments = isUser ? (meta.attachments ?? []) : [];
+
+  // Hermes turn identification: the persisted flag (backend epilogue) for
+  // reloaded messages, or the live mode for the streaming bubble.
+  const liveMode = useChatUiStore((s) => s.mode);
+  const isHermes =
+    !isUser && (meta.hermes === true || (isStreaming && liveMode === "hermes"));
+  const hermesMemory = meta.hermes_memory === true;
 
   // Citation integrity: strip any in-text [source N] that has no backing
   // citation. The structured citation chips (rendered below) are the source of
@@ -280,10 +331,20 @@ export const MessageBubble = memo(function MessageBubble({
       <Avatar className="h-7 w-7 shrink-0" role="img" aria-label={isUser ? "你的消息" : "AI 助手"}>
         <AvatarFallback
           className={cn(
-            isUser ? "bg-indigo-500 text-white" : "bg-muted text-muted-foreground"
+            isUser
+              ? "bg-indigo-500 text-white"
+              : isHermes
+                ? "bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white"
+                : "bg-muted text-muted-foreground"
           )}
         >
-          {isUser ? <UserIcon className="h-3.5 w-3.5" aria-hidden /> : <Sparkles className="h-3.5 w-3.5" aria-hidden />}
+          {isUser ? (
+            <UserIcon className="h-3.5 w-3.5" aria-hidden />
+          ) : isHermes ? (
+            <Zap className="h-3.5 w-3.5" aria-hidden />
+          ) : (
+            <Sparkles className="h-3.5 w-3.5" aria-hidden />
+          )}
         </AvatarFallback>
       </Avatar>
 
@@ -293,6 +354,14 @@ export const MessageBubble = memo(function MessageBubble({
           isUser ? "items-end" : "items-start"
         )}
       >
+        {isHermes && (
+          <HermesHeader
+            streaming={Boolean(isStreaming)}
+            memory={hermesMemory}
+            error={status === "error"}
+          />
+        )}
+
         {!isUser && isMultiAgent && meta.run_id && (
           <button
             type="button"
