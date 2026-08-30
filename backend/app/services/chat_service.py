@@ -1361,6 +1361,23 @@ class ChatService:
                     in ("low", "medium", "high")
                     else None
                 ),
+                # Hermes 模式：工具全部在 Hermes 服务端执行（平台只透传流），
+                # 平台侧预算（时长/token）会把长任务掐断——单轮真实搜索就能
+                # 烧 35k+ tokens。这里放宽到适合 Agent 长任务的量级并授权
+                # 提升，使 web 端体验对齐 IM 平台直连。
+                **(
+                    {
+                        "budget_overrides": {
+                            "max_runtime_seconds": 900.0,   # 15 分钟
+                            "max_total_tokens": 1_000_000,
+                            "max_tool_output_chars": 200_000,
+                            "max_agent_steps": 64,
+                        },
+                        "budget_policy_authorized": True,
+                    }
+                    if route.mode == "hermes"
+                    else {}
+                ),
             },
         )
 

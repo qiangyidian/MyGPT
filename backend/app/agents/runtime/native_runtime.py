@@ -115,7 +115,18 @@ class NativeChatRuntime:
         assistant_msg = ctx.assistant_msg
         conversation_id = ctx.conversation.id
 
-        provider = get_provider_for_config(cfg)
+        # Server-side session memory (Hermes): per-conversation isolation +
+        # per-user long-term scope. Other providers ignore these kwargs. The
+        # try/except keeps injected test doubles with the old single-arg
+        # signature working.
+        try:
+            provider = get_provider_for_config(
+                cfg,
+                session_id=str(conversation_id),
+                session_key=f"user:{ctx.user.id}",
+            )
+        except TypeError:
+            provider = get_provider_for_config(cfg)
         registry = get_default_registry()
         # Merge statically-configured MCP server tools into this run's registry
         # so the model is offered them and calls route through ToolGateway
@@ -513,6 +524,26 @@ class NativeChatRuntime:
                                 if novel:
                                     novel_parts.append(novel)
                                     yield ev_token(delta=novel)
+                            if delta.meta and "hermes_tool" in delta.meta:
+                                # Hermes server-side tool progress — re-emit as
+                                # standard tool_call/tool_result events so the
+                                # existing progress UI renders them.
+                                prog = delta.meta["hermes_tool"]
+                                _hid = str(prog.get("toolCallId") or prog.get("tool") or "")
+                                if prog.get("status") == "running":
+                                    yield ev_tool_call(
+                                        id=_hid,
+                                        name=str(prog.get("tool") or "tool"),
+                                        arguments={"label": prog.get("label", ""), "emoji": prog.get("emoji", "")},
+                                        agent_id="assistant",
+                                    )
+                                else:
+                                    yield ev_tool_result(
+                                        id=_hid,
+                                        name=str(prog.get("tool") or "tool"),
+                                        ok=prog.get("status") != "error",
+                                        agent_id="assistant",
+                                    )
                             if delta.tool_calls:
                                 pending_tool_calls.extend(delta.tool_calls)
                             if delta.finish_reason:

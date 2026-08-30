@@ -103,7 +103,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     enable_tools: bool = False        # explicit override (legacy / advanced)
     # ---- Phase 1: user-facing mode + attachments ----
-    mode: str = "speed"               # speed | expert (UI picker); legacy: auto|search|deep_research|create|data_analysis|debate
+    mode: str = "speed"               # speed | expert | hermes (UI picker); legacy: auto|search|deep_research|create|data_analysis|debate
     attachment_ids: list[uuid.UUID] = []
     # Reasoning-effort hint (B6). Honored only when the selected model config
     # declares supports_reasoning_effort; ignored otherwise (never an error).

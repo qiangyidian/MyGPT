@@ -10,6 +10,7 @@ export type Role = "system" | "user" | "assistant" | "tool";
 export type UserChatMode =
   | "speed"
   | "expert"
+  | "hermes"
   // Legacy values kept for displaying older conversations / backward compat:
   | "auto"
   | "search"

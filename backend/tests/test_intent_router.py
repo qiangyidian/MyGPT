@@ -55,10 +55,11 @@ def test_invalid_mode_falls_back_to_speed():
 
 
 def test_valid_modes_set():
-    # speed | expert are the exposed picker modes; the rest remain valid for
-    # backward compatibility (legacy clients / internal escalation / tests).
+    # speed | expert | hermes are the exposed picker modes; the rest remain
+    # valid for backward compatibility (legacy clients / internal escalation /
+    # tests).
     assert VALID_MODES == {
-        "speed", "expert",
+        "speed", "expert", "hermes",
         "auto", "search", "deep_research", "create", "data_analysis", "debate",
     }
 

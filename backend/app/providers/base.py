@@ -106,6 +106,10 @@ class ChatDelta:
     # Token usage — populated on the final usage-only chunk when streaming with
     # include_usage (OpenAI-compatible), or on ChatResult for non-streaming.
     usage: dict[str, int] | None = None
+    # Out-of-band provider payloads (e.g. Hermes tool-progress notifications).
+    # Consumers that don't read it are unaffected; the chat layer re-emits
+    # these as regular agent events.
+    meta: dict[str, Any] | None = None
 
 
 @dataclass

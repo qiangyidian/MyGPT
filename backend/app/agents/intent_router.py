@@ -26,7 +26,7 @@ from app.agents.schemas import ExecutionMode
 # The UI picker now exposes only `speed` and `expert`; the rest remain valid for
 # backward compatibility (older clients, internal escalation, tests).
 VALID_MODES = {
-    "speed", "expert",
+    "speed", "expert", "hermes",
     "auto", "search", "deep_research", "create", "data_analysis", "debate",
 }
 
@@ -87,6 +87,20 @@ def decide_route(
             tool_allowlist=["web_search", "http_get"],
             mode="speed",
             requested_mode="speed",
+        )
+
+    if m == "hermes":
+        # Hermes 模式：整段透传给 Hermes Agent（服务端执行全部 27 个工具集：
+        # 联网搜索/浏览器自动化/Terminal/文件/多模态/子任务委派等）。
+        # 本地不启动任何工具（本地 schema 不发给 Hermes），不加 RAG 注入 ——
+        # Hermes 有自己的记忆与检索；首 token 后由 Hermes 服务端自主工作。
+        return RouteDecision(
+            execution_mode=ExecutionMode.auto,
+            agent_profile="general",
+            enable_tools=False,
+            use_multi_agent=False,
+            mode="hermes",
+            requested_mode="hermes",
         )
 
     if m == "expert":

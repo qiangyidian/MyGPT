@@ -31,6 +31,10 @@ interface ComposerToolbarProps {
  * Compact toolbar above the textarea: mode picker (primary), knowledge-base
  * selector (compact), and the advanced model selector (hidden unless opted in).
  * Kept to a single row on mobile by design.
+ *
+ * Hermes 模式下只保留模式选择器：知识库（平台 RAG 对 Hermes 不生效——它有
+ * 自己的服务端记忆与检索）、模型选择（由页面自动锁定 hermes provider 的
+ * 模型）与推理力度（Hermes 不消费）全部隐藏，避免无效选项误导。
  */
 export function ComposerToolbar({
   modelId,
@@ -42,12 +46,14 @@ export function ComposerToolbar({
   className,
 }: ComposerToolbarProps) {
   const hasKbs = !!knowledgeBases && knowledgeBases.length > 0;
+  const mode = useChatUiStore((s) => s.mode);
+  const isHermes = mode === "hermes";
 
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
       <ChatModeSelector />
 
-      {hasKbs && (
+      {!isHermes && hasKbs && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="outline" size="sm" className="h-9 gap-1.5 text-sm font-medium">
@@ -73,13 +79,15 @@ export function ComposerToolbar({
         </DropdownMenu>
       )}
 
-      <AdvancedModelSelector
-        value={modelId}
-        onChange={onModelChange}
-        mimes={attachmentMimes}
-      />
+      {!isHermes && (
+        <AdvancedModelSelector
+          value={modelId}
+          onChange={onModelChange}
+          mimes={attachmentMimes}
+        />
+      )}
 
-      <ReasoningEffortSelectorStoreBridge modelId={modelId} />
+      {!isHermes && <ReasoningEffortSelectorStoreBridge modelId={modelId} />}
     </div>
   );
 }

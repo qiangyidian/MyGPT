@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -69,6 +69,37 @@ function ChatPanel({
     else if (modelId === null && chatModels.length > 0) setModelId(chatModels[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail.data?.model_id, chatModels]);
+
+  // Hermes 模式：模型选择器已隐藏，自动锁定 hermes provider 的模型；知识库
+  // 同步清空（平台 RAG 不注入 Hermes）。切回其他模式时恢复用户原先的选择。
+  const hermesModelId = useMemo(
+    () => chatModels.find((m) => m.provider === "hermes")?.id ?? null,
+    [chatModels]
+  );
+  const prevModelRef = useRef<string | null>(null);
+  const prevKbRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (mode === "hermes") {
+      if (hermesModelId && modelId !== hermesModelId) {
+        if (prevModelRef.current === null) prevModelRef.current = modelId;
+        setModelId(hermesModelId);
+      }
+      if (kbIds.length > 0) {
+        if (!prevKbRef.current.length) prevKbRef.current = kbIds;
+        setKbIds([]);
+      }
+    } else if (prevModelRef.current !== null || prevKbRef.current.length) {
+      // 离开 hermes 模式：仅当用户没有手动改选时恢复（手动改选会更新
+      // modelId，此时恢复旧值反而覆盖用户意图）。
+      if (prevModelRef.current !== null && prevModelRef.current !== hermesModelId) {
+        setModelId(prevModelRef.current);
+      }
+      if (prevKbRef.current.length) setKbIds(prevKbRef.current);
+      prevModelRef.current = null;
+      prevKbRef.current = [];
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, hermesModelId]);
 
   useEffect(() => {
     if (detail.data?.knowledge_base_id !== undefined) {
