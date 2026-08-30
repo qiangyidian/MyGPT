@@ -75,6 +75,39 @@ from app.providers.registry import get_provider_for_config
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
+from app.services.title_service import (
+    is_default_title,
+    maybe_autotitle,
+    maybe_autotitle_after_answer,
+)
+
+
+async def _refine_title_after_answer(
+    conversation_id: str,
+    cfg: ModelConfig,
+    first_user_message: str,
+    assistant_prefix: str,
+) -> None:
+    """Background LLM title refinement (fire-and-forget after the SSE done).
+
+    Owns its DB session (the request session may be closed by the time the
+    LLM responds) and reloads the conversation so a user rename that landed
+    in the meantime wins. Every failure is swallowed — titling is cosmetic.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            conversation = await db.get(Conversation, uuid.UUID(conversation_id))
+            if conversation is None:
+                return
+            await maybe_autotitle_after_answer(
+                db,
+                conversation,
+                cfg,
+                first_user_message=first_user_message,
+                assistant_prefix=assistant_prefix,
+            )
+    except Exception:  # noqa: BLE001 — cosmetic; never surface
+        logger.debug("background title refinement failed", exc_info=True)
 from app.services.attachment_service import (
     collect_image_parts,
     resolve_and_bind_attachments,
@@ -988,6 +1021,10 @@ class ChatService:
 
         # 2. Persist the user message (unless regenerating).
         user_content = request.content or ""
+        # Raw user input BEFORE attachment augmentation — used for the
+        # conversation auto-title (augmented text would leak chunk headers
+        # into the sidebar).
+        user_content_original = (request.content or "").strip()
         if request.regenerate:
             user_content = await _delete_last_assistant_message(db, conversation.id)
         else:
@@ -1035,6 +1072,21 @@ class ChatService:
                         logger.warning("attachment binding failed: %s", exc)
                 # Cheap sidebar preview (last user message text).
                 conversation.last_message_preview = (user_content or "").strip()[:280]
+
+                # Auto-title (ChatGPT-style): an untitled conversation gets an
+                # immediate truncated-title from the first user message; the
+                # LLM refinement runs after the answer completes (below).
+                # User-renamed conversations are never touched.
+                if user_msg and conversation and is_default_title(conversation.title):
+                    try:
+                        await maybe_autotitle(
+                            db,
+                            conversation,
+                            cfg,
+                            first_user_message=request.content or "",
+                        )
+                    except Exception:  # noqa: BLE001 — titling never blocks
+                        logger.debug("auto-title (fallback) failed", exc_info=True)
 
                 # Auto memory proposal (B7): extract 0-3 candidate memories
                 # (rule-based, no model calls) and persist them INACTIVE for
@@ -1495,6 +1547,20 @@ class ChatService:
                     conversation.last_message_preview = (assistant_msg.content or "")[:280]
                     async with db_mutation_scope(db_mutation_lock):
                         await commit_with_rollback(db)
+                    # Auto-title refinement: now that the answer exists, try
+                    # an LLM-generated concise title (replaces the truncated
+                    # fallback set at turn start). Fire-and-forget on a fresh
+                    # session — the LLM call (1-3s) must not delay the SSE
+                    # close; it uses its own DB session and skips
+                    # conversations the user renamed in the meantime.
+                    asyncio.create_task(
+                        _refine_title_after_answer(
+                            str(conversation.id),
+                            cfg,
+                            user_content_original,
+                            (assistant_msg.content or "")[:400],
+                        )
+                    )
                     # Rolling summary: if history grew past the budget, roll the
                     # older messages into a summary memory for future turns.
                     try:
@@ -1752,6 +1818,15 @@ class ChatService:
         db.add(run)
         await db.flush()
         conversation.last_message_preview = (user_content or "").strip()[:280]
+        # Auto-title fallback for the durable path too (LLM refinement happens
+        # in the worker's post-turn hook if configured there).
+        if is_default_title(conversation.title) and (user_content or "").strip():
+            try:
+                await maybe_autotitle(
+                    db, conversation, None, first_user_message=user_content, commit=False
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("durable auto-title failed", exc_info=True)
         await commit_with_rollback(db)
 
         # 5. Enqueue for the background worker.

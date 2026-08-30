@@ -278,6 +278,12 @@ export function useChatStream(): ChatStreamState {
         queryClient.invalidateQueries({
           queryKey: CONVERSATION_DETAIL_QUERY_KEY(convId),
         });
+        // The backend auto-titles a fresh conversation from this turn (cheap
+        // truncation immediately, LLM refinement after the answer) — refetch
+        // the sidebar list so the new title shows up without a manual reload.
+        queryClient.invalidateQueries({
+          queryKey: CONVERSATIONS_QUERY_KEY,
+        });
         setFinishReason(fr);
         setStatus(finishReasonToStatus(fr));
       };
