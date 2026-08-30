@@ -46,8 +46,12 @@ worst, and the local tool loop must not engage (finish_reason never becomes
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import os
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -354,6 +358,84 @@ class HermesProvider(OpenAICompatibleProvider):
         except httpx.HTTPError as exc:
             logger.debug("hermes stop_run failed for %s: %r", run_id, exc)
 
+    # -- file delivery (2026-08: chat file cards) -------------------------------
+    # A Hermes turn often ends with "文件已生成: /root/report.pptx" — the file
+    # lives on the HERMES host, unreachable from the browser. fetch_file brings
+    # it back as bytes so the chat layer can land it in the platform's artifact
+    # store and render a download card in the conversation.
+
+    # Hard cap for one fetched file — matches the platform's upload ceiling and
+    # keeps a misbehaving agent from streaming gigabytes through the chat turn.
+    MAX_FETCH_FILE_BYTES = 64 * 1024 * 1024  # 64 MB
+
+    async def fetch_file(self, path: str) -> tuple[bytes, str]:
+        """Read one file from the Hermes host → (data, media_type).
+
+        Strategy: local direct read when the path exists on THIS machine
+        (backend co-located with Hermes — the common self-hosted deploy);
+        otherwise ask the agent itself to base64 the file via a one-shot run.
+        Raises ProviderError on any failure (missing, too large, unparseable).
+        """
+        if not path or not _is_absolute_path(path):
+            raise ProviderError(f"not an absolute path: {path!r}")
+
+        # Local fast path (same-host deploy).
+        if os.path.isfile(path):
+            size = os.path.getsize(path)
+            if size > self.MAX_FETCH_FILE_BYTES:
+                raise ProviderError(f"file too large ({size} bytes): {path}")
+            with open(path, "rb") as fh:
+                return fh.read(), _guess_media_type(path)
+
+        # Remote: one-shot run that prints the file as base64.
+        data = await self._fetch_file_via_agent(path)
+        return data, _guess_media_type(path)
+
+    async def _fetch_file_via_agent(self, path: str) -> bytes:
+        """Have the Hermes agent read ``path`` and return its base64 content.
+
+        Works on both transports: the chat/completions fallback buffers the
+        whole assistant message; the Runs path subscribes to one run's events.
+        The prompt pins an exact output format (``<B64>...</B64>``) and bans
+        commentary so decoding is deterministic.
+        """
+        prompt = (
+            f"Read the file at {path} and output ONLY its base64 encoding "
+            f"wrapped exactly like <B64>BASE64</B64> with no other text, no "
+            f"markdown fences, no commentary. If the file does not exist or "
+            f"you cannot read it, output exactly <B64_ERROR>cannot read</B64_ERROR>."
+        )
+        chunks: list[ChatDelta] = []
+
+        async def _collect() -> None:
+            if await self._probe_runs_support():
+                async for d in self._stream_via_runs(
+                    [{"role": "user", "content": prompt}], None
+                ):
+                    chunks.append(d)
+            else:
+                async for d in super(HermesProvider, self).stream_chat(
+                    [{"role": "user", "content": prompt}], None
+                ):
+                    chunks.append(d)
+
+        try:
+            await _collect()
+        except ProviderError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface as provider failure
+            raise ProviderError(f"hermes fetch_file transport failed: {exc}") from exc
+
+        text = "".join(c.content for c in chunks)
+        return _decode_b64_payload(text, path)
+
+    def _fetch_via_chat_completions(self, prompt: str) -> AsyncIterator[ChatDelta]:
+        """Direct generator over the inherited chat/completions transport.
+
+        (Kept as a thin named wrapper for testability.)
+        """
+        return super().stream_chat([{"role": "user", "content": prompt}], None)
+
     # -- ModelProvider: stream -------------------------------------------------
     async def stream_chat(
         self, messages: list[dict[str, Any]], options: ChatOptions | None = None
@@ -456,3 +538,135 @@ class HermesProvider(OpenAICompatibleProvider):
     @staticmethod
     def _flush_tool_accum(tool_accum: dict[int, dict[str, Any]]) -> ChatDelta:
         return OpenAICompatibleProvider._flush_tool_accum(tool_accum)
+
+
+# ---------------------------------------------------------------------------
+# File-delivery helpers (module-level for testability)
+# ---------------------------------------------------------------------------
+
+# Extensions safe to auto-attach as chat file cards. Anything else (source
+# code of the server itself, dotfiles, executables) is left as plain text —
+# we only turn DELIVERABLES into downloads, never arbitrary host files.
+DELIVERABLE_EXTENSIONS = frozenset({
+    ".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls",
+    ".csv", ".txt", ".md", ".json", ".xml", ".yaml", ".yml",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".zip",
+    ".tar", ".gz", ".mp3", ".mp4", ".wav", ".html", ".py", ".ipynb",
+})
+
+# Absolute path in the final assistant text (Windows or POSIX). Filenames
+# are treated as space-free (word chars, dots, dashes, underscores, CJK-free)
+# — agents overwhelmingly name generated files that way, and it keeps a
+# trailing Chinese clause ("已生成 /root/x.pdf 重复一次…") from being
+# swallowed into the match.
+_PATH_SEG = r"[A-Za-z0-9_.\-]+"
+_FILE_PATH_RE = re.compile(
+    r"(?<![\w./\\-])"
+    r"("
+    rf"[A-Za-z]:\\(?:{_PATH_SEG}\\)*{_PATH_SEG}\.[A-Za-z0-9]{{2,8}}"
+    rf"|/(?:{_PATH_SEG}/)*{_PATH_SEG}\.[A-Za-z0-9]{{2,8}}"
+    r")"
+    r"(?![\w.])",
+)
+
+# Never auto-deliver from these prefixes even with a safe extension (the
+# Hermes host's own secrets/config are not "files the user asked for").
+_FORBIDDEN_PREFIXES = ("/etc/", "/proc/", "/sys/", "/dev/", "C:\\Windows\\")
+
+
+def extract_deliverable_paths(text: str) -> list[str]:
+    """Find file paths in an assistant reply worth turning into downloads.
+
+    Deduplicated, order-preserved, filtered by extension whitelist and
+    forbidden-location blacklist. Relative paths are ignored (too ambiguous
+    — the platform can't verify where they live).
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _FILE_PATH_RE.finditer(text):
+        raw = m.group(1).rstrip(".,;:!?)]}\"'")
+        normalized = raw.replace("\\", "/")
+        lowered = normalized.lower()
+        ext = os.path.splitext(lowered)[1]
+        if ext not in DELIVERABLE_EXTENSIONS:
+            continue
+        if any(lowered.startswith(p.lower().replace("\\", "/")) for p in _FORBIDDEN_PREFIXES):
+            continue
+        if raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
+
+
+def _guess_media_type(path: str) -> str:
+    """Cheap extension→MIME map (no stdlib mimetypes guess on every platform)."""
+    ext = os.path.splitext(path)[1].lower()
+    return _MIME_BY_EXT.get(ext, "application/octet-stream")
+
+
+def _is_absolute_path(path: str) -> bool:
+    """Platform-independent absolute check: ``/root/x`` is absolute even when
+    the backend runs on Windows (the path refers to the POSIX Hermes host)."""
+    return path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", path) is not None
+
+
+_MIME_BY_EXT: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".zip": "application/zip",
+    ".tar": "application/x-tar",
+    ".gz": "application/gzip",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".html": "text/html",
+    ".py": "text/x-python",
+    ".ipynb": "application/x-ipynb+json",
+}
+
+
+_B64_RE = re.compile(r"<B64>([A-Za-z0-9+/=\s]*)</B64>")
+_B64_ERROR_RE = re.compile(r"<B64_ERROR>(.*?)</B64_ERROR>")
+
+
+def _decode_b64_payload(text: str, path: str) -> bytes:
+    """Extract + decode the <B64>…</B64> payload from an agent reply."""
+    err = _B64_ERROR_RE.search(text)
+    if err and not _B64_RE.search(text):
+        raise ProviderError(f"hermes agent could not read {path}: {err.group(1).strip()}")
+    m = _B64_RE.search(text)
+    if not m:
+        snippet = text.strip()[:120]
+        raise ProviderError(
+            f"hermes agent returned no <B64> payload for {path} (got: {snippet!r})"
+        )
+    compact = re.sub(r"\s+", "", m.group(1))
+    try:
+        data = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProviderError(f"hermes agent returned invalid base64 for {path}") from exc
+    if not data:
+        raise ProviderError(f"hermes agent returned empty file for {path}")
+    if len(data) > HermesProvider.MAX_FETCH_FILE_BYTES:
+        raise ProviderError(f"file too large via agent ({len(data)} bytes): {path}")
+    return data

@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
-from app.providers.base import ChatOptions
+from app.providers.base import ChatDelta, ChatOptions
 from app.providers.hermes import HermesProvider
 from app.providers.registry import get_provider_for_config
 
@@ -487,3 +487,142 @@ async def test_stop_run_posts_stop_and_is_noop_when_idle():
         assert len(posts) == 1
     finally:
         hermes_mod.httpx.AsyncClient = orig_client
+
+
+# --------------------------------------------------------------------------
+# File delivery (2026-08: chat file cards)
+# --------------------------------------------------------------------------
+
+from pathlib import Path
+
+from app.providers.hermes import (
+    _decode_b64_payload,
+    _guess_media_type,
+    extract_deliverable_paths,
+)
+
+
+def test_extract_deliverable_paths_filters_and_dedupes():
+    text = "\n".join([
+        "已生成 /root/report.pptx（64 KB）",
+        "PDF 版： /root/report.pdf 重复一次 /root/report.pptx",
+        "配置在 /etc/nginx/nginx.conf 不应交付",
+        "无扩展名 /root/notes 忽略",
+        "相对路径 ./local.txt 忽略",
+        "Windows 路径 D:\\Reports\\Q3.xlsx 应识别",
+        "危险类型 /tmp/evil.exe 忽略",
+    ])
+    paths = extract_deliverable_paths(text)
+    assert paths == [
+        "/root/report.pptx",
+        "/root/report.pdf",
+        "D:\\Reports\\Q3.xlsx",
+    ]
+
+
+def test_extract_deliverable_paths_empty_text():
+    assert extract_deliverable_paths("") == []
+    assert extract_deliverable_paths(None) == []  # type: ignore[arg-type]
+
+
+def test_guess_media_type_common_extensions():
+    assert _guess_media_type("/a/b/c.pptx").endswith("presentationml.presentation")
+    assert _guess_media_type("/a/b/c.pdf") == "application/pdf"
+    assert _guess_media_type("/a/b/c.png") == "image/png"
+    assert _guess_media_type("/a/b/c.unknown") == "application/octet-stream"
+
+
+def test_decode_b64_payload_roundtrip():
+    import base64 as _b64
+
+    payload = "<B64>" + _b64.b64encode(b"file-bytes-here").decode() + "</B64>"
+    assert _decode_b64_payload(payload, "/x.txt") == b"file-bytes-here"
+
+    # Whitespace inside the payload is tolerated (agents wrap long lines).
+    spaced = "<B64>\n" + "\n".join(_b64.b64encode(b"x" * 64).decode()) + "\n</B64>"
+    assert _decode_b64_payload(spaced, "/x.bin") == b"x" * 64
+
+
+def test_decode_b64_payload_error_shapes():
+    import pytest as _pytest
+
+    # Explicit agent-side error wins when no payload present.
+    with _pytest.raises(Exception, match="could not read"):
+        _decode_b64_payload("<B64_ERROR>cannot read</B64_ERROR>", "/x")
+    # No payload, no error marker.
+    with _pytest.raises(Exception, match="no <B64> payload"):
+        _decode_b64_payload("I could not do that, sorry.", "/x")
+    # Garbage payload inside the tags (regex-legible but non-base64 body).
+    with _pytest.raises(Exception, match="invalid base64|no <B64> payload"):
+        _decode_b64_payload("<B64>@@@not-base64@@@</B64>", "/x")
+    # Empty file.
+    import base64 as _b64
+    with _pytest.raises(Exception, match="empty file"):
+        _decode_b64_payload("<B64>" + _b64.b64encode(b"").decode() + "</B64>", "/x")
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_local_direct_read(tmp_path: Path):
+    """同机部署：文件存在 → 直接读盘，不发起任何 HTTP。"""
+    f = tmp_path / "deck.pptx"
+    f.write_bytes(b"PK\x03\x04 fake pptx")
+    p = _provider()
+    data, media = await p.fetch_file(str(f))
+    assert data == b"PK\x03\x04 fake pptx"
+    assert "presentationml" in media
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_rejects_relative_path():
+    p = _provider()
+    try:
+        await p.fetch_file("relative/x.txt")
+        assert False, "should raise"
+    except Exception as exc:
+        assert "absolute" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_remote_via_agent_b64(tmp_path: Path, monkeypatch):
+    """异机部署：本地无文件 → 一次 agent 往返取 <B64> 载荷。"""
+    import base64 as _b64
+
+    payload = _b64.b64encode(b"remote-file-bytes").decode()
+    captured: dict[str, Any] = {}
+
+    async def fake_stream_via_runs(messages, options):
+        captured["prompt"] = messages[-1]["content"]
+        yield ChatDelta(content=f"<B64>{payload}</B64>")
+
+    async def fake_probe():
+        return True
+
+    p = _provider()
+    monkeypatch.setattr(p, "_stream_via_runs", fake_stream_via_runs)
+    monkeypatch.setattr(p, "_probe_runs_support", fake_probe)
+
+    data, media = await p.fetch_file("/root/remote.txt")
+    assert data == b"remote-file-bytes"
+    assert media == "text/plain"
+    # The prompt pins the exact output format and mentions the path.
+    assert "/root/remote.txt" in captured["prompt"]
+    assert "<B64>" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_remote_agent_reports_error(tmp_path: Path, monkeypatch):
+    async def fake_stream_via_runs(messages, options):
+        yield ChatDelta(content="<B64_ERROR>cannot read</B64_ERROR>")
+
+    async def fake_probe():
+        return True
+
+    p = _provider()
+    monkeypatch.setattr(p, "_stream_via_runs", fake_stream_via_runs)
+    monkeypatch.setattr(p, "_probe_runs_support", fake_probe)
+
+    try:
+        await p.fetch_file("/root/missing.txt")
+        assert False, "should raise"
+    except Exception as exc:
+        assert "could not read" in str(exc)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -1161,6 +1162,21 @@ class NativeChatRuntime:
                 getattr(provider, "hermes_session_id", "")
                 or getattr(provider, "hermes_session_key", "")
             )
+            # File delivery: a Hermes reply typically references files it just
+            # generated on ITS host ("/root/report.pptx"). Fetch each one and
+            # land it in the platform artifact store so the chat renders a
+            # download card instead of a dead path. Best-effort: a failed fetch
+            # logs and skips — it must never fail the turn after a good answer.
+            try:
+                delivered = await _hermes_deliver_files(
+                    provider, ctx, assistant_msg, _meta
+                )
+                if delivered:
+                    existing = list(_meta.get("artifacts") or [])
+                    _meta["artifacts"] = existing + delivered
+                    ctx.extra["spilled_artifacts"] = _meta["artifacts"]
+            except Exception:  # noqa: BLE001 — never fail the turn on delivery
+                logger.warning("hermes file delivery failed", exc_info=True)
         assistant_msg.metadata_ = _meta
         if finish_reason == "budget":
             reason = (
@@ -1194,6 +1210,62 @@ class NativeChatRuntime:
                 await ctx.db.commit()
         except Exception:  # pragma: no cover - status update is best-effort
             logger.warning("failed to set agent_run status=%s", status, exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+async def _hermes_deliver_files(
+    provider: Any,
+    ctx: AgentTurnContext,
+    assistant_msg: Any,
+    meta: dict[str, Any],
+) -> list[str]:
+    """Turn file paths in a Hermes reply into platform artifacts.
+
+    Scans the final assistant text for deliverable absolute paths (extension
+    whitelist + sensitive-directory blacklist live in the provider module),
+    fetches each via ``provider.fetch_file`` (local read or agent round-trip),
+    and stores it with :class:`ArtifactService` owned by the turn's user.
+    Returns the ``artifact:<id>`` handles to append to metadata.artifacts.
+    """
+    from app.providers.hermes import extract_deliverable_paths
+
+    fetch_file = getattr(provider, "fetch_file", None)
+    if not callable(fetch_file):
+        return []
+
+    text = assistant_msg.content or ""
+    paths = extract_deliverable_paths(text)[:5]  # cap: 5 files per turn
+    if not paths:
+        return []
+
+    from app.artifacts.service import ArtifactService
+
+    svc = ArtifactService(ctx.db)
+    handles: list[str] = []
+    for path in paths:
+        try:
+            async with asyncio.timeout(120):
+                data, media_type = await fetch_file(path)
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001 — skip & continue
+            logger.info("hermes deliver: skip %s (%s)", path, exc)
+            continue
+        filename = os.path.basename(path.replace("\\", "/")) or "hermes-file"
+        try:
+            art = await svc.create_from_bytes(
+                owner_id=ctx.user.id,
+                data=data,
+                media_type=media_type,
+                filename=filename,
+                source="generation",
+                run_id=str(ctx.run_id),
+                generator={"origin": "hermes", "path": path},
+            )
+        except Exception as exc:  # noqa: BLE001 — storage failure skips file
+            logger.warning("hermes deliver: store failed for %s (%s)", path, exc)
+            continue
+        handles.append(f"artifact:{art.id}")
+        logger.info("hermes delivered %s as artifact %s (%d bytes)", path, art.id, len(data))
+    return handles
 
 
 # --------------------------------------------------------------------------- #
