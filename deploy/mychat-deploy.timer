@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll origin/main every 2 minutes and auto-deploy MyChat when updated
+
+[Timer]
+# 每 2 分钟轮询一次远端 main（deploy 脚本内部 no-op 快速返回）
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

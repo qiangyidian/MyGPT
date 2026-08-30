@@ -1,0 +1,14 @@
+[Unit]
+Description=MyChat auto-deploy: pull main + build + restart (invoked by timer or manually)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/mychat-deploy.sh
+# 部署本身可以慢（构建+迁移），但要有界
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target
