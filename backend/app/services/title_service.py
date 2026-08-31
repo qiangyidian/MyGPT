@@ -100,7 +100,9 @@ async def _generate_llm_title(
         provider = get_provider_for_config(cfg)
         result = await provider.chat(
             [{"role": "user", "content": build_title_prompt(first_user_message, assistant_prefix)}],
-            ChatOptions(temperature=0.3, max_tokens=48),
+            # Budget must cover reasoning models' thinking blocks — at 48 the
+            # GLM thinking phase consumed everything and text came back empty.
+            ChatOptions(temperature=0.3, max_tokens=512),
         )
         return clean_llm_title(result.content or "")
     except Exception:  # noqa: BLE001 — titling is best-effort, never fatal

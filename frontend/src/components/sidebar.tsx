@@ -9,6 +9,7 @@ import {
   FolderInput,
   FolderPlus,
   LogOut,
+  MessageSquareMore,
   MessageSquarePlus,
   Pin,
   Pencil,
@@ -18,7 +19,7 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { cn, relativeTime } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { withReturnTo } from "@/lib/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -83,6 +84,25 @@ function bucketOf(updatedAt: string): Bucket {
   if (t >= startToday - day) return "yesterday";
   if (t >= startToday - 7 * day) return "week";
   return "older";
+}
+
+// Doubao-style per-conversation pastel bubble icon: hash the stable id into a
+// small palette so each conversation keeps one color across renders/sessions.
+const BUBBLE_COLORS = [
+  "bg-amber-100 text-amber-600",
+  "bg-emerald-100 text-emerald-600",
+  "bg-sky-100 text-sky-600",
+  "bg-rose-100 text-rose-600",
+  "bg-violet-100 text-violet-600",
+  "bg-teal-100 text-teal-600",
+  "bg-orange-100 text-orange-600",
+  "bg-fuchsia-100 text-fuchsia-600",
+];
+
+function bubbleColorOf(id: string): string {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return BUBBLE_COLORS[Math.abs(h) % BUBBLE_COLORS.length];
 }
 
 export function Sidebar({
@@ -175,14 +195,13 @@ export function Sidebar({
     const flatIndex = flatIds.indexOf(conv.id);
     const isActive = activeConversationId === conv.id;
     const isEditing = editingId === conv.id;
-    const subtitle = conv.last_message_preview?.trim() || relativeTime(conv.updated_at);
 
     return (
       <li key={conv.id} className="group relative">
         <button
           type="button"
           className={cn(
-            "flex w-full flex-col gap-0.5 rounded-md px-3 py-2 text-left text-sm transition-colors",
+            "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
             isActive
               ? "bg-background text-foreground shadow-sm"
               : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
@@ -194,6 +213,15 @@ export function Sidebar({
             setEditingValue(conv.title);
           }}
         >
+          {/* Doubao-style pastel bubble avatar, color derived from the id. */}
+          <span
+            className={cn(
+              "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+              bubbleColorOf(conv.id)
+            )}
+          >
+            <MessageSquareMore className="h-3.5 w-3.5" />
+          </span>
           {isEditing ? (
             <Input
               autoFocus
@@ -212,13 +240,10 @@ export function Sidebar({
               className="h-7 text-sm"
             />
           ) : (
-            <span className="flex items-center gap-1 truncate font-medium">
+            <span className="flex min-w-0 flex-1 items-center gap-1 truncate">
               {conv.is_pinned && <Pin className="h-3 w-3 shrink-0 text-muted-foreground" />}
               <span className="truncate">{conv.title || "新对话"}</span>
             </span>
-          )}
-          {!isEditing && (
-            <span className="truncate text-[11px] text-muted-foreground">{subtitle}</span>
           )}
         </button>
 
