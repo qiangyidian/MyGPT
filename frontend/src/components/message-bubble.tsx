@@ -373,10 +373,6 @@ export const MessageBubble = memo(function MessageBubble({
           </button>
         )}
 
-        {!isUser && !isMultiAgent && resolvedSteps && resolvedSteps.length > 0 && (
-          <ResearchSteps steps={resolvedSteps} live={Boolean(isStreaming)} />
-        )}
-
         {/* User attachments */}
         {isUser && attachments.length > 0 && (
           <AttachmentList
@@ -433,6 +429,14 @@ export const MessageBubble = memo(function MessageBubble({
           ) : (
             isStreaming && <AgentInlineStatus />
           )
+        )}
+
+        {/* Live tool steps sit AFTER the streamed text (GPT tool-use style):
+            each batch is sandwiched between the narration before it and the
+            narration that follows — once the next text arrives, the stream
+            layer slices the batch out and the block disappears. */}
+        {!isUser && !isMultiAgent && resolvedSteps && resolvedSteps.length > 0 && (
+          <ResearchSteps steps={resolvedSteps} live={Boolean(isStreaming)} />
         )}
 
         {!isUser && resolvedCitations && resolvedCitations.length > 0 && (

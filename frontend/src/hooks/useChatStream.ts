@@ -51,6 +51,11 @@ export interface ChatStreamState {
   citations: Citation[];
   /** Live agent execution steps (plan / agent / tool / review / approval). */
   steps: AgentStep[];
+  /** Index into `steps` where the CURRENT tool batch begins — i.e. steps
+   *  emitted after the last text token. Slicing `steps` by it yields the
+   *  batch "sandwiched" between the narration so far and the next narration,
+   *  which the UI shows; older batches are considered consumed and hidden. */
+  stepsSinceTextFrom: number;
   /** Pending human-approval requests for dangerous tools in the live run. */
   pendingApprovals: PendingApproval[];
   currentConversationId: string | null;
@@ -107,6 +112,9 @@ export function useChatStream(): ChatStreamState {
   const [streamingText, setStreamingText] = useState("");
   const [citations, setCitations] = useState<Citation[]>([]);
   const [steps, setSteps] = useState<AgentStep[]>([]);
+  // GPT-style sandwiched tool batches: the UI only shows steps emitted after
+  // the last text token (see ChatStreamState.stepsSinceTextFrom).
+  const [stepsSinceTextFrom, setStepsSinceTextFrom] = useState(0);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [currentConversationId, setCurrentConversationId] = useState<
     string | null
@@ -182,6 +190,7 @@ export function useChatStream(): ChatStreamState {
       setStreamingText("");
       setCitations([]);
       setSteps([]);
+      setStepsSinceTextFrom(0);
       setPendingApprovals([]);
       setError(null);
       setStatus("complete");
@@ -492,6 +501,10 @@ export function useChatStream(): ChatStreamState {
         onToken: (delta) => {
           accumulated += delta;
           setStreamingText(accumulated);
+          // Text resuming consumes the batch before it: everything emitted so
+          // far is now "narration history", and the next step starts a fresh
+          // batch to be shown after this text.
+          setStepsSinceTextFrom(accumulatedStepsRef.current.length);
         },
         onCitations: (cits) => {
           // Merge (not replace): KB document citations arrive early, web sources
@@ -750,6 +763,7 @@ export function useChatStream(): ChatStreamState {
     streamingText,
     citations,
     steps,
+    stepsSinceTextFrom,
     pendingApprovals,
     currentConversationId,
     currentRunId,

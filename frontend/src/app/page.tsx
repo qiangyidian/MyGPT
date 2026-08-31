@@ -298,7 +298,11 @@ function ChatPanel({
           streamingText={isThisConvStreaming ? chat.streamingText : undefined}
           isStreaming={isThisConvStreaming}
           streamingCitations={isThisConvStreaming ? chat.citations : undefined}
-          streamingSteps={isThisConvStreaming ? chat.steps : undefined}
+          streamingSteps={
+            isThisConvStreaming
+              ? chat.steps.slice(chat.stepsSinceTextFrom)
+              : undefined
+          }
           canRegenerate={messages.length > 0 && !chat.isStreaming}
           onRegenerate={() => void chat.regenerate()}
           onContinue={() => void chat.continueGeneration()}
