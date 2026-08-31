@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  ChevronDown,
   Check,
   Globe,
   Search,
@@ -124,7 +123,6 @@ function formatSeconds(seconds: number): string {
 const COLLAPSE_MS = 350;
 
 export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
-  const [open, setOpen] = useState(true);
   const [hidden, setHidden] = useState(true);
   const everActiveRef = useRef(false);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -160,7 +158,6 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
 
   if (!steps || steps.length === 0 || hidden) return null;
 
-  const errorCount = steps.filter((s) => s.status === "error").length;
   // Between `active` flipping false and the unmount timer, the panel plays
   // its collapse transition instead of cutting off mid-frame.
   const collapsing = !active;
@@ -174,24 +171,6 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
       )}
     >
       <div className="min-h-0 overflow-hidden">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 py-1 text-left"
-      >
-        <ChevronDown
-          className={cn(
-            "h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
-            open ? "" : "-rotate-90"
-          )}
-        />
-        <span className="shimmer-text text-xs font-medium">正在执行</span>
-        {errorCount > 0 && (
-          <span className="text-xs text-destructive">（{errorCount} 失败）</span>
-        )}
-      </button>
-
-      {open && (
         <ol className="space-y-1.5 pb-1 pl-[3px]">
           {steps.map((step, i) => {
             const Icon = stepIcon(step);
@@ -252,7 +231,6 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
             );
           })}
         </ol>
-      )}
       </div>
     </div>
   );
