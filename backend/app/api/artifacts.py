@@ -87,12 +87,22 @@ async def download_artifact(
         body = await svc.open_stream(artifact_id, user)
     except AppException as exc:
         raise _envelope_status(exc)
-    safe_name = (meta.filename or "artifact").replace('"', "").replace("\r", "").replace("\n", "")
+    # HTTP headers are latin-1 — a CJK filename crashes the response with
+    # UnicodeEncodeError. RFC 5987: ASCII fallback + filename*=UTF-8''percent-
+    # encoded original. Browsers prefer filename*; curl keeps the fallback.
+    from urllib.parse import quote
+
+    raw_name = meta.filename or "artifact"
+    safe_name = raw_name.replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_name = safe_name.encode("latin-1", "replace").decode("latin-1")
     return StreamingResponse(
         body,
         media_type=meta.media_type or "application/octet-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(safe_name)}"
+            ),
             "Cache-Control": "private, no-store",
             "Content-Length": str(meta.size),
         },
