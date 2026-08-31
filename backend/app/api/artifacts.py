@@ -109,6 +109,63 @@ async def download_artifact(
     )
 
 
+@router.get("/{artifact_id}/preview")
+async def preview_artifact(
+    artifact_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """A PDF render of an Office artifact (类飞书在线预览).
+
+    Converts via Gotenberg on first hit and caches the derived PDF as its own
+    artifact; later hits stream the cached bytes. Returns the PDF INLINE (no
+    attachment disposition) so an <iframe> displays it directly. 422 when the
+    format isn't convertible or conversion is unconfigured — the frontend then
+    falls back to the download-only panel.
+    """
+    from urllib.parse import quote
+
+    from app.services.preview_converter import (
+        PreviewUnavailable,
+        get_preview_pdf,
+        is_convertible,
+    )
+
+    svc = ArtifactService(db)
+    try:
+        origin = await svc.get(artifact_id, user)
+    except AppException as exc:
+        raise _envelope_status(exc)
+    if not is_convertible(origin.filename, origin.media_type):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "该格式不支持在线预览，请下载后查看",
+        )
+    try:
+        pdf = await get_preview_pdf(origin)
+    except PreviewUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"预览服务暂不可用：{exc}",
+        )
+    body = await svc.open_stream(pdf.id, user)
+    raw_name = pdf.filename or "preview.pdf"
+    safe_name = raw_name.replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_name = safe_name.encode("latin-1", "replace").decode("latin-1")
+    return StreamingResponse(
+        body,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(safe_name)}"
+            ),
+            "Cache-Control": "private, max-age=3600",
+            "Content-Length": str(pdf.size),
+        },
+    )
+
+
 @router.get("/{artifact_id}/meta")
 async def get_artifact_meta(
     artifact_id: uuid.UUID,

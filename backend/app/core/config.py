@@ -187,6 +187,14 @@ class Settings(BaseSettings):
     # to the existing CrewAI path, so enabling this can never make a turn worse.
     AGENT_WORKFLOW_ENGINE: str = ""
 
+    # ---- Office→PDF preview conversion (类飞书在线预览) ----
+    # Gotenberg server (docker: gotenberg/gotenberg:8) deployed on a SEPARATE
+    # box — this VPS lacks the RAM. Empty string disables the feature and the
+    # preview panel falls back to download-only for Office formats.
+    GOTENBERG_URL: str = ""
+    # Conversion timeout: LibreOffice can take a while on big decks.
+    GOTENBERG_TIMEOUT_S: int = 120
+
     # ---- Chat attachments (Phase 1) ----
     # Broader than KB uploads: includes images for multimodal chat and audio
     # for audio-input models (input_audio parts) / transcription fallback.

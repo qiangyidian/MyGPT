@@ -42,10 +42,22 @@ function isTextPreview(meta: ArtifactMeta): boolean {
   return TEXT_PREVIEW_EXT.has(ext);
 }
 
-function previewKind(meta: ArtifactMeta): "pdf" | "image" | "text" | "none" {
+const OFFICE_PREVIEW_EXT = new Set([
+  "pptx", "ppt", "docx", "doc", "xlsx", "xls", "odt", "ods", "odp",
+]);
+
+function isOfficePreview(meta: ArtifactMeta): boolean {
+  if (meta.media_type === "application/pdf") return false;
+  if (meta.media_type.startsWith("text/")) return false;
+  const ext = (meta.filename ?? "").split(".").pop()?.toLowerCase() ?? "";
+  return OFFICE_PREVIEW_EXT.has(ext);
+}
+
+function previewKind(meta: ArtifactMeta): "pdf" | "image" | "text" | "office" | "none" {
   if (meta.media_type === "application/pdf") return "pdf";
   if (meta.media_type.startsWith("image/")) return "image";
   if (isTextPreview(meta)) return "text";
+  if (isOfficePreview(meta)) return "office";
   return "none";
 }
 
@@ -75,11 +87,21 @@ export function ArtifactPreviewPanel() {
         const m = await artifactsApi.getMeta(artifactId);
         if (cancelled) return;
         setMeta(m);
-        const blob = await artifactsApi.download(artifactId);
-        if (cancelled) return;
-        if (previewKind(m) === "text") {
+        const kind = previewKind(m);
+        if (kind === "office") {
+          // Office formats: server converts to PDF (cached); 4xx/5xx falls
+          // back to the download-only panel below via previewFailed.
+          const blob = await artifactsApi.preview(artifactId);
+          if (cancelled) return;
+          createdUrl = URL.createObjectURL(blob);
+          setObjectUrl(createdUrl);
+        } else if (kind === "text") {
+          const blob = await artifactsApi.download(artifactId);
+          if (cancelled) return;
           setTextContent(await blob.text());
         } else {
+          const blob = await artifactsApi.download(artifactId);
+          if (cancelled) return;
           createdUrl = URL.createObjectURL(blob);
           setObjectUrl(createdUrl);
         }
@@ -149,15 +171,20 @@ export function ArtifactPreviewPanel() {
             </div>
           )}
           {!loading && error && (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-sm text-muted-foreground">
+            <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-sm text-muted-foreground">
               <FileQuestion className="h-8 w-8" />
               {error}
+              {meta && (
+                <Button size="sm" className="gap-1.5" onClick={() => void handleDownload()}>
+                  <Download className="h-4 w-4" /> 下载 {meta.filename}
+                </Button>
+              )}
             </div>
           )}
-          {!loading && !error && meta && kind === "pdf" && objectUrl && (
+          {!loading && !error && meta && (kind === "pdf" || kind === "office") && objectUrl && (
             <iframe
               src={objectUrl}
-              title={meta.filename ?? "PDF 预览"}
+              title={meta.filename ?? "文件预览"}
               className="h-full w-full border-0 bg-white"
             />
           )}

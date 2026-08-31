@@ -394,6 +394,20 @@ export const artifactsApi = {
   /** Lightweight metadata (filename/size/media type) — no bytes transferred. */
   getMeta: (id: string) =>
     request<ArtifactMeta>("GET", `/api/artifacts/${id}/meta`),
+  /**
+   * Server-converted PDF render of an Office artifact (类飞书预览). First
+   * call converts via Gotenberg (slow); subsequent calls stream the cached
+   * derived PDF. Same auth path as download.
+   */
+  preview: async (id: string): Promise<Blob> => {
+    const res = await request<Response>(
+      "GET",
+      `/api/artifacts/${id}/preview`,
+      undefined,
+      { raw: true },
+    );
+    return res.blob();
+  },
   delete: (id: string) => request("DELETE", `/api/artifacts/${id}`),
 };
 

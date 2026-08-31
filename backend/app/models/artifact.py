@@ -35,8 +35,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
 from app.models._mixins import TimestampMixin
 
-# Allowed provenance sources.
-SOURCES = {"tool_output", "spill", "upload", "generation"}
+# Allowed provenance sources. "preview" marks a DERIVED artifact (e.g. the
+# Office→PDF conversion backing in-chat preview) linked to its origin via
+# generator.preview_of.
+SOURCES = {"tool_output", "spill", "upload", "generation", "preview"}
 
 
 class Artifact(Base, TimestampMixin):
