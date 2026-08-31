@@ -174,9 +174,7 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
 
   if (!steps || steps.length === 0 || hidden) return null;
 
-  const doneCount = steps.filter((s) => s.status === "done").length;
   const errorCount = steps.filter((s) => s.status === "error").length;
-  const pendingCount = Math.max(steps.length - doneCount - errorCount, 0);
   // Between `active` flipping false and the unmount timer, the panel plays
   // its collapse transition instead of cutting off mid-frame.
   const collapsing = !active;
@@ -201,15 +199,9 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
           )}
         />
         <span className="shimmer-text text-xs font-medium">正在执行</span>
-        <span className="text-xs text-muted-foreground">
-          · {steps.length} 步
-          {errorCount > 0 && (
-            <span className="ml-1.5 text-destructive">（{errorCount} 失败）</span>
-          )}
-        </span>
-        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
-          {pendingCount > 0 ? `${pendingCount} 项进行中` : "进行中"}
-        </span>
+        {errorCount > 0 && (
+          <span className="text-xs text-destructive">（{errorCount} 失败）</span>
+        )}
       </button>
 
       {open && (
