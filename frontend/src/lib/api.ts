@@ -503,51 +503,28 @@ export interface ChatStreamHandlers {
   onError?: (e: { code: string; message: string }) => void;
 }
 
-export async function streamChat(
-  req: ChatRequest,
+/**
+ * Dispatch one chat SSE event to the handlers. Returns true when the event is
+ * terminal (done/error) so the caller can stop consuming the stream.
+ *
+ * Exported (not private to streamChat) so the durable reattach path can feed
+ * events from the agent-runs event log through the EXACT same mapping — the
+ * worker persists AgentEvent.kind, which IS the SSE event name.
+ */
+export function dispatchChatStreamEvent(
   handlers: ChatStreamHandlers,
-  signal?: AbortSignal,
-  /** internal: bounds the 401 → refresh → retry path to a single attempt. */
-  _attempt = 0
-): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/chat/stream`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(getAccessToken() ? { Authorization: `Bearer ${getAccessToken()}` } : {}),
-    },
-    credentials: "include",
-    body: JSON.stringify(req),
-    signal,
-  });
-
-  if (!res.ok || !res.body) {
-    let message = res.statusText;
-    try {
-      const d = await res.json();
-      message = d.message || d.detail || message;
-    } catch { /* ignore */ }
-    // Retry once after a refresh; never recurse unbounded (a refresh that
-    // returns ok while the endpoint still 401s would otherwise stack-overflow).
-    if (res.status === 401 && _attempt < 1) {
-      const ok = await refreshAccessToken();
-      if (ok) return streamChat(req, handlers, signal, _attempt + 1);
-    }
-    handlers.onError?.({ code: "http_error", message });
-    return;
+  eventName: string,
+  dataStr: string
+): boolean {
+  if (!dataStr) return false;
+  let data: any;
+  try {
+    data = JSON.parse(dataStr);
+  } catch {
+    return false; // malformed JSON payload — drop this one event only
   }
-
-  let terminated = false;
-  const dispatch = (eventName: string, dataStr: string) => {
-    if (!dataStr) return;
-    let data: any;
-    try {
-      data = JSON.parse(dataStr);
-    } catch {
-      return; // malformed JSON payload — drop this one event only
-    }
-    try {
-      switch (eventName) {
+  try {
+    switch (eventName) {
         case "meta":
           handlers.onMeta?.(data.conversation_id, data.message_id);
           break;
@@ -669,19 +646,83 @@ export async function streamChat(
           handlers.onRunResumed?.({ runId: data.run_id, resumedAt: data.resumed_at });
           break;
         case "done":
-          terminated = true;
           handlers.onDone?.({ messageId: data.message_id, finishReason: data.finish_reason });
           break;
         case "error":
-          terminated = true;
           handlers.onError?.(data);
           break;
       }
-    } catch (err) {
-      // Surface handler bugs to the console instead of silently masking them as
-      // a "malformed chunk"; the stream continues past a single bad event.
-      console.error("[streamChat] handler error for event", eventName, err);
+  } catch (err) {
+    // Surface handler bugs to the console instead of silently masking them as
+    // a "malformed chunk"; the stream continues past a single bad event.
+    console.error("[streamChat] handler error for event", eventName, err);
+  }
+  return eventName === "done" || eventName === "error";
+}
+
+export interface ActiveConversationRun {
+  runId: string;
+  messageId: string | null;
+  status: string;
+}
+
+/**
+ * Latest non-terminal (pending/running) durable run for a conversation — the
+ * reattach probe on conversation open / browser refresh. Runs survive client
+ * disconnects when BACKGROUND_WORKER is enabled server-side.
+ */
+export async function findActiveConversationRun(
+  conversationId: string
+): Promise<ActiveConversationRun | null> {
+  try {
+    const runs = await request<
+      Array<{ id: string; message_id: string | null; status: string }>
+    >("GET", `/api/agent-runs?conversation_id=${encodeURIComponent(conversationId)}`);
+    const active = runs.find((r) => r.status === "running" || r.status === "pending");
+    if (!active) return null;
+    return { runId: active.id, messageId: active.message_id, status: active.status };
+  } catch {
+    return null;
+  }
+}
+
+export async function streamChat(
+  req: ChatRequest,
+  handlers: ChatStreamHandlers,
+  signal?: AbortSignal,
+  /** internal: bounds the 401 → refresh → retry path to a single attempt. */
+  _attempt = 0
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/chat/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(getAccessToken() ? { Authorization: `Bearer ${getAccessToken()}` } : {}),
+    },
+    credentials: "include",
+    body: JSON.stringify(req),
+    signal,
+  });
+
+  if (!res.ok || !res.body) {
+    let message = res.statusText;
+    try {
+      const d = await res.json();
+      message = d.message || d.detail || message;
+    } catch { /* ignore */ }
+    // Retry once after a refresh; never recurse unbounded (a refresh that
+    // returns ok while the endpoint still 401s would otherwise stack-overflow).
+    if (res.status === 401 && _attempt < 1) {
+      const ok = await refreshAccessToken();
+      if (ok) return streamChat(req, handlers, signal, _attempt + 1);
     }
+    handlers.onError?.({ code: "http_error", message });
+    return;
+  }
+
+  let terminated = false;
+  const dispatch = (eventName: string, dataStr: string) => {
+    if (dispatchChatStreamEvent(handlers, eventName, dataStr)) terminated = true;
   };
 
   // Robust SSE framing: the parser keeps its buffer/event/data accumulators

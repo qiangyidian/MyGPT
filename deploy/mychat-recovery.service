@@ -1,0 +1,16 @@
+[Unit]
+Description=MyChat run recovery scheduler (requeues lease-expired runs)
+After=network-online.target postgresql.service redis-server.service mychat-worker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/MyGPT/backend
+EnvironmentFile=/root/MyGPT/.env
+ExecStart=/opt/mychat-venv/bin/python -m app.recovery
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

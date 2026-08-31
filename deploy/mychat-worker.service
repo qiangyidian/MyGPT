@@ -1,0 +1,18 @@
+[Unit]
+Description=MyChat durable run worker (executes agent runs off the SSE path)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/MyGPT/backend
+EnvironmentFile=/root/MyGPT/.env
+ExecStart=/opt/mychat-venv/bin/python -m app.worker
+Restart=always
+RestartSec=5
+# 回合执行可以很慢（LLM + 工具），stop 给足排空时间
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

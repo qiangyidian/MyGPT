@@ -156,6 +156,16 @@ function ChatPanel({
     if (detail.data && !chat.isStreaming) chat.rebuildLastSend(activeConversationId);
   }, [detail.data, chat.isStreaming, activeConversationId]);
 
+  // Durable runs: on conversation open / browser refresh, adopt a run that is
+  // still executing server-side and resume its live view (no-op otherwise).
+  // Deliberately NOT keyed on chat.reattach — its identity churns per render
+  // (factory dep), which would probe the API on every keystroke.
+  useEffect(() => {
+    if (!activeConversationId || chat.isStreaming) return;
+    void chat.reattach(activeConversationId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationId, chat.isStreaming]);
+
   // ---- Context Panel auto-open rules (respect per-run suppression) ----
   // Waiting on a dangerous-tool approval -> open Execution.
   useEffect(() => {
