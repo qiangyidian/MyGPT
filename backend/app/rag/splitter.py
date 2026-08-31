@@ -7,6 +7,7 @@ mid-sentence more than necessary.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 import tiktoken
@@ -15,7 +16,21 @@ from app.core.config import get_settings
 from app.rag.base import TextSplitter
 
 # Cheap separators, tried in order of preference (most natural first).
-_SEPARATORS: tuple[str, ...] = ("\n\n\n", "\n\n", "\n", ". ", "。", " ", "")
+# Markdown headings split FIRST so each section becomes its own chunk even
+# when the whole document fits in one chunk_size — retrieval needs topical
+# granularity, not just size capping.
+_SEPARATORS: tuple[str, ...] = (
+    "\n\n\n",
+    "\n# ",      # markdown h1
+    "\n## ",     # markdown h2
+    "\n### ",    # markdown h3
+    "\n\n",
+    "\n",
+    ". ",
+    "。",
+    " ",
+    "",
+)
 
 
 def _count_tokens(text: str, model: str) -> int:
@@ -57,15 +72,52 @@ class RecursiveTextSplitter(TextSplitter):
     def split(self, text: str) -> list[str]:
         if not text or not text.strip():
             return []
-        # Fast path: already small enough.
-        if self.count_tokens(text) <= self.chunk_size:
-            return [text.strip()]
-
+        # Markdown sections are TOPICAL units: split each heading section into
+        # its own chunk even when the whole file would fit in one chunk_size.
+        # A small mixed-topic file as a single chunk defeats retrieval — a hit
+        # returns every topic at once and scores blur across sections.
+        # Overlap is applied WITHIN a section's sub-chunks only: consecutive
+        # sections are different topics, so gluing their text together via
+        # overlap would only blur the vectors again.
+        sections = self._split_markdown_sections(text)
+        if sections:
+            out: list[str] = []
+            for sec in sections:
+                parts = self._split_oversized(sec)
+                if self.chunk_overlap and len(parts) > 1:
+                    parts = self._apply_overlap(parts)
+                out.extend(parts)
+            return [c for c in out if c and c.strip()]
+        # Plain text: structural boundaries (paragraph → sentence → word).
         chunks: list[str] = []
         self._split_text(text, _SEPARATORS, chunks)
-        # Apply overlap between consecutive chunks for context continuity.
         if self.chunk_overlap and len(chunks) > 1:
             chunks = self._apply_overlap(chunks)
+        return [c for c in chunks if c and c.strip()]
+
+    _HEADING_RE = re.compile(r"(?m)^#{1,6}\s+.+$")
+
+    def _split_markdown_sections(self, text: str) -> list[str]:
+        """Split into per-heading sections. Empty when there are < 2 headings
+        (a single heading adds no topical structure worth splitting on)."""
+        matches = list(self._HEADING_RE.finditer(text))
+        if len(matches) < 2:
+            return []
+        sections: list[str] = []
+        # Preamble before the first heading (if any).
+        if matches[0].start() > 0 and text[: matches[0].start()].strip():
+            sections.append(text[: matches[0].start()].strip())
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            sections.append(text[m.start():end].strip())
+        return [s for s in sections if s]
+
+    def _split_oversized(self, text: str) -> list[str]:
+        """Chunk one section further only when it exceeds chunk_size."""
+        if self.count_tokens(text) <= self.chunk_size:
+            return [text]
+        chunks: list[str] = []
+        self._split_text(text, _SEPARATORS, chunks)
         return [c for c in chunks if c and c.strip()]
 
     def _split_text(self, text: str, separators: tuple[str, ...], out: list[str]) -> None:

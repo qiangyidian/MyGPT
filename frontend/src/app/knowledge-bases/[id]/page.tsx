@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { RefreshCw, Trash2, Upload, Search } from "lucide-react";
+import { RefreshCw, Trash2, Upload, Search, Eye } from "lucide-react";
 
 import { api, ApiError } from "@/lib/api";
 import type { Citation, DocFile } from "@/lib/types";
@@ -12,6 +12,7 @@ import { formatBytes } from "@/lib/utils";
 import { resolveChatHome, withReturnTo } from "@/lib/navigation";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { AppPageShell } from "@/components/navigation/app-page-shell";
+import { DocumentPreviewDialog } from "@/components/kb/document-preview-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -93,6 +94,9 @@ function KbDetailContent() {
     onError: (e: ApiError) => toast.error(e.message),
   });
 
+  // Online document preview
+  const [previewId, setPreviewId] = useState<string | null>(null);
+
   const kbName = kb?.name ?? "知识库";
   const listHref = withReturnTo("/knowledge-bases", returnTo);
 
@@ -155,7 +159,14 @@ function KbDetailContent() {
               docs.map((d) => (
                 <tr key={d.id} className="border-t border-border">
                   <td className="p-3">
-                    <div className="font-medium">{d.filename}</div>
+                    <button
+                      type="button"
+                      className="max-w-[22rem] truncate text-left font-medium hover:underline"
+                      onClick={() => setPreviewId(d.id)}
+                      title="点击预览"
+                    >
+                      {d.filename}
+                    </button>
                     {d.error_message && (
                       <div className="text-xs text-destructive">{d.error_message}</div>
                     )}
@@ -170,6 +181,15 @@ function KbDetailContent() {
                   <td className="hidden p-3 text-muted-foreground sm:table-cell">{d.chunk_count}</td>
                   <td className="p-3">
                     <div className="flex justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setPreviewId(d.id)}
+                        aria-label={`预览 ${d.filename}`}
+                        title="在线预览"
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="sm"
@@ -235,6 +255,8 @@ function KbDetailContent() {
           </div>
         )}
       </div>
+
+      <DocumentPreviewDialog documentId={previewId} onClose={() => setPreviewId(null)} />
     </AppPageShell>
   );
 }

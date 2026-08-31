@@ -13,6 +13,7 @@ import {
   Conversation,
   ConversationDetail,
   DocFile,
+  DocumentPreview,
   KnowledgeBase,
   MessageFeedback,
   MessageFeedbackRating,
@@ -273,6 +274,7 @@ export const api = {
   },
   deleteDocument: (id: string) => request("DELETE", `/api/documents/${id}`),
   reindexDocument: (id: string) => request<{ document_id: string; status: string; chunk_count: number }>("POST", `/api/documents/${id}/reindex`),
+  previewDocument: (id: string) => request<DocumentPreview>("GET", `/api/documents/${id}/preview`),
 
   // ---- Retrieval ----
   searchKnowledgeBase: (kbId: string, query: string, topK = 5) =>

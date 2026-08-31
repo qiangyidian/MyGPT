@@ -30,6 +30,11 @@ from typing import AsyncIterator
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["ENV"] = "test"
 os.environ["AUTO_CREATE_TABLES"] = "false"
+# Tests exercise the INLINE executor; durable dispatch has its own dedicated
+# suites. Pinning this also isolates tests from a production .env that sets
+# BACKGROUND_WORKER=redis (the chat API would otherwise route test traffic
+# to a worker that doesn't exist in the test process).
+os.environ["BACKGROUND_WORKER"] = "inprocess"
 # Redis is not available in tests -> auth_service degrades to in-memory set.
 os.environ["REDIS_URL"] = "redis://localhost:6399/0"
 # CrewAI (Phase 1+) uses an internal memory cache + telemetry that try to talk

@@ -68,17 +68,20 @@ def _parse_txt(path: str, _ext: str) -> ParsedDocument:
 
 
 def _parse_markdown(path: str, _ext: str) -> ParsedDocument:
-    """Render Markdown to plain text (strip HTML tags from the rendered HTML)."""
-    try:
-        import markdown as md  # type: ignore
-        from bs4 import BeautifulSoup  # type: ignore
-    except Exception:
-        # Without the libs, fall back to raw text — still usable for chunking.
-        return _parse_txt(path, _ext)
+    """Keep Markdown source as-is.
+
+    Rendering to HTML then stripping tags destroyed the heading structure
+    (``## 标题`` became bare text), which defeated the splitter's per-section
+    chunking — a multi-topic .md collapsed into one mixed chunk. The raw
+    source IS the best chunking input: headings survive, prose is unchanged,
+    and models read Markdown natively anyway.
+    """
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        html = md.markdown(fh.read())
-    text = BeautifulSoup(html, "html.parser").get_text(separator="\n")
-    return ParsedDocument(text=text, metadata={"parser_used": "markdown", "chars": len(text)})
+        text = fh.read()
+    return ParsedDocument(
+        text=text,
+        metadata={"parser_used": "markdown-raw", "chars": len(text)},
+    )
 
 
 # ---------------------------------------------------------------------------

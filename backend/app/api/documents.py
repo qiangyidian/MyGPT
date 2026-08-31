@@ -7,6 +7,7 @@ document's knowledge base.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 
@@ -18,7 +19,7 @@ from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
 from app.db import AsyncSessionLocal, get_db
 from app.models import Document, KnowledgeBase, User
-from app.schemas import DocumentOut, ReindexResult
+from app.schemas import DocumentOut, DocumentPreview, ReindexResult
 from app.services import document_service
 
 router = APIRouter(prefix="/api", tags=["documents"])
@@ -118,3 +119,49 @@ async def reindex_document(
     await db.commit()
     background_tasks.add_task(_index_background, document_id)
     return ReindexResult(document_id=doc.id, status="pending", chunk_count=doc.chunk_count)
+
+
+# Extensions whose parsed text is (or likely is) Markdown source — render the
+# preview with the Markdown renderer instead of a <pre> block.
+_MD_LIKE_EXTS = {".md", ".markdown", ".mdx"}
+
+# Hard cap so a pathological upload can't blow up the JSON response.
+_PREVIEW_MAX_CHARS = 500_000
+
+
+@router.get("/documents/{document_id}/preview", response_model=DocumentPreview)
+async def preview_document(
+    document_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentPreview:
+    """Online preview: the parsed full text of an ingested document.
+
+    Reuses the SAME ingestion parser (pdf/docx/md/txt/…), so what the user
+    previews is exactly what was chunked + embedded. The original file must
+    still exist on disk; a missing file 404s instead of returning stale text.
+    """
+    from app.rag.parsers import default_parser
+
+    doc = await _load_owned_doc(db, document_id, user)
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(NOT_FOUND, "原始文件不存在或已被清理，无法预览")
+    try:
+        parsed = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
+    except ValueError as exc:
+        raise HTTPException(BAD, f"该格式暂不支持预览: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 — parser failures are user-facing
+        raise HTTPException(500, f"解析失败: {exc}") from exc
+
+    text = parsed.text or ""
+    truncated = len(text) > _PREVIEW_MAX_CHARS
+    content = text[:_PREVIEW_MAX_CHARS]
+    render_as = "markdown" if doc.file_type.lower() in _MD_LIKE_EXTS else "text"
+    return DocumentPreview(
+        document_id=doc.id,
+        filename=doc.filename,
+        file_type=doc.file_type,
+        render_as=render_as,
+        chars=len(content),
+        content=content + ("\n\n…（内容过长，已截断）" if truncated else ""),
+    )

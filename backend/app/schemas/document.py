@@ -25,3 +25,17 @@ class ReindexResult(BaseModel):
     document_id: uuid.UUID
     status: str
     chunk_count: int = 0
+
+
+class DocumentPreview(BaseModel):
+    """Online preview payload: the parsed full text of a document.
+
+    ``render_as`` tells the client how to present the text: markdown source
+    (rendered), or plain text (preformatted).
+    """
+    document_id: uuid.UUID
+    filename: str
+    file_type: str
+    render_as: str            # "markdown" | "text"
+    chars: int
+    content: str

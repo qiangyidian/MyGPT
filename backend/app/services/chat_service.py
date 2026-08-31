@@ -1812,6 +1812,10 @@ class ChatService:
                 "knowledge_base_id": (
                     str(request.knowledge_base_id) if request.knowledge_base_id else None
                 ),
+                # Per-turn KB selection (multi-KB) so the worker-side turn can
+                # run RAG — without this the durable path always saw no KB.
+                "knowledge_base_ids": [str(k) for k in (request.knowledge_base_ids or [])],
+                "mode": request.mode or "speed",
             },
             model_config_snapshot=snapshot,
         )
@@ -1968,16 +1972,66 @@ async def run_durable_turn(
         execution_mode = ExecutionMode.auto
     agent_profile = run_input.get("agent_profile") or "general"
 
+    # ---- Knowledge bases (per-turn selection persisted on the run) ----
+    # Same precedence as the inline ``_run``: explicit multi-select, else the
+    # legacy single id, else the conversation's bound KB. Ownership-checked
+    # against the requesting user so a forged run.input can't read another
+    # user's knowledge bases.
+    kb_ids: list[uuid.UUID] = []
+    for raw in run_input.get("knowledge_base_ids") or []:
+        try:
+            kb_ids.append(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not kb_ids and run_input.get("knowledge_base_id"):
+        try:
+            kb_ids.append(uuid.UUID(str(run_input["knowledge_base_id"])))
+        except (TypeError, ValueError):
+            pass
+    if not kb_ids and conversation.knowledge_base_id is not None:
+        kb_ids = [conversation.knowledge_base_id]
+    kb_ids = [
+        kb_id
+        for kb_id in kb_ids
+        if (_kb := await db.get(KnowledgeBase, kb_id)) is not None
+        and _kb.user_id == user.id
+    ]
+
     # Derive a native single-agent route. Durable execution is additive and
     # currently scoped to native turns; the route's ``use_multi_agent=False``
     # guarantees the orchestrator selects the native runtime.
     route = decide_route(
-        "speed",
-        has_knowledge_base=False,
+        run_input.get("mode") or "speed",
+        has_knowledge_base=bool(kb_ids),
         has_attachment=False,
         user_content=user_content,
     )
     route = replace(route, use_multi_agent=False)
+
+    # ---- RAG retrieval (mirrors the inline path) ----
+    # Best-effort: a retrieval failure degrades to a normal answer, never
+    # kills the turn. Casual chit-chat skips retrieval so a KB bound to the
+    # conversation doesn't leak into greetings.
+    citations: list[Citation] = []
+    rag_context = ""
+    if not kb_ids:
+        rag_skipped_reason = "no_knowledge_base"
+    elif get_settings().RAG_SKIP_CASUAL and is_casual_question(user_content):
+        rag_skipped_reason = "casual_question"
+    else:
+        rag_skipped_reason = None
+        try:
+            rag_context, citations = await rag_service.retrieve(
+                db, user_content, kb_ids, top_k=5
+            )
+        except Exception as exc:  # noqa: BLE001 — RAG is best-effort
+            logger.warning("durable RAG retrieval failed, continuing without context: %s", exc)
+            rag_context, citations = "", []
+            rag_skipped_reason = "retrieval_error"
+    logger.info(
+        "rag_decision(durable) rag_used=%s rag_skipped_reason=%s kb_count=%d citation_count=%d",
+        bool(rag_context), rag_skipped_reason, len(kb_ids), len(citations),
+    )
 
     # Rebuild the system prompt + trimmed history using the shared helpers.
     # Task 7: route the durable path through the SAME ContextManager assembly
@@ -1986,10 +2040,10 @@ async def run_durable_turn(
     # re-hydration), matching the prior behavior.
     history = await _load_history(db, conversation.id)
     _active_user_memories = await _load_active_user_memories(db, user.id)
-    system_prompt = _build_system_prompt(conversation, rag_context="")
+    system_prompt = _build_system_prompt(conversation, rag_context=rag_context)
     system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
         base=system_prompt,
-        rag_context="",
+        rag_context="",  # already folded into base by _build_system_prompt
         summary="",
         goal="",
         memories=_active_user_memories,
@@ -2016,14 +2070,14 @@ async def run_durable_turn(
         user_content=user_content,
         system_prompt=system_prompt,
         messages=messages,
-        rag_context="",
-        citations=[],
+        rag_context=rag_context,
+        citations=citations,
         assistant_msg=assistant_msg,
         run_id=run.id,
         execution_mode=execution_mode,
         agent_profile=agent_profile,
         enable_tools=enable_tools,
-        knowledge_base_id=None,
+        knowledge_base_id=kb_ids[0] if kb_ids else None,
         mode=route.mode,
         extra={
             "state": ConversationFlowState(
@@ -2040,6 +2094,13 @@ async def run_durable_turn(
 
     turn_started = time.monotonic()
     try:
+        # Surface retrieval citations BEFORE the first token (same as the
+        # inline path) so the client can render source chips with the answer.
+        if citations:
+            yield AgentEvent(
+                kind="citations",
+                data={"citations": [c.model_dump(mode="json") for c in citations]},
+            )
         async for evt in chat_orchestrator.stream(ctx):
             # M5: the durable worker already appended ``run.started`` (dotted,
             # Task-4 scheme) when it acquired the lease. Suppress the
@@ -2050,7 +2111,7 @@ async def run_durable_turn(
             if evt.kind == "done":
                 finish = evt.data.get("finish_reason", "stop")
                 assistant_msg.metadata_ = ChatService._meta(
-                    cfg, [], finish, assistant_msg.metadata_
+                    cfg, citations, finish, assistant_msg.metadata_
                 )
                 # Drop live tool_calls trace (same rationale as the inline path).
                 assistant_msg.metadata_.pop("tool_calls", None)

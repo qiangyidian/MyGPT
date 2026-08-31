@@ -54,7 +54,7 @@ from app.schemas.conversation import (
     ConversationOut,
     ConversationUpdate,
 )
-from app.schemas.document import DocumentOut, ReindexResult
+from app.schemas.document import DocumentOut, DocumentPreview, ReindexResult
 from app.schemas.feedback import MessageFeedbackOut, MessageFeedbackRequest
 from app.schemas.knowledge_base import (
     KnowledgeBaseCreate,
@@ -118,7 +118,7 @@ __all__ = [
     "ProviderManifestOut",
     # knowledge base / documents
     "KnowledgeBaseCreate", "KnowledgeBaseUpdate", "KnowledgeBaseOut",
-    "DocumentOut", "ReindexResult",
+    "DocumentOut", "DocumentPreview", "ReindexResult",
     # tools
     "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult", "ToolCallOut",
     # admin

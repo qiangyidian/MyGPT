@@ -295,6 +295,16 @@ export interface DocFile {
   updated_at: string;
 }
 
+/** GET /api/documents/{id}/preview — parsed full text for online preview. */
+export interface DocumentPreview {
+  document_id: string;
+  filename: string;
+  file_type: string;
+  render_as: "markdown" | "text";
+  chars: number;
+  content: string;
+}
+
 export interface ToolInfo {
   name: string;
   description: string;
