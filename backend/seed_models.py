@@ -63,8 +63,8 @@ async def main() -> None:
                         model_name=m["model_name"],
                         supports_stream=True,
                         supports_tools=True,
-                        max_context_tokens=32768,
-                        max_tokens=2048,
+                        max_context_tokens=131072,
+                        max_tokens=8192,
                         temperature=0.7,
                         top_p=1.0,
                     )

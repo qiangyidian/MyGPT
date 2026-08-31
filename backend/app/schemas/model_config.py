@@ -28,8 +28,8 @@ class ModelConfigBase(BaseModel):
     supports_structured_output: bool = False
     supports_reasoning_effort: bool = False
     output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
-    max_context_tokens: int = Field(default=8192, gt=0)
-    max_tokens: int = Field(default=1024, gt=0)
+    max_context_tokens: int = Field(default=131072, gt=0)
+    max_tokens: int = Field(default=8192, gt=0)
     temperature: float = Field(default=0.7, ge=0, le=2, allow_inf_nan=False)
     top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     is_embedding: bool = False

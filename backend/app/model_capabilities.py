@@ -7,8 +7,8 @@ from typing import Any, Literal
 
 OutputTokenParameter = Literal["max_tokens", "max_completion_tokens"]
 
-_DEFAULT_CONTEXT_WINDOW = 8192
-_DEFAULT_MAX_OUTPUT_TOKENS = 1024
+_DEFAULT_CONTEXT_WINDOW = 131072
+_DEFAULT_MAX_OUTPUT_TOKENS = 8192
 _OUTPUT_TOKEN_PARAMETERS = {"max_tokens", "max_completion_tokens"}
 
 

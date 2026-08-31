@@ -56,10 +56,10 @@ const EMPTY: ModelConfigInput = {
   is_embedding: false,
   temperature: 0.7,
   top_p: 1,
-  // A code-capable chat model needs headroom for long answers; the backend now
-  // honors this configured value (it used to hard-cap the writer at 1024).
-  max_tokens: 4096,
-  max_context_tokens: 8192,
+  // A code-capable chat model needs headroom for long answers; a small
+  // max_tokens shows the "输出达到长度上限" truncation banner on long agent runs.
+  max_tokens: 8192,
+  max_context_tokens: 131072,
 };
 
 export default function ModelsPage() {
