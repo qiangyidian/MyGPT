@@ -48,6 +48,11 @@ export class ApiError extends Error {
   }
 }
 
+// These endpoints answer 401 with *credential* errors ("Invalid email or
+// password"), not session expiry — running the refresh dance on them would
+// mask the real message behind "会话已过期", so they bypass the retry below.
+const CREDENTIAL_AUTH_PATHS = new Set(["/api/auth/login", "/api/auth/register"]);
+
 let refreshing: Promise<boolean> | null = null;
 
 async function refreshAccessToken(): Promise<boolean> {
@@ -105,7 +110,7 @@ async function request<T>(
 
   let res = await doFetch(getAccessToken());
 
-  if (res.status === 401) {
+  if (res.status === 401 && !CREDENTIAL_AUTH_PATHS.has(path)) {
     const ok = await refreshAccessToken();
     if (ok) res = await doFetch(getAccessToken());
     else {

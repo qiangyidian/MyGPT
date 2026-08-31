@@ -292,8 +292,16 @@ function ErrorBox({ message }: { message: string }) {
   );
 }
 
+// Backend auth errors arrive in English; map the common ones to Chinese so the
+// form reads consistently (unknown messages fall through untouched).
+const AUTH_ERROR_ZH: Record<string, string> = {
+  "Invalid email or password": "邮箱或密码错误",
+  "Account disabled": "账号已被禁用",
+  "Email or username already registered": "邮箱或用户名已被注册",
+};
+
 function toMessage(err: unknown): string {
-  if (err instanceof ApiError) return err.message;
+  if (err instanceof ApiError) return AUTH_ERROR_ZH[err.message] ?? err.message;
   if (err instanceof Error) return err.message;
   return "操作失败，请稍后重试";
 }
