@@ -374,7 +374,7 @@ export const MessageBubble = memo(function MessageBubble({
         )}
 
         {!isUser && !isMultiAgent && resolvedSteps && resolvedSteps.length > 0 && (
-          <ResearchSteps steps={resolvedSteps} />
+          <ResearchSteps steps={resolvedSteps} live={Boolean(isStreaming)} />
         )}
 
         {/* User attachments */}

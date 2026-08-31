@@ -118,6 +118,39 @@
   50% { box-shadow: 0 0 0 4px hsl(var(--primary) / 0.12); }
 }
 
+/* ------------------------------------------------------------------ */
+/* GPT-reasoning-style shimmer for in-flight agent step labels: a soft */
+/* highlight band sweeps across otherwise muted text. New step rows    */
+/* fade in as they stream in.                                          */
+/* ------------------------------------------------------------------ */
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted-foreground) / 0.85) 0%,
+    hsl(var(--muted-foreground) / 0.85) 35%,
+    hsl(var(--foreground)) 50%,
+    hsl(var(--muted-foreground) / 0.85) 65%,
+    hsl(var(--muted-foreground) / 0.85) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: text-shimmer 2.2s linear infinite;
+}
+@keyframes text-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+.step-row-in {
+  animation: step-row-in 0.25s ease-out both;
+}
+@keyframes step-row-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .agent-edge-active,
   .agent-node-running {
@@ -131,6 +164,16 @@
   .animate-ping,
   .animate-bounce,
   .msg-streaming > :last-child::after {
+    animation: none !important;
+  }
+  /* Shimmer degrades to plain muted text (background-clip needs the
+     animation to look right; a frozen gradient reads as a rendering bug). */
+  .shimmer-text {
+    animation: none !important;
+    background: none;
+    color: hsl(var(--muted-foreground));
+  }
+  .step-row-in {
     animation: none !important;
   }
 }

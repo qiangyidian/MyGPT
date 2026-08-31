@@ -5,7 +5,6 @@ import {
   ChevronDown,
   Check,
   Globe,
-  Loader2,
   Search,
   Terminal,
   AlertCircle,
@@ -22,8 +21,10 @@ import type { AgentStep } from "@/lib/types";
 
 interface ResearchStepsProps {
   steps: AgentStep[];
-  /** When true, the panel auto-expands (e.g. while the agent is running). */
-  defaultOpen?: boolean;
+  /** True while the enclosing turn is still streaming (live mode). The panel
+   *  only renders for in-flight runs: it shimmers while steps execute and
+   *  collapses away once the turn settles (GPT high-reasoning style). */
+  live?: boolean;
 }
 
 const TOOL_META: Record<string, { label: string; icon: typeof Search }> = {
@@ -118,90 +119,122 @@ function formatSeconds(seconds: number): string {
   return s ? `${m}m${s}s` : `${m}m`;
 }
 
-export function ResearchSteps({ steps, defaultOpen = true }: ResearchStepsProps) {
-  const [open, setOpen] = useState(defaultOpen);
-  const wasRunningRef = useRef(false);
+/** Delay before unmounting after the run settles — lets the collapse
+ *  transition play out instead of the panel vanishing in one frame. */
+const COLLAPSE_MS = 350;
 
-  const running =
+export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
+  const [open, setOpen] = useState(true);
+  const [hidden, setHidden] = useState(true);
+  const everActiveRef = useRef(false);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Auto-scroll: stick to the newest step like the GPT reasoning list, but
+  // stop hijacking the scroll the moment the user scrolls up to inspect an
+  // earlier step (they re-stick by scrolling back near the bottom).
+  const listRef = useRef<HTMLOListElement>(null);
+  const stickToBottomRef = useRef(true);
+
+  const runningStep =
     steps?.some((s) => s.status === "running" || s.status === "waiting") ?? false;
+  const active = live || runningStep;
 
-  // Agent-UX: auto-expand while work is in flight; once every step settles,
-  // collapse to the one-line summary so the answer text takes over. The user
-  // can still reopen — this only flips the default once per run.
   useEffect(() => {
-    if (running) {
-      wasRunningRef.current = true;
-      setOpen(true);
-    } else if (wasRunningRef.current) {
-      wasRunningRef.current = false;
-      setOpen(false);
+    if (active) {
+      if (hideTimerRef.current) {
+        clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = null;
+      }
+      everActiveRef.current = true;
+      setHidden(false);
+    } else if (everActiveRef.current) {
+      everActiveRef.current = false;
+      hideTimerRef.current = setTimeout(() => {
+        hideTimerRef.current = null;
+        setHidden(true);
+      }, COLLAPSE_MS);
     }
-  }, [running]);
+  }, [active]);
 
-  if (!steps || steps.length === 0) return null;
+  useEffect(
+    () => () => {
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    },
+    []
+  );
+
+  const stepCount = steps?.length ?? 0;
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (active && open && el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [stepCount, active, open]);
+
+  if (!steps || steps.length === 0 || hidden) return null;
 
   const doneCount = steps.filter((s) => s.status === "done").length;
   const errorCount = steps.filter((s) => s.status === "error").length;
-
-  // Total wall time: earliest start → latest finish across steps.
-  let totalMs = 0;
-  const starts = steps
-    .map((s) => (s.startedAt ? new Date(s.startedAt).getTime() : NaN))
-    .filter(Number.isFinite);
-  const ends = steps
-    .map((s) => (s.finishedAt ? new Date(s.finishedAt).getTime() : NaN))
-    .filter(Number.isFinite);
-  if (starts.length && ends.length) {
-    totalMs = Math.max(...ends) - Math.min(...starts);
-  }
+  const pendingCount = Math.max(steps.length - doneCount - errorCount, 0);
+  // Between `active` flipping false and the unmount timer, the panel plays
+  // its collapse transition instead of cutting off mid-frame.
+  const collapsing = !active;
 
   return (
-    <div className="mb-2 rounded-lg border border-border bg-background/60 text-sm">
+    <div
+      aria-hidden={collapsing}
+      className={cn(
+        "overflow-hidden rounded-lg border border-border bg-background/60 text-sm transition-all duration-300 ease-out",
+        collapsing ? "max-h-0 border-transparent opacity-0" : "mb-2 max-h-[480px] opacity-100"
+      )}
+    >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent/40"
       >
         <ChevronDown
-          className={cn("h-3.5 w-3.5 transition-transform", open ? "" : "-rotate-90")}
+          className={cn(
+            "h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
+            open ? "" : "-rotate-90"
+          )}
         />
-        <span>
-          {running ? "正在执行" : "已完成"} · {steps.length} 步
+        <span className="shimmer-text text-xs font-medium">正在执行</span>
+        <span className="text-xs text-muted-foreground">
+          · {steps.length} 步
           {errorCount > 0 && (
             <span className="ml-1.5 text-destructive">（{errorCount} 失败）</span>
           )}
-          {!running && totalMs > 0 && (
-            <span className="ml-1.5 text-muted-foreground/80">
-              · {formatSeconds(totalMs / 1000)}
-            </span>
-          )}
         </span>
-        {running && (
-          <span className="inline-flex items-center gap-1 text-foreground">
-            <Loader2 className="h-3 w-3 animate-spin" />
-            <span className="text-muted-foreground">
-              {steps.length - doneCount - errorCount > 0
-                ? `${steps.length - doneCount - errorCount} 项进行中`
-                : "进行中"}
-            </span>
-          </span>
-        )}
+        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
+          {pendingCount > 0 ? `${pendingCount} 项进行中` : "进行中"}
+        </span>
       </button>
 
       {open && (
-        <ol className="space-y-1.5 border-t border-border px-3 py-2">
+        <ol
+          ref={listRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickToBottomRef.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+          className="max-h-60 space-y-1.5 overflow-y-auto border-t border-border px-3 py-2"
+        >
           {steps.map((step, i) => {
             const Icon = stepIcon(step);
             const emoji = stepEmoji(step);
             const duration = stepDuration(step);
             const dangerous = step.type === "tool" && step.tool?.dangerous;
+            const isRunning = step.status === "running";
             return (
-              <li key={step.id ?? i} className="flex gap-2">
+              <li key={step.id ?? i} className="step-row-in flex gap-2">
                 <div className="mt-0.5 flex shrink-0 flex-col items-center">
                   <span
                     className={cn(
                       "flex h-5 w-5 items-center justify-center rounded-full",
-                      step.status === "running"
+                      isRunning
                         ? "bg-primary/10 text-primary"
                         : step.status === "waiting"
                           ? "bg-amber-500/10 text-amber-600"
@@ -210,8 +243,10 @@ export function ResearchSteps({ steps, defaultOpen = true }: ResearchStepsProps)
                             : "bg-muted text-muted-foreground"
                     )}
                   >
-                    {step.status === "running" ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
+                    {isRunning ? (
+                      // No spinner — the shimmering label below carries the
+                      // in-flight signal (GPT reasoning style).
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
                     ) : step.status === "error" ? (
                       <AlertCircle className="h-3 w-3" />
                     ) : step.status === "waiting" ? (
@@ -228,9 +263,13 @@ export function ResearchSteps({ steps, defaultOpen = true }: ResearchStepsProps)
                         {emoji}
                       </span>
                     ) : (
-                      <Icon className="h-3 w-3 text-muted-foreground" />
+                      <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
                     )}
-                    <span className="truncate text-foreground">{stepTitle(step)}</span>
+                    <span
+                      className={cn("truncate", isRunning ? "shimmer-text" : "text-foreground")}
+                    >
+                      {stepTitle(step)}
+                    </span>
                     {duration && (
                       <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/70">
                         {duration}
