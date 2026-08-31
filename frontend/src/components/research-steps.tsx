@@ -185,14 +185,14 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
     <div
       aria-hidden={collapsing}
       className={cn(
-        "overflow-hidden rounded-lg border border-border bg-background/60 text-sm transition-all duration-300 ease-out",
-        collapsing ? "max-h-0 border-transparent opacity-0" : "mb-2 max-h-[480px] opacity-100"
+        "overflow-hidden text-sm transition-all duration-300 ease-out",
+        collapsing ? "max-h-0 opacity-0" : "mb-3 max-h-[480px] opacity-100"
       )}
     >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent/40"
+        className="flex w-full items-center gap-2 py-1 text-left"
       >
         <ChevronDown
           className={cn(
@@ -220,7 +220,7 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
             stickToBottomRef.current =
               el.scrollHeight - el.scrollTop - el.clientHeight < 40;
           }}
-          className="max-h-60 space-y-1.5 overflow-y-auto border-t border-border px-3 py-2"
+          className="max-h-60 space-y-1.5 overflow-y-auto pb-1 pl-[3px]"
         >
           {steps.map((step, i) => {
             const Icon = stepIcon(step);
@@ -230,31 +230,18 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
             const isRunning = step.status === "running";
             return (
               <li key={step.id ?? i} className="step-row-in flex gap-2">
-                <div className="mt-0.5 flex shrink-0 flex-col items-center">
-                  <span
-                    className={cn(
-                      "flex h-5 w-5 items-center justify-center rounded-full",
-                      isRunning
-                        ? "bg-primary/10 text-primary"
-                        : step.status === "waiting"
-                          ? "bg-amber-500/10 text-amber-600"
-                          : step.status === "error"
-                            ? "bg-destructive/10 text-destructive"
-                            : "bg-muted text-muted-foreground"
-                    )}
-                  >
-                    {isRunning ? (
-                      // No spinner — the shimmering label below carries the
-                      // in-flight signal (GPT reasoning style).
-                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
-                    ) : step.status === "error" ? (
-                      <AlertCircle className="h-3 w-3" />
-                    ) : step.status === "waiting" ? (
-                      <ShieldAlert className="h-3 w-3" />
-                    ) : (
-                      <Check className="h-3 w-3" />
-                    )}
-                  </span>
+                <div className="flex w-3.5 shrink-0 justify-center pt-[3px]">
+                  {isRunning ? (
+                    // No spinner — the shimmering label below carries the
+                    // in-flight signal (GPT reasoning style).
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+                  ) : step.status === "error" ? (
+                    <AlertCircle className="h-3.5 w-3.5 text-destructive" />
+                  ) : step.status === "waiting" ? (
+                    <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
+                  ) : (
+                    <Check className="h-3.5 w-3.5 text-muted-foreground/70" />
+                  )}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 text-xs">
