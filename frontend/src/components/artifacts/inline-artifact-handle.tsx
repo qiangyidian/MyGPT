@@ -8,12 +8,14 @@ import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { artifactsApi } from "@/lib/api";
 import { formatArtifactSize } from "@/lib/artifacts";
+import { openArtifactPreview } from "@/lib/artifact-preview-store";
 
 /**
  * Inline card for an `artifact:<id>` handle found in message text (or listed in
  * the message's persisted `metadata.artifacts`). Fetches lightweight metadata
- * (`GET /api/artifacts/{id}/meta`) so the filename + size render immediately;
- * the download button streams the bytes with auth on click.
+ * (`GET /api/artifacts/{id}/meta`) so the filename + size render immediately.
+ * Clicking the card opens the right-side preview panel; the download button
+ * streams the bytes with auth directly.
  */
 export function InlineArtifactHandle({
   artifactId,
@@ -67,10 +69,20 @@ export function InlineArtifactHandle({
   return (
     <div
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-[11px] align-middle",
+        "inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-[11px] align-middle transition-colors hover:border-primary/40 hover:bg-accent",
         className,
       )}
       data-artifact-id={artifactId}
+      onClick={() => openArtifactPreview(artifactId)}
+      title="点击预览"
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openArtifactPreview(artifactId);
+        }
+      }}
     >
       <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
       <span

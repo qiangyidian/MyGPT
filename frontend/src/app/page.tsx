@@ -12,6 +12,7 @@ import { ApprovalCard } from "@/components/approval-card";
 import { ContextPanel } from "@/components/context/context-panel";
 import { ContextPanelTrigger } from "@/components/context/context-panel-trigger";
 import { AgentPanelTrigger } from "@/components/agents/agent-panel-trigger";
+import { ArtifactPreviewPanel } from "@/components/artifacts/artifact-preview-panel";
 import { useConversationDetail, useConversations } from "@/hooks/useConversations";
 import { useChatStream } from "@/hooks/useChatStream";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
@@ -334,6 +335,7 @@ function ChatPanel({
       </main>
 
       <ContextPanel conversationId={activeConversationId} />
+      <ArtifactPreviewPanel />
     </div>
   );
 }

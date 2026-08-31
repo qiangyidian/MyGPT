@@ -572,7 +572,11 @@ DELIVERABLE_EXTENSIONS = frozenset({
 # — agents overwhelmingly name generated files that way, and it keeps a
 # trailing Chinese clause ("已生成 /root/x.pdf 重复一次…") from being
 # swallowed into the match.
-_PATH_SEG = r"[A-Za-z0-9_.\-]+"
+# One path segment. Must include CJK (JP/KR for good measure): Hermes writes
+# deliverables like /root/report/AI新闻简报_2026-08-31.pptx, and an
+# ASCII-only segment class truncates at the first 非-ASCII char so nothing
+# with a Chinese filename ever matches.
+_PATH_SEG = r"[A-Za-z0-9_.\-一-鿿぀-ヿ가-힯]+"
 _FILE_PATH_RE = re.compile(
     r"(?<![\w./\\-])"
     r"("
