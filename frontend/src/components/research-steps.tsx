@@ -129,15 +129,10 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
   const everActiveRef = useRef(false);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Auto-scroll: stick to the newest step like the GPT reasoning list, but
-  // stop hijacking the scroll the moment the user scrolls up to inspect an
-  // earlier step (they re-stick by scrolling back near the bottom).
-  const listRef = useRef<HTMLOListElement>(null);
-  const stickToBottomRef = useRef(true);
-
-  const runningStep =
-    steps?.some((s) => s.status === "running" || s.status === "waiting") ?? false;
-  const active = live || runningStep;
+  // In-flight is decided SOLELY by the live prop (the enclosing streaming
+  // turn). Persisted steps can carry stale "running"/"waiting" statuses —
+  // trusting them would resurrect the panel on finished messages forever.
+  const active = live;
 
   useEffect(() => {
     if (active) {
@@ -163,15 +158,6 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
     []
   );
 
-  const stepCount = steps?.length ?? 0;
-
-  useEffect(() => {
-    const el = listRef.current;
-    if (active && open && el && stickToBottomRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [stepCount, active, open]);
-
   if (!steps || steps.length === 0 || hidden) return null;
 
   const errorCount = steps.filter((s) => s.status === "error").length;
@@ -183,10 +169,11 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
     <div
       aria-hidden={collapsing}
       className={cn(
-        "overflow-hidden text-sm transition-all duration-300 ease-out",
-        collapsing ? "max-h-0 opacity-0" : "mb-3 max-h-[480px] opacity-100"
+        "grid text-sm transition-[grid-template-rows,opacity] duration-300 ease-out",
+        collapsing ? "grid-rows-[0fr] opacity-0" : "mb-3 grid-rows-[1fr] opacity-100"
       )}
     >
+      <div className="min-h-0 overflow-hidden">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -205,15 +192,7 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
       </button>
 
       {open && (
-        <ol
-          ref={listRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            stickToBottomRef.current =
-              el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-          }}
-          className="max-h-60 space-y-1.5 overflow-y-auto pb-1 pl-[3px]"
-        >
+        <ol className="space-y-1.5 pb-1 pl-[3px]">
           {steps.map((step, i) => {
             const Icon = stepIcon(step);
             const emoji = stepEmoji(step);
@@ -274,6 +253,7 @@ export function ResearchSteps({ steps, live = false }: ResearchStepsProps) {
           })}
         </ol>
       )}
+      </div>
     </div>
   );
 }
