@@ -247,6 +247,7 @@ class HermesProvider(OpenAICompatibleProvider):
         silently drop tokens.
         """
         final_usage: dict[str, int] | None = None
+        saw_text = False  # any token delta streamed for this run
         async for raw_line in resp.aiter_lines():
             line = raw_line.strip()
             if not line.startswith("data:"):
@@ -270,17 +271,29 @@ class HermesProvider(OpenAICompatibleProvider):
             if kind in _RUN_TERMINAL_FINISH:
                 if isinstance(data.get("usage"), dict):
                     final_usage = data["usage"]
+                # ``run.completed`` carries the full final answer in ``output``
+                # (older versions: ``message``/``text``). Use it only when no
+                # token deltas streamed — the consumer appends every content
+                # chunk, so yielding it after streamed deltas would double the
+                # message text.
+                final_text = (
+                    "" if saw_text
+                    else str(data.get("output") or data.get("message") or data.get("text") or "")
+                )
                 yield ChatDelta(
-                    content="",
+                    content=final_text,
                     finish_reason=_RUN_TERMINAL_FINISH[kind],  # type: ignore[arg-type]
                     usage=final_usage,
                 )
                 return
 
             # -- token deltas -------------------------------------------------------
-            if kind in ("assistant.delta", "token", "run.delta"):
+            # Hermes v0.20.x streams text as ``message.delta``; the other names
+            # cover older/alternate versions (matched leniently on purpose).
+            if kind in ("message.delta", "assistant.delta", "token", "run.delta"):
                 text = data.get("delta") or data.get("text") or ""
                 if text:
+                    saw_text = True
                     yield ChatDelta(content=str(text))
 
             # -- tool progress (same shape as hermes.tool.progress) -----------------
