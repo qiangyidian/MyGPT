@@ -1891,21 +1891,28 @@ async def maybe_enqueue_durable_run(run_id: uuid.UUID | str) -> bool:
 
 
 async def _resolve_model_for_durable_run(
-    db: AsyncSession, conversation: Conversation
+    db: AsyncSession, conversation: Conversation, user: User | None = None
 ) -> ModelConfig | None:
     """Resolve the ModelConfig for a durable run.
 
     Prefers the conversation's bound model; falls back to the first available
-    chat config so a durable run never dead-ends on model resolution.
+    chat config so a durable run never dead-ends on model resolution. The
+    fallback honors the same visibility rule as the inline path (system-wide
+    configs, or the user's own) — never another user's private config.
     """
     cfg_id = getattr(conversation, "model_id", None)
     if cfg_id is not None:
         cfg = await db.get(ModelConfig, cfg_id)
         if cfg is not None:
             return cfg
+    visibility = (
+        or_(ModelConfig.user_id.is_(None), ModelConfig.user_id == user.id)
+        if user is not None
+        else ModelConfig.user_id.is_(None)
+    )
     result = await db.execute(
         select(ModelConfig)
-        .where(ModelConfig.is_embedding.is_(False))
+        .where(ModelConfig.is_embedding.is_(False), visibility)
         .order_by(ModelConfig.created_at.asc())
         .limit(1)
     )
@@ -1971,7 +1978,7 @@ async def run_durable_turn(
         )
         return
 
-    cfg = await _resolve_model_for_durable_run(db, conversation)
+    cfg = await _resolve_model_for_durable_run(db, conversation, user=user)
     if cfg is None:
         yield AgentEvent(
             kind="error", data={"code": "model_config_not_found", "run_id": str(run_id)}
