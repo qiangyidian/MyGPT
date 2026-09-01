@@ -29,6 +29,13 @@ interface MessageListProps {
   onSourceClick?: (index: number, citations: Citation[]) => void;
   onOpenAttachment?: (attachmentId: string) => void;
   onPickSuggestion?: (prompt: string) => void;
+  /**
+   * Increment to force-scroll to the newest message. Sending is an explicit
+   * "jump to the answer" intent, so it scrolls even when the user was
+   * scrolled up reading history (the streaming auto-follow below politely
+   * does not). Signal pattern (not a boolean) so repeat sends retrigger.
+   */
+  scrollToBottomSignal?: number;
   className?: string;
 }
 
@@ -45,19 +52,34 @@ export function MessageList({
   onSourceClick,
   onOpenAttachment,
   onPickSuggestion,
+  scrollToBottomSignal,
   className,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  const scrollToBottom = (smooth = true) => {
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    bottomRef.current?.scrollIntoView({
+      behavior: smooth && !reduce ? "smooth" : "auto",
+    });
+  };
+
+  // A send always jumps to the newest message, regardless of scroll position.
+  useEffect(() => {
+    if (scrollToBottomSignal) scrollToBottom();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- signal-only dep by design
+  }, [scrollToBottomSignal]);
+
+  // Streaming auto-follow: only while already near the bottom, so a user
+  // scrolled up reading history isn't yanked back on every token.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     const nearBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight < 120;
     if (nearBottom) {
-      const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-      bottomRef.current?.scrollIntoView({ behavior: reduce ? "auto" : "smooth" });
+      scrollToBottom();
     }
   }, [messages, streamingText, isStreaming]);
 

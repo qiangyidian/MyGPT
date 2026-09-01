@@ -124,6 +124,12 @@ function ChatPanel({
   const chat = useChatStream();
   const lastRestoredRunRef = useRef<string | null>(null);
 
+  // Bumped on every send so MessageList force-scrolls to the newest message
+  // (a send is an explicit "jump to the answer", even if the user was
+  // scrolled up reading history).
+  const [scrollToBottomSignal, setScrollToBottomSignal] = useState(0);
+  const bumpScrollSignal = () => setScrollToBottomSignal((n) => n + 1);
+
   // If a stream surfaces a conversation id while NONE is selected, switch to it.
   // CRITICAL: only react to a NEWLY-streamed id (tracked via the ref below) —
   // never re-activate a stale id merely because activeId became null (e.g. after
@@ -234,6 +240,7 @@ function ChatPanel({
       activeConversationId == null);
 
   const handleSend = (content: string, opts: { mode: typeof mode; attachmentIds: string[] }) => {
+    bumpScrollSignal();
     void chat.send(content, {
       conversationId: activeConversationId,
       modelId,
@@ -248,6 +255,7 @@ function ChatPanel({
     try {
       const branch = await branchConversation(activeConversationId, messageId, newContent);
       setActiveConversationId(branch.id);
+      bumpScrollSignal();
       await chat.send(newContent, {
         conversationId: branch.id,
         modelId,
@@ -270,6 +278,7 @@ function ChatPanel({
   }, []);
 
   const handlePickSuggestion = (prompt: string) => {
+    bumpScrollSignal();
     void chat.send(prompt, {
       conversationId: activeConversationId,
       modelId,
@@ -333,6 +342,7 @@ function ChatPanel({
           onSourceClick={handleSourceClick}
           onOpenAttachment={handleOpenAttachment}
           onPickSuggestion={handlePickSuggestion}
+          scrollToBottomSignal={scrollToBottomSignal}
         />
 
         <div className="mx-auto w-full shrink-0 max-w-3xl px-4">
