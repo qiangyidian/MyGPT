@@ -124,8 +124,11 @@ async def reindex_document(
 
 
 # Extensions whose parsed text is (or likely is) Markdown source — render the
-# preview with the Markdown renderer instead of a <pre> block.
+# preview with the Markdown renderer instead of a <pre> block. Structured
+# formats below are re-rendered as GFM Markdown by preview_render (tables,
+# page boundaries) so they also render richly.
 _MD_LIKE_EXTS = {".md", ".markdown", ".mdx"}
+_STRUCTURED_EXTS = {".pdf", ".csv", ".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp"}
 
 # Hard cap per page so a pathological upload can't blow up a single JSON
 # response; the client pages through the rest via ?offset=.
@@ -143,12 +146,15 @@ async def preview_document(
     """Online preview: the parsed full text of an ingested document.
 
     Reuses the SAME ingestion parser (pdf/docx/md/txt/…), so what the user
-    previews is exactly what was chunked + embedded. Long texts are paged:
-    pass ``offset`` (and optionally ``limit`` ≤ the page cap) to fetch the
+    previews is exactly what was chunked + embedded. Structured formats
+    (pdf/office/csv) are re-rendered as GFM Markdown (real tables, page
+    markers) from the SAME parse result. Long texts are paged: pass
+    ``offset`` (and optionally ``limit`` ≤ the page cap) to fetch the
     remainder. The original file must still exist on disk; a missing file
     404s instead of returning stale text.
     """
     from app.rag.parsers import default_parser
+    from app.rag.preview_render import render_preview_markdown
 
     doc = await _load_owned_doc(db, document_id, user)
     if not doc.file_path or not os.path.exists(doc.file_path):
@@ -166,11 +172,19 @@ async def preview_document(
     except Exception as exc:  # noqa: BLE001 — parser failures are user-facing
         raise HTTPException(500, f"解析失败: {exc}") from exc
 
-    text = parsed.text or ""
+    ft = doc.file_type.lower()
+    if ft in _STRUCTURED_EXTS:
+        # Render structured formats as rich Markdown (tables, page markers)
+        # from the same parse result the pipeline chunked.
+        text = await asyncio.to_thread(render_preview_markdown, parsed, ft)
+        render_as = "markdown"
+    else:
+        text = parsed.text or ""
+        render_as = "markdown" if ft in _MD_LIKE_EXTS else "text"
+
     offset = max(0, offset)
     limit = max(1, min(limit, _PREVIEW_PAGE_CHARS))
     page = text[offset : offset + limit]
-    render_as = "markdown" if doc.file_type.lower() in _MD_LIKE_EXTS else "text"
     return DocumentPreview(
         document_id=doc.id,
         filename=doc.filename,
