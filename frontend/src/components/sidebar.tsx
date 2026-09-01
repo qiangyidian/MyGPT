@@ -401,7 +401,7 @@ export function Sidebar({
             {viewMode === "archived" ? "返回对话" : "归档"}
           </Button>
           <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
-            <Link href={withReturnTo("/knowledge-bases", returnTo)}>
+            <Link href={withReturnTo("/settings/knowledge-bases", returnTo)}>
               <Boxes className="h-4 w-4" />
               知识库
             </Link>

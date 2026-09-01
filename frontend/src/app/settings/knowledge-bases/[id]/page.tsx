@@ -11,7 +11,7 @@ import type { Citation, DocFile } from "@/lib/types";
 import { formatBytes } from "@/lib/utils";
 import { resolveChatHome, withReturnTo } from "@/lib/navigation";
 import { NavSuspense } from "@/components/navigation/page-loading";
-import { AppPageShell } from "@/components/navigation/app-page-shell";
+import { BackLink } from "@/components/navigation/back-link";
 import { DocumentPreviewDialog } from "@/components/kb/document-preview-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -98,19 +98,20 @@ function KbDetailContent() {
   const [previewId, setPreviewId] = useState<string | null>(null);
 
   const kbName = kb?.name ?? "知识库";
-  const listHref = withReturnTo("/knowledge-bases", returnTo);
+  const listHref = withReturnTo("/settings/knowledge-bases", returnTo);
 
   return (
-    <AppPageShell
-      title={kbName}
-      description={kb?.description ?? undefined}
-      breadcrumbs={[
-        { label: "对话", href: "/" },
-        { label: "知识库", href: listHref },
-        { label: kbName },
-      ]}
-      secondaryBack={{ href: listHref, label: "返回知识库" }}
-    >
+    <div className="space-y-6">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="truncate text-2xl font-semibold">{kbName}</h1>
+          {kb?.description && (
+            <p className="mt-0.5 truncate text-sm text-muted-foreground">{kb.description}</p>
+          )}
+        </div>
+        <BackLink href={listHref} label="返回列表" />
+      </div>
+
       {/* Upload */}
       <div className="flex flex-wrap items-center gap-3">
         <label>
@@ -257,6 +258,6 @@ function KbDetailContent() {
       </div>
 
       <DocumentPreviewDialog documentId={previewId} onClose={() => setPreviewId(null)} />
-    </AppPageShell>
+    </div>
   );
 }

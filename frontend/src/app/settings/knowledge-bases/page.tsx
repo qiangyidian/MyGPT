@@ -12,7 +12,6 @@ import type { KnowledgeBase } from "@/lib/types";
 import { cn, relativeTime } from "@/lib/utils";
 import { resolveChatHome, withReturnTo } from "@/lib/navigation";
 import { NavSuspense } from "@/components/navigation/page-loading";
-import { AppPageShell } from "@/components/navigation/app-page-shell";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -210,11 +209,17 @@ function KnowledgeBasesContent() {
   );
 
   return (
-    <AppPageShell
-      title="知识库"
-      description="管理文档集合，为对话提供检索增强（RAG）。"
-      actions={createDialog}
-    >
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">知识库</h1>
+          <p className="text-sm text-muted-foreground">
+            管理文档集合，为对话提供检索增强（RAG）。
+          </p>
+        </div>
+        {createDialog}
+      </div>
+
       {/* Search */}
       <div className="relative max-w-sm">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -245,7 +250,7 @@ function KnowledgeBasesContent() {
           </div>
         )}
       </div>
-    </AppPageShell>
+    </div>
   );
 }
 
@@ -262,7 +267,7 @@ function KbCard({
     <Card className="group relative flex flex-col p-5 transition-shadow hover:shadow-md">
       <div className="flex items-start justify-between gap-3">
         <Link
-          href={withReturnTo(`/knowledge-bases/${kb.id}`, returnTo)}
+          href={withReturnTo(`/settings/knowledge-bases/${kb.id}`, returnTo)}
           className="min-w-0 flex-1"
           aria-label={`打开知识库 ${kb.name}`}
         >

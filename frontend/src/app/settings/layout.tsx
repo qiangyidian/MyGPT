@@ -34,7 +34,7 @@ const NAV = [
   },
   {
     label: "知识库",
-    href: "/knowledge-bases",
+    href: "/settings/knowledge-bases",
     icon: Boxes,
     description: "管理向量知识库与文档",
   },
