@@ -410,7 +410,15 @@ async def tail_run_events(
     tail_factory = async_sessionmaker(
         bind=bind, class_=AsyncSession, expire_on_commit=False, autoflush=False
     )
-    poll_interval = max(0.5, get_settings().WORKER_POLL_INTERVAL_SECONDS)
+    # Adaptive polling: while events are flowing (an answer is streaming),
+    # poll at streaming cadence so tokens reach the client in ~real time
+    # (WORKER_POLL_INTERVAL_SECONDS=1s batches a fast code block into big
+    # chunks that read as "the code appears only when it finishes"). When
+    # idle, back off to the regular worker poll interval.
+    stream_interval = max(0.05, getattr(
+        get_settings(), "SSE_STREAM_POLL_INTERVAL_SECONDS", 0.15
+    ))
+    idle_interval = max(stream_interval, get_settings().WORKER_POLL_INTERVAL_SECONDS)
     heartbeat = max(5, get_settings().SSE_HEARTBEAT_SECONDS)
 
     last_seq = cursor
@@ -448,7 +456,9 @@ async def tail_run_events(
             yield ": keepalive\n\n"
             last_event_at = now
 
-        await asyncio.sleep(poll_interval)
+        # Events are still flowing → fast poll (streaming cadence); idle →
+        # the regular worker interval.
+        await asyncio.sleep(stream_interval if events else idle_interval)
 
 
 @router.get("/{run_id}/events")

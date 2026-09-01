@@ -112,6 +112,9 @@ class Settings(BaseSettings):
     RUN_LEASE_RENEW_SECONDS: int = 30
     # Worker poll interval when the queue is empty (InMemoryQueue / fallback).
     WORKER_POLL_INTERVAL_SECONDS: float = 1.0
+    # SSE event-tail poll interval while events are actively flowing (a reply
+    # is streaming). The idle interval stays WORKER_POLL_INTERVAL_SECONDS.
+    SSE_STREAM_POLL_INTERVAL_SECONDS: float = 0.15
     # xreadgroup block timeout for the Redis transport (seconds, 0 = non-blocking).
     WORKER_BLOCK_TIMEOUT_SECONDS: int = 5
     # Recovery scheduler scan interval.
