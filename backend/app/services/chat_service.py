@@ -33,7 +33,7 @@ from dataclasses import replace
 from typing import Any, AsyncIterator
 
 import tiktoken
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -383,13 +383,16 @@ def _safe_int(value: Any, default: int) -> int:
 
 
 async def _resolve_model_config(
-    db: AsyncSession, request: ChatRequest, conversation: Conversation | None
+    db: AsyncSession, request: ChatRequest, conversation: Conversation | None, user: User | None = None
 ) -> ModelConfig:
     """Pick the ModelConfig to run this turn against.
 
     Priority: explicit request.model_id > conversation.model_id > any available
-    non-embedding config. System-wide (user_id IS NULL) configs count as
-    available to everyone.
+    non-embedding config. "Available" matches the /api/models visibility rule:
+    the user's own configs plus system-wide (user_id IS NULL) ones — never
+    another user's private config (falling back onto it surfaced as a confusing
+    404 model_not_found for fresh users, or worse, ran their turn on someone
+    else's API key).
     """
     cfg_id = request.model_id or (conversation.model_id if conversation else None)
     if cfg_id is not None:
@@ -400,9 +403,14 @@ async def _resolve_model_config(
 
     # Fall back to the first available chat config so a freshly registered user
     # with no personal config can still chat.
+    visibility = (
+        or_(ModelConfig.user_id.is_(None), ModelConfig.user_id == user.id)
+        if user is not None
+        else ModelConfig.user_id.is_(None)
+    )
     result = await db.execute(
         select(ModelConfig)
-        .where(ModelConfig.is_embedding.is_(False))
+        .where(ModelConfig.is_embedding.is_(False), visibility)
         .order_by(ModelConfig.created_at.asc())
         .limit(1)
     )
@@ -962,7 +970,7 @@ class ChatService:
         turn_started = time.monotonic()  # for per-message latency accounting
         # 1. Resolve conversation + model.
         conversation = await _get_or_create_conversation(db, user, request)
-        cfg = await _resolve_model_config(db, request, conversation)
+        cfg = await _resolve_model_config(db, request, conversation, user=user)
 
         # 1b. Resolve the execution route from the user-facing mode. The UI sends
         # ``mode`` (auto | search | deep_research | create | data_analysis); the
@@ -1766,7 +1774,7 @@ class ChatService:
 
         # 1. Resolve conversation + model (same helpers as _run).
         conversation = await _get_or_create_conversation(db, user, request)
-        cfg = await _resolve_model_config(db, request, conversation)
+        cfg = await _resolve_model_config(db, request, conversation, user=user)
         # Ownership (same guard as _run).
         if cfg.user_id is not None and cfg.user_id != user.id:
             raise AppException(404, "model_not_found", "Model config not found")
