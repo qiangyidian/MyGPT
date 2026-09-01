@@ -49,6 +49,19 @@ export function ComposerToolbar({
   const mode = useChatUiStore((s) => s.mode);
   const isHermes = mode === "hermes";
 
+  // Button label shows WHAT is selected, not just how many: the chosen KB's
+  // name (single), first name + "+N" (multiple), or the bare placeholder.
+  const kbById = new Map((knowledgeBases ?? []).map((kb) => [kb.id, kb]));
+  const selectedNames = knowledgeBaseIds
+    .map((id) => kbById.get(id)?.name)
+    .filter((n): n is string => !!n);
+  const kbLabel =
+    selectedNames.length === 0
+      ? "知识库"
+      : selectedNames.length === 1
+        ? selectedNames[0]
+        : `${selectedNames[0]} +${selectedNames.length - 1}`;
+
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
       <ChatModeSelector />
@@ -56,9 +69,14 @@ export function ComposerToolbar({
       {!isHermes && hasKbs && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" className="h-9 gap-1.5 text-sm font-medium">
-              <Database className="h-4 w-4" />
-              {knowledgeBaseIds.length === 0 ? "知识库" : `知识库 · ${knowledgeBaseIds.length}`}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-9 max-w-[180px] gap-1.5 text-sm font-medium"
+              title={selectedNames.length > 0 ? selectedNames.join("、") : undefined}
+            >
+              <Database className="h-4 w-4 shrink-0" />
+              <span className="truncate">{kbLabel}</span>
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-[200px]">
