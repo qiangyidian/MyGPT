@@ -49,18 +49,13 @@ export function ComposerToolbar({
   const mode = useChatUiStore((s) => s.mode);
   const isHermes = mode === "hermes";
 
-  // Button label shows WHAT is selected, not just how many: the chosen KB's
-  // name (single), first name + "+N" (multiple), or the bare placeholder.
+  // Button label shows WHICH KB is selected (single-select): its name, or the
+  // bare placeholder when none.
   const kbById = new Map((knowledgeBases ?? []).map((kb) => [kb.id, kb]));
   const selectedNames = knowledgeBaseIds
     .map((id) => kbById.get(id)?.name)
     .filter((n): n is string => !!n);
-  const kbLabel =
-    selectedNames.length === 0
-      ? "知识库"
-      : selectedNames.length === 1
-        ? selectedNames[0]
-        : `${selectedNames[0]} +${selectedNames.length - 1}`;
+  const kbLabel = selectedNames.length > 0 ? selectedNames[0] : "知识库";
 
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
@@ -85,9 +80,8 @@ export function ComposerToolbar({
                 key={kb.id}
                 checked={knowledgeBaseIds.includes(kb.id)}
                 onCheckedChange={(c) =>
-                  onKnowledgeBaseIdsChange(
-                    c ? [...knowledgeBaseIds, kb.id] : knowledgeBaseIds.filter((x) => x !== kb.id)
-                  )
+                  // 单选语义：选中一个即替换当前选择，取消即清空。
+                  onKnowledgeBaseIdsChange(c ? [kb.id] : [])
                 }
               >
                 {kb.name}

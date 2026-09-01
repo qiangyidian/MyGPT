@@ -102,11 +102,24 @@ function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, hermesModelId]);
 
+  // Sync the KB picker from the conversation ONLY on a conversation switch.
+  // The detail query refetches after every turn; blindly copying its
+  // knowledge_base_id here wiped the user's per-turn selection right after
+  // the first answer. (The backend now also binds the pick to the
+  // conversation, so switching conversations restores it correctly — and a
+  // brand-new conversation created by the first send keeps the selection.)
+  const kbSyncPrevConvRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
-    if (detail.data?.knowledge_base_id !== undefined) {
-      setKbIds(detail.data.knowledge_base_id ? [detail.data.knowledge_base_id] : []);
-    }
-  }, [detail.data?.knowledge_base_id]);
+    const convId = detail.data?.id ?? null;
+    const prev = kbSyncPrevConvRef.current;
+    kbSyncPrevConvRef.current = convId;
+    // Same conversation refetch → keep the user's current selection.
+    if (prev !== undefined && prev === convId) return;
+    // First send created the conversation (null → id) → the just-made
+    // selection applies; don't clobber it with the fresh binding.
+    if (prev === null && convId !== null) return;
+    setKbIds(detail.data?.knowledge_base_id ? [detail.data.knowledge_base_id] : []);
+  }, [detail.data?.id, detail.data?.knowledge_base_id]);
 
   const chat = useChatStream();
   const lastRestoredRunRef = useRef<string | null>(null);

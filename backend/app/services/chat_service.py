@@ -995,9 +995,17 @@ class ChatService:
             kb_by_id = {kb.id: kb for kb in kb_rows}
             for _kb_id in kb_ids:
                 kb_row = kb_by_id.get(_kb_id)
-                if kb_row is None or kb_row.user_id != user.id:
+                # Same rule as the KB API: admins may use any KB; users only
+                # their own. (Admins SEE every KB in the picker — dropping
+                # their selection here silently produced "no knowledge base"
+                # answers.)
+                if kb_row is None or (kb_row.user_id != user.id and user.role != "admin"):
                     raise AppException(404, "knowledge_base_not_found", "Knowledge base not found")
                 kb_names.append(kb_row.name or str(_kb_id))
+            # Bind the selection to the conversation so it survives refreshes
+            # and the detail refetch restores the picker state.
+            if conversation.knowledge_base_id != kb_ids[0]:
+                conversation.knowledge_base_id = kb_ids[0]
         route = decide_route(
             request.mode,
             has_knowledge_base=bool(kb_ids),
@@ -1994,8 +2002,12 @@ async def run_durable_turn(
         kb_id
         for kb_id in kb_ids
         if (_kb := await db.get(KnowledgeBase, kb_id)) is not None
-        and _kb.user_id == user.id
+        and (_kb.user_id == user.id or user.role == "admin")
     ]
+    # Bind the selection to the conversation (single-KB semantics) so the
+    # client's detail refetch restores the picker state after the turn.
+    if kb_ids and conversation.knowledge_base_id != kb_ids[0]:
+        conversation.knowledge_base_id = kb_ids[0]
 
     # Derive a native single-agent route. Durable execution is additive and
     # currently scoped to native turns; the route's ``use_multi_agent=False``
