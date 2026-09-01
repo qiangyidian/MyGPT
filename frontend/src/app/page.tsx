@@ -342,6 +342,7 @@ function ChatPanel({
           onSourceClick={handleSourceClick}
           onOpenAttachment={handleOpenAttachment}
           onPickSuggestion={handlePickSuggestion}
+          conversationId={activeConversationId}
           scrollToBottomSignal={scrollToBottomSignal}
         />
 
