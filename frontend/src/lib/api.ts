@@ -274,7 +274,23 @@ export const api = {
   },
   deleteDocument: (id: string) => request("DELETE", `/api/documents/${id}`),
   reindexDocument: (id: string) => request<{ document_id: string; status: string; chunk_count: number }>("POST", `/api/documents/${id}/reindex`),
-  previewDocument: (id: string) => request<DocumentPreview>("GET", `/api/documents/${id}/preview`),
+  previewDocument: (id: string, offset = 0) =>
+    request<DocumentPreview>(
+      "GET",
+      `/api/documents/${id}/preview?offset=${offset}`
+    ),
+  /** Download the original upload (authenticated). */
+  downloadDocument: async (id: string): Promise<Blob> => {
+    // Route through the central request() so an expired access token is
+    // refreshed + the call retried (a raw fetch would just 401 after expiry).
+    const res = await request<Response>(
+      "GET",
+      `/api/documents/${id}/download`,
+      undefined,
+      { raw: true }
+    );
+    return res.blob();
+  },
 
   // ---- Retrieval ----
   searchKnowledgeBase: (kbId: string, query: string, topK = 5) =>

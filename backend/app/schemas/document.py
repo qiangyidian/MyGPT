@@ -31,11 +31,17 @@ class DocumentPreview(BaseModel):
     """Online preview payload: the parsed full text of a document.
 
     ``render_as`` tells the client how to present the text: markdown source
-    (rendered), or plain text (preformatted).
+    (rendered), or plain text (preformatted). ``truncated`` marks that the
+    full text exceeded the preview cap and ``content`` was cut; the client
+    can then page in the rest via ``offset``.
     """
     document_id: uuid.UUID
     filename: str
     file_type: str
+    file_size: int            # original upload size in bytes
+    status: str               # document status at preview time
     render_as: str            # "markdown" | "text"
-    chars: int
+    chars: int                # chars returned in this page
+    total_chars: int          # chars in the full parsed text
+    truncated: bool = False   # True if the full text was not fully returned
     content: str

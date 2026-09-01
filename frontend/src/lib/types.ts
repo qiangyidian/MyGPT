@@ -295,13 +295,17 @@ export interface DocFile {
   updated_at: string;
 }
 
-/** GET /api/documents/{id}/preview — parsed full text for online preview. */
+/** GET /api/documents/{id}/preview — one page of the parsed full text. */
 export interface DocumentPreview {
   document_id: string;
   filename: string;
   file_type: string;
+  file_size: number;
+  status: string;
   render_as: "markdown" | "text";
   chars: number;
+  total_chars: number;
+  truncated: boolean;
   content: string;
 }
 

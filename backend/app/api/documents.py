@@ -8,10 +8,12 @@ document's knowledge base.
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import os
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -125,27 +127,38 @@ async def reindex_document(
 # preview with the Markdown renderer instead of a <pre> block.
 _MD_LIKE_EXTS = {".md", ".markdown", ".mdx"}
 
-# Hard cap so a pathological upload can't blow up the JSON response.
-_PREVIEW_MAX_CHARS = 500_000
+# Hard cap per page so a pathological upload can't blow up a single JSON
+# response; the client pages through the rest via ?offset=.
+_PREVIEW_PAGE_CHARS = 200_000
 
 
 @router.get("/documents/{document_id}/preview", response_model=DocumentPreview)
 async def preview_document(
     document_id: uuid.UUID,
+    offset: int = 0,
+    limit: int = _PREVIEW_PAGE_CHARS,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentPreview:
     """Online preview: the parsed full text of an ingested document.
 
     Reuses the SAME ingestion parser (pdf/docx/md/txt/…), so what the user
-    previews is exactly what was chunked + embedded. The original file must
-    still exist on disk; a missing file 404s instead of returning stale text.
+    previews is exactly what was chunked + embedded. Long texts are paged:
+    pass ``offset`` (and optionally ``limit`` ≤ the page cap) to fetch the
+    remainder. The original file must still exist on disk; a missing file
+    404s instead of returning stale text.
     """
     from app.rag.parsers import default_parser
 
     doc = await _load_owned_doc(db, document_id, user)
     if not doc.file_path or not os.path.exists(doc.file_path):
         raise HTTPException(NOT_FOUND, "原始文件不存在或已被清理，无法预览")
+    if doc.status == "failed":
+        raise HTTPException(BAD, f"文档解析失败：{doc.error_message or '未知错误'}")
+    if doc.status in ("pending", "parsing", "chunking", "embedding"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "文档正在解析中，请稍后再试"
+        )
     try:
         parsed = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
     except ValueError as exc:
@@ -154,14 +167,38 @@ async def preview_document(
         raise HTTPException(500, f"解析失败: {exc}") from exc
 
     text = parsed.text or ""
-    truncated = len(text) > _PREVIEW_MAX_CHARS
-    content = text[:_PREVIEW_MAX_CHARS]
+    offset = max(0, offset)
+    limit = max(1, min(limit, _PREVIEW_PAGE_CHARS))
+    page = text[offset : offset + limit]
     render_as = "markdown" if doc.file_type.lower() in _MD_LIKE_EXTS else "text"
     return DocumentPreview(
         document_id=doc.id,
         filename=doc.filename,
         file_type=doc.file_type,
+        file_size=doc.file_size or 0,
+        status=doc.status or "indexed",
         render_as=render_as,
-        chars=len(content),
-        content=content + ("\n\n…（内容过长，已截断）" if truncated else ""),
+        chars=len(page),
+        total_chars=len(text),
+        truncated=offset + len(page) < len(text),
+        content=page,
+    )
+
+
+@router.get("/documents/{document_id}/download")
+async def download_document(
+    document_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    """Stream the original upload back to the owner (preview → 下载原文件)."""
+    doc = await _load_owned_doc(db, document_id, user)
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(NOT_FOUND, "原始文件不存在或已被清理")
+
+    media_type = mimetypes.guess_type(doc.filename)[0] or "application/octet-stream"
+    return FileResponse(
+        doc.file_path,
+        media_type=media_type,
+        filename=doc.filename,
     )
