@@ -112,11 +112,19 @@ export function useChatStream(): ChatStreamState {
     opts: SendOptions;
   } | null>(null);
 
-  // Abort any in-flight stream when the consumer unmounts, so navigating away
-  // mid-stream doesn't leak the SSE connection and let the backend run to
-  // completion.
+  // Distinguishes a USER-initiated stop (cancel the backend run) from an
+  // unmount cleanup abort (only close the SSE subscription — the durable
+  // run keeps executing on the worker, and reattach picks it back up when
+  // the user returns to the conversation).
+  const userStopRef = useRef(false);
+
+  // Close the in-flight SSE subscription when the consumer unmounts, so
+  // navigating away mid-stream doesn't leak the connection. This does NOT
+  // cancel the backend run — the durable worker keeps generating, and the
+  // reattach path resumes the view on return.
   useEffect(() => {
     return () => {
+      userStopRef.current = false;
       abortRef.current?.abort();
     };
   }, []);
@@ -711,23 +719,29 @@ export function useChatStream(): ChatStreamState {
       } finally {
         if (!session.terminated) {
           if (controller.signal.aborted) {
-            // User Stop (button) or unmount-abort. Preserve partial as cancelled
-            // (NOT a connection drop) and explicitly cancel the backend run.
-            if (session.resolvedConversationId && session.accumulated) {
-              session.commitAssistant(
-                session.resolvedConversationId,
-                session.accumulated,
-                "cancelled",
-                session.assistantMessageId || `cancelled-${Date.now()}`
-              );
-            } else {
-              session.markTerminated();
-              setFinishReason("cancelled");
-              setStatus("cancelled");
+            if (userStopRef.current) {
+              // USER Stop (button): preserve partial as cancelled and cancel
+              // the backend run — the only path allowed to do so.
+              if (session.resolvedConversationId && session.accumulated) {
+                session.commitAssistant(
+                  session.resolvedConversationId,
+                  session.accumulated,
+                  "cancelled",
+                  session.assistantMessageId || `cancelled-${Date.now()}`
+                );
+              } else {
+                session.markTerminated();
+                setFinishReason("cancelled");
+                setStatus("cancelled");
+              }
+              if (session.resolvedRunId) {
+                api.cancelAgentRun(session.resolvedRunId).catch(() => undefined);
+              }
             }
-            if (session.resolvedRunId) {
-              api.cancelAgentRun(session.resolvedRunId).catch(() => undefined);
-            }
+            // Unmount cleanup abort: do nothing here. The durable run keeps
+            // executing on the worker; the partial stays uncommitted and the
+            // reattach path (conversation remount) replays the full event
+            // log, so returning to the page shows the finished answer.
           } else if (session.resolvedConversationId && session.accumulated) {
             // Socket dropped with NO terminal event and NO user abort.
             setError("连接中断，已保留已生成内容");
@@ -741,6 +755,7 @@ export function useChatStream(): ChatStreamState {
         }
         setIsStreaming(false);
         abortRef.current = null;
+        userStopRef.current = false;
         setStreamingText("");
       }
     },
@@ -755,6 +770,8 @@ export function useChatStream(): ChatStreamState {
   );
 
   const stop = useCallback(() => {
+    // User-initiated: the ONLY path allowed to cancel the backend run.
+    userStopRef.current = true;
     abortRef.current?.abort();
   }, []);
 
