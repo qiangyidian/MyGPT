@@ -12,7 +12,6 @@ import {
   Square,
   ThumbsDown,
   ThumbsUp,
-  User as UserIcon,
   UsersRound,
   WifiOff,
   X,
@@ -328,30 +327,33 @@ export const MessageBubble = memo(function MessageBubble({
         isUser ? "flex-row-reverse" : "flex-row"
       )}
     >
-      <Avatar className="h-7 w-7 shrink-0" role="img" aria-label={isUser ? "你的消息" : "AI 助手"}>
-        <AvatarFallback
-          className={cn(
-            isUser
-              ? "bg-indigo-500 text-white"
-              : isHermes
+      {/* Avatar on the ASSISTANT side only (ChatGPT/DeepSeek pattern): the
+          user bubble sits flush against the column's right edge so bubble,
+          AI text, and composer all share one axis. */}
+      {!isUser && (
+        <Avatar className="h-7 w-7 shrink-0" role="img" aria-label="AI 助手">
+          <AvatarFallback
+            className={cn(
+              isHermes
                 ? "bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white"
                 : "bg-muted text-muted-foreground"
-          )}
-        >
-          {isUser ? (
-            <UserIcon className="h-3.5 w-3.5" aria-hidden />
-          ) : isHermes ? (
-            <Zap className="h-3.5 w-3.5" aria-hidden />
-          ) : (
-            <Sparkles className="h-3.5 w-3.5" aria-hidden />
-          )}
-        </AvatarFallback>
-      </Avatar>
+            )}
+          >
+            {isHermes ? (
+              <Zap className="h-3.5 w-3.5" aria-hidden />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" aria-hidden />
+            )}
+          </AvatarFallback>
+        </Avatar>
+      )}
 
       <div
         className={cn(
-          "flex min-w-0 max-w-[calc(100%-3rem)] flex-col",
-          isUser ? "items-end" : "items-start"
+          // Assistant: leave avatar(1.75rem) + gap(0.75rem) = 2.5rem for the
+          // avatar. User: full width, flush right (no avatar).
+          "flex min-w-0 flex-col",
+          isUser ? "max-w-full items-end" : "max-w-[calc(100%-2.5rem)] items-start"
         )}
       >
         {isHermes && (
@@ -401,8 +403,8 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         ) : (
           isUser ? (
-            <div className="w-fit max-w-[85%] rounded-2xl rounded-br-md bg-indigo-50 px-4 py-2.5 text-indigo-900 dark:bg-indigo-500/15 dark:text-indigo-100">
-              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+            <div className="w-fit max-w-full rounded-3xl rounded-br-lg bg-indigo-50 px-4 py-2.5 text-indigo-900 dark:bg-indigo-500/15 dark:text-indigo-100">
+              <p className="whitespace-pre-wrap break-words text-[0.95rem] leading-[1.7]">
                 {message.content}
               </p>
             </div>

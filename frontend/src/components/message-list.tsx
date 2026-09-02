@@ -187,7 +187,7 @@ export function MessageList({
   return (
     <div className={cn("relative flex min-h-0 flex-1 flex-col", className)}>
       <div ref={containerRef} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-4xl px-4 py-6">
+        <div className="mx-auto w-full max-w-3xl px-4 py-6">
           {shownMessages.map((msg, i) => (
             <MessageBubble
               key={msg.id}
