@@ -617,9 +617,7 @@ def _estimate_available_tool_schema_tokens(
 ) -> int:
     """Estimate advertised tool schemas when this turn can expose them."""
     caps = capabilities_from_config(cfg)
-    if not enable_tools or not (
-        caps.supports_tools or (getattr(cfg, "provider", "") or "") == "mock"
-    ):
+    if not enable_tools or not caps.supports_tools:
         return 0
     try:
         import json
@@ -1484,8 +1482,7 @@ class ChatService:
                     )
                     # Citation integrity: strip any [source N] in the final
                     # answer that has no real backing citation (a model may
-                    # hallucinate a marker; the deterministic demo writer emits
-                    # them unconditionally). The persisted text is cleaned so a
+                    # hallucinate a marker). The persisted text is cleaned so a
                     # reload/regenerate shows honest markers; the frontend also
                     # cleans the live stream on render. Flag the turn when any
                     # marker had to be stripped.
@@ -1535,15 +1532,11 @@ class ChatService:
                     elif route.requested_mode and route.requested_mode != route.mode:
                         assistant_msg.metadata_["requested_mode"] = route.requested_mode
                         assistant_msg.metadata_["effective_mode"] = route.mode
-                    # is_demo: True only when the answer came from the
-                    # deterministic demo executor (canned, non-real content).
-                    # Drives the persistent UI warning; always False on the
-                    # public chat path (demo needs an explicit request opt-in).
-                    # ``sel`` (runtime_selection) was resolved just above.
-                    _is_demo = bool(ctx.extra.get("is_demo")) or bool(
+                    # is_demo is a legacy field (the demo executor was removed);
+                    # always False. Kept on the wire for old clients.
+                    assistant_msg.metadata_["is_demo"] = bool(
                         getattr(sel, "is_demo", False)
                     )
-                    assistant_msg.metadata_["is_demo"] = _is_demo
                     # RAG + observability fields: persisted on the message (so
                     # the debug panel / future turns can read them) AND emitted
                     # as one structured log line per turn for production tracing.
@@ -1567,7 +1560,7 @@ class ChatService:
                         "complete",
                         sel=sel,
                         route=route,
-                        is_demo=_is_demo,
+                        is_demo=bool(getattr(sel, "is_demo", False)),
                         rag_requested=rag_requested,
                         rag_used=rag_used,
                         rag_skipped_reason=rag_skipped_reason,

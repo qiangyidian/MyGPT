@@ -193,10 +193,8 @@ def ev_runtime_selected(
     the frontend opens the agent panel ONLY when ``multi_agent_executed`` is true
     and shows a fallback warning when a multi-agent request couldn't run.
 
-    ``is_demo`` is True only when the answer came from the deterministic
-    DemoStageExecutor (canned, non-real content). The frontend MUST render a
-    persistent '演示模式，内容非真实生成' warning in that case so a demo answer is
-    never mistaken for a genuine model reply."""
+    ``is_demo`` is a legacy wire field, always False (the demo executor was
+    removed); kept so old clients parsing the event don't break."""
     return AgentEvent(
         kind="runtime_selected",
         data={

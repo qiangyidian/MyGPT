@@ -295,3 +295,27 @@ def admin_token() -> str:
 
     admin_id = _asyncio.get_event_loop().run_until_complete(_resolve_admin_id())
     return get_access_token(admin_id)
+
+
+@pytest.fixture
+def offline_model(monkeypatch):
+    """Patch provider resolution to always return MockProvider (offline).
+
+    E2E tests that drive a full chat turn through the API use this instead of a
+    real endpoint: the model row is created with provider=openai-compatible
+    (the public API no longer accepts mock), and this fixture swaps the
+    resolved provider for the deterministic offline one. Consumers import
+    ``get_provider_for_config`` by name, so patch each consumer module's
+    binding — patching the registry module alone is not visible to them.
+    """
+    from app.providers.mock import MockProvider
+
+    def _offline(cfg, *args, **kwargs):
+        return MockProvider(
+            base_url=cfg.api_base_url, api_key="", model=cfg.model_name
+        )
+
+    import app.services.chat_service as _chat_svc
+    import app.agents.runtime.native_runtime as _native_rt
+    monkeypatch.setattr(_chat_svc, "get_provider_for_config", _offline)
+    monkeypatch.setattr(_native_rt, "get_provider_for_config", _offline)

@@ -6,11 +6,11 @@ user data:
 
 * optionally creates tables (dev convenience; prod uses Alembic migrations);
 * seeds the bootstrap admin user from ``ADMIN_*`` env if missing;
-* seeds a system-wide default chat ``ModelConfig`` from ``MODEL_*`` env;
-* seeds a ``Mock (演示)`` provider so the app works with zero external model;
-* seeds a default embedding ``ModelConfig`` from ``EMBEDDING_*`` env.
-
-All seed rows are system-wide (``user_id=None``).
+* seeds a system-wide default chat ``ModelConfig`` from ``MODEL_*`` env —
+  ONLY when a real endpoint is configured (provider + base URL + key). The
+  built-in defaults are placeholders (``my-model`` @ localhost) and are never
+  seeded; a fresh install starts with an empty model list and the admin adds
+  real models in Settings → Models. No mock/demo models are seeded, ever.
 """
 from __future__ import annotations
 
@@ -160,49 +160,54 @@ async def _seed_model(
 
 
 async def _seed_default_models(session) -> None:
+    """Seed system models ONLY from explicitly-configured real endpoints.
+
+    A seed happens when the env carries a real provider + base URL + API key
+    for that slot. The config defaults (``my-model`` @ localhost, empty key)
+    are placeholders and never qualify — otherwise every restart re-inserted
+    a dead "Default Chat Model" row the admin had just deleted.
+    """
     settings = get_settings()
 
-    chat = await _seed_model(
-        session,
-        name="Default Chat Model",
-        provider=settings.MODEL_PROVIDER,
-        base_url=settings.MODEL_API_BASE_URL,
-        api_key=settings.MODEL_API_KEY,
-        model_name=settings.MODEL_NAME,
-        is_embedding=False,
-        supports_stream=True,
+    chat_configured = (
+        settings.MODEL_PROVIDER not in ("", "mock")
+        and bool((settings.MODEL_API_BASE_URL or "").strip())
+        and bool((settings.MODEL_API_KEY or "").strip())
     )
-    if chat is not None:
-        logger.info("Seeded default chat model", model=settings.MODEL_NAME)
+    if chat_configured:
+        chat = await _seed_model(
+            session,
+            name=f"Default ({settings.MODEL_NAME})",
+            provider=settings.MODEL_PROVIDER,
+            base_url=settings.MODEL_API_BASE_URL,
+            api_key=settings.MODEL_API_KEY,
+            model_name=settings.MODEL_NAME,
+            is_embedding=False,
+            supports_stream=True,
+        )
+        if chat is not None:
+            logger.info("Seeded default chat model", model=settings.MODEL_NAME)
 
-    # Mock provider: zero-dependency demo model so the app is usable out of the
-    # box even without an LLM endpoint configured.
-    mock = await _seed_model(
-        session,
-        name="Mock (演示)",
-        provider="mock",
-        base_url="http://localhost/v1",
-        api_key="",
-        model_name="mock-model",
-        is_embedding=False,
-        supports_stream=True,
-        supports_tools=False,
+    embedding_configured = (
+        bool((settings.EMBEDDING_API_BASE_URL or "").strip())
+        and bool((settings.EMBEDDING_API_KEY or "").strip())
+        and (settings.EMBEDDING_MODEL_NAME or "") not in ("", "my-embedding-model")
     )
-    if mock is not None:
-        logger.info("Seeded Mock provider config")
-
-    embedding = await _seed_model(
-        session,
-        name="Default Embedding Model",
-        provider=settings.MODEL_PROVIDER,
-        base_url=settings.EMBEDDING_API_BASE_URL,
-        api_key=settings.EMBEDDING_API_KEY,
-        model_name=settings.EMBEDDING_MODEL_NAME,
-        is_embedding=True,
-        supports_stream=False,
-    )
-    if embedding is not None:
-        logger.info("Seeded default embedding model", model=settings.EMBEDDING_MODEL_NAME)
+    if embedding_configured:
+        embedding = await _seed_model(
+            session,
+            name=f"Default ({settings.EMBEDDING_MODEL_NAME})",
+            provider="openai-compatible",  # embeddings ride the OpenAI-compatible /embeddings API
+            base_url=settings.EMBEDDING_API_BASE_URL,
+            api_key=settings.EMBEDDING_API_KEY,
+            model_name=settings.EMBEDDING_MODEL_NAME,
+            is_embedding=True,
+            supports_stream=False,
+        )
+        if embedding is not None:
+            logger.info(
+                "Seeded default embedding model", model=settings.EMBEDDING_MODEL_NAME
+            )
 
 
 async def init_db(app: FastAPI) -> None:

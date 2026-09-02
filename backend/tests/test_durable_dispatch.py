@@ -37,11 +37,11 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Durable dispatch mock",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,
-            "supports_tools": False,
+            "supports_tools": True,
             "is_embedding": False,
         },
         headers=headers,
@@ -54,7 +54,7 @@ async def _create_mock_model(client, headers):
 # C1: durable dispatch wiring
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_durable_dispatch_creates_and_enqueues(client, db_session, monkeypatch):
+async def test_durable_dispatch_creates_and_enqueues(client, db_session, monkeypatch, offline_model):
     """BACKGROUND_WORKER=durable → POST /chat/stream creates a run + enqueues,
     does NOT execute inline, and the stream reaches terminal after the worker
     processes the run."""
@@ -262,7 +262,7 @@ async def test_lease_loss_aborts_execution_without_acking(db_session):
 # M1: disconnect-safety — client disconnect does NOT cancel the run
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_disconnect_does_not_cancel_run(client, db_session, monkeypatch):
+async def test_disconnect_does_not_cancel_run(client, db_session, monkeypatch, offline_model):
     """A client disconnecting from the events stream does NOT cancel the run.
     The worker keeps executing and the run reaches terminal ``completed``."""
     settings = get_settings()

@@ -285,7 +285,7 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Mock for quota",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,

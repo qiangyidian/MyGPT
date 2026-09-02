@@ -89,10 +89,7 @@ class RuntimeSelection:
     agent_profile: str
     requested_mode: str
     effective_mode: str
-    # True only when the answer came from the deterministic DemoStageExecutor
-    # (canned, non-real). Drives the persistent UI warning; always False on the
-    # public chat path because demo requires an explicit per-request opt-in.
-    is_demo: bool = False
+    is_demo: bool = False  # always False; kept for wire compatibility
 
 
 class ChatOrchestrator:
@@ -158,8 +155,6 @@ class ChatOrchestrator:
         # reason, multi_agent_executed). This is the anti-"fake-multi-agent"
         # signal: the frontend opens the agent panel only when
         # multi_agent_executed is true and shows a fallback warning otherwise.
-        # ``is_demo`` additionally flags canned (non-real) answers so the UI can
-        # warn the user the content is not a genuine model reply.
         yield ev_runtime_selected(
             run_id=run.id,
             requested_mode=selection.requested_mode,
@@ -270,13 +265,6 @@ class ChatOrchestrator:
         otherwise it falls back to native with a VISIBLE ``fallback_reason`` and
         ``multi_agent_executed=False`` — never a silent single-model run that
         role-plays multiple agents.
-
-        Demo isolation: the deterministic DemoStageExecutor (canned answers)
-        runs ONLY on an explicit per-request opt-in (``request.demo``) AND only
-        when ``AGENT_DEMO_MODE`` is enabled. A normal turn has ``demo=False``,
-        so ``is_demo`` is always False on the public chat path and a fallback
-        NEVER substitutes demo content — a deep_research request with CrewAI off
-        degrades visibly to native instead of answering with fabricated text.
         """
         route = ctx.extra.get("route")
         multi_agent_requested = bool(getattr(route, "use_multi_agent", False))
@@ -287,16 +275,6 @@ class ChatOrchestrator:
         ) or "general"
 
         settings = get_settings()
-        req = getattr(ctx, "request", None)
-        # Two gates for demo: the env flag AND the per-request flag. Neither
-        # alone is enough — that is what previously let demo leak (env default
-        # True + any deep_research request).
-        demo_requested = bool(getattr(settings, "AGENT_DEMO_MODE", False)) and bool(
-            getattr(req, "demo", False)
-        )
-        # When real CrewAI is enabled, prefer it even if demo was requested;
-        # demo is only the stand-in when there is no real runtime.
-        is_demo = demo_requested and not bool(getattr(settings, "CREWAI_ENABLED", False))
 
         if not multi_agent_requested:
             # Native turn (auto / search / create / data_analysis / chat).
@@ -314,7 +292,7 @@ class ChatOrchestrator:
             )
             return self._native, selection
 
-        available, reason = self._crewai_status(demo_requested=demo_requested)
+        available, reason = self._crewai_status()
         if available:
             selection = RuntimeSelection(
                 requested_runtime="crewai",
@@ -326,18 +304,16 @@ class ChatOrchestrator:
                 agent_profile=profile,
                 requested_mode=requested_mode,
                 effective_mode=effective_mode,
-                is_demo=is_demo,
+                is_demo=False,
             )
             return self._crewai_runtime() or self._native, selection
 
-        # Multi-agent requested but CrewAI unavailable (and no explicit demo
-        # opt-in) → explicit native fallback. We deliberately do NOT fall back
-        # to demo content here: that would answer a real research question with
-        # fabricated text. The fallback is visible (fallback_reason) so the UI
-        # warns the user the multi-agent run did not execute.
+        # Multi-agent requested but CrewAI unavailable → explicit native
+        # fallback. The fallback is visible (fallback_reason) so the UI warns
+        # the user the multi-agent run did not execute.
         logger.warning(
             "multi-agent run requested (mode=%s, profile=%s) but CrewAI unavailable (%s); "
-            "falling back to native with a visible fallback_reason (demo content NOT used)",
+            "falling back to native with a visible fallback_reason",
             requested_mode, profile, reason,
         )
         selection = RuntimeSelection(
@@ -568,17 +544,10 @@ class ChatOrchestrator:
         stages_by_id = {spec.agent_id: spec for spec in stages}
         return StageAdapterExecutor(stages_by_id, stage_ctx)
 
-    def _crewai_status(self, demo_requested: bool = False) -> tuple[bool, str | None]:
-        """Return (available, fallback_reason). Cached after the first check.
-
-        ``demo_requested`` is the per-request opt-in: demo mode counts as
-        availability ONLY when both the env flag and this flag are set, so a
-        normal turn (demo=False) never treats demo as a real runtime.
-        """
+    def _crewai_status(self) -> tuple[bool, str | None]:
+        """Return (available, fallback_reason). Cached after the first check."""
         settings = get_settings()
-        real_enabled = bool(getattr(settings, "CREWAI_ENABLED", False))
-        demo_enabled = bool(getattr(settings, "AGENT_DEMO_MODE", False)) and demo_requested
-        if not (real_enabled or demo_enabled):
+        if not bool(getattr(settings, "CREWAI_ENABLED", False)):
             return False, "crewai_disabled"
         if not self._crewai_checked:
             self._crewai_checked = True

@@ -276,7 +276,7 @@ export default function ModelsPage() {
                     const defaults: Record<string, { url: string; model: string }> = {
                       "openai-compatible": { url: "https://api.openai.com/v1", model: "gpt-4o" },
                       anthropic: { url: "https://api.anthropic.com", model: "claude-sonnet-4-6" },
-                      mock: { url: "", model: "mock-model" },
+                      hermes: { url: "", model: "hermes-agent" },
                     };
                     const d = defaults[v];
                     setForm({
@@ -293,7 +293,7 @@ export default function ModelsPage() {
                   <SelectContent>
                     <SelectItem value="openai-compatible">openai-compatible</SelectItem>
                     <SelectItem value="anthropic">anthropic (Claude 原生)</SelectItem>
-                    <SelectItem value="mock">mock</SelectItem>
+                    <SelectItem value="hermes">hermes (会话记忆 Agent)</SelectItem>
                   </SelectContent>
                 </Select>
               </Field>

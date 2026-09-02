@@ -14,7 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Repo root (this file is backend/app/core/config.py → parents[3]). The config
 # is loaded from the repo-root .env regardless of the current working directory:
 # start.bat runs uvicorn from backend/, docker-compose from /app — both must see
-# the SAME source for CREWAI_ENABLED / AGENT_DEMO_MODE. A CWD-local .env
+# the SAME source for CREWAI_ENABLED. A CWD-local .env
 # (backend/.env) is read too and takes per-key precedence, so a host-run dev DB
 # URL (localhost) still overrides the docker service-name URL in the root .env.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -55,13 +55,17 @@ class Settings(BaseSettings):
     QDRANT_EMBEDDING_DIM: int = 1024
 
     # ---- Default model ----
-    MODEL_PROVIDER: str = "openai-compatible"
-    MODEL_API_BASE_URL: str = "http://localhost:8000/v1"
+    # Empty = unset. Bootstrap seeds a system model only when provider + base
+    # URL + key are all real; models are managed in Settings → Models. The
+    # defaults must stay empty so a fresh install never starts with a dead
+    # "my-model @ localhost" row that re-appears after deletion.
+    MODEL_PROVIDER: str = ""
+    MODEL_API_BASE_URL: str = ""
     MODEL_API_KEY: str = ""
-    MODEL_NAME: str = "my-model"
-    EMBEDDING_API_BASE_URL: str = "http://localhost:8000/v1"
+    MODEL_NAME: str = ""
+    EMBEDDING_API_BASE_URL: str = ""
     EMBEDDING_API_KEY: str = ""
-    EMBEDDING_MODEL_NAME: str = "my-embedding-model"
+    EMBEDDING_MODEL_NAME: str = ""
 
     # ---- Storage ----
     STORAGE_BACKEND: str = "local"
@@ -152,19 +156,6 @@ class Settings(BaseSettings):
     # transient failure falls back to the keyword router immediately rather than
     # doubling the worst-case latency.
     INTENT_MAX_RETRIES: int = 0
-    # Demo mode: the CrewAI multi-agent runtime MAY use a deterministic fake
-    # executor (no external LLM) so the full multi-agent panel — real SSE,
-    # graph, tool attribution, sequential/parallel lifecycle — can be exercised
-    # live without configuring a model endpoint. Default OFF. It is a STRICT
-    # OPT-IN, gated TWO ways: this flag must be True AND the request must carry
-    # an explicit ``demo=True`` flag (see ChatRequest.demo). A normal
-    # /api/chat/stream turn NEVER silently receives canned demo answers — even
-    # with this flag on, a plain ``mode=deep_research`` request runs the real
-    # executor (or falls back to native with a visible reason). A production
-    # deployment MUST leave this False (enforced at startup; the demo emits
-    # canned, non-real answers) and enable CREWAI_ENABLED with a real
-    # MODEL_API_BASE_URL / MODEL_API_KEY instead.
-    AGENT_DEMO_MODE: bool = False
     # Plan-approval gate (B5): when truthy, a multi-agent deep_research run
     # publishes its draft plan and WAITS (bounded by PLAN_CONFIRM_TIMEOUT_S)
     # for the user to confirm/revise via /api/agent-runs/{id}/plan/confirm
@@ -398,18 +389,6 @@ class Settings(BaseSettings):
                     "and become undecryptable on restart. Generate one with: "
                     "python -c \"from cryptography.fernet import Fernet; "
                     "print(Fernet.generate_key().decode())\""
-                )
-            # Demo mode emits CANNED, non-real answers from a fake executor.
-            # It must never run in production — a real user would receive
-            # fabricated content presented as a genuine model answer (this is
-            # exactly the regression that leaked "CrewAI supports stateful
-            # Flows…" into normal chat). Fail startup loudly, do not warn-and-
-            # continue: a warning is too easy to miss in deploy logs.
-            if getattr(self, "AGENT_DEMO_MODE", False):
-                raise ValueError(
-                    "AGENT_DEMO_MODE must be False in non-dev environments "
-                    "(demo mode serves canned, non-real answers). Set ENV=dev "
-                    "for local demos, or enable CREWAI_ENABLED with a real model."
                 )
         return self
 

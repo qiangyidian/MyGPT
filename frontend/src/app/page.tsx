@@ -21,7 +21,7 @@ import { useModels } from "@/hooks/useModels";
 import { api } from "@/lib/api";
 import { useChatUiStore } from "@/stores/chat-ui-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
-import { useAgentRunStore, selectIsDemo } from "@/stores/agent-run-store";
+import { useAgentRunStore } from "@/stores/agent-run-store";
 import { BranchHistory } from "@/components/branch-history";
 import type { Citation, KnowledgeBase } from "@/lib/types";
 
@@ -58,7 +58,6 @@ function ChatPanel({
   });
 
   const mode = useChatUiStore((s) => s.mode);
-  const isDemo = useAgentRunStore(selectIsDemo);
 
   const [modelId, setModelId] = useState<string | null>(null);
   const [kbIds, setKbIds] = useState<string[]>([]);
@@ -309,23 +308,6 @@ function ChatPanel({
           />
         </div>
 
-        {isDemo && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="mx-auto w-full max-w-3xl shrink-0 px-4"
-          >
-            <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-              <span className="mt-0.5 font-bold" aria-hidden>
-                ⚠️
-              </span>
-              <span>
-                演示模式：当前回答由演示执行器生成，<strong>内容非真实模型输出</strong>，
-                仅供展示多 Agent 面板与执行流程，请勿作为真实结论使用。
-              </span>
-            </div>
-          </div>
-        )}
 
         <MessageList
           messages={messages}

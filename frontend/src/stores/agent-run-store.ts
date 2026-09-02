@@ -146,10 +146,3 @@ export function selectRuntimeFallback(state: AgentRunStoreState): RuntimeSelecti
   if (!sel) return null;
   return sel.multiAgentRequested && !sel.multiAgentExecuted ? sel : null;
 }
-
-/** True when the active run's answer came from the deterministic demo executor
- *  (canned, non-real content). The UI MUST render a persistent warning so a
- *  demo answer is never mistaken for a genuine model reply. */
-export function selectIsDemo(state: AgentRunStoreState): boolean {
-  return !!state.active.selection?.isDemo;
-}

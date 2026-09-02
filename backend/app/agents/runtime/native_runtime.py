@@ -192,12 +192,8 @@ class NativeChatRuntime:
             max_result_chars=guard.limits.max_tool_output_chars,
         )
 
-        # Tools run when the user enabled them AND the model declares capability
-        # (or it's the mock provider, which simulates a search step for demos).
-        tools_enabled = bool(
-            ctx.enable_tools
-            and (getattr(cfg, "supports_tools", False) or (cfg.provider or "") == "mock")
-        )
+        # Tools run when the user enabled them AND the model declares capability.
+        tools_enabled = bool(ctx.enable_tools and getattr(cfg, "supports_tools", False))
         # Advertise only the tools the intent route allows (e.g. search mode =>
         # web_search/http_get only), never the whole registry.
         tool_names = [t.name for t in registry.list()]

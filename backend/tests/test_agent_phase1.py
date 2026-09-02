@@ -41,7 +41,6 @@ def _ctx(execution_mode, *, multi_agent: bool, mode: str = "auto", profile: str 
 def test_orchestrator_native_when_crewai_disabled(monkeypatch):
     settings = __import__("app.core.config", fromlist=["get_settings"]).get_settings()
     monkeypatch.setattr(settings, "CREWAI_ENABLED", False)
-    monkeypatch.setattr(settings, "AGENT_DEMO_MODE", False)
 
     orch = ChatOrchestrator()
     available, reason = orch._crewai_status()
@@ -65,7 +64,6 @@ def test_orchestrator_native_when_crewai_disabled(monkeypatch):
 def test_orchestrator_crewai_when_enabled_and_agent_mode(monkeypatch):
     settings = __import__("app.core.config", fromlist=["get_settings"]).get_settings()
     monkeypatch.setattr(settings, "CREWAI_ENABLED", True)
-    monkeypatch.setattr(settings, "AGENT_DEMO_MODE", False)
 
     orch = ChatOrchestrator()
     available, reason = orch._crewai_status()

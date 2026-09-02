@@ -272,11 +272,11 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Mock for agent",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,
-            "supports_tools": False,
+            "supports_tools": True,
             "is_embedding": False,
         },
         headers=headers,
@@ -310,7 +310,7 @@ async def _collect_events(client, headers, body):
     return events
 
 
-async def test_agent_turn_emits_new_events_and_audits(client, monkeypatch):
+async def test_agent_turn_emits_new_events_and_audits(client, monkeypatch, offline_model):
     # Make web_search deterministic + offline so the test never hits the network.
     async def _fake_run(self, **kwargs):
         return {"ok": True, "query": kwargs.get("query"), "results": [{"title": "t", "url": "u", "snippet": "s"}]}

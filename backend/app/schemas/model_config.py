@@ -11,7 +11,10 @@ from app.schemas.common import ORMModel
 
 class ModelConfigBase(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    provider: str = "openai-compatible"            # openai-compatible | anthropic | mock
+    # Real providers only. "mock" is a test-only stand-in (app.providers.mock)
+    # and must never be creatable through the public API — a mock row in the
+    # picker gives users fake "You said: ..." replies that look like bugs.
+    provider: Literal["openai-compatible", "anthropic", "hermes"] = "openai-compatible"
     # anthropic 的原生 Messages API 端点；api_base_url 可留空默认 https://api.anthropic.com，
     # 但 schema 校验要求非空 —— 创建时前端会自动填入默认值。
     api_base_url: str = Field(min_length=1, max_length=512)

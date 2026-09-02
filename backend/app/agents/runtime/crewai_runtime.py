@@ -54,8 +54,6 @@ from app.agents.lifecycle import AgentLifecycleEmitter
 from app.agents.planning import build_plan, classify_intent
 from app.agents.runtime.stage_executor import (
     CrewAIStageExecutor,
-    DemoStageExecutor,
-    FakeStageExecutor,
     StageExecutor,
     StageResult,
     _extract_usage_rounds,
@@ -125,24 +123,6 @@ def _guard_for_context(ctx: Any) -> BudgetGuard:
     )
     setattr(ctx, "budget_guard", guard)
     return guard
-
-
-def _demo_executor_enabled(settings: Any, request: Any) -> bool:
-    """Decide whether the deterministic DemoStageExecutor should run this turn.
-
-    Demo is a STRICT double opt-in: the env flag (AGENT_DEMO_MODE) AND the
-    per-request flag (request.demo) must both be set, AND no real CrewAI
-    runtime may be configured (CREWAI_ENABLED) — real CrewAI always wins. This
-    MUST stay in lock-step with ChatOrchestrator's ``is_demo`` computation so the
-    ``runtime_selected`` event's is_demo (which drives the UI warning banner)
-    matches the executor that actually ran. Diverging here would serve canned
-    demo content with no visible warning — the exact regression this guards.
-    """
-    return (
-        bool(getattr(settings, "AGENT_DEMO_MODE", False))
-        and bool(getattr(request, "demo", False))
-        and not bool(getattr(settings, "CREWAI_ENABLED", False))
-    )
 
 
 def _writer_finish_reason(stages: list[StageSpec], outputs: dict[str, StageResult]) -> str:
@@ -608,21 +588,11 @@ class CrewAIRuntime:
 
         executor: StageExecutor = ctx.extra.get("stage_executor")
         if executor is None:
-            # Demo isolation: the deterministic DemoStageExecutor (canned,
-            # non-real answers) runs ONLY on the strict double opt-in resolved by
-            # _demo_executor_enabled (env flag + per-request flag, and real
-            # CrewAI NOT enabled). A normal /api/chat/stream turn has demo=False,
-            # so it ALWAYS runs the real executor below — the canned "CrewAI
-            # supports stateful Flows…" text can never reach a real user this
-            # way. (Tests inject their own executor via ctx.extra["stage_executor"].)
-            if _demo_executor_enabled(get_settings(), ctx.request):
-                executor = DemoStageExecutor()
-                ctx.extra["is_demo"] = True
-            else:
-                # Real path: wrap the CrewAI executor so the writer stage
-                # streams its answer token-by-token (see StreamingWriterExecutor)
-                # while every other stage keeps using aexecute_task unchanged.
-                executor = StreamingWriterExecutor(CrewAIStageExecutor())
+            # Real path: wrap the CrewAI executor so the writer stage streams
+            # its answer token-by-token (see StreamingWriterExecutor) while
+            # every other stage keeps using aexecute_task unchanged.
+            # (Tests inject their own executor via ctx.extra["stage_executor"].)
+            executor = StreamingWriterExecutor(CrewAIStageExecutor())
         emitter = AgentLifecycleEmitter(run_id=ctx.run_id, graph=graph, stage_ctx=stage_ctx)
 
         # Wire the cross-thread approval bridge so dangerous tools pause the

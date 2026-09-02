@@ -151,7 +151,7 @@ class StageContext:
     # ---- Phase 1: streaming writer support ----
     # Populated by CrewAIRuntime before the stage walk so StreamingWriterExecutor
     # can call the provider directly and mutate the assistant message. All
-    # Optional so FakeStageExecutor/DemoStageExecutor tests are unaffected.
+    # Optional so FakeStageExecutor tests are unaffected.
     provider: Any = None
     model_config: Any = None
     assistant_msg: Any = None

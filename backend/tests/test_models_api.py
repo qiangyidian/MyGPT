@@ -14,7 +14,7 @@ async def test_create_list_model_and_key_is_masked(client):
         "/api/models",
         json={
             "name": "Mock",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "api_key": "super-secret-key-12345",
             "model_name": "mock-model",
@@ -43,7 +43,7 @@ async def test_model_capabilities_round_trip_through_api(client):
         "/api/models",
         json={
             "name": "Reasoner",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "reasoner",
             "supports_tools": True,
@@ -84,7 +84,7 @@ async def test_model_update_rejects_null_non_nullable_capability(client):
         "/api/models",
         json={
             "name": "Null guard",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
         },
@@ -107,7 +107,7 @@ async def test_model_validation_error_never_echoes_api_key_or_raw_input(client):
         "/api/models",
         json={
             "name": "Secret validation",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "api_key": secret,
             "model_name": "mock-model",
@@ -149,7 +149,7 @@ async def test_model_api_rejects_invalid_sampling_without_echoing_input_or_secre
         path = "/api/models"
         payload = {
             "name": "Invalid sampling",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "api_key": secret,
             "model_name": "mock-model",
@@ -160,7 +160,7 @@ async def test_model_api_rejects_invalid_sampling_without_echoing_input_or_secre
             "/api/models",
             json={
                 "name": "Invalid sampling update",
-                "provider": "mock",
+                "provider": "openai-compatible",
                 "api_base_url": "http://localhost/v1",
                 "model_name": "mock-model",
             },
@@ -190,7 +190,7 @@ async def test_disabling_tools_also_disables_parallel_tools(client):
         "/api/models",
         json={
             "name": "Parallel model",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_tools": True,
@@ -211,22 +211,37 @@ async def test_disabling_tools_also_disables_parallel_tools(client):
     assert updated.json()["supports_parallel_tools"] is False
 
 
-async def test_model_test_endpoint_ok(client):
+async def test_model_test_endpoint_ok(client, monkeypatch):
     h = auth_headers()
     created = await client.post(
         "/api/models",
         json={
             "name": "Mock2",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
         },
         headers=h,
     )
     mid = created.json()["id"]
+
+    # Offline stub: the /test endpoint's job under test is the ok/latency/sample
+    # envelope around a provider call, not the network itself.
+    from app.providers.base import ChatResult
+    from app.providers import registry as provider_registry
+
+    class OkStub:
+        async def chat(self, messages, options=None):
+            return ChatResult(content="pong", finish_reason="stop", usage={})
+
+    monkeypatch.setattr(
+        provider_registry, "get_provider_for_config", lambda cfg: OkStub()
+    )
+
     result = await client.post(f"/api/models/{mid}/test", headers=h)
     assert result.status_code == 200
     assert result.json()["ok"] is True
+    assert result.json()["sample"] == "pong"
 
 
 async def test_delete_model(client):
@@ -235,7 +250,7 @@ async def test_delete_model(client):
         "/api/models",
         json={
             "name": "MockDel",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
         },

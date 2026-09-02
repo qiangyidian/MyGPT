@@ -159,7 +159,7 @@ async def test_maybe_summarize_persists_summary(db_session):
 
     cfg = ModelConfig(
         name="mock",
-        provider="mock",
+        provider="openai-compatible",
         api_base_url="http://localhost/v1",
         model_name="mock-model",
         max_context_tokens=100,  # tiny -> forces summarization
@@ -185,7 +185,7 @@ async def test_maybe_summarize_persists_summary(db_session):
 async def _create_mock_model(client, headers, **overrides):
     body = {
         "name": "Mock phase2",
-        "provider": "mock",
+        "provider": "openai-compatible",
         "api_base_url": "http://localhost/v1",
         "model_name": "mock-model",
         "supports_stream": True,
@@ -221,7 +221,7 @@ async def _collect_events(client, headers, body):
     return events
 
 
-async def test_agent_mode_emits_plan_created(client, monkeypatch):
+async def test_agent_mode_emits_plan_created(client, monkeypatch, offline_model):
     async def _fake_run(self, **kwargs):
         return {"ok": True, "query": kwargs.get("query"), "results": []}
 

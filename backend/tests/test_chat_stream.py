@@ -12,11 +12,11 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Mock for stream",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,
-            "supports_tools": False,
+            "supports_tools": True,
             "is_embedding": False,
         },
         headers=headers,
@@ -25,7 +25,7 @@ async def _create_mock_model(client, headers):
     return r.json()["id"]
 
 
-async def test_chat_stream_emits_meta_token_done(client):
+async def test_chat_stream_emits_meta_token_done(client, offline_model):
     h = auth_headers()
     model_id = await _create_mock_model(client, h)
 

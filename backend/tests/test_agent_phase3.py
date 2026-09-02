@@ -155,11 +155,11 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Mock p3",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,
-            "supports_tools": False,
+            "supports_tools": True,
             "is_embedding": False,
         },
         headers=headers,

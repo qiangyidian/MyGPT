@@ -164,11 +164,11 @@ async def _create_mock_model(client, headers):
         "/api/models",
         json={
             "name": "Mock p5",
-            "provider": "mock",
+            "provider": "openai-compatible",
             "api_base_url": "http://localhost/v1",
             "model_name": "mock-model",
             "supports_stream": True,
-            "supports_tools": False,
+            "supports_tools": True,
             "is_embedding": False,
         },
         headers=headers,
@@ -199,7 +199,7 @@ async def _collect(client, headers, body):
     return events
 
 
-async def test_full_native_agent_path(client, monkeypatch):
+async def test_full_native_agent_path(client, monkeypatch, offline_model):
     """All phases together: plan -> tool_call -> tool_result -> done, with a
     persisted AgentRun + AgentStep audit trail and a non-ok result surfaced."""
     from app.tools.builtin import WebSearchTool
