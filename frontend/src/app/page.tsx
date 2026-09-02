@@ -289,9 +289,11 @@ function ChatPanel({
   };
 
   return (
-    <div className="flex min-h-0 flex-1">
+    <div className="relative flex min-h-0 flex-1">
       <main className="flex min-w-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-center justify-end gap-2 px-4 py-2">
+        {/* Context-panel / agent-panel triggers float over the message area
+            (top-right, absolute) so they no longer claim a header row. */}
+        <div className="absolute right-4 top-2 z-10 flex items-center gap-2">
           {activeConversationId && (
             <BranchHistory
               conversationId={activeConversationId}

@@ -119,8 +119,8 @@ export function Composer({
     !!value.trim() && !isStreaming && allReady && !modalityBlocked;
 
   return (
-    <div className={cn("border-t bg-background", className)}>
-      <div className="mx-auto w-full max-w-3xl px-4 py-3">
+    <div className={cn("bg-background", className)}>
+      <div className="mx-auto w-full max-w-3xl px-4 pb-3 pt-2">
         <ComposerToolbar
           modelId={modelId}
           onModelChange={onModelChange}
