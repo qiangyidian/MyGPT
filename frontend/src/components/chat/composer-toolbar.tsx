@@ -74,7 +74,7 @@ export function ComposerToolbar({
               <span className="truncate">{kbLabel}</span>
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-[200px]">
+          <DropdownMenuContent align="start" side="top" className="w-[200px]">
             {knowledgeBases.map((kb) => (
               <DropdownMenuCheckboxItem
                 key={kb.id}

@@ -50,7 +50,8 @@ export function ReasoningEffortSelector({
         <BrainCircuit className="h-4 w-4 shrink-0" />
         <SelectValue />
       </SelectTrigger>
-      <SelectContent>
+      {/* Composer sits at the bottom of the chat column — always open upward. */}
+      <SelectContent side="top">
         {EFFORTS.map((e) => (
           <SelectItem key={e.value} value={e.value}>
             {e.label}

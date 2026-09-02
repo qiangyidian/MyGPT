@@ -67,7 +67,8 @@ export function ModelSelector({
       <SelectTrigger className={cn("w-[200px] font-medium", className)}>
         <SelectValue placeholder="选择模型" />
       </SelectTrigger>
-      <SelectContent>
+      {/* Composer sits at the bottom of the chat column — always open upward. */}
+      <SelectContent side="top">
         <SelectItem value="__none__">默认模型</SelectItem>
         {filtered.map((m) => (
           <SelectItem key={m.id} value={m.id}>

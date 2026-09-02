@@ -43,7 +43,7 @@ export function ChatModeSelector({ className }: { className?: string }) {
           <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-72">
+      <DropdownMenuContent align="start" side="top" className="w-72">
         <DropdownMenuLabel className="text-xs text-muted-foreground">
           选择能力
         </DropdownMenuLabel>
