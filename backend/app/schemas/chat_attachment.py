@@ -28,3 +28,22 @@ class ChatAttachmentOut(BaseModel):
 
 class SaveToKbRequest(BaseModel):
     knowledge_base_id: uuid.UUID
+
+
+class AttachmentTextOut(BaseModel):
+    """Parsed-text preview for an attachment (document content preview).
+
+    ``text`` is truncated to ``max_chars`` (server-capped) with a flag; the
+    full text stays server-side — the preview dialog never needs megabytes.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    filename: str
+    mime_type: str
+    parse_status: str
+    preview_metadata: Optional[dict[str, Any]] = None
+    text: str = ""
+    truncated: bool = False
+    total_chars: int = 0

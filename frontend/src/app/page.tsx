@@ -8,6 +8,7 @@ import { AppShell } from "@/components/app-shell";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { MessageList } from "@/components/message-list";
 import { Composer } from "@/components/composer";
+import { AttachmentDropzone } from "@/components/attachments/attachment-dropzone";
 import { ApprovalCard } from "@/components/approval-card";
 import { ContextPanel } from "@/components/context/context-panel";
 import { ContextPanelTrigger } from "@/components/context/context-panel-trigger";
@@ -220,6 +221,14 @@ function ChatPanel({
     }
   }, [runStatus]);
 
+  // Upload bridge: the full-screen dropzone routes dropped/pasted files to the
+  // composer's upload flow (which owns conversation creation + draft state).
+  // A ref avoids re-mounting the drop listeners on every composer render.
+  const composerUploadRef = useRef<((files: FileList | File[]) => void) | null>(null);
+  const handleFilesPicked = useCallback((files: FileList | File[]) => {
+    composerUploadRef.current?.(files);
+  }, []);
+
   const ensureConversationId = useCallback(async () => {
     const conv = await createConversation({});
     setActiveConversationId(conv.id);
@@ -289,6 +298,7 @@ function ChatPanel({
 
   return (
     <div className="relative flex min-h-0 flex-1">
+      <AttachmentDropzone onPick={handleFilesPicked}>
       <main className="flex min-w-0 flex-1 flex-col">
         {/* Context-panel / agent-panel triggers float over the message area
             (top-right, absolute) so they no longer claim a header row. */}
@@ -353,8 +363,10 @@ function ChatPanel({
           knowledgeBases={kbsQuery.data}
           conversationId={activeConversationId}
           ensureConversationId={ensureConversationId}
+          onUploadReady={(fn) => (composerUploadRef.current = fn)}
         />
       </main>
+      </AttachmentDropzone>
 
       <ContextPanel conversationId={activeConversationId} />
       <ArtifactPreviewPanel />

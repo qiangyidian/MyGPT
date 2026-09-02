@@ -1,6 +1,6 @@
 "use client";
 
-import { type KeyboardEvent, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Send, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -8,7 +8,6 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ComposerToolbar } from "@/components/chat/composer-toolbar";
 import { AttachmentPicker } from "@/components/chat/attachment-picker";
-import { AttachmentDropzone } from "@/components/attachments/attachment-dropzone";
 import { AttachmentList } from "@/components/attachments/attachment-list";
 import { useChatAttachments } from "@/hooks/useChatAttachments";
 import { useModels } from "@/hooks/useModels";
@@ -39,6 +38,12 @@ interface ComposerProps {
   /** Create a conversation on demand when attaching to a brand-new chat. */
   ensureConversationId?: () => Promise<string>;
   className?: string;
+  /**
+   * Receives the composer's upload entry point so a page-level drop zone can
+   * route dropped/pasted files into the same flow as the paperclip button.
+   * Called once on mount with the function, null on unmount.
+   */
+  onUploadReady?: (upload: ((files: FileList | File[]) => void) | null) => void;
 }
 
 export function Composer({
@@ -53,6 +58,7 @@ export function Composer({
   conversationId,
   ensureConversationId,
   className,
+  onUploadReady,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const mode = useChatUiStore((s) => s.mode);
@@ -63,6 +69,17 @@ export function Composer({
     ensureConversationId
   );
   const { chatModels } = useModels();
+
+  // Publish the upload entry point for the page-level drop zone. The upload fn
+  // is unstable (recreated per render by the hook); bridge through a ref so the
+  // published callback identity stays stable.
+  const uploadFnRef = useRef(upload);
+  uploadFnRef.current = upload;
+  useEffect(() => {
+    onUploadReady?.((files: FileList | File[]) => void uploadFnRef.current(files));
+    return () => onUploadReady?.(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount/unmount only
+  }, []);
 
   // Derive the modalities required by the current attachments (image/audio/
   // file). This drives modality-aware model filtering in the dropdown below.
@@ -140,9 +157,8 @@ export function Composer({
           />
         )}
 
-        <AttachmentDropzone onPick={(f) => void upload(f)} className="rounded-xl">
-          <div className="flex items-center gap-2 rounded-xl border border-input bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
-            <AttachmentPicker onPick={(f) => void upload(f)} />
+        <div className="flex items-center gap-2 rounded-xl border border-input bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
+          <AttachmentPicker onPick={(f) => void upload(f)} />
 
             <Textarea
               ref={textareaRef}
@@ -181,8 +197,7 @@ export function Composer({
                 <Send className="h-4 w-4" />
               </Button>
             )}
-          </div>
-        </AttachmentDropzone>
+        </div>
 
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
           {modalityBlocked

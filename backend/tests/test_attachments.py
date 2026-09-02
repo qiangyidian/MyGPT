@@ -167,3 +167,65 @@ async def test_extract_parses_text(db_session):
     # Clean up the stored file.
     from app.core.storage import get_storage
     await get_storage().delete(att.storage_key)
+
+
+# --------------------------------------------------------------------------- #
+# GET /{id}/text — parsed-text preview for the document preview dialog
+# --------------------------------------------------------------------------- #
+async def test_attachment_text_endpoint_serves_parsed_text(client, monkeypatch):
+    """The /text preview endpoint returns the stored extracted_text, capped."""
+    import app.services.attachment_service as svc
+
+    captured = {}
+
+    class _FakeAtt:
+        id = uuid.uuid4()
+        original_filename = "note.txt"
+        mime_type = "text/plain"
+        parse_status = "ready"
+        preview_metadata = {"chars": 20, "kind": "text"}
+        extracted_text = "parsed content for preview"
+
+    async def _fake_get_owned(db, att_id, user_id):
+        captured["att_id"] = att_id
+        return _FakeAtt()
+
+    monkeypatch.setattr(svc, "get_owned", _fake_get_owned)
+    # The router imported the symbol at module load — patch there too.
+    import app.api.chat_attachments as router_mod
+
+    monkeypatch.setattr(router_mod.attachment_service, "get_owned", _fake_get_owned)
+
+    r = await client.get(f"/api/chat-attachments/{_FakeAtt.id}/text", headers=auth_headers())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["text"] == "parsed content for preview"
+    assert body["truncated"] is False
+    assert body["total_chars"] == len("parsed content for preview")
+    assert body["preview_metadata"]["chars"] == 20
+
+
+async def test_attachment_text_endpoint_truncates(client, monkeypatch):
+    import app.api.chat_attachments as router_mod
+
+    class _FakeAtt:
+        id = uuid.uuid4()
+        original_filename = "big.pdf"
+        mime_type = "application/pdf"
+        parse_status = "ready"
+        preview_metadata = None
+        extracted_text = "x" * 1500
+
+    async def _fake_get_owned(db, att_id, user_id):
+        return _FakeAtt()
+
+    monkeypatch.setattr(router_mod.attachment_service, "get_owned", _fake_get_owned)
+
+    r = await client.get(
+        f"/api/chat-attachments/{_FakeAtt.id}/text?max_chars=1000", headers=auth_headers()
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["text"]) == 1000
+    assert body["truncated"] is True
+    assert body["total_chars"] == 1500

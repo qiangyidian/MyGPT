@@ -18,7 +18,7 @@ from app.core.deps import get_current_user
 from app.core.exceptions import AppException
 from app.db import get_db
 from app.models import Conversation, User
-from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
+from app.schemas.chat_attachment import AttachmentTextOut, ChatAttachmentOut, SaveToKbRequest
 from app.services import attachment_service
 
 router = APIRouter(prefix="/api/chat-attachments", tags=["chat-attachments"])
@@ -90,6 +90,34 @@ async def download_attachment_content(
             "Content-Disposition": f'attachment; filename="{safe_name}"',
             "Cache-Control": "private, no-store",
         },
+    )
+
+
+@router.get("/{attachment_id}/text", response_model=AttachmentTextOut)
+async def get_attachment_text(
+    attachment_id: uuid.UUID,
+    max_chars: int = Query(20000, ge=500, le=100000),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentTextOut:
+    """Parsed-text preview for the attachment-preview dialog.
+
+    Serves the stored ``extracted_text`` (produced by the background parse:
+    document parsers / image OCR). Capped server-side; ``truncated`` tells the
+    client the full text is longer (download or save-to-KB for everything).
+    """
+    att = await attachment_service.get_owned(db, attachment_id, user.id)
+    full = (att.extracted_text or "").strip()
+    total = len(full)
+    return AttachmentTextOut(
+        id=att.id,
+        filename=att.original_filename,
+        mime_type=att.mime_type or "",
+        parse_status=att.parse_status or "",
+        preview_metadata=att.preview_metadata,
+        text=full[:max_chars],
+        truncated=total > max_chars,
+        total_chars=total,
     )
 
 

@@ -4,6 +4,7 @@ import {
   AgentRun,
   AgentStep,
   ArtifactMeta,
+  AttachmentTextPreview,
   ChatAttachment,
   ChatRequest,
   Citation,
@@ -218,6 +219,12 @@ export const api = {
       `/api/chat-attachments?conversation_id=${encodeURIComponent(conversationId)}`
     ),
   deleteChatAttachment: (id: string) => request("DELETE", `/api/chat-attachments/${id}`),
+  /** Parsed-text preview (document content) for the preview dialog. */
+  getAttachmentText: (id: string, maxChars = 20000) =>
+    request<AttachmentTextPreview>(
+      "GET",
+      `/api/chat-attachments/${id}/text?max_chars=${maxChars}`
+    ),
   saveAttachmentToKb: (id: string, knowledgeBaseId: string) =>
     request<ChatAttachment>("POST", `/api/chat-attachments/${id}/save-to-kb`, {
       knowledge_base_id: knowledgeBaseId,

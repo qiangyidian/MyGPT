@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Download, Loader2 } from "lucide-react";
+import { Download, FileText, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -12,13 +12,26 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
+import { Markdown } from "@/components/markdown";
 import { formatSize } from "@/components/attachments/attachment-card";
 import type { ChatAttachment } from "@/lib/types";
 
+interface AttachmentTextPreview {
+  text: string;
+  truncated: boolean;
+  total_chars: number;
+  parse_status: string;
+  preview_metadata: Record<string, unknown> | null;
+}
+
 /**
- * Authenticated attachment preview dialog. Images render from a fetched blob;
- * other types show metadata + a download button (bytes are fetched on demand so
- * the stored path is never exposed to the client).
+ * Authenticated attachment preview dialog.
+ *
+ * - Images render from a fetched blob.
+ * - Documents (PDF/Word/Excel/Markdown/…) fetch the server-parsed text via
+ *   ``/text`` and render it — plain text in a <pre>, Markdown rendered (it is
+ *   the most common doc type here and stays readable as plain text anyway).
+ * - Structured parse metadata (pages / sheets / chars / OCR) shows as chips.
  */
 export function AttachmentPreview({
   attachment,
@@ -29,11 +42,17 @@ export function AttachmentPreview({
 }) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [textPreview, setTextPreview] = useState<AttachmentTextPreview | null>(null);
+  const [textLoading, setTextLoading] = useState(false);
 
+  const isImage = attachment?.mime_type?.startsWith("image/");
+  const isAudio = attachment?.mime_type?.startsWith("audio/");
+  const isMarkdown = !!attachment?.original_filename?.toLowerCase().match(/\.(md|markdown)$/);
+
+  // Image bytes.
   useEffect(() => {
     setBlobUrl(null);
-    if (!attachment) return;
-    if (!attachment.mime_type?.startsWith("image/")) return;
+    if (!attachment || !isImage) return;
     let url: string | null = null;
     let cancelled = false;
     setLoading(true);
@@ -52,9 +71,41 @@ export function AttachmentPreview({
       cancelled = true;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [attachment]);
+  }, [attachment, isImage]);
 
-  const isImage = attachment?.mime_type?.startsWith("image/");
+  // Document parsed text.
+  useEffect(() => {
+    setTextPreview(null);
+    if (!attachment || isImage || isAudio) return;
+    let cancelled = false;
+    setTextLoading(true);
+    api
+      .getAttachmentText(attachment.id)
+      .then((p) => {
+        if (!cancelled) setTextPreview(p);
+      })
+      .catch(() => {
+        if (!cancelled) setTextPreview(null);
+      })
+      .finally(() => {
+        if (!cancelled) setTextLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment, isImage, isAudio]);
+
+  const meta = textPreview?.preview_metadata;
+  const metaChips: string[] = [];
+  if (meta) {
+    const m = meta as Record<string, unknown>;
+    if (typeof m.pages === "number") metaChips.push(`${m.pages} 页`);
+    if (typeof m.sheets === "number") metaChips.push(`${m.sheets} 工作表`);
+    if (typeof m.rows === "number") metaChips.push(`${m.rows} 行`);
+    if (typeof m.chars === "number") metaChips.push(`${m.chars} 字符`);
+    if (m.ocr_used === true) metaChips.push("OCR");
+    if (m.rag_indexed === true) metaChips.push("已建索引");
+  }
 
   return (
     <Dialog open={!!attachment} onOpenChange={onOpenChange}>
@@ -77,14 +128,51 @@ export function AttachmentPreview({
             ) : (
               <p className="text-sm text-muted-foreground">无法预览此图片。</p>
             )
-          ) : attachment?.preview_metadata ? (
-            <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground">
-              {JSON.stringify(attachment.preview_metadata, null, 2)}
-            </pre>
-          ) : (
+          ) : isAudio ? (
             <p className="text-sm text-muted-foreground">
-              该类型文件不支持在线预览，可下载后查看。
+              音频附件不支持在线预览；发送时音频输入模型可直接消费，或下载后收听。
             </p>
+          ) : textLoading ? (
+            <div className="flex h-40 items-center justify-center text-muted-foreground">
+              <Loader2 className="mr-2 h-5 w-5 animate-spin" /> 正在解析文档内容…
+            </div>
+          ) : textPreview && textPreview.text ? (
+            <div className="space-y-2">
+              {metaChips.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {metaChips.map((c) => (
+                    <span
+                      key={c}
+                      className="rounded-full bg-secondary px-2 py-0.5 text-[11px] text-secondary-foreground"
+                    >
+                      {c}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {isMarkdown ? (
+                <div className="text-sm">
+                  <Markdown content={textPreview.text} />
+                </div>
+              ) : (
+                <pre className="whitespace-pre-wrap break-words text-xs leading-relaxed">
+                  {textPreview.text}
+                </pre>
+              )}
+              {textPreview.truncated && (
+                <p className="border-t border-border pt-2 text-[11px] text-muted-foreground">
+                  内容较长，仅显示前 {textPreview.text.length.toLocaleString()} 字符（共{" "}
+                  {textPreview.total_chars.toLocaleString()}）。完整内容会作为上下文发给模型；如需查看全文请下载。
+                </p>
+              )}
+            </div>
+          ) : textPreview && textPreview.parse_status === "parsing" ? (
+            <p className="text-sm text-muted-foreground">文档正在解析中，稍后重试预览。</p>
+          ) : (
+            <div className="flex flex-col items-center gap-2 py-8 text-muted-foreground">
+              <FileText className="h-8 w-8" />
+              <p className="text-sm">暂无可预览的文本内容，可下载后查看。</p>
+            </div>
           )}
         </div>
         {attachment && (

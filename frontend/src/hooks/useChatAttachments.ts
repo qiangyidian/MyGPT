@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
+import { attachmentRejectionMessage } from "@/lib/attachment-types";
 import { useAttachmentStore, EMPTY_DRAFTS, type AttachmentDraft } from "@/stores/attachment-store";
 
 interface UseChatAttachmentsResult {
@@ -39,8 +41,16 @@ export function useChatAttachments(
 
   const upload = useCallback(
     async (files: File[] | FileList) => {
-      const list = Array.from(files);
+      let list = Array.from(files);
       if (list.length === 0) return;
+      // Reject unsupported types up front — a clear toast beats a failed
+      // upload after the bytes were already sent. Valid files still proceed.
+      const rejected = attachmentRejectionMessage(list);
+      if (rejected) {
+        toast.error("无法添加附件", { description: rejected });
+        list = list.filter((f) => attachmentRejectionMessage([f]) === null);
+        if (list.length === 0) return;
+      }
       setIsUploading(true);
       try {
         let convId = conversationId;

@@ -4,6 +4,7 @@ import { useRef } from "react";
 import { Paperclip } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { ATTACHMENT_ACCEPT } from "@/lib/attachment-types";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -48,6 +49,7 @@ export function AttachmentPicker({ onPick, disabled, className }: AttachmentPick
         ref={inputRef}
         type="file"
         multiple
+        accept={ATTACHMENT_ACCEPT}
         className="sr-only"
         tabIndex={-1}
         aria-hidden="true"

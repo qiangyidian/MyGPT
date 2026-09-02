@@ -215,6 +215,18 @@ export interface AttachmentRef {
 }
 
 /** A full chat attachment row (from /api/chat-attachments). */
+/** Parsed-text preview served by GET /api/chat-attachments/{id}/text. */
+export interface AttachmentTextPreview {
+  id: string;
+  filename: string;
+  mime_type: string;
+  parse_status: string;
+  preview_metadata: Record<string, unknown> | null;
+  text: string;
+  truncated: boolean;
+  total_chars: number;
+}
+
 export interface ChatAttachment {
   id: string;
   conversation_id: string;
