@@ -10,7 +10,6 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.deps import get_current_user
 from app.db import get_db
@@ -30,18 +29,16 @@ router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 NOT_FOUND = status.HTTP_404_NOT_FOUND
 # Cap on how many recent messages the detail endpoint returns in one response.
 # selectinload would pull the ENTIRE history; an explicit capped query bounds
-# memory + serialization for very long conversations. High enough that normal
-# conversations are unaffected.
-_DETAIL_MESSAGE_WINDOW = 1000
+# memory + serialization for very long conversations. The frontend renders this
+# list unvirtualized, so a smaller window also caps first-paint cost; older
+# history stays reachable via the chat stream's own capped history.
+_DETAIL_MESSAGE_WINDOW = 200
 
 
 async def _load_owned(
-    db: AsyncSession, conv_id: uuid.UUID, user: User, *, with_messages: bool = False
+    db: AsyncSession, conv_id: uuid.UUID, user: User
 ) -> Conversation:
-    opts = [selectinload(Conversation.messages)] if with_messages else []
     stmt = select(Conversation).where(Conversation.id == conv_id)
-    if opts:
-        stmt = stmt.options(*opts)
     conv = (await db.execute(stmt)).scalars().first()
     if conv is None:
         raise HTTPException(NOT_FOUND, "Conversation not found")
@@ -103,8 +100,12 @@ async def create_conversation(
     db.add(conv)
     await db.commit()
     await db.refresh(conv)
-    detail = ConversationDetail.model_validate(conv)
-    detail.messages = []  # brand-new conversation has no messages yet
+    # Populate via model_construct-style copy: validating the ORM object would
+    # touch the lazy `messages` relationship (async IO outside greenlet context).
+    detail = ConversationDetail(
+        **ConversationOut.model_validate(conv).model_dump(),
+        messages=[],  # brand-new conversation has no messages yet
+    )
     return detail
 
 
@@ -126,8 +127,12 @@ async def get_conversation(
             .limit(_DETAIL_MESSAGE_WINDOW)
         )
     ).scalars().all()
-    detail = ConversationDetail.model_validate(conv)
-    detail.messages = [MessageOut.model_validate(m) for m in reversed(msg_rows)]
+    # Build from the flat ConversationOut dump — validating the ORM object
+    # directly would touch the lazy `messages` relationship.
+    detail = ConversationDetail(
+        **ConversationOut.model_validate(conv).model_dump(),
+        messages=[MessageOut.model_validate(m) for m in reversed(msg_rows)],
+    )
     return detail
 
 
@@ -179,11 +184,20 @@ async def branch_conversation(
     )
     if branch is None:
         raise HTTPException(NOT_FOUND, "Conversation or message not found")
-    detail = ConversationDetail.model_validate(branch)
-    detail.messages = [
-        MessageOut.model_validate(m)
-        for m in sorted(branch.messages, key=lambda m: m.created_at)
-    ]
+    # Explicit history query (relationship is default-lazy now) — same bounded
+    # window semantics as the detail endpoint.
+    msg_rows = (
+        await db.execute(
+            select(Message)
+            .where(Message.conversation_id == branch.id)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+            .limit(_DETAIL_MESSAGE_WINDOW)
+        )
+    ).scalars().all()
+    detail = ConversationDetail(
+        **ConversationOut.model_validate(branch).model_dump(),
+        messages=[MessageOut.model_validate(m) for m in msg_rows],
+    )
     return detail
 
 

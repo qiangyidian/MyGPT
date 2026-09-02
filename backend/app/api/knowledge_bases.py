@@ -32,14 +32,25 @@ async def _load_owned(
     return kb
 
 
-async def _counts(db: AsyncSession) -> tuple[dict, dict]:
-    """Return (doc_count_by_kb, chunk_count_by_kb) in one pass each."""
+async def _counts(db: AsyncSession, kb_ids: list[uuid.UUID]) -> tuple[dict, dict]:
+    """Return (doc_count_by_kb, chunk_count_by_kb) for the given KB ids.
+
+    Scoped to the KBs being listed — the unscoped version aggregated the whole
+    platform's documents/chunks (including other users') on every KB page load,
+    which grows with global content volume, not the caller's.
+    """
+    if not kb_ids:
+        return {}, {}
     doc_rows = await db.execute(
-        select(Document.knowledge_base_id, func.count()).group_by(Document.knowledge_base_id)
+        select(Document.knowledge_base_id, func.count())
+        .where(Document.knowledge_base_id.in_(kb_ids))
+        .group_by(Document.knowledge_base_id)
     )
     doc_counts = {str(kb): n for kb, n in doc_rows.all()}
     chunk_rows = await db.execute(
-        select(DocumentChunk.knowledge_base_id, func.count()).group_by(DocumentChunk.knowledge_base_id)
+        select(DocumentChunk.knowledge_base_id, func.count())
+        .where(DocumentChunk.knowledge_base_id.in_(kb_ids))
+        .group_by(DocumentChunk.knowledge_base_id)
     )
     chunk_counts = {str(kb): n for kb, n in chunk_rows.all()}
     return doc_counts, chunk_counts
@@ -68,7 +79,7 @@ async def list_knowledge_bases(
         stmt = select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
     res = await db.execute(stmt)
     kbs = list(res.scalars().all())
-    doc_counts, chunk_counts = await _counts(db)
+    doc_counts, chunk_counts = await _counts(db, [kb.id for kb in kbs])
     return [_to_out(kb, doc_counts, chunk_counts) for kb in kbs]
 
 
@@ -97,7 +108,7 @@ async def get_knowledge_base(
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseOut:
     kb = await _load_owned(db, kb_id, user)
-    doc_counts, chunk_counts = await _counts(db)
+    doc_counts, chunk_counts = await _counts(db, [kb.id])
     return _to_out(kb, doc_counts, chunk_counts)
 
 

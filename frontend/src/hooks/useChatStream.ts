@@ -145,6 +145,43 @@ export function useChatStream(): ChatStreamState {
   const [status, setStatus] = useState<GenerationStatus>("complete");
   const [finishReason, setFinishReason] = useState<FinishReason | null>(null);
 
+  // ---- Streaming token throttle ------------------------------------------- #
+  // Each SSE token delta used to setState immediately, re-rendering the whole
+  // markdown tree per delta (O(n²) parse cost on long answers). We accumulate
+  // into a ref and flush to state at most once per animation frame — the screen
+  // can't paint faster anyway, so this collapses dozens of renders per frame
+  // into one without any visible latency.
+  const pendingTextRef = useRef<string | null>(null);
+  const flushHandleRef = useRef<number | null>(null);
+  const flushStreamingText = useCallback(() => {
+    flushHandleRef.current = null;
+    if (pendingTextRef.current !== null) {
+      setStreamingText(pendingTextRef.current);
+      pendingTextRef.current = null;
+    }
+  }, []);
+  const enqueueStreamingText = useCallback(
+    (text: string) => {
+      pendingTextRef.current = text;
+      if (flushHandleRef.current === null) {
+        flushHandleRef.current = requestAnimationFrame(flushStreamingText);
+      }
+    },
+    [flushStreamingText],
+  );
+  const syncStreamingText = useCallback(
+    (text: string) => {
+      // Immediate (uncancelled) set + drop any scheduled flush.
+      if (flushHandleRef.current !== null) {
+        cancelAnimationFrame(flushHandleRef.current);
+        flushHandleRef.current = null;
+      }
+      pendingTextRef.current = null;
+      setStreamingText(text);
+    },
+    [],
+  );
+
   // Remember the last send so regenerate() can replay it.
   // REBUILD AFTER REFRESH: the backend persists `send_params` on each user
   // message (mode/model/kb/attachments); when the in-memory ref is empty —
@@ -458,7 +495,7 @@ export function useChatStream(): ChatStreamState {
       },
       onToken: (delta) => {
         accumulated += delta;
-        setStreamingText(accumulated);
+        enqueueStreamingText(accumulated);
         // Text resuming consumes the batch before it: everything emitted so
         // far is now "narration history", and the next step starts a fresh
         // batch to be shown after this text.
@@ -613,7 +650,7 @@ export function useChatStream(): ChatStreamState {
       abortRef.current = controller;
 
       setIsStreaming(true);
-      setStreamingText("");
+      syncStreamingText("");
       setCitations([]);
       setSteps([]);
       setStepsSinceTextFrom(0);
@@ -756,7 +793,7 @@ export function useChatStream(): ChatStreamState {
         setIsStreaming(false);
         abortRef.current = null;
         userStopRef.current = false;
-        setStreamingText("");
+        syncStreamingText("");
       }
     },
     [isStreaming, currentConversationId, appendMessage, queryClient]
@@ -832,7 +869,7 @@ export function useChatStream(): ChatStreamState {
         // The durable event log has no meta frame — seed the ids up front.
         session.seed(conversationId, active.messageId);
         setIsStreaming(true);
-        setStreamingText("");
+        syncStreamingText("");
         setCitations([]);
         setSteps([]);
         setStepsSinceTextFrom(0);
@@ -869,7 +906,7 @@ export function useChatStream(): ChatStreamState {
           }
           setIsStreaming(false);
           abortRef.current = null;
-          setStreamingText("");
+          syncStreamingText("");
         }
       } finally {
         reattachInFlightRef.current = false;

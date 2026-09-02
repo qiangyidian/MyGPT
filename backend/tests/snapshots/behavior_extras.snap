@@ -10,12 +10,3 @@
 用户已设定新的沟通风格，后续回答请遵循：
 简洁、技术、少客套
 </personality_spec>
-
-<realtime_delegation>
-source: handoff
-<input>
-继续重构
-<transcript_delta>
-user: 上一步改了 X
-请基于以上继续（交接自实时会话）。
-</realtime_delegation>

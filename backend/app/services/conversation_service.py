@@ -51,14 +51,14 @@ async def list_for_user(
 async def get(
     db: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID
 ) -> Optional[Conversation]:
-    """Fetch a conversation with messages, enforcing ownership.
+    """Fetch a conversation, enforcing ownership.
 
     Returns None when the conversation does not exist or belongs to another user.
+    Messages are NOT eager-loaded (the model relationship is default-lazy);
+    callers that need history query Message explicitly.
     """
     result = await db.execute(
-        select(Conversation)
-        .options(selectinload(Conversation.messages))
-        .where(
+        select(Conversation).where(
             Conversation.id == conversation_id,
             Conversation.user_id == user_id,
         )
@@ -206,14 +206,3 @@ def _truncate_title(content: str) -> str:
     if " " in cut:
         cut = cut.rsplit(" ", 1)[0]
     return cut + "…"
-
-
-async def first_message_autotitle(
-    db: AsyncSession,
-    conversation: Conversation,
-    message: Message,
-) -> Optional[str]:
-    """Convenience wrapper: derive a title from a just-created user message."""
-    if message.role != "user":
-        return None
-    return await maybe_autotitle(db, conversation, message.content)

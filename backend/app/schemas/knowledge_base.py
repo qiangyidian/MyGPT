@@ -14,12 +14,6 @@ class KnowledgeBaseCreate(BaseModel):
     embedding_model_id: uuid.UUID | None = None
 
 
-class KnowledgeBaseUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    embedding_model_id: uuid.UUID | None = None
-
-
 class KnowledgeBaseOut(ORMModel):
     id: uuid.UUID
     user_id: uuid.UUID

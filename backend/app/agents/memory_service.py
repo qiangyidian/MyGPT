@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
-from sqlalchemy import desc, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.datetime_utils import is_expired as _is_expired
@@ -293,26 +293,6 @@ class MemoryService:
         rows = [r for r in rows if not _is_expired(r.expires_at, now)]
         rows.sort(key=lambda r: hit_ids.get(str(r.id), 0.0), reverse=True)
         return rows[:top_k]
-
-    async def list_active_contents(
-        self, db: AsyncSession, user: Any, *, limit: int = 50
-    ) -> list[str]:
-        """Return the plain-text contents of a user's active, non-expired
-        memories — the list folded into the effective system prompt."""
-        user_id = _user_or_id(user)
-        rows = (
-            await db.execute(
-                select(UserMemory)
-                .where(
-                    UserMemory.user_id == user_id,
-                    UserMemory.active.is_(True),
-                )
-                .order_by(desc(UserMemory.updated_at))
-                .limit(limit)
-            )
-        ).scalars().all()
-        now = datetime.now(timezone.utc)
-        return [r.content for r in rows if not _is_expired(r.expires_at, now)]
 
     # ------------------------------------------------------------------ #
     async def _get_owned(self, db: AsyncSession, memory_id: uuid.UUID) -> UserMemory:

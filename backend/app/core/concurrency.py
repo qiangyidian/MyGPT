@@ -36,12 +36,6 @@ def model_limiter() -> asyncio.Semaphore:
     return _semaphore
 
 
-def reset_limiter() -> None:
-    """Drop the cached semaphore (test hook)."""
-    global _semaphore
-    _semaphore = None
-
-
 class CircuitBreakerOpenError(RuntimeError):
     """Raised when a call is rejected because the breaker for a key is OPEN."""
 

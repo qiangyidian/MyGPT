@@ -19,7 +19,6 @@ from app.schemas.auth import (
     TokenResponse,
     UserOut,
 )
-from app.schemas.background_task import BackgroundTaskEnqueue, BackgroundTaskOut
 from app.schemas.connector import (
     ConnectorCreate,
     ConnectorOut,
@@ -27,30 +26,13 @@ from app.schemas.connector import (
     ConnectorUpdate,
     ProviderManifestOut,
 )
-from app.schemas.chat import (
-    ChatMessage,
-    ChatRequest,
-    ChatRole,
-    Citation,
-    CitationEvent,
-    DoneEvent,
-    ErrorEvent,
-    MetaEvent,
-    ResearchPlanEvent,
-    RunInstructionEvent,
-    RunPauseEvent,
-    RunResumeEvent,
-    TokenEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-)
+from app.schemas.chat import ChatRequest, Citation
 from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
-from app.schemas.common import ErrorDetail, Ok, ORMModel, Page
+from app.schemas.common import ORMModel
 from app.schemas.conversation import (
     ConversationBranchRequest,
     ConversationCreate,
     ConversationDetail,
-    ConversationListResponse,
     ConversationOut,
     ConversationUpdate,
 )
@@ -59,7 +41,6 @@ from app.schemas.feedback import MessageFeedbackOut, MessageFeedbackRequest
 from app.schemas.knowledge_base import (
     KnowledgeBaseCreate,
     KnowledgeBaseOut,
-    KnowledgeBaseUpdate,
 )
 from app.schemas.memory import MemoryOut, MemoryUpdate
 from app.schemas.user_memory import (
@@ -77,7 +58,6 @@ from app.schemas.model_config import (
 )
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
 from app.schemas.tool import (
-    ToolCallOut,
     ToolInfo,
     ToolParameter,
     ToolTestRequest,
@@ -86,7 +66,7 @@ from app.schemas.tool import (
 
 __all__ = [
     # common
-    "Ok", "ErrorDetail", "ORMModel", "Page",
+    "ORMModel",
     # agent runs (Phase 3)
     "AgentRunOut", "AgentStepOut", "ToolApprovalOut", "ToolCallAuditOut",
     "ApproveRequest", "RejectRequest", "ActionResult",
@@ -97,19 +77,15 @@ __all__ = [
     "ModelConfigCreate", "ModelConfigUpdate", "ModelConfigOut", "ModelTestResult",
     # conversation / message
     "ConversationCreate", "ConversationUpdate", "ConversationOut", "ConversationDetail",
-    "ConversationListResponse", "ConversationBranchRequest",
+    "ConversationBranchRequest",
     "MessageOut",
     # chat
-    "ChatRequest", "ChatMessage", "ChatRole", "Citation",
-    "MetaEvent", "TokenEvent", "CitationEvent", "ToolCallEvent", "ToolResultEvent",
-    "DoneEvent", "ErrorEvent",
-    "ResearchPlanEvent", "RunInstructionEvent", "RunPauseEvent", "RunResumeEvent",
+    "ChatRequest", "Citation",
     # chat attachments + feedback (Phase 1)
     "ChatAttachmentOut", "SaveToKbRequest",
     "MessageFeedbackOut", "MessageFeedbackRequest",
-    # projects + background tasks + memories (Phase 3)
+    # projects + memories (Phase 3)
     "ProjectCreate", "ProjectUpdate", "ProjectOut",
-    "BackgroundTaskEnqueue", "BackgroundTaskOut",
     "MemoryOut", "MemoryUpdate",
     # Task 7: opt-in semantic user memory
     "UserMemoryOut", "UserMemoryPropose", "UserMemoryEdit", "UserMemoryBulkAction",
@@ -117,10 +93,10 @@ __all__ = [
     "ConnectorCreate", "ConnectorUpdate", "ConnectorRotate", "ConnectorOut",
     "ProviderManifestOut",
     # knowledge base / documents
-    "KnowledgeBaseCreate", "KnowledgeBaseUpdate", "KnowledgeBaseOut",
+    "KnowledgeBaseCreate", "KnowledgeBaseOut",
     "DocumentOut", "DocumentPreview", "ReindexResult",
     # tools
-    "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult", "ToolCallOut",
+    "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult",
     # admin
     "AdminUserUpdate", "UsageStat", "SystemStatus", "AuditLogOut",
 ]

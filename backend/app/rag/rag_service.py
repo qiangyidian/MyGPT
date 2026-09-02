@@ -52,11 +52,50 @@ def _effective_score(hit: Any) -> float:
     return float(getattr(hit, "score", 0.0) or 0.0)
 
 
+# TTL cache for resolved embedding configs. Every retrieval used to re-query
+# (and re-decrypt the key of) the KB's embedding ModelConfig per KB per turn;
+# model configs change rarely, so a short TTL is a safe trade.
+_embedding_cfg_cache: dict[uuid.UUID, tuple[float, ModelConfig | None]] = {}
+_embedding_cfg_ttl = 30.0
+
+
+def _cached_kb_embedding(kb: KnowledgeBase) -> ModelConfig | None:
+    """Return the KB's own embedding config from the TTL cache, if fresh.
+
+    NOTE: returns the config only when kb.embedding_model_id is set AND the
+    cached lookup succeeded recently; a cache miss returns None so the caller
+    falls through to a fresh resolve (which then refreshes the cache).
+    """
+    if kb.embedding_model_id is None:
+        return None
+    entry = _embedding_cfg_cache.get(kb.embedding_model_id)
+    if entry is None:
+        return None
+    ts, cfg = entry
+    import time as _time
+
+    if _time.monotonic() - ts > _embedding_cfg_ttl:
+        return None
+    return cfg
+
+
+def _cache_kb_embedding(kb: KnowledgeBase, cfg: ModelConfig | None) -> None:
+    if kb.embedding_model_id is None:
+        return
+    import time as _time
+
+    _embedding_cfg_cache[kb.embedding_model_id] = (_time.monotonic(), cfg)
+
+
 async def _resolve_embedding_config(db: AsyncSession, kb: KnowledgeBase) -> ModelConfig:
     """Pick the embedding ModelConfig: the KB's own, else any system/user embedding config."""
+    cached = _cached_kb_embedding(kb)
+    if cached is not None:
+        return cached
     if kb.embedding_model_id is not None:
         cfg = await db.get(ModelConfig, kb.embedding_model_id)
         if cfg is not None:
+            _cache_kb_embedding(kb, cfg)
             return cfg
     result = await db.execute(
         select(ModelConfig)

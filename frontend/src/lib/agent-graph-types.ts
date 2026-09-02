@@ -15,8 +15,6 @@ export type AgentEdgeStatus = "pending" | "active" | "completed" | "failed";
 
 export type EdgeType = "dependency" | "handoff" | "delegation";
 
-export type GraphMode = "sequential" | "parallel" | "hybrid";
-
 export type GraphRunStatus =
   | "pending"
   | "running"
@@ -70,7 +68,7 @@ export interface AgentGraphState {
   runId: string;
   runtime: "native" | "crewai";
   flowName: string;
-  mode: GraphMode;
+  mode: "sequential" | "parallel" | "hybrid";
   status: GraphRunStatus;
 
   nodes: AgentGraphNode[];
@@ -116,14 +114,10 @@ export const TERMINAL_NODE_STATUSES: ReadonlySet<AgentNodeStatus> = new Set([
   "cancelled",
 ]);
 
-export function isTerminalNodeStatus(s: AgentNodeStatus): boolean {
-  return TERMINAL_NODE_STATUSES.has(s);
-}
-
 /** True if transitioning from -> to is a forward (or equal) move. */
 export function canTransitionTo(from: AgentNodeStatus, to: AgentNodeStatus): boolean {
   // Terminal states never regress (a late "running" can't revive a completed node).
-  if (isTerminalNodeStatus(from)) return false;
+  if (TERMINAL_NODE_STATUSES.has(from)) return false;
   // "waiting" is a side state: reachable from any active state, and a waiting
   // node can resume to running or move to a terminal state.
   if (to === "waiting" || from === "waiting") return true;

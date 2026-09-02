@@ -217,7 +217,6 @@ export const api = {
       "GET",
       `/api/chat-attachments?conversation_id=${encodeURIComponent(conversationId)}`
     ),
-  getChatAttachment: (id: string) => request<ChatAttachment>("GET", `/api/chat-attachments/${id}`),
   deleteChatAttachment: (id: string) => request("DELETE", `/api/chat-attachments/${id}`),
   saveAttachmentToKb: (id: string, knowledgeBaseId: string) =>
     request<ChatAttachment>("POST", `/api/chat-attachments/${id}/save-to-kb`, {
@@ -302,8 +301,6 @@ export const api = {
 
   // ---- Tools ----
   listTools: () => request<ToolInfo[]>("GET", "/api/tools"),
-  testTool: (name: string, args: Record<string, unknown>) =>
-    request<{ ok: boolean; result: unknown; error: string | null }>("POST", "/api/tools/test", { name, arguments: args }),
 
   // ---- Admin ----
   adminListUsers: () => request<User[]>("GET", "/api/admin/users"),
@@ -325,11 +322,6 @@ export const api = {
     >("GET", `/api/admin/audit?limit=${limit}`),
 
   // ---- Agent runs (Phase 3) ----
-  listAgentRuns: (conversationId?: string) =>
-    request<AgentRun[]>(
-      "GET",
-      conversationId ? `/api/agent-runs?conversation_id=${conversationId}` : "/api/agent-runs"
-    ),
   getAgentRun: (runId: string) => request<AgentRun>("GET", `/api/agent-runs/${runId}`),
   approveToolCall: (runId: string, approvalId: string) =>
     request<{ ok: boolean; status: string; message: string | null }>(
@@ -375,8 +367,6 @@ export const api = {
 export const projectsApi = {
   list: () => request<Project[]>("GET", "/api/projects"),
   create: (body: ProjectInput) => request<Project>("POST", "/api/projects", body),
-  update: (id: string, body: Partial<ProjectInput>) =>
-    request<Project>("PATCH", `/api/projects/${id}`, body),
   delete: (id: string) => request("DELETE", `/api/projects/${id}`),
   assignConversation: (projectId: string, conversationId: string) =>
     request<Conversation>("POST", `/api/projects/${projectId}/conversations/${conversationId}`),
@@ -388,7 +378,6 @@ export const projectsApi = {
 // Artifacts (Task 12) — tenant-scoped upload + authorized streaming download.
 // ===========================================================================
 export const artifactsApi = {
-  list: () => request<ArtifactMeta[]>("GET", "/api/artifacts"),
   create: (
     file: File,
     fields: { source?: string; run_id?: string } = {},
@@ -426,7 +415,6 @@ export const artifactsApi = {
     );
     return res.blob();
   },
-  delete: (id: string) => request("DELETE", `/api/artifacts/${id}`),
 };
 
 // ===========================================================================

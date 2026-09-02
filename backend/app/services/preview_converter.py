@@ -117,6 +117,5 @@ def _read_artifact_bytes(origin: Artifact) -> bytes:
         return fh.read()
 
 
-def preview_url(artifact_id) -> str:
     """Frontend-facing endpoint path for an artifact's converted PDF."""
     return f"/api/artifacts/{artifact_id}/preview"

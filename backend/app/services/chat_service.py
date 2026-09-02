@@ -468,6 +468,27 @@ async def _load_history(
     return rows
 
 
+# Resolved tiktoken encodings by model name. encoding_for_model is registry-
+# cached internally, but the miss path (unknown model -> fallback chain) was
+# re-walked per MESSAGE on every trim; memoize the final encoding per model.
+_encoding_cache: dict[str, tiktoken.Encoding | None] = {}
+
+
+def _resolve_encoding(model_name: str) -> tiktoken.Encoding | None:
+    if model_name in _encoding_cache:
+        return _encoding_cache[model_name]
+    enc: tiktoken.Encoding | None
+    try:
+        enc = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            enc = None
+    _encoding_cache[model_name] = enc
+    return enc
+
+
 def _estimate_tokens(text: str, model_name: str) -> int:
     """Best-effort token count.
 
@@ -477,16 +498,10 @@ def _estimate_tokens(text: str, model_name: str) -> int:
     """
     if not text:
         return 0
-    try:
-        enc = tiktoken.encoding_for_model(model_name)
+    enc = _resolve_encoding(model_name)
+    if enc is not None:
         return len(enc.encode(text))
-    except Exception:
-        pass
-    try:
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except Exception:
-        return max(1, len(text) // _CHARS_PER_TOKEN)
+    return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 def _trim_history(
@@ -1861,35 +1876,6 @@ class ChatService:
         return run.id
 
 
-# --------------------------------------------------------------------------- #
-# Task 5: durable execution seam (additive, gated behind BACKGROUND_WORKER)
-# --------------------------------------------------------------------------- #
-async def maybe_enqueue_durable_run(run_id: uuid.UUID | str) -> bool:
-    """When ``BACKGROUND_WORKER`` is the durable mode, enqueue ``run_id`` for the
-    background worker. In the default ``inprocess`` mode this is a no-op and the
-    existing inline stream handles execution.
-
-    Returns True if the run was enqueued (durable mode), False otherwise.
-
-    This is the single integration point the chat API calls after persisting an
-    AgentRun. It does NOT modify the existing ``stream`` path — the inline
-    generator runs unchanged when ``BACKGROUND_WORKER=inprocess`` (the default).
-    """
-    settings = get_settings()
-    if settings.BACKGROUND_WORKER == "inprocess":
-        return False
-    try:
-        from app.agents.workflow.queue import get_run_queue
-        from app.db import AsyncSessionLocal
-
-        queue = await get_run_queue()
-        await queue.enqueue(run_id, db_session_factory=AsyncSessionLocal)
-        return True
-    except Exception:  # noqa: BLE001 — never crash the request on enqueue failure
-        logger.warning("durable enqueue failed for run %s (inline fallback)", run_id, exc_info=True)
-        return False
-
-
 async def _resolve_model_for_durable_run(
     db: AsyncSession, conversation: Conversation, user: User | None = None
 ) -> ModelConfig | None:
@@ -2013,12 +1999,17 @@ async def run_durable_turn(
             pass
     if not kb_ids and conversation.knowledge_base_id is not None:
         kb_ids = [conversation.knowledge_base_id]
-    kb_ids = [
-        kb_id
-        for kb_id in kb_ids
-        if (_kb := await db.get(KnowledgeBase, kb_id)) is not None
-        and (_kb.user_id == user.id or user.role == "admin")
-    ]
+    # Batch ownership check with one IN query instead of one db.get per id
+    # (mirrors the inline path's N+1 fix).
+    if kb_ids:
+        rows = (
+            await db.execute(select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids)))
+        ).scalars().all()
+        owned = {
+            kb.id for kb in rows
+            if kb.user_id == user.id or user.role == "admin"
+        }
+        kb_ids = [kb_id for kb_id in kb_ids if kb_id in owned]
     # Bind the selection to the conversation (single-KB semantics) so the
     # client's detail refetch restores the picker state after the turn.
     if kb_ids and conversation.knowledge_base_id != kb_ids[0]:

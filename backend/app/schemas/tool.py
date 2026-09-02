@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -36,15 +34,3 @@ class ToolTestResult(BaseModel):
     result: Any = None
     error: str | None = None
     latency_ms: int = 0
-
-
-class ToolCallOut(ORMModel):
-    id: uuid.UUID
-    conversation_id: uuid.UUID
-    message_id: uuid.UUID | None
-    tool_name: str
-    arguments: dict[str, Any]
-    result: dict[str, Any] | None
-    status: str
-    error_message: str | None
-    created_at: datetime

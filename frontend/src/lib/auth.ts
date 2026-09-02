@@ -21,6 +21,3 @@ export function setAccessToken(token: string | null): void {
   else sessionStorage.removeItem(KEY);
 }
 
-export function clearTokens(): void {
-  setAccessToken(null);
-}

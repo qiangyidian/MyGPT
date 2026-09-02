@@ -2,26 +2,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel
-
-
-class ChatRole(str, Enum):
-    system = "system"
-    user = "user"
-    assistant = "assistant"
-    tool = "tool"
-
-
-class ChatMessage(BaseModel):
-    """OpenAI-style message used to talk to providers."""
-    role: ChatRole
-    content: str | None = None
-    name: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
-    tool_call_id: str | None = None
 
 
 # ---- Task 10: typed multimodal message parts (additive) -------------------
@@ -119,76 +102,3 @@ class ChatRequest(BaseModel):
     # When True the runtime_selection/meta carries is_demo=True so the UI MUST
     # show a persistent "演示模式，内容非真实生成" warning.
     demo: bool = False
-
-
-# ---- SSE event payloads ----------------------------------------------------
-class MetaEvent(BaseModel):
-    message_id: str
-    conversation_id: str
-
-
-class TokenEvent(BaseModel):
-    delta: str
-
-
-class CitationEvent(BaseModel):
-    citations: list[Citation]
-
-
-class ToolCallEvent(BaseModel):
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-class ToolResultEvent(BaseModel):
-    id: str
-    name: str
-    ok: bool
-    result: Any = None
-    error: str | None = None
-
-
-class DoneEvent(BaseModel):
-    message_id: str
-    finish_reason: str = "stop"
-
-
-class ErrorEvent(BaseModel):
-    code: str
-    message: str
-
-
-# ---- Phase 1+: research plan + run-control event payloads (reserved) -------
-class ResearchPlanStep(BaseModel):
-    id: str
-    title: str
-    description: str = ""
-    sources: list[str] = []
-
-
-class ResearchPlanEvent(BaseModel):
-    """``research_plan`` / ``research_plan_updated`` SSE payload."""
-    run_id: str
-    status: str = "draft"             # draft | confirmed | rejected | updated
-    summary: str = ""
-    steps: list[ResearchPlanStep] = []
-    requires_confirmation: bool = True
-
-
-class RunInstructionEvent(BaseModel):
-    """``run_instruction_received`` payload (user appended mid-run guidance)."""
-    run_id: str
-    instruction: str
-    acknowledged: bool = True
-
-
-class RunPauseEvent(BaseModel):
-    run_id: str
-    reason: str = "user"
-    paused_at: datetime | None = None
-
-
-class RunResumeEvent(BaseModel):
-    run_id: str
-    resumed_at: datetime | None = None

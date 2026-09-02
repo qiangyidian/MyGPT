@@ -171,25 +171,6 @@ export function applyEvent(
 }
 
 /**
- * Replay a batch of events (e.g. the result of a cursor-replay reconnect)
- * onto the state. Already-seen events (sequence <= cursor) are dropped;
- * duplicates within the batch collapse via `reduceEvents`.
- */
-export function replayEvents(
-  state: DurableRunState,
-  batch: DurableRunEvent[],
-): DurableRunState {
-  const fresh = reduceEvents(batch);
-  let s = state;
-  for (const e of fresh) {
-    if (e.run_id !== s.runId) continue;
-    if (e.sequence <= s.cursor) continue;
-    s = applyEvent(s, e);
-  }
-  return s;
-}
-
-/**
  * Mark the SSE subscription as disconnected WITHOUT touching the workflow
  * status. A client disconnect (navigate away, network drop) leaves the run
  * exactly where it was — the workflow continues server-side, and a reconnect

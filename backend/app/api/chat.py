@@ -1,4 +1,4 @@
-"""Chat router: SSE streaming chat + regenerate.
+"""Chat router: SSE streaming chat.
 
 Consumes the ChatService singleton whose ``stream(db, user, request)`` yields event
 dicts shaped ``{"event": <name>, "data": {...}}``. The router is responsible only
@@ -206,29 +206,5 @@ async def chat_stream(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # disable proxy buffering (nginx)
-        },
-    )
-
-
-@router.post("/regenerate/{conversation_id}",
-             dependencies=[Depends(rate_limit_user(60, 60, "chat"))])
-async def regenerate(
-    conversation_id: uuid.UUID,
-    request: Request,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> StreamingResponse:
-    """Re-run the assistant turn for the last user message in a conversation."""
-    await _assert_owned(db, conversation_id, user)
-    chat_service = _get_chat_service()
-    payload = ChatRequest(conversation_id=conversation_id, regenerate=True)
-    generator = _event_generator(request, chat_service, db, user, payload)
-    return StreamingResponse(
-        generator,
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
         },
     )

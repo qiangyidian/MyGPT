@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from app.agents.context_fragments import ContextFragment
 
 EnvStatus = Literal["starting", "ready", "error"]
 
@@ -34,26 +33,6 @@ class Environment:
     status: EnvStatus = "ready"
     shell: str = ""
     workspace_roots: tuple[str, ...] = ()
-
-
-def environment_fragment(env: Environment) -> ContextFragment:
-    """One labeled <environment_context> block per environment id."""
-    parts = [f"id: {env.env_id}", f"cwd: {env.cwd or '(unset)'}", f"status: {env.status}"]
-    if env.shell:
-        parts.append(f"shell: {env.shell}")
-    if env.workspace_roots:
-        parts.append("workspace_roots: " + ", ".join(env.workspace_roots))
-    return ContextFragment(
-        name=f"environment:{env.env_id}",
-        tag=f"environment_context_{env.env_id}",
-        body="\n".join(parts),
-    )
-
-
-def environments_instructions_fragment() -> ContextFragment:
-    return ContextFragment(
-        name="environments_instructions", tag="environments_instructions", body=_CONTINUE_UNRELATED
-    )
 
 
 @dataclass

@@ -1,9 +1,9 @@
 """Pluggable file storage for uploaded documents.
 
-Currently only the local filesystem is wired up; a MinIO stub is provided so a
-future ``minio`` backend slots in behind the same ``StorageBackend`` protocol
-without touching call sites. Business code obtains a backend via
-``get_storage()`` — never constructs paths or talks to the FS directly.
+Only the local filesystem backend exists. Business code obtains a backend via
+``get_storage()`` — never constructs paths or talks to the FS directly, so a
+future S3/MinIO backend can slot in behind the same ``StorageBackend`` protocol
+without touching call sites.
 """
 from __future__ import annotations
 
@@ -115,30 +115,6 @@ class LocalStorage(StorageBackend):
             target.unlink()
 
 
-class MinioStorage(StorageBackend):
-    """Stub S3-compatible backend. Not yet implemented; raises on use.
-
-    Kept so ``get_storage("minio")`` returns a real object the type system
-    understands, with a clear runtime message for anyone who opts in early.
-    """
-
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.endpoint = settings.MINIO_ENDPOINT
-        self.bucket = settings.MINIO_BUCKET
-
-    async def save(
-        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
-    ) -> str:
-        raise NotImplementedError("MinIO storage backend is not implemented yet; use 'local'")
-
-    def open(self, path: str) -> IO[bytes]:
-        raise NotImplementedError("MinIO storage backend is not implemented yet; use 'local'")
-
-    async def delete(self, path: str) -> None:
-        raise NotImplementedError("MinIO storage backend is not implemented yet; use 'local'")
-
-
 _backend: StorageBackend | None = None
 
 
@@ -155,15 +131,10 @@ def get_storage(backend: str | None = None) -> StorageBackend:
     settings = get_settings()
     chosen = (backend or settings.STORAGE_BACKEND).lower().strip()
     if chosen == "minio":
-        instance: StorageBackend = MinioStorage()
-    else:
-        instance = LocalStorage()
+        raise NotImplementedError(
+            "MinIO/S3 storage backend is not implemented; set STORAGE_BACKEND=local"
+        )
+    instance: StorageBackend = LocalStorage()
     if backend is None:
         _backend = instance
     return instance
-
-
-def reset_storage_cache() -> None:
-    """Drop the cached backend (test helper)."""
-    global _backend
-    _backend = None

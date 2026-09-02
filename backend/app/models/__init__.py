@@ -5,7 +5,6 @@ from app.models.artifact import Artifact
 from app.models.audit_event import AuditEvent
 from app.models.agent_run import AgentRun
 from app.models.agent_step import AgentStep
-from app.models.background_task import BackgroundTask
 from app.models.chat_attachment import ChatAttachment
 from app.models.conversation import Conversation
 from app.models.conversation_memory import ConversationMemory
@@ -49,7 +48,6 @@ __all__ = [
     "MessageFeedback",
     # ---- Phase 3: projects + background tasks ----
     "Project",
-    "BackgroundTask",
     # ---- Task 4: durable workflow (events, commands, leases, attempts) ----
     "RunEvent",
     "RunCommand",

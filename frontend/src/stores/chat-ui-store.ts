@@ -81,4 +81,3 @@ export const useChatUiStore = create<ChatUiState>((set) => ({
 }));
 
 // Exposed for tests: force a clean migration re-run by clearing the v4 key.
-export const __modeKeys = { MODE_KEY, LEGACY_MODE_KEY_V3 };

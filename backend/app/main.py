@@ -29,7 +29,6 @@ from app.api import (
     agent_runs,
     artifacts,
     auth,
-    background_tasks,
     chat,
     chat_attachments,
     connectors,
@@ -42,7 +41,6 @@ from app.api import (
     projects,
     retrieval,
     tools,
-    usage,
 )
 from app.core.bootstrap import init_db
 from app.core.config import get_settings
@@ -152,8 +150,6 @@ def create_app() -> FastAPI:
     app.include_router(memories.router)
     app.include_router(memories.user_router)
     app.include_router(connectors.router)
-    app.include_router(background_tasks.router)
-    app.include_router(usage.router)
     app.include_router(artifacts.router)
 
     @app.get("/health", tags=["health"])

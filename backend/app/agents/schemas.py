@@ -57,23 +57,6 @@ class RuntimeKind(str, Enum):
     crewai = "crewai"
 
 
-class RunStatus(str, Enum):
-    pending = "pending"
-    running = "running"
-    waiting_approval = "waiting_approval"
-    completed = "completed"
-    failed = "failed"
-    cancelled = "cancelled"
-
-
-class StepType(str, Enum):
-    plan = "plan"
-    llm = "llm"
-    tool = "tool"
-    review = "review"
-    approval = "approval"
-
-
 class StepStatus(str, Enum):
     pending = "pending"
     running = "running"
@@ -668,31 +651,6 @@ def bounded_json_observation(
 # --------------------------------------------------------------------------- #
 # Exceptions
 # --------------------------------------------------------------------------- #
-class ApprovalRequired(Exception):
-    """Raised when a dangerous tool call has no valid approval.
-
-    Phase 0: the gateway returns a ``needs_approval`` :class:`ToolExecution`
-    instead of raising, so the agent loop can emit the event and continue.
-    Phase 3 resume path raises this to pause the flow.
-    """
-
-    def __init__(
-        self,
-        *,
-        approval_id: uuid.UUID,
-        tool_name: str,
-        arguments: dict[str, Any],
-        risk_level: str,
-        summary: str,
-    ) -> None:
-        self.approval_id = approval_id
-        self.tool_name = tool_name
-        self.arguments = arguments
-        self.risk_level = risk_level
-        self.summary = summary
-        super().__init__(f"approval required for tool {tool_name!r}")
-
-
 class BudgetExceeded(Exception):
     """Raised when an agent run crosses a hard stop (steps/tools/time/tokens)."""
 

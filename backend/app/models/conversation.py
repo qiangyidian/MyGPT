@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,6 +12,16 @@ from app.models._mixins import TimestampMixin
 
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
+    # Sidebar hot path: list by user, not archived, newest-first. Matches the
+    # 0011 migration index so create_all baselines and migrated DBs agree.
+    __table_args__ = (
+        Index(
+            "ix_conversations_user_archived_updated",
+            "user_id",
+            "is_archived",
+            "updated_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -50,7 +60,10 @@ class Conversation(Base, TimestampMixin):
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="Message.created_at",
-        lazy="selectin",
+        # Default ("select") lazy loading: every read is explicit. A global
+        # selectin here made every Conversation fetch (each chat turn!) pull the
+        # ENTIRE message history into memory — long conversations doubled the
+        # per-turn IO since _load_history re-queries with a cap anyway.
         # Disambiguate from branch_from_message_id (also a conversations<->messages
         # FK path): this collection is keyed by Message.conversation_id.
         foreign_keys="Message.conversation_id",

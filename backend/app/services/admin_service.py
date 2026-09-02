@@ -118,6 +118,5 @@ async def system_status(db: AsyncSession) -> SystemStatus:
     )
 
 
-async def list_audit(db: AsyncSession) -> list:
     """No dedicated audit table yet — returns empty until one is added."""
     return []

@@ -203,6 +203,5 @@ async def maybe_autotitle_after_answer(
     return True
 
 
-def title_metadata(title: str) -> dict[str, Any]:
     """Optional provenance marker (unused for now; kept for future analytics)."""
     return {"auto_titled": title != DEFAULT_TITLE}

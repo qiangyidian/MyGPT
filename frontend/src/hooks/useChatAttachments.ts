@@ -127,13 +127,19 @@ export function useChatAttachments(
   // Status polling (B: comment now true): after upload the server parses the
   // file in the background (parsing → ready/failed). Poll drafts that are
   // still mid-parse every 2.5s so the tray shows the terminal state.
+  // The pending id list lives in a ref and the interval only depends on
+  // convId — a stable effect. (It previously depended on `drafts`, so every
+  // upload-progress tick or poll write tore down and re-created the interval,
+  // drifting the 2.5s period.)
   const convId = conversationId ?? "";
+  const pendingIdsRef = useRef<string[]>([]);
+  pendingIdsRef.current = drafts
+    .filter((d) => !d.id.startsWith("tmp-") && (d.parse_status === "parsing" || d.status === "parsing"))
+    .map((d) => d.id);
   useEffect(() => {
-    const pendingIds = drafts
-      .filter((d) => !d.id.startsWith("tmp-") && (d.parse_status === "parsing" || d.status === "parsing"))
-      .map((d) => d.id);
-    if (pendingIds.length === 0) return;
     const t = setInterval(() => {
+      const pendingIds = pendingIdsRef.current;
+      if (pendingIds.length === 0) return;
       void (async () => {
         try {
           const all = await api.listChatAttachments(convId);
@@ -154,7 +160,7 @@ export function useChatAttachments(
       })();
     }, 2500);
     return () => clearInterval(t);
-  }, [convId, drafts, updateDraft]);
+  }, [convId, updateDraft]);
 
   return { drafts, upload, remove, isUploading, allReady };
 }

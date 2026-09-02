@@ -111,28 +111,3 @@ async def save_summary(
         )
     )
     await db.flush()
-
-
-async def save_fact(
-    db: AsyncSession,
-    conversation_id: uuid.UUID,
-    user_id: Optional[uuid.UUID],
-    fact: str,
-    *,
-    confirmed: bool = False,
-    source_message_id: Optional[uuid.UUID] = None,
-) -> None:
-    if not fact.strip():
-        return
-    db.add(
-        ConversationMemory(
-            conversation_id=conversation_id,
-            user_id=user_id,
-            memory_type="fact",
-            content=fact.strip(),
-            confirmed_by_user=confirmed,
-            source_message_id=source_message_id,
-            confidence=1.0 if confirmed else 0.5,
-        )
-    )
-    await db.flush()

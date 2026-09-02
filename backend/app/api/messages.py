@@ -11,11 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_admin, get_current_user
+from app.core.deps import get_current_user
 from app.db import get_db
 from app.models import Conversation, Message, MessageFeedback, User
 from app.schemas.feedback import MessageFeedbackOut, MessageFeedbackRequest
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 router = APIRouter(prefix="/api/messages", tags=["messages"])
 
@@ -108,27 +108,3 @@ async def get_feedback(
         )
     ).scalars().first()
     return MessageFeedbackOut.model_validate(existing) if existing else None
-
-
-@router.get("/feedback/stats")
-async def feedback_stats(
-    admin: User = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    """Aggregate feedback counts (admin-only eval data)."""
-    rows = (
-        await db.execute(
-            select(MessageFeedback.rating, func.count(MessageFeedback.id))
-            .group_by(MessageFeedback.rating)
-        )
-    ).all()
-    counts = {"up": 0, "down": 0}
-    for rating, n in rows:
-        counts[rating] = int(n)
-    total = counts["up"] + counts["down"]
-    return {
-        "up": counts["up"],
-        "down": counts["down"],
-        "total": total,
-        "positive_rate": (counts["up"] / total) if total else None,
-    }

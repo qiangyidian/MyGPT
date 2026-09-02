@@ -115,32 +115,3 @@ def multi_agent_mode_fragment(mode: str = "explicit", *, custom: str = "") -> Co
         body = _MULTI_AGENT_MODES.get(key, _MULTI_AGENT_MODES["explicit"])
     return ContextFragment(name="multi_agent_mode", tag="multi_agent_mode", body=body)
 
-
-def realtime_delegation_fragment(
-    *, user_input: str, transcript_delta: str = "", source: str = "handoff"
-) -> ContextFragment:
-    """A tagged handoff from a realtime/ephemeral channel to a background agent.
-
-    Carries the input + the role-tagged transcript tail so the receiving agent
-    keeps full conversational continuity across the channel switch (Codex's
-    ``<realtime_delegation>``). Generalizes to any channel→channel handoff.
-    """
-    parts = [f"source: {source}", "<input>", user_input]
-    if transcript_delta:
-        parts.append("<transcript_delta>")
-        parts.append(transcript_delta)
-    parts.append("请基于以上继续（交接自实时会话）。")
-    return ContextFragment(
-        name="realtime_delegation", tag="realtime_delegation", body="\n".join(parts)
-    )
-
-
-def model_switch_fragment(instructions: str) -> ContextFragment:
-    """Preserve model-specific persona/format instructions across a model swap.
-
-    Wraps them in ``<model_switch>`` (Codex) so the rules survive the swap even
-    when the rest of the context is re-compacted under a new model.
-    """
-    body = (instructions or "").strip()
-    return ContextFragment(name="model_switch", tag="model_switch", body=body)
-

@@ -135,17 +135,6 @@ export function selectRunningCount(state: AgentRunStoreState): number {
   return state.active.activeAgentIds.length;
 }
 
-/** True if the active run is a multi-agent run (≥2 nodes) and not dismissed. */
-export function selectShouldShowPanel(state: AgentRunStoreState): boolean {
-  const { active, dismissedRunIds } = state;
-  if (!active.runId) return false;
-  if (active.nodes.length < 2) return false;
-  if (dismissedRunIds.has(active.runId) && isRunFinished(active)) return false;
-  // Dismissed but still running: keep closed until a NEW run starts.
-  if (dismissedRunIds.has(active.runId)) return false;
-  return true;
-}
-
 export function isRunFinished(g: AgentGraphState): boolean {
   return ["completed", "failed", "cancelled"].includes(g.status);
 }
@@ -163,10 +152,4 @@ export function selectRuntimeFallback(state: AgentRunStoreState): RuntimeSelecti
  *  demo answer is never mistaken for a genuine model reply. */
 export function selectIsDemo(state: AgentRunStoreState): boolean {
   return !!state.active.selection?.isDemo;
-}
-
-/** Convenience: dispatch helper bound to a specific runId. */
-export function makeDispatcher(runId: string, dispatch: (a: AgentGraphAction) => void) {
-  return (a: Omit<AgentGraphAction, "runId">) =>
-    dispatch({ ...(a as AgentGraphAction), runId });
 }

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_admin, get_current_user
 from app.db import get_db
 from app.models import AuditEvent, User
-from app.schemas import AdminUserUpdate, AuditLogOut, SystemStatus, UsageStat, UserOut
+from app.schemas import AdminUserUpdate, AuditLogOut, UsageStat, UserOut
 from app.services import admin_service
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -68,14 +68,6 @@ async def stats(
     usage = await admin_service.usage_stats(db)
     status_info = await admin_service.system_status(db)
     return {"usage": [u.model_dump(mode="json") for u in usage], "status": status_info.model_dump(mode="json")}
-
-
-@router.get("/status", response_model=SystemStatus)
-async def get_status(
-    admin: User = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-) -> SystemStatus:
-    return await admin_service.system_status(db)
 
 
 @router.get("/audit", response_model=list[AuditLogOut])

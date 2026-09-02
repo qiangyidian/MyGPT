@@ -7,7 +7,6 @@ import {
   disconnectSubscription,
   emptyRunState,
   reduceEvents,
-  replayEvents,
   reconnectionShouldStop,
   TERMINAL_RUN_STATUSES,
   type DurableRunEvent,
@@ -149,36 +148,6 @@ describe("applyEvent — reducer", () => {
   });
 });
 
-describe("replayEvents — cursor replay", () => {
-  it("applies events past the cursor in order", () => {
-    const s0 = applyEvent(emptyRunState("r1"), event(1)); // cursor 1
-    const s = replayEvents(s0, [
-      event(2, { event_type: "token" }),
-      event(3, { event_type: "token" }),
-    ]);
-    expect(s.cursor).toBe(3);
-    expect(s.events.map((e) => e.sequence)).toEqual([1, 2, 3]);
-  });
-
-  it("drops already-seen events (sequence <= cursor) on replay", () => {
-    // cursor 2, events [1,2]
-    const s0 = replayEvents(emptyRunState("r1"), [event(1), event(2)]);
-    const s = replayEvents(s0, [event(1), event(2), event(3)]);
-    expect(s.events.map((e) => e.sequence)).toEqual([1, 2, 3]);
-    expect(s.events).toHaveLength(3); // no duplicates
-    expect(s.cursor).toBe(3);
-  });
-
-  it("dedupes a replay batch that repeats a sequence", () => {
-    const s = replayEvents(emptyRunState("r1"), [
-      event(1, { data: { v: "a" } }),
-      event(1, { data: { v: "b" } }),
-    ]);
-    expect(s.events).toHaveLength(1);
-    expect((s.events[0].data as { v: string }).v).toBe("b");
-  });
-});
-
 describe("disconnectSubscription — subscription ≠ workflow state", () => {
   it("keeps a run active after the chat SSE subscription closes", () => {
     const runningState = applyEvent(
@@ -191,7 +160,7 @@ describe("disconnectSubscription — subscription ≠ workflow state", () => {
   });
 
   it("preserves events + cursor on disconnect", () => {
-    const s = replayEvents(emptyRunState("r1"), [event(1), event(2)]);
+    const s = applyEvent(applyEvent(emptyRunState("r1"), event(1)), event(2));
     const disconnected = disconnectSubscription(s);
     expect(disconnected.events).toHaveLength(2);
     expect(disconnected.cursor).toBe(2);

@@ -50,7 +50,6 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # ---- Vector DB ----
-    VECTOR_DB: str = "qdrant"
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
     QDRANT_EMBEDDING_DIM: int = 1024
@@ -69,10 +68,6 @@ class Settings(BaseSettings):
     STORAGE_DIR: str = "./data/uploads"
     MAX_UPLOAD_MB: int = 20
     ALLOWED_UPLOAD_EXT: str = ".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls"
-    MINIO_ENDPOINT: str = "minio:9000"
-    MINIO_ACCESS_KEY: str = "minioadmin"
-    MINIO_SECRET_KEY: str = "minioadmin"
-    MINIO_BUCKET: str = "ai-chat"
 
     # ---- RAG ----
     RAG_CHUNK_SIZE: int = 500
@@ -261,14 +256,6 @@ class Settings(BaseSettings):
     # Over-fetch factor: pull top_k * factor vector hits before reranking.
     RERANKER_OVERFETCH: int = 4
 
-    # ---- Object storage: S3 (Phase 1 production option; local still default) ----
-    S3_ENDPOINT: str = ""           # leave empty for AWS default
-    S3_REGION: str = ""
-    S3_BUCKET: str = "ai-chat"
-    S3_ACCESS_KEY: str = ""
-    S3_SECRET_KEY: str = ""
-    S3_USE_PATH_STYLE: bool = False
-
     # ---- Web search (tool: web_search) ----
     # Reachable search backend for the web_search tool. The dependency-free
     # DuckDuckGo HTML scrape is the default no-config fallback, but it is blocked
@@ -283,9 +270,6 @@ class Settings(BaseSettings):
     # get | post — how to call WEB_SEARCH_ENDPOINT. GET fits SearXNG/Bing;
     # POST fits Tavily/Serper (query + key go in the JSON body / provider header).
     WEB_SEARCH_METHOD: str = "get"
-    # Tavily search_depth: "basic" | "advanced". Advanced = deeper, higher-quality
-    # pass (slightly slower / more credits). Only read by Tavily; ignored elsewhere.
-    WEB_SEARCH_DEPTH: str = "advanced"
 
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
@@ -360,12 +344,7 @@ class Settings(BaseSettings):
     # the respective package is importable. Sampling 1.0 = every span, 0 = none.
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "mygpt-backend"
-    OTEL_TRACES_SAMPLER_RATE: float = 1.0
     PROMETHEUS_ENABLED: bool = False
-    # Structured-log redaction is ALWAYS on (sanitize_attributes runs
-    # unconditionally); this flag is reserved for a future verbose-trace mode.
-    LOG_REDACT_SENSITIVE: bool = True
-
     # ---- Quotas (Task 11) ----
     # Multi-axis per-tenant caps. Disabled in test (see QuotaLimits.from_settings)
     # so the suite is never blocked; production opts in via QUOTAS_ENABLED=true.
@@ -375,7 +354,6 @@ class Settings(BaseSettings):
     QUOTA_MAX_COST_USD: float = 50.0
     QUOTA_MAX_STORAGE_BYTES: int = 10 * 1024 * 1024 * 1024  # 10 GiB
     QUOTA_MAX_CONNECTORS: int = 25
-    QUOTA_MAX_TOOLS_PER_RUN: int = 40
 
     # ---- Derived ----
     @property

@@ -121,7 +121,55 @@ async def list_runs(
     if conversation_id is not None:
         stmt = stmt.where(AgentRun.conversation_id == conversation_id)
     runs = (await db.execute(stmt)).scalars().all()
-    return [await _build_run_out(db, r) for r in runs]
+
+    # Batch-load steps/approvals/tool-calls for the whole page instead of one
+    # _build_run_out per run (1 + 50×3 queries → 4 total). This endpoint is
+    # polled every ~2s while a run is live, so the N+1 was the dominant cost.
+    run_ids = [r.id for r in runs]
+    steps_by_run: dict[uuid.UUID, list[AgentStep]] = {}
+    approvals_by_run: dict[uuid.UUID, list[ToolApproval]] = {}
+    tool_calls_by_msg: dict[uuid.UUID, list[ToolCall]] = {}
+    if run_ids:
+        step_rows = (
+            await db.execute(
+                select(AgentStep).where(AgentStep.run_id.in_(run_ids)).order_by(AgentStep.sequence)
+            )
+        ).scalars().all()
+        for s in step_rows:
+            steps_by_run.setdefault(s.run_id, []).append(s)
+        approval_rows = (
+            await db.execute(
+                select(ToolApproval)
+                .where(ToolApproval.run_id.in_(run_ids))
+                .order_by(ToolApproval.created_at.desc())
+            )
+        ).scalars().all()
+        for a in approval_rows:
+            approvals_by_run.setdefault(a.run_id, []).append(a)
+        msg_ids = [r.message_id for r in runs if r.message_id is not None]
+        if msg_ids:
+            tc_rows = (
+                await db.execute(
+                    select(ToolCall)
+                    .where(ToolCall.message_id.in_(msg_ids))
+                    .order_by(ToolCall.created_at.asc())
+                )
+            ).scalars().all()
+            for t in tc_rows:
+                tool_calls_by_msg.setdefault(t.message_id, []).append(t)
+
+    outs = []
+    for r in runs:
+        out = AgentRunOut.model_validate(r)
+        out.steps = [AgentStepOut.model_validate(s) for s in steps_by_run.get(r.id, [])]
+        out.approvals = [ToolApprovalOut.model_validate(a) for a in approvals_by_run.get(r.id, [])]
+        out.tool_calls = [
+            ToolCallAuditOut.model_validate(t) for t in tool_calls_by_msg.get(r.message_id, [])
+        ] if r.message_id is not None else []
+        graph = getattr(r, "graph_state", None) or getattr(r, "graph_definition", None)
+        out.graph = graph
+        outs.append(out)
+    return outs
 
 
 @router.get("/{run_id}", response_model=AgentRunOut, response_model_exclude_none=True)

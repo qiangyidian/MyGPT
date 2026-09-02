@@ -148,7 +148,21 @@ export function MessageList({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- id-only dep by design
   }, [conversationId]);
 
-  const shownMessages = getVisibleMessages(messages, Boolean(isStreaming && streamingText !== undefined));
+  const visibleAll = getVisibleMessages(messages, Boolean(isStreaming && streamingText !== undefined));
+
+  // ---- Render window -------------------------------------------------------- #
+  // Rendering thousands of MessageBubble+Markdown trees at once janks long
+  // conversations (each bubble runs remark/highlight). We render the most
+  // recent RENDER_WINDOW messages and offer a "load earlier" button that
+  // extends the window; state resets on conversation switch.
+  const RENDER_WINDOW = 60;
+  const RENDER_STEP = 60;
+  const [renderCount, setRenderCount] = useState(RENDER_WINDOW);
+  useEffect(() => {
+    setRenderCount(RENDER_WINDOW);
+  }, [conversationId]);
+  const hiddenCount = Math.max(0, visibleAll.length - renderCount);
+  const shownMessages = hiddenCount > 0 ? visibleAll.slice(hiddenCount) : visibleAll;
 
   if (isEmpty) {
     return (
@@ -188,6 +202,17 @@ export function MessageList({
     <div className={cn("relative flex min-h-0 flex-1 flex-col", className)}>
       <div ref={containerRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-4 py-6">
+          {hiddenCount > 0 && (
+            <div className="mb-4 flex justify-center">
+              <button
+                type="button"
+                onClick={() => setRenderCount((c) => c + RENDER_STEP)}
+                className="rounded-full border border-border bg-card px-4 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent"
+              >
+                加载更早的 {Math.min(hiddenCount, RENDER_STEP)} 条消息（还有 {hiddenCount} 条）
+              </button>
+            </div>
+          )}
           {shownMessages.map((msg, i) => (
             <MessageBubble
               key={msg.id}

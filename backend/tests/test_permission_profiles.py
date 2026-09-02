@@ -16,8 +16,6 @@ from app.agents.permission_profiles import (
 from app.agents.environments import (
     Environment,
     EnvironmentSet,
-    environment_fragment,
-    environments_instructions_fragment,
 )
 
 
@@ -108,16 +106,6 @@ def test_unknown_workspace_operation_fails_closed_high_risk():
 
 
 # ---- environments ----
-def test_environment_fragment_labeled_per_env():
-    f = environment_fragment(Environment(env_id="dev", cwd="/repo", status="starting", shell="bash"))
-    body = f.render()
-    assert "<environment_context_dev>" in body
-    assert "id: dev" in body and "cwd: /repo" in body and "status: starting" in body
-
-
-def test_environments_instructions_fragment():
-    body = environments_instructions_fragment().render()
-    assert "starting" in body and "继续推进" in body
 
 
 def test_envset_ready_and_starting_split():

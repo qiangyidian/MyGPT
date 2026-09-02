@@ -28,12 +28,24 @@ if settings.DATABASE_URL.startswith("sqlite"):
         return "JSON"
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    future=True,
-)
+# Pool sizing: a streaming chat turn holds its request session for the whole
+# stream (agent runs can run up to the Hermes budget of 900s), so the asyncpg
+# defaults (pool_size=5, max_overflow=10) are starved by ~15 concurrent turns.
+# Explicit headroom keeps short API calls from queueing behind streams.
+# SQLite (dev/tests) uses a single connection — pass pool args only for server DBs.
+_engine_kwargs: dict = {
+    "echo": False,
+    "pool_pre_ping": True,
+    "future": True,
+}
+if not settings.DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs.update(
+        pool_size=max(10, int(getattr(settings, "DB_POOL_SIZE", 20))),
+        max_overflow=int(getattr(settings, "DB_MAX_OVERFLOW", 20)),
+        pool_recycle=1800,  # recycle before DB-side idle timeouts kill conns
+    )
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False

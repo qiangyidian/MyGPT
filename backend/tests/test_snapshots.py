@@ -10,7 +10,6 @@ from app.agents.behavior_fragments import (
     mode_behavior_fragment,
     multi_agent_mode_fragment,
     personality_fragment,
-    realtime_delegation_fragment,
 )
 from app.agents.context_fragments import (
     IntentContextInput,
@@ -59,6 +58,5 @@ def test_snapshot_multi_agent_mode_and_delegation():
         multi_agent_mode_fragment("explicit").render(),
         multi_agent_mode_fragment("proactive").render(),
         personality_fragment("简洁、技术、少客套").render(),
-        realtime_delegation_fragment(user_input="继续重构", transcript_delta="user: 上一步改了 X").render(),
     ])
     assert_snapshot("behavior_extras", out)

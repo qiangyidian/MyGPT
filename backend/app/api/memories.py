@@ -221,17 +221,6 @@ async def bulk_set_user_memories(
         return {"deactivated": count}
 
 
-@user_router.get("/active", response_model=list[str])
-async def list_active_user_memory_contents(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> list[str]:
-    """Return the plain-text contents of the user's active, non-expired
-    memories — the list folded into the effective system prompt each turn."""
-    service = await get_memory_service(db)
-    return await service.list_active_contents(db, user.id)
-
-
 @user_router.post("/{memory_id}/activate", response_model=UserMemoryOut)
 async def activate_user_memory(
     memory_id: uuid.UUID,

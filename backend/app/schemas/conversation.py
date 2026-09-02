@@ -50,13 +50,6 @@ class ConversationDetail(ConversationOut):
     messages: list[MessageOut] = []
 
 
-class ConversationListResponse(BaseModel):
-    """Paginated conversation list envelope (Phase 1)."""
-    items: list[ConversationOut]
-    next_cursor: str | None = None
-    total: int | None = None
-
-
 class ConversationBranchRequest(BaseModel):
     """Edit-and-resend from an earlier user message: create a branch.
 

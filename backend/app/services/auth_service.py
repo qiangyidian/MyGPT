@@ -241,7 +241,6 @@ async def revoke_refresh(token: str) -> None:
         await _blacklist_add(jti)
 
 
-async def rotate_refresh(db: AsyncSession, token: str) -> Optional[dict[str, Any]]:
     """Validate the old refresh token, revoke it, and mint a new pair.
 
     Returns the new token bundle, or None if the supplied token is invalid.
