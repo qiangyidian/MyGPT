@@ -11,6 +11,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import { Label } from "@/components/ui/label";
 import {
   Card,
@@ -217,9 +218,8 @@ function LoginForm() {
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="login-password">密码</Label>
-                    <Input
+                    <PasswordInput
                       id="login-password"
-                      type="password"
                       autoComplete="current-password"
                       placeholder="••••••"
                       value={password}
@@ -308,9 +308,8 @@ function LoginForm() {
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="reg-password">密码</Label>
-                    <Input
+                    <PasswordInput
                       id="reg-password"
-                      type="password"
                       autoComplete="new-password"
                       placeholder="至少 6 位"
                       value={password}
@@ -323,9 +322,8 @@ function LoginForm() {
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="reg-confirm">确认密码</Label>
-                    <Input
+                    <PasswordInput
                       id="reg-confirm"
-                      type="password"
                       autoComplete="new-password"
                       placeholder="再次输入密码"
                       value={confirm}
