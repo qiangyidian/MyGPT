@@ -52,6 +52,42 @@ function LoginForm() {
   // Register-only fields
   const [username, setUsername] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [codeSending, setCodeSending] = useState(false);
+  const [codeCountdown, setCodeCountdown] = useState(0);
+
+  // Countdown for the send-code button (60s resend interval mirrors the backend).
+  useEffect(() => {
+    if (codeCountdown <= 0) return;
+    const t = window.setInterval(() => {
+      setCodeCountdown((c) => (c <= 1 ? 0 : c - 1));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [codeCountdown]);
+
+  async function handleSendCode() {
+    const mail = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail)) {
+      setError("请先输入合法的邮箱地址，再发送验证码");
+      return;
+    }
+    setCodeSending(true);
+    setError(null);
+    try {
+      const res = await api.requestEmailCode(mail);
+      setCodeCountdown(60);
+      if (res.debug_code) {
+        // Dev mode without SMTP: show the echoed code directly.
+        toast.info(`开发环境验证码：${res.debug_code}`);
+      } else {
+        toast.success("验证码已发送，请查收邮箱（注意垃圾箱）");
+      }
+    } catch (err) {
+      setError(toMessage(err));
+    } finally {
+      setCodeSending(false);
+    }
+  }
 
   // Destination after a successful login/register: a validated `next` param, or "/".
   const next = resolveReturnTo(searchParams, "/");
@@ -92,6 +128,10 @@ function LoginForm() {
       setError("请填写邮箱、用户名和密码");
       return;
     }
+    if (!/^\d{6}$/.test(verificationCode.trim())) {
+      setError("请输入邮箱验证码（点击「发送验证码」获取）");
+      return;
+    }
     // Mirror the backend policy (PASSWORD_MIN_LENGTH=8 + upper/lower/digit)
     // so a weak password is caught client-side instead of as a 400.
     if (password.length < 8) {
@@ -112,7 +152,7 @@ function LoginForm() {
     }
     setLoading(true);
     try {
-      await api.register(email.trim(), username.trim(), password);
+      await api.register(email.trim(), username.trim(), password, verificationCode.trim());
       // Auto-login after register for smoother UX.
       const { user } = await api.login(email.trim(), password);
       toast.success(`注册成功，欢迎 ${user.username}`);
@@ -217,6 +257,40 @@ function LoginForm() {
                       }}
                       disabled={loading}
                     />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="reg-code">邮箱验证码</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        id="reg-code"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        placeholder="6 位数字"
+                        maxLength={6}
+                        value={verificationCode}
+                        onChange={(e) => {
+                          setVerificationCode(e.target.value.replace(/\D/g, "").slice(0, 6));
+                          resetError();
+                        }}
+                        disabled={loading}
+                        className="flex-1"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-28 shrink-0"
+                        disabled={loading || codeSending || codeCountdown > 0}
+                        onClick={() => void handleSendCode()}
+                      >
+                        {codeSending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : codeCountdown > 0 ? (
+                          `${codeCountdown}s 后重发`
+                        ) : (
+                          "发送验证码"
+                        )}
+                      </Button>
+                    </div>
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="reg-username">用户名</Label>

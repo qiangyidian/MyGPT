@@ -28,6 +28,7 @@ from app.db import get_db
 from app.services import audit_service
 from app.models import User
 from app.schemas import (
+    EmailCodeRequest,
     LoginRequest,
     RefreshResponse,
     RegisterRequest,
@@ -44,6 +45,26 @@ CRED = status.HTTP_401_UNAUTHORIZED
 CONF = status.HTTP_409_CONFLICT
 
 
+@router.post("/email-code",
+             dependencies=[Depends(rate_limit_ip(10, 60, "email_code"))])
+async def request_email_code(payload: EmailCodeRequest) -> dict:
+    """Send a one-time verification code to the email (for registration).
+
+    Throttled per address (resend interval + hourly burst) on top of the IP
+    rate limit. The code is echoed in the response only when SMTP is disabled
+    in a non-production environment (dev convenience).
+    """
+    from app.services import email_code_service
+    from app.services.mail_service import MailServiceError
+
+    try:
+        return await email_code_service.request_code(payload.email, purpose="register")
+    except email_code_service.EmailCodeError as exc:
+        raise HTTPException(429, str(exc)) from exc
+    except MailServiceError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED,
              dependencies=[Depends(rate_limit_ip(5, 60, "register"))])
 async def register(
@@ -55,6 +76,17 @@ async def register(
     # Password policy (replaces implicit "any non-empty string").
     from app.core.security import validate_password_strength
     validate_password_strength(payload.password)
+    # Email verification: consume the one-time code (single use). In test/dev
+    # without SMTP the code service is inert (no Redis) — accept the legacy
+    # no-code path so local flows and the test suite keep working; production
+    # (MAIL_ENABLED + real Redis) always enforces.
+    from app.services import email_code_service
+
+    code_enforced = get_settings().MAIL_ENABLED
+    if code_enforced and not await email_code_service.verify_and_consume(
+        payload.email, payload.verification_code, purpose="register"
+    ):
+        raise HTTPException(400, "验证码错误或已过期")
     # Uniqueness checks.
     existing = await db.execute(
         select(User).where((User.email == payload.email) | (User.username == payload.username))

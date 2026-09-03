@@ -262,6 +262,25 @@ class Settings(BaseSettings):
     # POST fits Tavily/Serper (query + key go in the JSON body / provider header).
     WEB_SEARCH_METHOD: str = "get"
 
+    # ---- Email verification codes (registration) ----
+    # SMTP sender for one-time registration codes. MAIL_ENABLED=false disables
+    # real sending — in that mode request_email_code returns the code in the
+    # response ONLY when ENV != "production" (dev convenience), and register
+    # falls back to no-code (also non-production only). Production requires a
+    # complete SMTP configuration.
+    MAIL_ENABLED: bool = False
+    MAIL_HOST: str = ""
+    MAIL_PORT: int = 465
+    MAIL_USERNAME: str = ""
+    MAIL_PASSWORD: str = ""          # SMTP auth password / provider auth code
+    MAIL_FROM: str = ""              # defaults to MAIL_USERNAME when empty
+    MAIL_AUTH: bool = True
+    # Verification code lifetime (seconds) and per-email send cadence.
+    EMAIL_CODE_TTL_SECONDS: int = 300       # 5 minutes
+    EMAIL_CODE_RESEND_INTERVAL: int = 60    # min seconds between sends
+    EMAIL_CODE_BURST_LIMIT: int = 5         # max sends per email per hour
+    EMAIL_CODE_BURST_WINDOW: int = 3600
+
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
     ADMIN_USERNAME: str = "admin"

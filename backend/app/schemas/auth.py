@@ -12,6 +12,12 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     username: str = Field(min_length=2, max_length=128)
     password: str = Field(min_length=6, max_length=128)
+    # One-time email verification code (required when MAIL_ENABLED is on).
+    verification_code: str | None = Field(default=None, min_length=6, max_length=6)
+
+
+class EmailCodeRequest(BaseModel):
+    email: EmailStr
 
 
 class LoginRequest(BaseModel):

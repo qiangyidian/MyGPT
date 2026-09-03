@@ -142,12 +142,26 @@ async function request<T>(
 // Auth
 // ===========================================================================
 export const api = {
-  async register(email: string, username: string, password: string) {
+  async register(
+    email: string,
+    username: string,
+    password: string,
+    verificationCode: string
+  ) {
     return request<{ user: User }>("POST", "/api/auth/register", {
       email,
       username,
       password,
+      verification_code: verificationCode,
     });
+  },
+  /** Send a one-time registration code to the email. */
+  async requestEmailCode(email: string) {
+    return request<{ sent: boolean; debug_code?: string }>(
+      "POST",
+      "/api/auth/email-code",
+      { email }
+    );
   },
   async login(email: string, password: string) {
     const data = await request<{

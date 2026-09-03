@@ -29,6 +29,10 @@ from typing import AsyncIterator
 # connection pool we build below keeps all sessions on the same physical DB.
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["ENV"] = "test"
+# Email verification codes need Redis + SMTP; tests exercise the code service
+# through its own fakes (tests/test_email_codes.py), so the register endpoint
+# must take the no-code path here (MAIL_ENABLED gates enforcement).
+os.environ["MAIL_ENABLED"] = "false"
 os.environ["AUTO_CREATE_TABLES"] = "false"
 # Tests exercise the INLINE executor; durable dispatch has its own dedicated
 # suites. Pinning this also isolates tests from a production .env that sets

@@ -13,6 +13,7 @@ from app.schemas.agent import (
 )
 from app.schemas.admin import AuditLogOut, AdminUserUpdate, SystemStatus, UsageStat
 from app.schemas.auth import (
+    EmailCodeRequest,
     LoginRequest,
     RefreshResponse,
     RegisterRequest,
@@ -73,6 +74,7 @@ __all__ = [
     "PlanStepIn", "PlanUpdateRequest", "RunInstructionRequest",
     # auth
     "RegisterRequest", "LoginRequest", "TokenResponse", "RefreshResponse", "UserOut",
+    "EmailCodeRequest",
     # model config
     "ModelConfigCreate", "ModelConfigUpdate", "ModelConfigOut", "ModelTestResult",
     # conversation / message
