@@ -17,11 +17,18 @@ interface AttachmentDropzoneProps {
  * Full-screen drag-drop target for the chat page.
  *
  * The drop listeners live on ``document`` (not a wrapper div), so a file can be
- * dropped anywhere over the conversation — not only on the composer — which is
- * the behaviour users expect from mainstream chat products. While a drag is
- * active a fixed overlay tells the user what will happen on release ("松开以上传").
+ * dropped anywhere over the conversation — not only on the composer. While a
+ * drag is active a fixed overlay tells the user what will happen on release.
  * Paste (images/files) and the labelled paperclip button remain the other two
  * upload affordances.
+ *
+ * Overlay lifecycle: dragover events fire continuously (~every 100-350ms)
+ * while a real drag is in flight. A heartbeat timer watches for them — if
+ * none arrive within the window the drag is over (dropped outside, cancelled
+ * with Esc, or the browser cleared dataTransfer on the final dragleave, which
+ * breaks naive enter/leave counters) and the overlay is torn down. This is
+ * deliberately more robust than the depth-counter approach: a missed leave
+ * event can no longer leave the overlay stuck on screen.
  */
 export function AttachmentDropzone({
   onPick,
@@ -30,51 +37,72 @@ export function AttachmentDropzone({
   children,
 }: AttachmentDropzoneProps) {
   const [dragging, setDragging] = useState(false);
-  const depthRef = useRef(0);
+  const lastDragOverRef = useRef(0);
 
-  // Document-level drag/drop. The counter (depth) pattern distinguishes a real
-  // leave from moving between child elements, which each fire enter/leave.
+  const stopDragging = useCallback(() => {
+    lastDragOverRef.current = 0;
+    setDragging(false);
+  }, []);
+
+  // Document-level drag/drop + the heartbeat watchdog.
   useEffect(() => {
-    if (disabled) return;
+    if (disabled) {
+      stopDragging();
+      return;
+    }
 
     const hasFiles = (e: DragEvent) =>
       Array.from(e.dataTransfer?.types ?? []).includes("Files");
 
     const onDragOver = (e: DragEvent) => {
-      if (hasFiles(e)) e.preventDefault(); // required to allow a drop
-    };
-    const onDragEnter = (e: DragEvent) => {
       if (!hasFiles(e)) return;
-      e.preventDefault();
-      depthRef.current += 1;
+      e.preventDefault(); // required to allow a drop
+      lastDragOverRef.current = Date.now();
       setDragging(true);
-    };
-    const onDragLeave = (e: DragEvent) => {
-      if (!hasFiles(e)) return;
-      depthRef.current = Math.max(0, depthRef.current - 1);
-      if (depthRef.current === 0) setDragging(false);
     };
     const onDrop = (e: DragEvent) => {
       if (!hasFiles(e)) return;
       e.preventDefault();
-      depthRef.current = 0;
-      setDragging(false);
+      stopDragging();
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
         onPick(e.dataTransfer.files);
       }
     };
+    // dragend fires on the SOURCE element when a drag is cancelled (Esc) or
+    // completes — belt-and-braces reset alongside the heartbeat.
+    const onDragEnd = () => stopDragging();
+    // Leaving the window entirely (relatedTarget null) ends the drag visually.
+    const onDragLeave = (e: DragEvent) => {
+      if (e.relatedTarget === null) stopDragging();
+    };
 
     document.addEventListener("dragover", onDragOver);
-    document.addEventListener("dragenter", onDragEnter);
-    document.addEventListener("dragleave", onDragLeave);
     document.addEventListener("drop", onDrop);
+    document.addEventListener("dragend", onDragEnd);
+    document.addEventListener("dragleave", onDragLeave);
+
+    // Watchdog: while `dragging` is on, require a recent dragover heartbeat.
+    // Browsers throttle dragover to a few hundred ms max gap; 700ms covers the
+    // slowest observed cadence with margin.
+    const watchdog = window.setInterval(() => {
+      if (lastDragOverRef.current === 0) return;
+      if (Date.now() - lastDragOverRef.current > 700) stopDragging();
+    }, 250);
+    // Tab hidden (alt-tab mid-drag) — the drag is dead; clean up.
+    const onVisibility = () => {
+      if (document.hidden) stopDragging();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
       document.removeEventListener("dragover", onDragOver);
-      document.removeEventListener("dragenter", onDragEnter);
-      document.removeEventListener("dragleave", onDragLeave);
       document.removeEventListener("drop", onDrop);
+      document.removeEventListener("dragend", onDragEnd);
+      document.removeEventListener("dragleave", onDragLeave);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(watchdog);
     };
-  }, [disabled, onPick]);
+  }, [disabled, onPick, stopDragging]);
 
   // Paste handler (document level): files/images copied to the clipboard.
   useEffect(() => {
@@ -99,7 +127,17 @@ export function AttachmentDropzone({
   }, [disabled, onPick]);
 
   return (
-    <div className={cn("relative", className)} aria-label="附件拖放区域">
+    <div
+      className={cn(
+        // Layout-transparent wrapper: this component's job is document-level
+        // listeners + a fixed overlay, NOT layout. contents keeps the parent's
+        // flex/grid treating children as direct items, so wrapping <main> can
+        // never distort the page layout.
+        "contents",
+        className
+      )}
+      aria-label="附件拖放区域"
+    >
       {children}
       {/* Full-screen drop hint overlay. pointer-events-none so the drag
           sequence is never interrupted; purely visual feedback. */}
