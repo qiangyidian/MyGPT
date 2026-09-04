@@ -95,14 +95,18 @@ export function Composer({
     () => filterModelsByModality(chatModels, attachmentMimes),
     [chatModels, attachmentMimes],
   );
-  // A modality mismatch blocks the send: the selected (or default) model can't
-  // accept the attached parts. When the user picks "默认模型" (null) we can't
-  // verify capabilities, so we only block an explicit, incapable selection.
+  // A modality mismatch blocks the send: the selected model can't accept the
+  // attached parts. When the user picks "默认模型" (null) we can't verify
+  // capabilities, so we only block an explicit, incapable selection. (The old
+  // `capableModels.length === 0` clause only blocked when NO capable model
+  // existed at all — with any vision model in the list, an explicitly selected
+  // non-vision model sailed through and the attachment silently never reached
+  // the model.)
   const modelCapable =
     !modelId ||
     capableModels.some((m) => m.id === modelId);
   const modalityBlocked =
-    requiredModalities.length > 0 && !modelCapable && capableModels.length === 0;
+    requiredModalities.length > 0 && !modelCapable;
 
   // Both modes accept optional attachments; neither requires a file.
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {

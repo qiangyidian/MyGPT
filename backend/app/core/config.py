@@ -209,6 +209,11 @@ class Settings(BaseSettings):
     OCR_SCANNED_PDF: bool = True
     # Max pages to OCR per scanned PDF (bound the cost on huge scans).
     OCR_SCANNED_PDF_MAX_PAGES: int = 30
+    # Long edge (px) an image is downscaled to BEFORE OCR. OCR cost scales
+    # super-linearly with pixel count — a full-screen screenshot (3000px+) on
+    # CPU easily blows the parse timeout. 1568px is rapidocr's native detection
+    # resolution, so accuracy is unaffected.
+    OCR_MAX_IMAGE_EDGE: int = 1568
     # Inline-injection budget for attachment text, as a fraction of the model's
     # context window. A doc whose text exceeds min(fraction*context, hard cap)
     # is auto-chunked into a per-attachment Qdrant collection and retrieved on

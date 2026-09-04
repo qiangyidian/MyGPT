@@ -397,6 +397,36 @@ async def resolve_and_bind_attachments(
     return summaries, "\n\n".join(text_parts)
 
 
+async def _attachment_context(
+    db: AsyncSession,
+    att: ChatAttachment,
+    query: str,
+    inline_budget: int,
+) -> str:
+    """Bounded context text for ONE attachment (smart-hybrid strategy).
+
+    Small documents are inlined verbatim; oversized ones are replaced by the
+    top-k chunks most relevant to ``query`` (per-attachment RAG, indexed at parse
+    time). Never raises: on any RAG failure it falls back to a truncated head so
+    the turn always has *something* from the file. Images contribute their OCR
+    text (small by nature); the raw bytes ride the vision path separately.
+    """
+    text = (att.extracted_text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= inline_budget:
+        return f"[附件: {att.original_filename}]\n{text[:inline_budget]}"
+    # Oversized → per-attachment RAG retrieval (pre-indexed at parse time).
+    snippets = await attachment_rag.retrieve(db, att.id, query, top_k=5)
+    if not snippets:
+        # Index missing / RAG unavailable → truncated head keeps it usable.
+        snippets = [text[:inline_budget] + "\n…（内容已截断，完整内容见附件）"]
+    joined = "\n\n".join(s for s in snippets if s)
+    return (
+        f"[附件: {att.original_filename}（文档较长，已按问题检索 {len(snippets)} 个相关片段）]\n{joined}"
+    )
+
+
 async def smart_attachment_text(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -405,14 +435,12 @@ async def smart_attachment_text(
     query: str,
     inline_budget: int,
 ) -> str:
-    """Assemble attachment context with the smart-hybrid strategy.
+    """Assemble the current turn's attachment context (smart-hybrid).
 
-    Small documents are inlined verbatim; oversized ones are replaced by the
-    top-k chunks most relevant to ``query`` (per-attachment RAG, indexed at parse
-    time). Images are skipped here — a vision model receives their bytes via
-    :func:`collect_image_parts`, and the OCR fallback text is small enough to
-    inline already. Never raises: on any RAG failure it falls back to a truncated
-    head so the turn always has *something* from the file.
+    Thin wrapper over :func:`_attachment_context` with ownership re-verification;
+    images are skipped — a vision model receives their bytes via
+    :func:`collect_image_parts`, and the OCR fallback text rides the history
+    re-hydration path instead.
     """
     if not attachment_ids:
         return ""
@@ -427,22 +455,52 @@ async def smart_attachment_text(
             continue
         if _ext_of(att.original_filename) in _IMAGE_EXTS:
             continue
-        text = (att.extracted_text or "").strip()
-        if not text:
-            continue
-        if len(text) <= inline_budget:
-            parts.append(f"[附件: {att.original_filename}]\n{text[:inline_budget]}")
-            continue
-        # Oversized → per-attachment RAG retrieval (pre-indexed at parse time).
-        snippets = await attachment_rag.retrieve(db, att.id, query, top_k=5)
-        if not snippets:
-            # Index missing / RAG unavailable → truncated head keeps it usable.
-            snippets = [text[:inline_budget] + "\n…（内容已截断，完整内容见附件）"]
-        joined = "\n\n".join(s for s in snippets if s)
-        parts.append(
-            f"[附件: {att.original_filename}（文档较长，已按问题检索 {len(snippets)} 个相关片段）]\n{joined}"
-        )
+        ctx_text = await _attachment_context(db, att, query, inline_budget)
+        if ctx_text:
+            parts.append(ctx_text)
     return "\n\n".join(parts)
+
+
+async def history_attachment_texts(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    message_ids: list[uuid.UUID],
+    query: str,
+    inline_budget: int,
+) -> dict[uuid.UUID, str]:
+    """Per-message attachment context for every BOUND attachment of those messages.
+
+    ChatGPT-style cross-turn file memory: follow-up turns re-hydrate the text of
+    files bound to earlier user messages (including image OCR text — old media
+    bytes are never re-sent, so the OCR text is the only carrier) so the model
+    keeps seeing an uploaded document across the conversation. One query loads
+    all rows; the per-message total is capped at ``inline_budget`` so an
+    attachment-heavy message stays sendable on small-context models.
+    """
+    ids = [mid for mid in message_ids if mid is not None]
+    if not ids:
+        return {}
+    res = await db.execute(
+        select(ChatAttachment).where(
+            ChatAttachment.message_id.in_(ids),
+            ChatAttachment.conversation_id == conversation_id,
+            ChatAttachment.user_id == user_id,
+            ChatAttachment.status != "deleted",
+        )
+    )
+    rows = sorted(res.scalars().all(), key=lambda a: a.created_at)
+    if not rows:
+        return {}
+    parts_by_message: dict[uuid.UUID, list[str]] = {}
+    for att in rows:
+        ctx_text = await _attachment_context(db, att, query, inline_budget)
+        if ctx_text:
+            parts_by_message.setdefault(att.message_id, []).append(ctx_text)
+    return {
+        mid: "\n\n".join(parts)[:inline_budget]
+        for mid, parts in parts_by_message.items()
+    }
 
 
 async def collect_image_parts(

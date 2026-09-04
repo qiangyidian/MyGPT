@@ -33,14 +33,25 @@ _engine_kind: str | None = None
 
 
 def _to_pil(image: ImageInput):
-    """Coerce path / bytes / PIL.Image into a PIL.Image."""
+    """Coerce path / bytes / PIL.Image into a (downscaled) PIL.Image.
+
+    Oversized images are downscaled to ``OCR_MAX_IMAGE_EDGE`` first: OCR cost
+    scales super-linearly with pixel count, and a full-screen screenshot on CPU
+    can blow the attachment parse timeout outright. 1568px is rapidocr's native
+    detection resolution, so the downscale costs no accuracy.
+    """
     from PIL import Image  # lazy
 
     if isinstance(image, (bytes, bytearray)):
-        return Image.open(io.BytesIO(image))
-    if isinstance(image, str):
-        return Image.open(image)
-    return image  # already a PIL image
+        pil = Image.open(io.BytesIO(image))
+    elif isinstance(image, str):
+        pil = Image.open(image)
+    else:
+        pil = image  # already a PIL image
+    max_edge = get_settings().OCR_MAX_IMAGE_EDGE
+    if max_edge > 0:
+        pil.thumbnail((max_edge, max_edge))
+    return pil
 
 
 def _to_ndarray(image: ImageInput):

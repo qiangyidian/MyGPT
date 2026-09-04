@@ -128,3 +128,47 @@ async def test_smart_attachment_text_inlines_small_doc(db_session):
     )
     assert "short doc body" in text
     assert "n.txt" in text
+
+
+# ---------------------------------------------------------------------------
+# Cross-turn re-hydration: the model keeps seeing a bound file on FOLLOW-UP
+# turns (current + history user messages get the text spliced into the
+# provider dicts; persisted content stays clean for the UI).
+# ---------------------------------------------------------------------------
+async def test_history_attachment_texts_and_message_dicts(db_session):
+    from app.models import Message
+    from app.services.chat_service import _messages_to_dicts
+
+    conv = Conversation(user_id=_SEEDED, title="cross-turn")
+    db_session.add(conv)
+    await db_session.flush()
+    m1 = Message(conversation_id=conv.id, role="user", content="总结这个文件")
+    a1 = Message(conversation_id=conv.id, role="assistant", content="好的")
+    m2 = Message(conversation_id=conv.id, role="user", content="追问第二句")
+    db_session.add_all([m1, a1, m2])
+    await db_session.flush()
+    att = ChatAttachment(
+        user_id=_SEEDED, conversation_id=conv.id, message_id=m1.id,
+        filename="n.txt", original_filename="n.txt", mime_type="text/plain",
+        size_bytes=10, storage_key="/tmp/n.txt", status="ready",
+        parse_status="ready", extracted_text="short doc body",
+    )
+    db_session.add(att)
+    await db_session.commit()
+
+    mapping = await attachment_service.history_attachment_texts(
+        db_session, _SEEDED, conv.id, [m1.id, m2.id], "any question",
+        inline_budget=8000,
+    )
+    assert set(mapping.keys()) == {m1.id}, (
+        f"only the bound message should map: {mapping}"
+    )
+    assert "short doc body" in mapping[m1.id]
+
+    dicts = _messages_to_dicts(None, [m1, a1, m2], attachment_text_by_id=mapping)
+    assert dicts[0]["role"] == "user"
+    assert "[附件内容]" in dicts[0]["content"] and "short doc body" in dicts[0]["content"]
+    # Persisted content stays clean — the UI bubble never shows spliced text.
+    assert dicts[0]["content"].startswith("总结这个文件")
+    assert dicts[1]["content"] == "好的"
+    assert dicts[2]["content"] == "追问第二句"

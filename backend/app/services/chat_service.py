@@ -109,9 +109,10 @@ async def _refine_title_after_answer(
     except Exception:  # noqa: BLE001 — cosmetic; never surface
         logger.debug("background title refinement failed", exc_info=True)
 from app.services.attachment_service import (
+    collect_audio_parts,
     collect_image_parts,
+    history_attachment_texts,
     resolve_and_bind_attachments,
-    smart_attachment_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -665,12 +666,21 @@ def _finalize_prompt_messages(
 
 
 def _messages_to_dicts(
-    system: str | None, history: list[Message], extra: list[dict[str, Any]] | None = None
+    system: str | None,
+    history: list[Message],
+    extra: list[dict[str, Any]] | None = None,
+    attachment_text_by_id: dict[uuid.UUID, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Flatten persisted Message rows + a system prompt into provider message dicts.
 
     ``extra`` carries already-shaped dicts (e.g. tool turns appended during the
     current turn) that are appended verbatim after the persisted history.
+    ``attachment_text_by_id`` carries per-message bounded attachment context
+    (keyed by Message.id): user messages with bound files get the extracted
+    text appended so the model actually SEES the uploads — both the current
+    turn and follow-up turns (cross-turn file memory). The persisted
+    ``Message.content`` itself stays clean so the UI bubble never shows the
+    spliced text.
     """
     out: list[dict[str, Any]] = []
     if system:
@@ -682,7 +692,12 @@ def _messages_to_dicts(
         # (possibly with RAG context). Avoids a duplicate system turn.
         if role == "system":
             continue
-        entry: dict[str, Any] = {"role": role, "content": msg.content or ""}
+        content = msg.content or ""
+        if role == "user" and attachment_text_by_id and msg.id in attachment_text_by_id:
+            content = _augment_with_attachments(
+                content, attachment_text_by_id[msg.id], max_chars=None
+            )
+        entry: dict[str, Any] = {"role": role, "content": content}
         meta = msg.metadata_ or {}
         # Preserve tool-call linkage so the model sees a coherent transcript.
         if role == "assistant" and meta.get("tool_calls"):
@@ -722,6 +737,39 @@ def _inline_attachment_budget(cfg: ModelConfig) -> int:
     ctx_tokens = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
     from_fraction = int(ctx_tokens * s.ATTACHMENT_INLINE_FRACTION * _CHARS_PER_TOKEN)
     return max(2000, min(from_fraction, s.ATTACHMENT_INLINE_MAX_CHARS))
+
+
+async def _history_attachment_map(
+    db: AsyncSession,
+    user: User,
+    conversation: Conversation,
+    history: list[Message],
+    *,
+    query: str,
+    cfg: ModelConfig,
+) -> dict[uuid.UUID, str]:
+    """Bounded attachment context per user message in the history window.
+
+    Best-effort: any failure degrades to ``{}`` (a normal no-attachment turn) —
+    re-hydration must never kill the chat. The raw current question is the
+    retrieval query so oversized documents contribute the chunks most relevant
+    to what the user is asking NOW.
+    """
+    user_msg_ids = [m.id for m in history if m.role == "user"]
+    if not user_msg_ids:
+        return {}
+    try:
+        return await history_attachment_texts(
+            db,
+            user.id,
+            conversation.id,
+            user_msg_ids,
+            query,
+            _inline_attachment_budget(cfg),
+        )
+    except Exception as exc:  # noqa: BLE001 — context re-hydration is best-effort
+        logger.warning("history attachment re-hydration failed: %s", exc)
+        return {}
 
 
 async def propose_user_memory(
@@ -772,7 +820,7 @@ async def propose_user_memory(
 
 
 def _augment_with_attachments(
-    user_content: str, attachment_text: str, max_chars: int = 8000
+    user_content: str, attachment_text: str, max_chars: int | None = 8000
 ) -> str:
     """Append parsed attachment text to the user content for this turn.
 
@@ -780,12 +828,14 @@ def _augment_with_attachments(
     so a text-only model can reason over the file. Larger files / structured
     data are meant to go through file tools in data_analysis mode; here we keep
     a bounded inline snippet so it never blows the context budget.
+    ``max_chars=None`` means the caller already bounded the text (the
+    history-rehydration path caps per message) — do not truncate again.
     """
     snippet = (attachment_text or "").strip()
     if not snippet:
         return user_content
     # Bound the inline injection; full text stays on the attachment row.
-    if len(snippet) > max_chars:
+    if max_chars is not None and len(snippet) > max_chars:
         snippet = snippet[:max_chars] + "\n…（内容已截断，完整内容见附件）"
     return f"{user_content}\n\n[附件内容]\n{snippet}"
 
@@ -1079,22 +1129,16 @@ class ChatService:
                 db.add(user_msg)
                 await db.flush()
                 # Bind chat attachments to this user message (ownership-checked).
+                # The metadata summaries drive the UI's attachment cards; the
+                # extracted TEXT is injected into the provider message list
+                # below (after the history load) so it also covers follow-up
+                # turns, not just this one.
                 if request.attachment_ids:
                     try:
                         summaries, _full_attachment_text = await resolve_and_bind_attachments(
                             db, user.id, conversation.id, user_msg.id, request.attachment_ids
                         )
                         user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
-                        # Smart-hybrid attachment text: small docs inlined verbatim,
-                        # oversized ones replaced by query-relevant chunks (RAG).
-                        attachment_text = await smart_attachment_text(
-                            db, user.id, conversation.id, request.attachment_ids,
-                            user_content, _inline_attachment_budget(cfg),
-                        )
-                        if attachment_text:
-                            user_content = _augment_with_attachments(
-                                user_content, attachment_text, _inline_attachment_budget(cfg)
-                            )
                     except AppException:
                         raise
                     except Exception as exc:  # noqa: BLE001 — attachments are best-effort
@@ -1215,7 +1259,30 @@ class ChatService:
         # rejecting a turn whose intent routing later disables tools. A final,
         # authoritative admission runs after routing/enrichment/images below.
         history = await _load_history(db, conversation.id)
-        messages = _messages_to_dicts(system_prompt, history)
+        # Cross-turn attachment memory: re-hydrate the extracted text of every
+        # file bound to a user message in the window — the current turn's files
+        # were just bound above, earlier turns' files keep riding along. Only
+        # the provider-side dicts get the spliced text; the persisted user
+        # content (and thus the UI bubble / sidebar preview) stays clean.
+        attachment_map = await _history_attachment_map(
+            db, user, conversation, history,
+            query=(request.content or user_content or "").strip(), cfg=cfg,
+        )
+        messages = _messages_to_dicts(
+            system_prompt, history, attachment_text_by_id=attachment_map
+        )
+        # ctx.user_content feeds the multi-agent / deep-research planners and
+        # the intent router — carry the current (or regenerated) turn's
+        # attachment text there too, matching what the native runtime sees.
+        for msg in reversed(history):
+            if msg.role != "user":
+                continue
+            att_text = attachment_map.get(msg.id)
+            if att_text:
+                user_content = _augment_with_attachments(
+                    user_content, att_text, max_chars=None
+                )
+            break
         messages = _admit_and_trim_history(
             messages,
             cfg,
@@ -1795,9 +1862,32 @@ class ChatService:
                 conversation_id=conversation.id,
                 role="user",
                 content=user_content,
+                metadata_={
+                    "send_params": {
+                        "mode": request.mode or "speed",
+                        "model_id": str(request.model_id) if request.model_id else None,
+                        "knowledge_base_ids": [str(k) for k in (request.knowledge_base_ids or [])],
+                        "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
+                    }
+                },
             )
             db.add(user_msg)
             await db.flush()
+            # Bind chat attachments to this user message (ownership-checked) —
+            # SAME as the inline path. Without this the durable path (the
+            # production BACKGROUND_WORKER=redis configuration) dropped every
+            # attachment: no message binding (message_id stayed NULL), no UI
+            # cards, and the worker-side turn never saw the file at all.
+            if request.attachment_ids:
+                try:
+                    summaries, _full_attachment_text = await resolve_and_bind_attachments(
+                        db, user.id, conversation.id, user_msg.id, request.attachment_ids
+                    )
+                    user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
+                except AppException:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — attachments are best-effort
+                    logger.warning("durable attachment binding failed: %s", exc)
 
         # 3. Create the pending assistant Message (same shape as _run).
         assistant_msg = Message(
@@ -1839,6 +1929,9 @@ class ChatService:
                 # Per-turn KB selection (multi-KB) so the worker-side turn can
                 # run RAG — without this the durable path always saw no KB.
                 "knowledge_base_ids": [str(k) for k in (request.knowledge_base_ids or [])],
+                # Bound attachment ids so the worker-side turn re-hydrates the
+                # file context (text injection + vision/audio parts + routing).
+                "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
                 "mode": request.mode or "speed",
             },
             model_config_snapshot=snapshot,
@@ -1918,10 +2011,14 @@ async def run_durable_turn(
       * Intent recognition (extra model call; the route is derived from the
         run's stored ``execution_mode`` instead).
       * Context-enrichment fragments (behavior / project instructions / skills).
-      * RAG retrieval + citations (no per-turn KB binding on the durable path).
-      * Attachment binding / inline image parts.
       * Cross-turn rolling-summary write-back (``_maybe_summarize``).
       * Goal upsert.
+
+    Attachment handling is NOT deferred: binding happens in
+    :meth:`create_and_enqueue_durable_run` (metadata summaries for the UI +
+    message_id linkage), and this executor re-hydrates the file context from
+    the ids persisted on ``run.input`` (text injection into the message list,
+    image/audio parts for capable models, routing hints).
 
     The orchestrator reuses the EXISTING AgentRun (the durable worker created +
     leased it before calling us) via ``ctx.extra["durable_run_id"]``.
@@ -2008,13 +2105,24 @@ async def run_durable_turn(
     if kb_ids and conversation.knowledge_base_id != kb_ids[0]:
         conversation.knowledge_base_id = kb_ids[0]
 
+    # ---- Attachments (ids persisted on the run by create_and_enqueue) ----
+    # Re-hydrate the turn's attachment context: text is injected into the
+    # provider message list, image/audio bytes ride the multimodal parts for
+    # capable models, and the route learns an attachment is present.
+    attachment_ids: list[uuid.UUID] = []
+    for raw in run_input.get("attachment_ids") or []:
+        try:
+            attachment_ids.append(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+
     # Derive a native single-agent route. Durable execution is additive and
     # currently scoped to native turns; the route's ``use_multi_agent=False``
     # guarantees the orchestrator selects the native runtime.
     route = decide_route(
         run_input.get("mode") or "speed",
         has_knowledge_base=bool(kb_ids),
-        has_attachment=False,
+        has_attachment=bool(attachment_ids),
         user_content=user_content,
     )
     route = replace(route, use_multi_agent=False)
@@ -2061,12 +2169,53 @@ async def run_durable_turn(
         intent_block=None,
         behavior_blocks=[_MULTI_AGENT_HONESTY],
     )
-    messages = _messages_to_dicts(system_prompt, history)
-    messages = _admit_and_trim_history(
+    # Attachment text re-hydration — same as the inline path: every user
+    # message with bound files gets its extracted text spliced into the
+    # provider dicts (current turn + follow-up turns), and ctx.user_content
+    # carries the current turn's text for the intent router / planners.
+    attachment_map = await _history_attachment_map(
+        db, user, conversation, history,
+        query=(user_content or "").strip(), cfg=cfg,
+    )
+    messages = _messages_to_dicts(
+        system_prompt, history, attachment_text_by_id=attachment_map
+    )
+    for msg in reversed(history):
+        if msg.role != "user":
+            continue
+        att_text = attachment_map.get(msg.id)
+        if att_text:
+            user_content = _augment_with_attachments(
+                user_content, att_text, max_chars=None
+            )
+        break
+
+    # Multimodal parts for capable models (mirrors the inline path's 4b/4b').
+    _image_parts: list[dict[str, Any]] = []
+    if cfg.supports_vision and attachment_ids:
+        try:
+            _image_parts = await collect_image_parts(
+                db, user.id, conversation.id, attachment_ids
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("durable collect_image_parts failed: %s", exc)
+            _image_parts = []
+    _audio_parts: list[dict[str, Any]] = []
+    if getattr(cfg, "supports_audio_input", False) and attachment_ids:
+        try:
+            _audio_parts = await collect_audio_parts(
+                db, user.id, conversation.id, attachment_ids
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("durable collect_audio_parts failed: %s", exc)
+            _audio_parts = []
+    messages = _finalize_prompt_messages(
         messages,
         cfg,
-        model_name=cfg.model_name,
-        tool_schema_tokens=0,
+        enable_tools=enable_tools,
+        route=route,
+        image_parts=_image_parts,
+        audio_parts=_audio_parts,
     )
 
     db_mutation_lock = asyncio.Lock()
