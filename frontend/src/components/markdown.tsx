@@ -84,7 +84,12 @@ export const Markdown = memo(function Markdown({
         "[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5",
         "[&_li]:my-0.5",
         // Code blocks (background / rounding / margin come from the pre renderer wrapper).
-        "[&_pre]:my-0 [&_pre]:overflow-x-auto [&_pre]:bg-transparent [&_pre]:p-4",
+        // The base text is forced to the same light color the .hljs theme uses
+        // (globals.css): while a message is streaming, Markdown renders in
+        // `lite` mode WITHOUT rehype-highlight, so no .hljs class exists yet —
+        // without this the code inherits text-foreground (near-black in light
+        // mode) and is invisible on the dark block until streaming completes.
+        "[&_pre]:my-0 [&_pre]:overflow-x-auto [&_pre]:bg-transparent [&_pre]:p-4 [&_pre]:text-[#e6e6e6]",
         "[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-[13px] [&_pre_code]:leading-relaxed",
         // Inline code.
         "[&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.85em] [&_code]:font-mono",

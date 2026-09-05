@@ -32,6 +32,13 @@ describe("Markdown streaming fences", () => {
     expect(html).toContain("print(2)");
     // Rendered as a code block (the custom pre wrapper), not inline text.
     expect(html).toContain("language-python");
+    // Regression (2026-09-05): in lite mode rehype-highlight does NOT run, so
+    // no .hljs class applies the light base color — the code inherited
+    // text-foreground (near-black in light mode) and was invisible on the
+    // dark block until streaming completed. The wrapper must force the light
+    // base color on <pre> whether or not highlighting has run. (The rendered
+    // class attribute is HTML-escaped: `&` → `&amp;`.)
+    expect(html).toContain("[&amp;_pre]:text-[#e6e6e6]");
   });
 
   it("shows the language label while the fence header just arrived", () => {
