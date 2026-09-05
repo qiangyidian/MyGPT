@@ -35,13 +35,16 @@ async def agent_runtime_status(
     (inline/durable) the chat API uses — the durable worker path historically
     forced single-agent regardless of the route.
     """
+    import asyncio
     import sys
 
     from app.agents.orchestrator import chat_orchestrator
     from app.core.config import get_settings
 
     settings = get_settings()
-    available, reason = chat_orchestrator._crewai_status()
+    # The first check may import crewai (seconds, disk-heavy) — run it in a
+    # thread so the event loop isn't blocked for other requests.
+    available, reason = await asyncio.to_thread(chat_orchestrator._crewai_status)
     return {
         "crewai_enabled": bool(getattr(settings, "CREWAI_ENABLED", False)),
         "crewai_available": available,

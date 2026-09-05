@@ -61,16 +61,14 @@ async def lifespan(app: FastAPI):
     """Startup: logging + DB; shutdown: nothing bespoke yet."""
     settings = get_settings()
     configure_logging("DEBUG" if settings.is_dev else "INFO")
-    # One-line agent-runtime boot state: makes "why did 专家模式 run a single
-    # agent?" answerable from journalctl alone (flag off vs package missing vs
-    # durable dispatch — the durable worker historically forced single-agent).
-    from app.agents.orchestrator import chat_orchestrator
-
-    _crew_ok, _crew_reason = chat_orchestrator._crewai_status()
+    # One-line agent-runtime boot state (flag + dispatch mode only — NO crewai
+    # import here: importing crewai blocks the event loop for seconds and, on
+    # a small VPS, can push the boot past the deploy health-check window and
+    # trigger a rollback loop. Importability is checked lazily on first
+    # multi-agent turn and on demand via /api/admin/agent-runtime.)
     logging.getLogger(__name__).info(
-        "agent runtime at boot: crewai_available=%s (%s) background_worker=%s",
-        _crew_ok,
-        _crew_reason or "enabled",
+        "agent runtime at boot: CREWAI_ENABLED=%s background_worker=%s",
+        settings.CREWAI_ENABLED,
         settings.BACKGROUND_WORKER,
     )
     await init_db(app)
