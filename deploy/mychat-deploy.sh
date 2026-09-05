@@ -100,6 +100,12 @@ cd "$REPO"
 # ---- 6. 重启服务 ----
 log "restarting services..."
 systemctl restart mychat-backend mychat-frontend
+# Best-effort: restart the durable worker/recovery units too when present.
+# A worker skipped here keeps executing runs with OLD code (durable turns run
+# in the worker process, not in the backend) — restarting the backend alone
+# is not enough on stacks with BACKGROUND_WORKER=durable.
+systemctl restart mychat-worker 2>/dev/null || log "no mychat-worker unit (skipped)"
+systemctl restart mychat-recovery 2>/dev/null || log "no mychat-recovery unit (skipped)"
 
 # ---- 7. 健康验证（失败回滚） ----
 healthy=0

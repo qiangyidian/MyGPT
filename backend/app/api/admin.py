@@ -23,6 +23,35 @@ NOT_FOUND = status.HTTP_404_NOT_FOUND
 BAD = status.HTTP_400_BAD_REQUEST
 
 
+@router.get("/agent-runtime")
+async def agent_runtime_status(
+    admin: User = Depends(get_current_admin),
+) -> dict[str, object]:
+    """Diagnostics for the multi-agent (CrewAI) runtime, admin-gated.
+
+    Answers, in one place, "why did 专家模式 run a single agent?": whether the
+    CrewAI flag is on, whether the package actually imports on THIS host (with
+    the concrete import error when not), and which dispatch path
+    (inline/durable) the chat API uses — the durable worker path historically
+    forced single-agent regardless of the route.
+    """
+    import sys
+
+    from app.agents.orchestrator import chat_orchestrator
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    available, reason = chat_orchestrator._crewai_status()
+    return {
+        "crewai_enabled": bool(getattr(settings, "CREWAI_ENABLED", False)),
+        "crewai_available": available,
+        "detail": reason,
+        "background_worker": settings.BACKGROUND_WORKER,
+        "agent_workflow_engine": settings.AGENT_WORKFLOW_ENGINE,
+        "python": sys.version.split()[0],
+    }
+
+
 @router.get("/users", response_model=list[UserOut])
 async def list_users(
     admin: User = Depends(get_current_admin),

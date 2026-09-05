@@ -100,6 +100,12 @@ class ChatOrchestrator:
         self._native = NativeChatRuntime()
         self._crewai: object | None = None
         self._crewai_checked = False
+        # The concrete import error when the CrewAI runtime fails to load.
+        # Surfaced via runtime_selected.fallback_reason and the admin
+        # agent-runtime diagnostics endpoint so a server-side import failure
+        # (missing wheel, dependency conflict) is diagnosable from the UI
+        # instead of collapsing into an opaque "crewai_not_installed".
+        self._crewai_import_error: str | None = None
 
     # ------------------------------------------------------------------ #
     async def stream(self, ctx: AgentTurnContext) -> AsyncIterator[AgentEvent]:
@@ -553,7 +559,10 @@ class ChatOrchestrator:
             self._crewai_checked = True
             self._crewai = self._crewai_runtime()
         if self._crewai is None:
-            return False, "crewai_not_installed"
+            reason = "crewai_not_installed"
+            if self._crewai_import_error:
+                reason = f"crewai_not_installed ({self._crewai_import_error})"
+            return False, reason
         return True, None
 
     def _crewai_runtime(self):  # pragma: no cover - implemented in Phase 1
@@ -561,7 +570,14 @@ class ChatOrchestrator:
         try:
             from app.agents.runtime.crewai_runtime import CrewAIRuntime  # type: ignore
         except Exception as exc:
-            logger.warning("CrewAI runtime unavailable, falling back to native: %s", exc)
+            # Keep the concrete error: "crewai_not_installed" alone hides WHY
+            # (ModuleNotFoundError vs a dependency conflict) and makes a prod
+            # fallback undiagnosable without shell access.
+            self._crewai_import_error = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning(
+                "CrewAI runtime unavailable, falling back to native: %s",
+                self._crewai_import_error,
+            )
             return None
         return CrewAIRuntime()
 

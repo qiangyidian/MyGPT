@@ -43,7 +43,7 @@ from app.agents.db_mutation import (
     commit_with_rollback,
     db_mutation_scope,
 )
-from app.agents.intent_router import decide_route, decide_route_with_intent
+from app.agents.intent_router import RouteDecision, decide_route, decide_route_with_intent
 from app.agents.orchestrator import chat_orchestrator
 from app.agents.output_spill import production_spill_writer
 from app.agents.persistence import persist_continuation_checkpoint
@@ -742,6 +742,36 @@ def _messages_to_dicts(
     return out
 
 
+def _resolve_turn_route(
+    request: ChatRequest,
+    *,
+    has_knowledge_base: bool,
+    has_attachment: bool,
+    user_content: str,
+) -> RouteDecision:
+    """Resolve the execution route for one turn — shared by the inline path and
+    the durable enqueue so BOTH dispatch paths route identically.
+
+    Wraps :func:`decide_route` plus the legacy explicit
+    ``execution_mode="agent"`` override (kept for older clients/tests).
+    """
+    route = decide_route(
+        request.mode,
+        has_knowledge_base=has_knowledge_base,
+        has_attachment=has_attachment,
+        user_content=user_content,
+    )
+    if (request.execution_mode or "auto").lower() == "agent" and request.mode == "auto":
+        route = replace(
+            route,
+            execution_mode=ExecutionMode.agent,
+            agent_profile=request.agent_profile or "deep_research",
+            enable_tools=True,
+            use_multi_agent=True,
+        )
+    return route
+
+
 def _build_system_prompt(conversation: Conversation | None, rag_context: str) -> str:
     """Compose the effective system prompt, prepending any RAG context."""
     base = (conversation.system_prompt if conversation else None) or _DEFAULT_SYSTEM_PROMPT
@@ -1177,8 +1207,8 @@ class ChatService:
             # and the detail refetch restores the picker state.
             if conversation.knowledge_base_id != kb_ids[0]:
                 conversation.knowledge_base_id = kb_ids[0]
-        route = decide_route(
-            request.mode,
+        route = _resolve_turn_route(
+            request,
             has_knowledge_base=bool(kb_ids),
             has_attachment=bool(request.attachment_ids),
             user_content=request.content or "",
@@ -1186,17 +1216,6 @@ class ChatService:
         enable_tools = route.enable_tools or request.enable_tools
         execution_mode = route.execution_mode
         agent_profile = route.agent_profile
-        if (request.execution_mode or "auto").lower() == "agent" and request.mode == "auto":
-            execution_mode = ExecutionMode.agent
-            agent_profile = request.agent_profile or "deep_research"
-            enable_tools = True
-            route = replace(
-                route,
-                execution_mode=execution_mode,
-                agent_profile=agent_profile,
-                enable_tools=True,
-                use_multi_agent=True,
-            )
 
         # 2. Persist the user message (unless regenerating).
         user_content = request.content or ""
@@ -2049,6 +2068,21 @@ class ChatService:
             "max_tokens": cfg.max_tokens,
             "supports_tools": getattr(cfg, "supports_tools", False),
         }
+        # Resolve the route NOW and persist the full decision: the worker must
+        # execute EXACTLY what was routed (including real multi-agent turns),
+        # not re-derive a degraded version. Historically the durable worker
+        # forced use_multi_agent=False, so every deployment running the durable
+        # worker answered 专家模式 with a native single agent.
+        route = _resolve_turn_route(
+            request,
+            has_knowledge_base=bool(
+                request.knowledge_base_ids
+                or request.knowledge_base_id
+                or conversation.knowledge_base_id
+            ),
+            has_attachment=bool(request.attachment_ids),
+            user_content=user_content,
+        )
         run = AgentRun(
             conversation_id=conversation.id,
             message_id=assistant_msg.id,
@@ -2059,9 +2093,9 @@ class ChatService:
             current_step="",
             input={
                 "content": user_content,
-                "enable_tools": bool(request.enable_tools),
-                "execution_mode": (request.execution_mode or "auto"),
-                "agent_profile": request.agent_profile or "general",
+                "enable_tools": bool(route.enable_tools or request.enable_tools),
+                "execution_mode": route.execution_mode.value,
+                "agent_profile": route.agent_profile,
                 "knowledge_base_id": (
                     str(request.knowledge_base_id) if request.knowledge_base_id else None
                 ),
@@ -2071,7 +2105,13 @@ class ChatService:
                 # Bound attachment ids so the worker-side turn re-hydrates the
                 # file context (text injection + vision/audio parts + routing).
                 "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
-                "mode": request.mode or "speed",
+                "mode": route.mode,
+                # The full route decision, rebuilt worker-side into a
+                # RouteDecision (RouteDecision fields are all JSON-safe).
+                "route_requested_mode": route.requested_mode,
+                "route_use_multi_agent": route.use_multi_agent,
+                "route_tool_allowlist": route.tool_allowlist,
+                "route_disable_web": route.disable_web,
             },
             model_config_snapshot=snapshot,
         )
@@ -2271,16 +2311,33 @@ async def run_durable_turn(
         except (TypeError, ValueError):
             continue
 
-    # Derive a native single-agent route. Durable execution is additive and
-    # currently scoped to native turns; the route's ``use_multi_agent=False``
-    # guarantees the orchestrator selects the native runtime.
-    route = decide_route(
-        run_input.get("mode") or "speed",
-        has_knowledge_base=bool(kb_ids),
-        has_attachment=bool(attachment_ids),
-        user_content=user_content,
-    )
-    route = replace(route, use_multi_agent=False)
+    # Rebuild the route decision. New runs persist the enqueue-time decision
+    # (see create_and_enqueue_durable_run) so the worker executes EXACTLY what
+    # was routed — including real multi-agent turns (专家模式). Legacy rows
+    # (enqueued before those fields existed) re-derive from the persisted mode.
+    # The old unconditional ``use_multi_agent=False`` force is GONE: it made
+    # every durable deployment answer expert mode with a native single agent,
+    # regardless of the route or CREWAI_ENABLED.
+    if "route_use_multi_agent" in run_input:
+        route = RouteDecision(
+            execution_mode=execution_mode,
+            agent_profile=agent_profile,
+            enable_tools=enable_tools,
+            use_multi_agent=bool(run_input.get("route_use_multi_agent", False)),
+            tool_allowlist=run_input.get("route_tool_allowlist"),
+            disable_web=bool(run_input.get("route_disable_web", False)),
+            mode=run_input.get("mode") or "speed",
+            requested_mode=run_input.get("route_requested_mode")
+            or run_input.get("mode")
+            or "speed",
+        )
+    else:
+        route = decide_route(
+            run_input.get("mode") or "speed",
+            has_knowledge_base=bool(kb_ids),
+            has_attachment=bool(attachment_ids),
+            user_content=user_content,
+        )
 
     # ---- RAG retrieval (mirrors the inline path) ----
     # Best-effort: a retrieval failure degrades to a normal answer, never
