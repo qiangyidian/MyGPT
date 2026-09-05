@@ -112,7 +112,7 @@ class StageAdapterExecutor:
         self._stage_ctx = stage_ctx
         # Lazy import so the workflow package imports cleanly without crewai.
         from app.agents.runtime.stage_executor import (
-            CrewAIStageExecutor,  # noqa: WPS433
+            CrewAIStageExecutor,
         )
 
         self._inner = CrewAIStageExecutor()

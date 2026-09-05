@@ -130,5 +130,5 @@ def load_active_policy() -> NetworkPolicy:
         return NetworkPolicy(default="allow")
     try:
         return NetworkRuleStore(Path(path)).load()
-    except Exception:  # noqa: BLE001 — a bad policy file must not block egress
+    except Exception:
         return NetworkPolicy(default="allow")

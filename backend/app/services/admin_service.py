@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,7 +53,7 @@ async def usage_stats(db: AsyncSession, days: int = 14) -> list[UsageStat]:
     load-everything version turned the admin dashboard into a table scan of
     hundreds of thousands of rows as data grew.
     """
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(UTC) - timedelta(days=days)
     day_expr = func.strftime("%Y-%m-%d", Message.created_at) if _is_sqlite(db) else func.to_char(
         func.date_trunc("day", Message.created_at), "YYYY-MM-DD"
     )

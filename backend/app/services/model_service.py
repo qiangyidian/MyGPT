@@ -188,6 +188,6 @@ async def test(cfg: ModelConfig) -> ModelTestResult:
     except ProviderError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ModelTestResult(ok=False, latency_ms=latency_ms, error=str(exc) or "provider error")
-    except Exception as exc:  # noqa: BLE001 - surface any failure to the caller
+    except Exception as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ModelTestResult(ok=False, latency_ms=latency_ms, error=str(exc) or "unknown error")

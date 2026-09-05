@@ -201,7 +201,7 @@ async def upload(
     def _cleanup() -> None:
         try:
             asyncio.get_event_loop().create_task(storage.delete(storage_key))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     if size > max_bytes:
@@ -215,7 +215,7 @@ async def upload(
         # Don't leave an rejected file on disk.
         try:
             await storage.delete(storage_key)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         raise
 
@@ -286,13 +286,13 @@ async def _parse_attachment_bg(attachment_id: uuid.UUID) -> None:
                 text, preview = await asyncio.wait_for(
                     _extract(att.storage_key, att.original_filename), settings.ATTACHMENT_PARSE_TIMEOUT
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 att.parse_status = "failed"
                 att.status = "failed"
                 att.error_message = "解析超时"
                 await db.commit()
                 return
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 att.parse_status = "failed"
                 att.status = "failed"
                 att.error_message = str(exc)[:500]
@@ -631,7 +631,7 @@ def _load_audio_part(att: ChatAttachment) -> dict[str, Any] | None:
     try:
         with storage.open(att.storage_key) as fh:
             data = fh.read()
-    except Exception:  # noqa: BLE001 — unreadable audio must not break the turn
+    except Exception:
         logger.warning("could not read audio attachment %s", att.id)
         return None
     if len(data) > AUDIO_PART_MAX_BYTES:
@@ -661,7 +661,7 @@ def _load_image_part(att: ChatAttachment) -> dict[str, Any] | None:
         with storage.open(att.storage_key) as fh:
             data = fh.read()
         img = Image.open(io.BytesIO(data))
-    except Exception:  # noqa: BLE001 — corrupt image must not break the turn
+    except Exception:
         logger.warning("could not open image attachment %s", att.id)
         return None
 
@@ -681,7 +681,7 @@ def _load_image_part(att: ChatAttachment) -> dict[str, Any] | None:
     buf = io.BytesIO()
     try:
         img.save(buf, format=save_fmt)
-    except Exception:  # noqa: BLE001
+    except Exception:
         img.convert("RGB").save(buf, format="JPEG")
         mime = "image/jpeg"
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -712,7 +712,7 @@ async def delete(db: AsyncSession, attachment_id: uuid.UUID, user_id: uuid.UUID)
     att = await get_owned(db, attachment_id, user_id)
     try:
         await get_storage().delete(att.storage_key)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # Drop any per-attachment RAG index (best-effort; no DB session needed).
     await attachment_rag.drop(attachment_id)
@@ -736,11 +736,11 @@ async def delete_for_conversation(db: AsyncSession, conversation_id: uuid.UUID) 
     for att in res.scalars().all():
         try:
             await storage.delete(att.storage_key)
-        except Exception:  # noqa: BLE001 — file may already be gone
+        except Exception:
             pass
         try:
             await attachment_rag.drop(att.id)
-        except Exception:  # noqa: BLE001 — vector store may be unavailable
+        except Exception:
             pass
 
 
@@ -757,12 +757,12 @@ async def delete_files_for_keys(
     for key in storage_keys:
         try:
             await storage.delete(key)
-        except Exception:  # noqa: BLE001 — file may already be gone
+        except Exception:
             pass
     for att_id in attachment_ids:
         try:
             await attachment_rag.drop(att_id)
-        except Exception:  # noqa: BLE001 — vector store may be unavailable
+        except Exception:
             pass
 
 

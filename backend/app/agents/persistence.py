@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy import select, update
@@ -126,7 +126,7 @@ async def persist_terminal_run(
             return
         current_output, current_status = row
         values: dict[str, Any] = {
-            "finished_at": datetime.now(timezone.utc),
+            "finished_at": datetime.now(UTC),
             "output": {**(current_output or {}), **event_data},
         }
         if event_kind == "done":

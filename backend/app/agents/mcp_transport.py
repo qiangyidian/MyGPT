@@ -160,7 +160,7 @@ class StdioTransport:
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except (asyncio.CancelledError, Exception):
                     pass
         self._reader = self._stderr_task = None
 
@@ -186,7 +186,7 @@ class StdioTransport:
         if self._proc is not None:
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         self._proc = None
         for task in (self._reader, self._stderr_task):
@@ -194,7 +194,7 @@ class StdioTransport:
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except (asyncio.CancelledError, Exception):
                     pass
         self._reader = self._stderr_task = None
 
@@ -210,7 +210,7 @@ class StdioTransport:
                 return
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     proc.kill()
                 except ProcessLookupError:
@@ -236,7 +236,7 @@ class StdioTransport:
                     logger.warning("mcp stdio: malformed stdout frame: %r", line_s[:200])
                     continue
                 self._dispatch(msg)
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except (asyncio.CancelledError, Exception):
             pass
         finally:
             # Subprocess exited: fail any pending requests still waiting.
@@ -257,7 +257,7 @@ class StdioTransport:
                 text = chunk.decode(errors="replace")
                 # Bounded ring buffer of individual chars (deque drops oldest).
                 self._stderr_buf.extend(text)
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except (asyncio.CancelledError, Exception):
             pass
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
@@ -305,7 +305,7 @@ class StdioTransport:
             raise McpError(f"mcp server pipe closed: {exc}") from exc
         try:
             return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._pending.pop(req_id, None)
             raise McpTimeoutError(
                 f"mcp request {method!r} (id={req_id}) timed out after {timeout}s"
@@ -419,7 +419,7 @@ class HttpTransport:
                 ),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise McpTimeoutError(
                 f"mcp http {method!r} (id={req_id}) timed out after {timeout}s"
             ) from exc

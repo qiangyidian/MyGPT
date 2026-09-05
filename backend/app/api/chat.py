@@ -86,14 +86,14 @@ async def _event_generator(
                     "data": {"code": exc.code, "message": exc.message},
                 }
             )
-        except Exception:  # noqa: BLE001 — never kill the stream silently
+        except Exception:
             # Release the idempotency marker so the client's retry isn't
             # blocked for the whole TTL after a failed first attempt.
             from app.core.idempotency import release as idempotency_release
 
             try:
                 await idempotency_release(request, user.id)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             await queue.put(
                 {
@@ -115,7 +115,7 @@ async def _event_generator(
                 break
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=heartbeat)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # SSE comment frame: keeps the connection alive, ignored by clients.
                 yield ": keepalive\n\n"
                 continue
@@ -131,7 +131,7 @@ async def _event_generator(
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
 
 

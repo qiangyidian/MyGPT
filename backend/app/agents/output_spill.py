@@ -77,7 +77,7 @@ def maybe_spill(
     name = f"{key}.txt"
     try:
         path = writer(name, text)
-    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+    except Exception:
         return SpillResult(in_context=text, spilled=False, path=None)
 
     preview = _preview(text)
@@ -122,12 +122,12 @@ def _run_async_sync(coro_factory):
         try:
             asyncio.set_event_loop(loop)
             box["result"] = loop.run_until_complete(coro_factory())
-        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+        except BaseException as exc:
             box["error"] = exc
         finally:
             try:
                 loop.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     t = threading.Thread(target=_runner, name="artifact-spill", daemon=True)
@@ -189,7 +189,7 @@ def production_spill_writer(name: str, content: str) -> str:
 
     try:
         art = _run_async_sync(_create)
-    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+    except Exception:
         return _default_writer(name, content)
 
     production_spill_writer.last_artifact_id = str(art.id)  # type: ignore[attr-defined]
@@ -230,7 +230,7 @@ def spill(
     artifact_id = f"artifact:{_uuid.uuid4().hex}"
     try:
         storage_key = writer(key, text)
-    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+    except Exception:
         return text, None
 
     preview = _preview(text)
@@ -290,7 +290,7 @@ async def spill_to_artifact(
             step_id=step_id,
             generator=gen,
         )
-    except Exception:  # noqa: BLE001 — spill is best-effort; never block on it
+    except Exception:
         return text, None
 
     preview = _preview(text)

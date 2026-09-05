@@ -82,7 +82,7 @@ def _sync_columns(conn) -> None:
                 logger.warning(
                     "schema-sync: added missing column %s.%s (%s)", table_name, col.name, coltype
                 )
-            except Exception as exc:  # noqa: BLE001 — never let a sync failure block startup
+            except Exception as exc:
                 logger.warning("schema-sync: could not add %s.%s: %s", table_name, col.name, exc)
 
 

@@ -219,7 +219,7 @@ async def logout(
 
         try:
             await blacklist_access_token(authorization[7:].strip())
-        except Exception:  # noqa: BLE001 — best-effort revocation
+        except Exception:
             pass
     token = request.cookies.get(REFRESH_COOKIE_NAME)
     _clear_refresh_cookie(response)
@@ -236,7 +236,7 @@ async def logout(
     from app.services import auth_service
     try:
         await auth_service.revoke_refresh(token)
-    except Exception:  # noqa: BLE001 — revocation store unavailable; cookie still cleared
+    except Exception:
         pass
 
 
@@ -335,7 +335,7 @@ async def delete_my_account(
     # Blob + vector cleanup AFTER commit (orphans are swept, never block).
     try:
         await attachment_service.delete_files_for_keys(storage_keys, attachment_ids)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     try:
         from app.rag.qdrant_store import get_vector_store
@@ -345,9 +345,9 @@ async def delete_my_account(
         for kb_id in kb_ids:
             try:
                 await store.drop_collection(collection_name(kb_id))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     _clear_refresh_cookie(response)

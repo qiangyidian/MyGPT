@@ -88,11 +88,11 @@ async def ensure_index(db: AsyncSession, attachment_id: uuid.UUID, text: str) ->
                     vector=vec,
                     payload={"attachment_id": aid, "chunk_index": start + i, "text": txt},
                 )
-                for i, (txt, vec) in enumerate(zip(batch, vectors))
+                for i, (txt, vec) in enumerate(zip(batch, vectors, strict=False))
             ]
             await store.upsert(_COLLECTION, points)
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("attachment RAG index failed for %s: %s", attachment_id, exc)
         return False
 
@@ -113,7 +113,7 @@ async def retrieve(
             _COLLECTION, qvec, top_k=top_k, filters={"attachment_id": str(attachment_id)}
         )
         return [h.payload.get("text", "") for h in hits if h.payload.get("text")]
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("attachment RAG retrieve failed for %s: %s", attachment_id, exc)
         return []
 
@@ -124,7 +124,7 @@ async def drop(attachment_id: uuid.UUID) -> None:
         await get_vector_store().delete_by_filter(
             _COLLECTION, {"attachment_id": str(attachment_id)}
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("attachment RAG drop failed for %s: %s", attachment_id, exc)
 
 

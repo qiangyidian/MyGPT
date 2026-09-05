@@ -70,7 +70,7 @@ class KeywordRetriever:
                 .limit(_MAX_CANDIDATES)
             )
             rows = (await self._db.execute(stmt)).all()
-        except Exception as exc:  # noqa: BLE001 — keyword is best-effort
+        except Exception as exc:
             logger.warning("keyword retrieve failed for kb %s: %s", kb_id, exc)
             return []
 

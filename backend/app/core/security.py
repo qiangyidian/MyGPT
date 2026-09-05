@@ -7,7 +7,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -59,7 +59,7 @@ REFRESH_TOKEN_TYPE = "refresh"
 
 
 def _create_token(subject: str, token_type: str, expires_delta: timedelta, extra: dict | None = None) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": subject,
         "type": token_type,

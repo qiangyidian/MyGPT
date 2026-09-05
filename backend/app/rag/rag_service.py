@@ -198,7 +198,7 @@ class RagService:
                         question, collection_name(kb.id), top_k=fetch_k, overfetch=1
                     )
                     all_v.extend(_tag_kb(v_hits, kb))
-            except Exception as exc:  # noqa: BLE001 — RAG is best-effort per-KB
+            except Exception as exc:
                 logger.warning("RAG retrieval failed for kb %s: %s", kb_id, exc)
                 continue
 

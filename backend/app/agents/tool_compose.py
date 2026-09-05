@@ -82,7 +82,7 @@ def execute_program(
             raise ToolComposeError(f"op {i} ({op.tool}): bad interpolation: {exc}") from exc
         try:
             result = call_tool(op.tool, interp_args)
-        except Exception as exc:  # noqa: BLE001 — surface tool failure to the model
+        except Exception as exc:
             result = {"error": str(exc)}
         res.results.append(result)
         if op.as_:

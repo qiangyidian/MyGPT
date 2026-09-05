@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from types import SimpleNamespace
 
 import pytest
@@ -238,7 +238,7 @@ def test_model_service_output_exposes_capability_fields():
         temperature=0.7,
         top_p=1.0,
         is_embedding=False,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
     out = to_out(cfg)

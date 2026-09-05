@@ -174,7 +174,7 @@ class ToolGateway:
             )
             try:
                 sp.set_attribute("outcome", result.status)
-            except Exception:  # noqa: BLE001 — never let tracing break the call
+            except Exception:
                 pass
             return result
 
@@ -306,7 +306,7 @@ class ToolGateway:
         # 5. Execute under a timeout backstop.
         try:
             result = await asyncio.wait_for(tool.run(**args), timeout=TOOL_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return await self._finalize(
                 tool_call_id, tool_name, args, started,
                 ok=False, status="timeout",

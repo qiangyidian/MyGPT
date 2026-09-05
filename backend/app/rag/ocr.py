@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Any, Union
+from typing import Any
 
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # A path, raw bytes, or a PIL.Image instance.
-ImageInput = Union[str, bytes, bytearray, Any]
+ImageInput = str | bytes | bytearray | Any
 
 _engine: Any | None = None
 _engine_kind: str | None = None
@@ -79,7 +79,7 @@ def _get_engine() -> tuple[Any | None, str | None]:
 
             _engine, _engine_kind = "tesseract", "tesseract"
             return _engine, _engine_kind
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("pytesseract 不可用，回退到 rapidocr: %s", exc)
             kind = "rapidocr"
 
@@ -88,7 +88,7 @@ def _get_engine() -> tuple[Any | None, str | None]:
 
         _engine = RapidOCR()
         _engine_kind = "rapidocr"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("rapidocr 不可用，OCR 已禁用: %s", exc)
         _engine, _engine_kind = None, "__failed__"
         return None, None
@@ -132,7 +132,7 @@ def image_to_text(image: ImageInput) -> str:
         # rapidocr accepts a path directly, else feed it an ndarray.
         payload = image if isinstance(image, str) else _to_ndarray(image)
         return _parse_rapidocr_result(engine(payload))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("OCR failed for one image: %s", exc)
         return ""
 

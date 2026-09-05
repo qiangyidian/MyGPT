@@ -158,7 +158,7 @@ async def blacklist_access_token(token: str) -> None:
         try:
             await client.sadd(ACCESS_BLACKLIST_KEY, jti)
             await client.expire(ACCESS_BLACKLIST_KEY, ttl)
-        except Exception:  # noqa: BLE001 — best-effort; memory fallback below
+        except Exception:
             _mem_blacklist.add(jti)
     else:
         _mem_blacklist.add(jti)
@@ -173,7 +173,7 @@ async def is_access_revoked(token_payload: dict) -> bool:
     if client is not None:
         try:
             return bool(await client.sismember(ACCESS_BLACKLIST_KEY, jti))
-        except Exception:  # noqa: BLE001 — Redis down: fall through to memory
+        except Exception:
             pass
     return jti in _mem_blacklist
 

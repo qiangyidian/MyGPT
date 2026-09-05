@@ -28,7 +28,11 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Install dev tools
-        run: pip install ruff mypy pytest-cov pip-audit
+        # ruff is version-PINNED: floating installs break the lint gate when an
+        # upstream release renames/removes a rule selector (the 2026-09 removal
+        # of PLB003 failed config parsing) — and a red CI BLOCKS the deploy
+        # signal. Bump the pin deliberately with pyproject.toml rule changes.
+        run: pip install "ruff==0.15.17" mypy pytest-cov pip-audit
       - name: Ruff (lint — gating)
         # The baseline is clean now (legacy noise rules are explicitly ignored
         # with documented reasons in backend/pyproject.toml), so lint failures

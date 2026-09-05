@@ -272,5 +272,5 @@ async def delete_conversation(
     await db.commit()
     try:
         await attachment_service.delete_files_for_keys(storage_keys, attachment_ids)
-    except Exception:  # noqa: BLE001 — rows are gone; files are swept later
+    except Exception:
         pass

@@ -299,7 +299,7 @@ class WorkflowEngine:
                     await self._close_attempt(step.id, attempt_number, obs)
                 observe_counter("workflow.steps", 1, outcome="done")
                 return obs
-            except BaseException as exc:  # noqa: BLE001 — executor may raise anything
+            except BaseException as exc:
                 transient = policy.is_transient(exc) and attempt <= policy.max_retries
                 await self._error_attempt(step.id, attempt_number, exc, transient)
                 if transient:

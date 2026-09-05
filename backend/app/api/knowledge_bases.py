@@ -124,7 +124,7 @@ async def delete_knowledge_base(
         from app.rag.qdrant_store import get_vector_store
         from app.rag.rag_service import collection_name
         await get_vector_store().delete_by_filter(collection_name(kb.id), {})
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     await db.delete(kb)  # cascades documents + chunks
     await db.commit()

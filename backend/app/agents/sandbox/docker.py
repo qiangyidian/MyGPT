@@ -146,7 +146,7 @@ class DockerRunner:
 
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=to)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:

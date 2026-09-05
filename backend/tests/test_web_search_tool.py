@@ -31,9 +31,20 @@ def test_settings_loads_web_search_config(monkeypatch: pytest.MonkeyPatch):
     assert s.WEB_SEARCH_METHOD == "post"
 
 
-def test_settings_defaults_are_safe():
+def test_settings_defaults_are_safe(monkeypatch):
     # _env_file=None isolates from the dev .env (which may configure a real
     # provider) so this asserts the PURE defaults: empty endpoint → DDG fallback.
+    # Monkeypatch belt-and-braces: importing crewai anywhere earlier in the
+    # suite calls load_dotenv() under the hood, which pushes the dev .env
+    # values into os.environ — env vars beat dotenv files in pydantic-settings,
+    # so without this the "pure defaults" premise leaks on dev machines.
+    for key in (
+        "WEB_SEARCH_ENDPOINT",
+        "WEB_SEARCH_API_KEY",
+        "WEB_SEARCH_METHOD",
+        "WEB_SEARCH_DEPTH",
+    ):
+        monkeypatch.delenv(key, raising=False)
     s = Settings(_env_file=None)
     assert getattr(s, "WEB_SEARCH_ENDPOINT", "") == ""
     assert getattr(s, "WEB_SEARCH_METHOD", "get") == "get"

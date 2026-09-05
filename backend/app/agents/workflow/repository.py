@@ -7,7 +7,7 @@ the session's transaction; the caller commits.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any
 
 from sqlalchemy import select, update
@@ -67,7 +67,7 @@ class CommandStore:
         makes the per-row refresh cheap.
         """
         run_id = _as_uuid(run_id)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         claim_stmt = (
             update(RunCommand)
             .where(RunCommand.run_id == run_id, RunCommand.status == "pending")
@@ -97,7 +97,7 @@ class CommandStore:
         if command is None or command.status != "claimed":
             return False
         command.status = "applied"
-        command.applied_at = datetime.now(timezone.utc)
+        command.applied_at = datetime.now(UTC)
         await self._session.flush()
         return True
 
@@ -148,7 +148,7 @@ class LeaseStore:
         lease expired (ownership/renewal is enforced by :meth:`renew`/:meth:`release`).
         """
         run_id = _as_uuid(run_id)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expires_at = now + timedelta(seconds=max(0, int(ttl_seconds)))
         lease = await self._get(run_id)
         if lease is None:
@@ -178,7 +178,7 @@ class LeaseStore:
         lease = await self._get(_as_uuid(run_id))
         if lease is None or lease.owner != owner:
             return None
-        lease.expires_at = datetime.now(timezone.utc) + timedelta(
+        lease.expires_at = datetime.now(UTC) + timedelta(
             seconds=max(0, int(ttl_seconds))
         )
         lease.version = (lease.version or 0) + 1
@@ -201,7 +201,7 @@ class LeaseStore:
     ) -> bool:
         """Pure logic: True when ``now`` is at/after the lease's expiry."""
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
         return now >= lease.expires_at
 
 

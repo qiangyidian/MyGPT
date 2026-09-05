@@ -63,7 +63,7 @@ class QdrantVectorStore(VectorStore):
         _, models = _import_qdrant()
         try:
             from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
-        except Exception:  # noqa: BLE001 — qdrant not importable here
+        except Exception:
             UnexpectedResponse = ()  # type: ignore
         try:
             info = await self._client.get_collection(collection_name=collection)
@@ -177,6 +177,6 @@ async def close_vector_store() -> None:
     if _store is not None:
         try:
             await _store._client.close()
-        except Exception:  # noqa: BLE001 — shutdown must always succeed
+        except Exception:
             pass
         _store = None

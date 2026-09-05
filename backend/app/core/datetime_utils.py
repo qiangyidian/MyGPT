@@ -5,7 +5,7 @@ Postgres returns offset-aware) are handled in ONE place.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 
 def is_expired(expires_at: datetime | None, now: datetime | None = None) -> bool:
@@ -17,11 +17,11 @@ def is_expired(expires_at: datetime | None, now: datetime | None = None) -> bool
     if expires_at is None:
         return False
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
     if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_at = expires_at.replace(tzinfo=UTC)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     return expires_at <= now
 
 

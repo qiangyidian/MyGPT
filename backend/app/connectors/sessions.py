@@ -44,6 +44,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.service import ConnectorService
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ class ConnectorSessionManager:
         # sessions actually opened, so the settings page's "最近使用" reflects
         # reality. Best-effort — a stamp failure never breaks the run.
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
 
             from sqlalchemy import update
 
@@ -158,7 +159,7 @@ class ConnectorSessionManager:
                 await self._db.execute(
                     update(Connector)
                     .where(Connector.id.in_(used_ids))
-                    .values(last_used_at=datetime.now(timezone.utc))
+                    .values(last_used_at=datetime.now(UTC))
                 )
                 await self._db.commit()
         except Exception:

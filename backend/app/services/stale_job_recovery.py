@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any
 
 from sqlalchemy import select
@@ -73,7 +73,7 @@ class StaleJobSweeper:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
 
@@ -85,14 +85,14 @@ class StaleJobSweeper:
                 logger.exception("stale-job sweep failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
 
 async def _stale_documents(session_factory: Any) -> list[uuid.UUID]:
     from app.models.document import Document
 
-    cutoff = datetime.now(timezone.utc) - _STALE_AFTER
+    cutoff = datetime.now(UTC) - _STALE_AFTER
     async with session_factory() as db:
         result = await db.execute(
             select(Document.id)
@@ -102,7 +102,7 @@ async def _stale_documents(session_factory: Any) -> list[uuid.UUID]:
             )
             .limit(_MAX_REQUEUE_PER_SWEEP)
         )
-        ids = [row for row in result.scalars().all()]
+        ids = list(result.scalars().all())
         if ids:
             # Flip parsing → pending so the index task starts clean.
             await db.execute(
@@ -117,7 +117,7 @@ async def _stale_documents(session_factory: Any) -> list[uuid.UUID]:
 async def _stale_attachments(session_factory: Any) -> list[uuid.UUID]:
     from app.models.chat_attachment import ChatAttachment
 
-    cutoff = datetime.now(timezone.utc) - _STALE_AFTER
+    cutoff = datetime.now(UTC) - _STALE_AFTER
     async with session_factory() as db:
         result = await db.execute(
             select(ChatAttachment.id)
@@ -127,7 +127,7 @@ async def _stale_attachments(session_factory: Any) -> list[uuid.UUID]:
             )
             .limit(_MAX_REQUEUE_PER_SWEEP)
         )
-        ids = [row for row in result.scalars().all()]
+        ids = list(result.scalars().all())
         if ids:
             await db.execute(
                 ChatAttachment.__table__.update()

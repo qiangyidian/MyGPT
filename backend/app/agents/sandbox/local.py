@@ -83,7 +83,7 @@ class LocalRunner:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Reap the timed-out child so it cannot outlive the call.
             try:
                 proc.kill()

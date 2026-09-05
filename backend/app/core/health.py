@@ -168,7 +168,7 @@ def _installed_qdrant_client_version() -> tuple[int, ...]:
     """Installed qdrant-client version (empty tuple if metadata unavailable)."""
     try:
         return _parse_version(importlib.metadata.version("qdrant-client"))
-    except Exception:  # noqa: BLE001 — best-effort metadata lookup
+    except Exception:
         return ()
 
 
@@ -189,7 +189,7 @@ async def _check_db() -> bool:
         async with AsyncSessionLocal() as db:
             await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=_PROBE_TIMEOUT)
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("health: DB check failed: %s", exc)
         return False
 
@@ -220,7 +220,7 @@ async def _check_db_migration() -> dict[str, Any]:
                     timeout=_PROBE_TIMEOUT,
                 )
                 current = row.scalar_one_or_none()
-            except Exception:  # noqa: BLE001 — table missing etc.
+            except Exception:
                 # Dev/test DBs built via create_all have no alembic_version.
                 return _fail(
                     "alembic_version table not present "
@@ -249,7 +249,7 @@ async def _check_db_migration() -> dict[str, Any]:
                 f"migration head mismatch: db={current!r} is not a revision in "
                 f"this repo's migration chain (repo head={REPO_MIGRATION_HEAD!r})"
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _fail(f"migration check error: {exc}")
 
 
@@ -260,7 +260,7 @@ async def _check_redis() -> dict[str, Any]:
         client = get_redis()
         await asyncio.wait_for(client.ping(), timeout=_PROBE_TIMEOUT)
         return _ok("reachable")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Redis is optional at boot (refresh revocation / rate limiting /
         # quota counters all degrade gracefully) but it IS required for /ready.
         return _fail(f"unreachable: {exc}")
@@ -311,13 +311,13 @@ async def _check_qdrant() -> dict[str, Any]:
                         f"{_QDRANT_MAX_SKEW}; pin qdrant-client to match the server)"
                     )
             return _ok(f"reachable; server={server_version}; client={client_label}")
-        except Exception as inner:  # noqa: BLE001 — version probe failed
+        except Exception as inner:
             # Reachable, but the compatibility probe could not run. A reachable-
             # but-unprobed Qdrant is treated as NOT ready: the operator must see
             # that the client/server pair couldn't be validated (the repo carries
             # a known version-skew warning), rather than a silent "ok".
             return _fail(f"reachable but version probe failed: {inner}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _fail(f"unreachable: {exc}")
 
 
@@ -333,7 +333,7 @@ async def _check_storage() -> dict[str, Any]:
         os.close(fd)
         os.unlink(path)
         return _ok(f"writable: {storage_dir}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _fail(f"not writable: {exc}")
 
 
@@ -355,7 +355,7 @@ async def _check_runner() -> dict[str, Any]:
             return _fail("docker --version exited non-zero")
         # local mode: the subprocess runner is always available.
         return _ok("local runner available")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _fail(f"runner check error: {exc}")
 
 
@@ -380,7 +380,7 @@ async def _check_chat_model() -> dict[str, Any]:
             if n > 0:
                 return _ok(f"{n} chat model(s) configured")
             return _fail("no eligible chat model configured")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _fail(f"chat model check error: {exc}")
 
 

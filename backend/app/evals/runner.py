@@ -126,7 +126,7 @@ def _eval_quota_enforcement_visible() -> dict[str, Any]:
             "pass",
             reason=f"reason+limit+used visible ({d['quota_type']})",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _result(
             "quota_enforcement_visible", "fail", reason=f"unexpected error: {exc}"
         )
@@ -146,7 +146,7 @@ def _eval_tool_allowlist_respected() -> dict[str, Any]:
     # the eval is reproducible both under pytest (ENV=test) and standalone.
     try:
         ok = validate_readonly_sql("SELECT id, name FROM users WHERE id = 1")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _result(
             "tool_allowlist_respected", "fail", reason=f"benign SELECT rejected: {exc}"
         )
@@ -260,7 +260,7 @@ def _eval_live_golden_chat() -> dict[str, Any]:
         return _result(
             "live_golden_chat", "pass", kind="live", reason=f"got reply ({len(content)} chars)"
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _result("live_golden_chat", "fail", kind="live", reason=f"live call failed: {exc}")
 
 

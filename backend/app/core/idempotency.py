@@ -60,7 +60,7 @@ async def check(request: Request, user_id: str | int) -> str | None:
         raise HTTPException(status.HTTP_409_CONFLICT, _CONFLICT_DETAIL)
     except HTTPException:
         raise
-    except Exception:  # noqa: BLE001 — Redis unavailable → in-memory fallback
+    except Exception:
         pass
 
     # In-memory fallback (single-process only).
@@ -92,6 +92,6 @@ async def release(request: Request, user_id: str | int) -> None:
         client = get_redis()
         await client.delete(key)
         return
-    except Exception:  # noqa: BLE001 — Redis unavailable → in-memory fallback
+    except Exception:
         pass
     _memory.pop(key, None)

@@ -425,7 +425,7 @@ async def summarize_prefix(
         summary = (result.content or "").strip()
         if summary:
             return summary
-    except Exception as exc:  # noqa: BLE001 — summarization is best-effort
+    except Exception as exc:
         logger.warning("history summarization failed, using heuristic: %s", exc)
 
     # Heuristic fallback: truncate the flattened older transcript.

@@ -116,7 +116,7 @@ def test_additional_context_injected_and_concatenated():
     assert "ctx-A" in r.additional_context
     assert "ctx-B" in r.additional_context
     # blank-line separator between the two contexts
-    assert "ctx-A\n\nctx-B" == r.additional_context
+    assert r.additional_context == "ctx-A\n\nctx-B"
 
 
 def test_any_deny_wins_over_allow_and_context():

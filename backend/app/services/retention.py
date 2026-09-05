@@ -17,7 +17,7 @@ Config (all optional, all defaulted on):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,7 @@ async def prune_audit_events(session_factory: Any, days: int | None = None) -> i
         return 0
     from app.models.audit_event import AuditEvent
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    cutoff = datetime.now(UTC) - timedelta(days=keep_days)
     async with session_factory() as db:
         result = await db.execute(delete(AuditEvent).where(AuditEvent.created_at < cutoff))
         await db.commit()
@@ -60,7 +60,7 @@ async def prune_terminal_run_events(session_factory: Any, days: int | None = Non
     from app.models.agent_run import AgentRun
     from app.models.run_event import RunEvent
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    cutoff = datetime.now(UTC) - timedelta(days=keep_days)
     async with session_factory() as db:
         terminal_ids = (
             await db.execute(
@@ -162,7 +162,7 @@ class RetentionSweeper:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
 
@@ -177,7 +177,7 @@ class RetentionSweeper:
                 logger.exception("retention sweep failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def run_once(self) -> None:

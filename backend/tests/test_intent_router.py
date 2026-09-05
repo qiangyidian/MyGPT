@@ -63,10 +63,10 @@ def test_valid_modes_set():
     # speed | expert | hermes are the exposed picker modes; the rest remain
     # valid for backward compatibility (legacy clients / internal escalation /
     # tests).
-    assert VALID_MODES == {
+    assert {
         "speed", "expert", "hermes",
         "auto", "search", "deep_research", "create", "data_analysis", "debate",
-    }
+    } == VALID_MODES
 
 
 def test_speed_mode_is_native_no_multi_agent_but_can_search():

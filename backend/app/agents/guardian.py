@@ -128,7 +128,7 @@ class GuardianService:
             result = await asyncio.wait_for(
                 provider.chat(messages, options), timeout=self._config.timeout_seconds
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("guardian timed out (%.1fs) -> deny", self._config.timeout_seconds)
             return _DENY
         except ProviderError as exc:

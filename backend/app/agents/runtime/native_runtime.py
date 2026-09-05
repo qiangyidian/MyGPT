@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from app.agents.approval_coordinator import approval_coordinator
@@ -166,7 +166,7 @@ class NativeChatRuntime:
                 if _conn_mgr is not None:
                     try:
                         await _conn_mgr.close_all()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
         settings = get_settings()
         guard = ctx.budget_guard
@@ -476,7 +476,7 @@ class NativeChatRuntime:
                         if not getattr(cfg, "supports_stream", True):
                             buffered = await provider.chat(working, options)
                             async def _one_delta():
-                                yield buffered
+                                yield buffered  # noqa: B023 — closure consumed within the same loop iteration
                             _delta_iter = _one_delta()
                         else:
                             _delta_iter = provider.stream_chat(working, options)
@@ -506,11 +506,12 @@ class NativeChatRuntime:
                                         "run_instruction_received",
                                         {"instruction": instr},
                                     )
-                                    working = working + [
+                                    working = [
+                                        *working,
                                         {
                                             "role": "user",
                                             "content": f"[追加指引] {instr}",
-                                        }
+                                        },
                                     ]
                                 if ctl.is_paused():
                                     await append_event_safe(
@@ -1243,7 +1244,7 @@ async def _hermes_deliver_files(
         try:
             async with asyncio.timeout(120):
                 data, media_type = await fetch_file(path)
-        except (TimeoutError, Exception) as exc:  # noqa: BLE001 — skip & continue
+        except (TimeoutError, Exception) as exc:
             logger.info("hermes deliver: skip %s (%s)", path, exc)
             continue
         filename = os.path.basename(path.replace("\\", "/")) or "hermes-file"
@@ -1257,7 +1258,7 @@ async def _hermes_deliver_files(
                 run_id=str(ctx.run_id),
                 generator={"origin": "hermes", "path": path},
             )
-        except Exception as exc:  # noqa: BLE001 — storage failure skips file
+        except Exception as exc:
             logger.warning("hermes deliver: store failed for %s (%s)", path, exc)
             continue
         handles.append(f"artifact:{art.id}")
@@ -1313,7 +1314,7 @@ def _gate_model_retry(guard: BudgetGuard) -> float:
 def _safe_get(registry, name: str):
     try:
         return registry.get(name)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -1337,7 +1338,7 @@ def _approval_summary(tool_name: str, args: dict[str, Any]) -> str:
 
 def _now_iso() -> str:
     """UTC now as an ISO-8601 string (for started_at / finished_at fields)."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _record_hermes_step(
@@ -1396,7 +1397,7 @@ def _elapsed_ms(start_iso: str) -> int:
     """Whole-ms between ``start_iso`` and now; 0 if unparseable."""
     try:
         start = datetime.fromisoformat(start_iso)
-        return max(0, int((datetime.now(timezone.utc) - start).total_seconds() * 1000))
+        return max(0, int((datetime.now(UTC) - start).total_seconds() * 1000))
     except (TypeError, ValueError):
         return 0
 

@@ -75,7 +75,7 @@ def extract_memory_candidates(user_message: str) -> list[MemoryCandidate]:
                 _add(f"{verb}{body}", "preference", 0.6)
             break  # one preference per message
 
-    for pattern, mtype in _FACT_PATTERNS:
+    for pattern, _mtype in _FACT_PATTERNS:
         m = pattern.search(text)
         if m:
             prefix = m.group(0)[: m.start("body") - m.start()] if "body" in m.groupdict() else ""

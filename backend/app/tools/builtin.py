@@ -17,7 +17,7 @@ import ipaddress
 import json
 import socket
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 import httpx
@@ -125,7 +125,7 @@ class DateTimeNowTool(BaseTool):
     parameters: list[ToolParameter] = []
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return {
             "utc_iso": now.isoformat(),
             "utc_rfc2822": now.strftime("%a, %d %b %Y %H:%M:%S +0000"),
@@ -174,7 +174,7 @@ class HttpGetTool(BaseTool):
         #     second resolution cannot DNS-rebind us to an internal host (TOCTOU).
         try:
             parsed = httpx.URL(url)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise ToolError(f"invalid url: {exc}")
         if parsed.scheme not in ("http", "https"):
             raise ToolError("only http/https URLs are allowed")
@@ -295,7 +295,7 @@ class WebSearchTool(BaseTool):
                 )
             else:
                 results = await self._search_duckduckgo(query, top_k)
-        except Exception as exc:  # noqa: BLE001 — must never raise
+        except Exception as exc:
             return {"ok": False, "error": str(exc), "results": [], "query": query}
 
         return {"ok": True, "query": query, "results": results[:top_k]}
@@ -574,7 +574,7 @@ class PythonExecTool(BaseTool):
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(), timeout=timeout
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Kill the timed-out child so it doesn't leak.
                 try:
                     proc.kill()
@@ -670,7 +670,7 @@ class DbQueryTool(BaseTool):
                     if result.returns_rows:
                         for row in result.fetchmany(_DB_ROW_LIMIT):
                             rows.append(
-                                {c: _jsonable(v) for c, v in zip(cols, row)}
+                                {c: _jsonable(v) for c, v in zip(cols, row, strict=False)}
                             )
                     return {
                         "ok": True,
@@ -685,7 +685,7 @@ class DbQueryTool(BaseTool):
         try:
             # Run the blocking sync DB call off the event loop.
             return await asyncio.to_thread(_exec)
-        except Exception as exc:  # noqa: BLE001 — wrap, don't raise
+        except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "rows": []}
 
 

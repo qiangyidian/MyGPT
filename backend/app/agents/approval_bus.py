@@ -58,7 +58,7 @@ class ApprovalBus:
                 await client.publish(
                     _CHANNEL, json.dumps({"approval_id": approval_id, "decision": decision, "reason": reason})
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("approval bus publish failed (local still signaled): %s", exc)
 
     def _signal_local(self, approval_id: str, decision: str, reason: str) -> None:
@@ -90,7 +90,7 @@ class ApprovalBus:
             self._sub_task.cancel()
             try:
                 await self._sub_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._sub_task = None
         self._started = False
@@ -112,7 +112,7 @@ class ApprovalBus:
                         data.get("decision", ""),
                         data.get("reason", ""),
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning("approval bus: bad message %r", message.get("data"))
         except asyncio.CancelledError:
             raise
@@ -122,7 +122,7 @@ class ApprovalBus:
             try:
                 await pubsub.unsubscribe(_CHANNEL)
                 await pubsub.aclose()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     # ------------------------------------------------------------------ #
@@ -134,7 +134,7 @@ class ApprovalBus:
             client = get_redis()
             await client.ping()
             self._redis_ok = True
-        except Exception:  # noqa: BLE001
+        except Exception:
             self._redis_ok = False
         return self._redis_ok
 

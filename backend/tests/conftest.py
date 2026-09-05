@@ -137,7 +137,7 @@ async def _override_get_db() -> AsyncIterator[AsyncSession]:
 # router agent). We import inside the fixture so collection does not fail if the
 # app module is momentarily absent during early development.
 def _get_app():
-    from app.main import app  # noqa: WPS433  -- late import on purpose
+    from app.main import app
 
     return app
 

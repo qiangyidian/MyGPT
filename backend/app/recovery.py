@@ -67,7 +67,7 @@ async def main() -> None:
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
     except KeyboardInterrupt:
         pass

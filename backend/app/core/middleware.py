@@ -85,7 +85,7 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
                 max(time.perf_counter() - _started(request), 0.0),
                 method=request.method, route=template,
             )
-        except Exception:  # noqa: BLE001 — metrics must never break requests
+        except Exception:
             pass
 
 

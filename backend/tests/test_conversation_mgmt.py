@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from app.models import Conversation, Message
 from tests.conftest import auth_headers
@@ -62,7 +62,7 @@ async def test_pin_cross_user_isolation(client):
 
 async def _seed_thread(db_session) -> tuple[uuid.UUID, uuid.UUID]:
     """Create a conv with user/assistant/user; return (conv_id, last_user_msg_id)."""
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
     conv = Conversation(user_id=uuid.UUID("00000000-0000-0000-0000-000000000001"), title="thread")
     db_session.add(conv)
     await db_session.flush()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, Text
 from sqlalchemy import Index as _sa_Index
@@ -33,7 +33,7 @@ class Message(Base, TimestampMixin):
     # order stable.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         nullable=False,
     )
     role: Mapped[str] = mapped_column(String(32), nullable=False)  # system | user | assistant | tool

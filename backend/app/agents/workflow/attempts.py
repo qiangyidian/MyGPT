@@ -14,7 +14,7 @@ poisoned by an attempt-persistence failure.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy import func, select
@@ -50,7 +50,7 @@ class AttemptRepository:
         """Flip a ``pending`` (or ``error``) attempt to ``running``."""
         attempt.status = "running"
         if attempt.started_at is None:
-            attempt.started_at = datetime.now(timezone.utc)
+            attempt.started_at = datetime.now(UTC)
         await self._session.flush()
 
     async def mark_done(
@@ -62,7 +62,7 @@ class AttemptRepository:
         attempt.status = "done"
         if usage is not None:
             attempt.usage = dict(usage)
-        attempt.finished_at = datetime.now(timezone.utc)
+        attempt.finished_at = datetime.now(UTC)
         await self._session.flush()
 
     async def mark_error(
@@ -73,7 +73,7 @@ class AttemptRepository:
         """Flip a ``running`` attempt to ``error`` with a message."""
         attempt.status = "error"
         attempt.error = str(error)
-        attempt.finished_at = datetime.now(timezone.utc)
+        attempt.finished_at = datetime.now(UTC)
         await self._session.flush()
 
     async def next_attempt_number(

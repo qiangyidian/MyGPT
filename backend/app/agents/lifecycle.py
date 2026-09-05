@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from app.agents.graph import (
@@ -53,7 +53,7 @@ _TERMINAL = {AgentNodeStatus.completed, AgentNodeStatus.failed, AgentNodeStatus.
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class AgentLifecycleEmitter:

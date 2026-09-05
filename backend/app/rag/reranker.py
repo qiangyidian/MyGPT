@@ -66,11 +66,11 @@ class LocalBgeReranker(Reranker):
 
         try:
             scores = await asyncio.to_thread(_score)
-        except Exception as exc:  # noqa: BLE001 — degrade to score-order
+        except Exception as exc:
             logger.warning("local bge rerank failed, falling back to score order: %s", exc)
             return sorted(hits, key=lambda h: h.score, reverse=True)[:top_k]
 
-        for h, s in zip(hits, scores):
+        for h, s in zip(hits, scores, strict=False):
             h.rerank_score = float(s)
         ordered = sorted(hits, key=lambda h: (h.rerank_score or 0.0), reverse=True)
         return ordered[:top_k]
@@ -119,12 +119,12 @@ class RemoteApiReranker(Reranker):
 
         try:
             scores = await asyncio.to_thread(_post)
-        except Exception as exc:  # noqa: BLE001 — degrade to score-order
+        except Exception as exc:
             logger.warning("remote rerank failed, falling back to score order: %s", exc)
             return sorted(hits, key=lambda h: h.score, reverse=True)[:top_k]
 
         if len(scores) == len(hits):
-            for h, s in zip(hits, scores):
+            for h, s in zip(hits, scores, strict=False):
                 h.rerank_score = float(s)
             ordered = sorted(hits, key=lambda h: (h.rerank_score or 0.0), reverse=True)
             return ordered[:top_k]
@@ -138,7 +138,7 @@ def make_reranker(settings: Any = None) -> Reranker:
     if kind == "local_bge":
         try:
             return LocalBgeReranker(getattr(settings, "RERANKER_MODEL", "BAAI/bge-reranker-base"))
-        except Exception as exc:  # noqa: BLE001 — optional dep
+        except Exception as exc:
             logger.warning("local_bge reranker unavailable, using noop: %s", exc)
             return NoopReranker()
     if kind == "remote_api":

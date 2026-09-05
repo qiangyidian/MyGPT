@@ -23,7 +23,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -203,7 +203,7 @@ async def approve_run(
 
     ap.status = "approved"
     ap.approved_by = user.id
-    ap.decided_at = datetime.now(timezone.utc)
+    ap.decided_at = datetime.now(UTC)
     # PERSIST FIRST: durable command, then commit, THEN publish the live signal.
     await durable_controls.record_approve(db, run.id, ap.id, user_id=user.id)
     await db.commit()
@@ -237,7 +237,7 @@ async def reject_run(
 
     ap.status = "rejected"
     ap.reason = body.reason or "rejected by user"
-    ap.decided_at = datetime.now(timezone.utc)
+    ap.decided_at = datetime.now(UTC)
     # PERSIST FIRST: durable command, then commit, THEN publish the live signal.
     await durable_controls.record_reject(
         db, run.id, ap.id, reason=ap.reason, user_id=user.id
@@ -266,7 +266,7 @@ async def cancel_run(
         return ActionResult(ok=False, status=run.status, message="run already finished")
 
     run.status = "cancelled"
-    run.finished_at = datetime.now(timezone.utc)
+    run.finished_at = datetime.now(UTC)
     # PERSIST FIRST: durable cancel command, then commit, THEN signal the run.
     await durable_controls.record_cancel(db, run.id)
     await db.commit()
@@ -374,7 +374,7 @@ async def pause_run(
 ):
     run = await _load_run(db, run_id)
     await _assert_owned(run, user)
-    run.paused_at = datetime.now(timezone.utc)
+    run.paused_at = datetime.now(UTC)
     # PERSIST FIRST: durable pause command, then commit, THEN signal the run.
     await durable_controls.record_pause(db, run.id)
     await db.commit()

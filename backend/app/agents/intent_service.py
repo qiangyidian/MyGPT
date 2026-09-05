@@ -82,7 +82,7 @@ class IntentClassifierConfig:
             from app.core.config import get_settings
 
             s = get_settings()
-        except Exception:  # noqa: BLE001 — settings must never break intent
+        except Exception:
             return IntentClassifierConfig()
 
         def _num(name: str, default: float, cast=float) -> float:
@@ -100,7 +100,7 @@ class IntentClassifierConfig:
                 if isinstance(v, str):
                     return v.strip().lower() in ("1", "true", "yes", "on")
                 return default
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return default
 
         return IntentClassifierConfig(
@@ -241,7 +241,7 @@ class IntentService:
                     provider.chat(messages, options),
                     timeout=self._config.timeout_seconds,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 last_reason = "timeout"
                 logger.warning(
                     "intent classifier timed out after %.1fs (attempt %d/%d)",
@@ -374,7 +374,7 @@ def _clamp_float(value: Any, *, default: float, lo: float = 0.0, hi: float = 1.0
         v = float(value)
     except (TypeError, ValueError):
         return default
-    if v != v:  # NaN
+    if v != v:  # noqa: PLR0124 — deliberate NaN check
         return default
     return max(lo, min(hi, v))
 
@@ -403,7 +403,7 @@ def _cache_key(user_content: str, ctx_block: str, provider: Any) -> str:
             or getattr(provider, "name", None)
             or ""
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     h = hashlib.sha1()
     h.update(model.encode("utf-8", "ignore"))
@@ -420,7 +420,7 @@ def _cache_active() -> bool:
         from app.core.config import get_settings
 
         return get_settings().ENV != "test"
-    except Exception:  # noqa: BLE001
+    except Exception:
         return True
 
 

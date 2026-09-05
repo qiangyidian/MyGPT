@@ -116,7 +116,7 @@ async def lifespan(app: FastAPI):
         # Close MCP sessions so their subprocesses/HTTP pools don't leak.
         try:
             await mcp_registry.disconnect_all()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         set_live_mcp_registry(None)
         # Close shared clients so their connection pools don't leak on reload /

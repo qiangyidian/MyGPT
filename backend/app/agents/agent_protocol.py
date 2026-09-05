@@ -119,7 +119,7 @@ class AgentPath:
         ``child`` must be a single valid segment (no slashes).
         """
         _validate_segment(child)
-        return AgentPath._from_segments(self._segments + (child,))
+        return AgentPath._from_segments((*self._segments, child))
 
     def relative_to(self, other: AgentPath | str) -> str:
         """Return the portion of this path below ``other``.

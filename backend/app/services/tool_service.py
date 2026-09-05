@@ -73,6 +73,6 @@ async def test_tool(
     except ToolError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ToolTestResult(ok=False, result=None, error=str(exc), latency_ms=latency_ms)
-    except Exception as exc:  # noqa: BLE001 — surface any failure
+    except Exception as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ToolTestResult(ok=False, result=None, error=f"{type(exc).__name__}: {exc}", latency_ms=latency_ms)

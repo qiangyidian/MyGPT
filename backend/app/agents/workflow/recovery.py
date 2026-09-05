@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,10 +42,10 @@ _RECOVERY_EVENT = "recovery.requeued"
 
 def _is_expired(expires_at: datetime) -> bool:
     """True when ``expires_at`` is at/before now (normalises naive datetimes)."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     exp = expires_at
     if exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
+        exp = exp.replace(tzinfo=UTC)
     return now >= exp
 
 
@@ -125,14 +125,14 @@ class RecoveryScheduler:
         runs_result = await session.execute(
             select(AgentRun.id).where(AgentRun.status.in_(_actively_executing))
         )
-        run_ids = [row for row in runs_result.scalars().all()]
+        run_ids = list(runs_result.scalars().all())
         if not run_ids:
             return []
         # Runs that have a lease.
         lease_result = await session.execute(
             select(RunLease.run_id).where(RunLease.run_id.in_(run_ids))
         )
-        leased = {row for row in lease_result.scalars().all()}
+        leased = set(lease_result.scalars().all())
         return [rid for rid in run_ids if rid not in leased]
 
     # ------------------------------------------------------------------ #
@@ -171,7 +171,7 @@ class RecoveryScheduler:
             else:
                 # Exhausted: terminally fail with an explicit reason.
                 run.status = "failed"
-                run.finished_at = datetime.now(timezone.utc)
+                run.finished_at = datetime.now(UTC)
                 run.error_message = (
                     "lease expired; recovery exhausted retries "
                     f"({retry_count}/{self._max_retries})"

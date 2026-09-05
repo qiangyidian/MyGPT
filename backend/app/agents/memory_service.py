@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any, Protocol
 
 from sqlalchemy import select
@@ -290,7 +290,7 @@ class MemoryService:
                 )
             )
         ).scalars().all()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         rows = [r for r in rows if not _is_expired(r.expires_at, now)]
         rows.sort(key=lambda r: hit_ids.get(str(r.id), 0.0), reverse=True)
         return rows[:top_k]

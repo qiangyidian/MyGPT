@@ -142,7 +142,7 @@ class ApprovalBridge:
             )
             try:
                 wr = await approval_coordinator.wait(req.approval_id, timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 wr.decision = "timed_out"
             finally:
                 approval_coordinator.release(req.approval_id)

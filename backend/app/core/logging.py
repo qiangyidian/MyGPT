@@ -35,7 +35,7 @@ def _redact_processor(logger, method_name, event_dict):
         from app.observability import sanitize_attributes
 
         return sanitize_attributes(event_dict)
-    except Exception:  # noqa: BLE001 — never break logging
+    except Exception:
         return event_dict
 
 

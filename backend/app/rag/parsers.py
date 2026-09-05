@@ -63,7 +63,7 @@ def _df_to_text(df: Any, sheet: str | None = None) -> str:
 # Plain-text family
 # ---------------------------------------------------------------------------
 def _parse_txt(path: str, _ext: str) -> ParsedDocument:
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open(path, encoding="utf-8", errors="ignore") as fh:
         text = fh.read()
     return ParsedDocument(text=text, metadata={"parser_used": "text", "chars": len(text)})
 
@@ -77,7 +77,7 @@ def _parse_markdown(path: str, _ext: str) -> ParsedDocument:
     source IS the best chunking input: headings survive, prose is unchanged,
     and models read Markdown natively anyway.
     """
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open(path, encoding="utf-8", errors="ignore") as fh:
         text = fh.read()
     return ParsedDocument(
         text=text,
@@ -101,7 +101,7 @@ def _ocr_pdf_pages(doc: Any, max_pages: int) -> list[str]:
             pix = page.get_pixmap(dpi=150)
             img_bytes = pix.tobytes("png")
             pages.append(ocr.image_to_text(img_bytes))
-        except Exception as exc:  # noqa: BLE001 — one page must not kill the rest
+        except Exception as exc:
             logger.debug("OCR page %d failed: %s", i, exc)
             pages.append("")
     return pages
@@ -131,7 +131,7 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
                     rendered = _table_to_text(rows)
                     if rendered.strip():
                         tables.append(rendered)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             pages.append(text)
     finally:
@@ -146,7 +146,7 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
     if settings.OCR_SCANNED_PDF and len(full_text.strip()) < 20:
         try:
             ocr_pages = _ocr_pdf_pages(pymupdf.open(path), settings.OCR_SCANNED_PDF_MAX_PAGES)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("scanned-PDF OCR failed: %s", exc)
             ocr_pages = []
         if any(p.strip() for p in ocr_pages):
@@ -260,7 +260,7 @@ def _parse_table(path: str, ext: str) -> ParsedDocument:
     finally:
         try:
             xl.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     text = "\n\n".join(frames)
     return ParsedDocument(
@@ -275,7 +275,7 @@ def _parse_table(path: str, ext: str) -> ParsedDocument:
 # Markup / e-book family
 # ---------------------------------------------------------------------------
 def _parse_html(path: str, _ext: str) -> ParsedDocument:
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open(path, encoding="utf-8", errors="ignore") as fh:
         raw = fh.read()
     text = ""
     parser_used = "trafilatura"
@@ -283,7 +283,7 @@ def _parse_html(path: str, _ext: str) -> ParsedDocument:
         import trafilatura  # type: ignore
 
         text = trafilatura.extract(raw) or ""
-    except Exception as exc:  # noqa: BLE001 — fall back to bs4
+    except Exception as exc:
         logger.debug("trafilatura extract failed, using bs4: %s", exc)
         parser_used = "beautifulsoup"
     if not text.strip():
@@ -326,7 +326,7 @@ def _parse_rtf(path: str, _ext: str) -> ParsedDocument:
         from striprtf.striprtf import rtf_to_text  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dep
         raise ValueError(f"striprtf 未安装，无法解析 RTF: {exc}") from exc
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open(path, encoding="utf-8", errors="ignore") as fh:
         raw = fh.read()
     text = rtf_to_text(raw)
     return ParsedDocument(text=text, metadata={"parser_used": "striprtf", "chars": len(text)})
@@ -354,7 +354,7 @@ def _convert_via_libreoffice(path: str, target_ext: str, timeout: int = 120) -> 
         base = os.path.splitext(os.path.basename(path))[0]
         converted = os.path.join(out_dir, f"{base}{target_ext}")
         return converted if os.path.exists(converted) else None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("LibreOffice conversion failed: %s", exc)
         return None
 

@@ -530,7 +530,7 @@ class CrewAIRuntime:
         # All Optional; harmless for the non-writer stages and for fakes/demos.
         try:
             stage_ctx.provider = get_provider_for_config(ctx.model_config)
-        except Exception as exc:  # noqa: BLE001 — provider build must not kill the run
+        except Exception as exc:
             logger.warning("could not build provider for streaming writer: %s", exc)
             stage_ctx.provider = None
         stage_ctx.model_config = ctx.model_config
@@ -898,7 +898,7 @@ class CrewAIRuntime:
                                 await session.flush()
                                 continue
                             await store.mark_applied(cmd.id)
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             await store.mark_failed(cmd.id, str(exc)[:500])
                     await session.commit()
         except asyncio.CancelledError:
@@ -1077,7 +1077,7 @@ class CrewAIRuntime:
                 if _local_mgr is not None and _stashed_mgr is None:
                     try:
                         await _local_mgr.close_all()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
         # Apply the intent route's allowlist / disable_web (search / create modes).
         route = ctx.extra.get("route")
@@ -1104,7 +1104,7 @@ class CrewAIRuntime:
                         ),
                     )
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("failed to adapt tool %s: %s", src.name, exc)
         return tools
 

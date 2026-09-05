@@ -118,7 +118,7 @@ async def _check(scope: str, identity: str, limit: int, window: int) -> None:
         redis = get_redis()
         try:
             count = int(await redis.eval(_RATELimit_LUA, 1, redis_rkey, window))
-        except Exception:  # noqa: BLE001 — eval unavailable (fakeredis/older) → 2-step
+        except Exception:
             count = await redis.incr(redis_rkey)
             if count == 1:
                 await redis.expire(redis_rkey, window)
@@ -132,7 +132,7 @@ async def _check(scope: str, identity: str, limit: int, window: int) -> None:
         return
     except HTTPException:
         raise
-    except Exception:  # noqa: BLE001 — Redis unavailable -> in-memory fallback
+    except Exception:
         pass
 
     # In-memory sliding window (single-process only).

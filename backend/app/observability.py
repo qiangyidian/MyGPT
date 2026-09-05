@@ -35,7 +35,7 @@ try:  # pragma: no cover - exercised by the presence/absence of the package
     from opentelemetry import trace as _otel_trace  # type: ignore
 
     _OTEL_AVAILABLE = True
-except Exception:  # noqa: BLE001 — any import failure → no-op
+except Exception:
     _OTEL_AVAILABLE = False
     _otel_trace = None  # type: ignore
 
@@ -43,7 +43,7 @@ try:  # pragma: no cover
     import prometheus_client  # noqa: F401  — presence probe only
 
     _PROM_AVAILABLE = True
-except Exception:  # noqa: BLE001
+except Exception:
     _PROM_AVAILABLE = False
 
 
@@ -62,7 +62,7 @@ def _emit_traces() -> bool:
         from app.core.config import get_settings
 
         return bool(get_settings().OTEL_ENABLED)
-    except Exception:  # noqa: BLE001 — never let config access crash a span call
+    except Exception:
         return False
 
 
@@ -74,7 +74,7 @@ def _emit_metrics() -> bool:
         from app.core.config import get_settings
 
         return bool(get_settings().PROMETHEUS_ENABLED)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -246,19 +246,19 @@ class _OtelSpan(_NoopSpan):
         super().set_attribute(key, value)
         try:
             self._span.set_attribute(key, _sanitize(value))
-        except Exception:  # noqa: BLE001 — never let tracing crash the call
+        except Exception:
             pass
 
     def record_exception(self, exc: BaseException) -> None:
         try:
             self._span.record_exception(exc)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
         try:
             self._span.add_event(name, sanitize_attributes(attributes or {}))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def __enter__(self) -> _OtelSpan:
@@ -267,7 +267,7 @@ class _OtelSpan(_NoopSpan):
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
             self._span.end()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -308,7 +308,7 @@ class _PromCounter(_NoopCounter):
     def inc(self, amount: float = 1, attributes: dict[str, Any] | None = None) -> None:
         try:
             self._c.labels(**_extract_labels(sanitize_attributes(attributes))).inc(amount)
-        except Exception:  # noqa: BLE001 — metrics must never break the call
+        except Exception:
             pass
 
 
@@ -331,7 +331,7 @@ class _PromHistogram(_NoopHistogram):
     def record(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
         try:
             self._h.labels(**_extract_labels(sanitize_attributes(attributes))).observe(amount)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -455,7 +455,7 @@ def observe_span(name: str, **attributes: Any) -> Iterator[Any]:
         try:
             if sp is not None:
                 sp.record_exception(exc)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         raise
     finally:
@@ -484,7 +484,7 @@ def observe_counter(name: str, value: float = 1, **attributes: Any) -> None:
     if _emit_metrics():
         try:
             _cached_counter(name).inc(value, clean)
-        except Exception:  # noqa: BLE001 — metrics must never break the call
+        except Exception:
             pass
     if _metric_recorder is not None:
         _metric_recorder.append(
@@ -500,7 +500,7 @@ def observe_histogram(name: str, value: float, **attributes: Any) -> None:
     if _emit_metrics():
         try:
             _cached_histogram(name).record(value, clean)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     if _metric_recorder is not None:
         _metric_recorder.append(
@@ -537,7 +537,7 @@ def bind_correlation_id(cid: str | None) -> None:
             structlog.contextvars.unbind_contextvars("correlation_id")
         else:
             structlog.contextvars.bind_contextvars(correlation_id=cid)
-    except Exception:  # noqa: BLE001 — structlog optional at this layer
+    except Exception:
         pass
 
 

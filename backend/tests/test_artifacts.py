@@ -162,7 +162,7 @@ async def test_retention_expiry_hides_artifact(db_session):
     art = await svc.create_from_bytes(
         owner_id=SEEDED, data=b"ephemeral", media_type="text/plain",
         filename="e.txt", source="spill",
-        expires_at=_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1),
+        expires_at=_dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=1),
     )
     try:
         with pytest.raises(AppException) as exc:
@@ -177,7 +177,7 @@ async def test_retention_not_expired_is_openable(db_session):
     art = await svc.create_from_bytes(
         owner_id=SEEDED, data=b"alive", media_type="text/plain",
         filename="a.txt", source="spill",
-        expires_at=_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1),
+        expires_at=_dt.datetime.now(_dt.UTC) + _dt.timedelta(days=1),
     )
     try:
         got = await svc.open(art.id, _user_with_id(SEEDED))

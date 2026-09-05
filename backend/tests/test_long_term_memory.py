@@ -7,7 +7,7 @@ Qdrant, no live embedding endpoint).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 import pytest
 
@@ -267,7 +267,7 @@ async def test_expired_memories_excluded_from_retrieval(service, db_session, use
     memory = await service.propose(db_session, user_id, "on vacation until Friday")
     await service.activate(db_session, memory.id)
     # Force expiry in the past.
-    memory.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    memory.expires_at = datetime.now(UTC) - timedelta(days=1)
     await db_session.commit()
 
     retrieved = await service.retrieve_for_prompt(

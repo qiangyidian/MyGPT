@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from app.agents.schemas import RiskLevel
 
@@ -50,15 +50,15 @@ def risk_summary(tool_name: str, arguments: dict) -> str:
 
 
 def expiry_from_now(ttl: timedelta | None = None) -> datetime:
-    return datetime.now(timezone.utc) + (ttl or APPROVAL_TTL)
+    return datetime.now(UTC) + (ttl or APPROVAL_TTL)
 
 
 def is_expired(expires_at: datetime | None, *, now: datetime | None = None) -> bool:
     if expires_at is None:
         return False
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_at = expires_at.replace(tzinfo=UTC)
     return now >= expires_at
 
 

@@ -246,7 +246,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return int(await self._redis.incr(key, amount))
-            except Exception:  # noqa: BLE001 — Redis down -> memory fallback
+            except Exception:
                 pass
         return await self._mem.incr_int(key, amount)
 
@@ -254,7 +254,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return int(await self._redis.decr(key, amount))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.decr_int(key, amount)
 
@@ -262,7 +262,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return float(await self._redis.incrbyfloat(key, amount))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.incr_float(key, amount)
 
@@ -272,7 +272,7 @@ class QuotaService:
             return
         try:
             await self._redis.expire(key, self._period_seconds() * 2)
-        except Exception:  # noqa: BLE001 — housekeeping must never break charging
+        except Exception:
             pass
 
     async def _get_int(self, key: str) -> int:
@@ -280,7 +280,7 @@ class QuotaService:
             try:
                 v = await self._redis.get(key)
                 return int(v) if v not in (None, "") else 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.get_int(key)
 
@@ -289,7 +289,7 @@ class QuotaService:
             try:
                 v = await self._redis.get(key)
                 return float(v) if v not in (None, "") else 0.0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.get_float(key)
 
@@ -299,7 +299,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return int(await self._redis.sadd(key, member)) == 1
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.set_add(key, member)
 
@@ -312,7 +312,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return int(await self._redis.srem(key, member))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.set_remove(key, member)
 
@@ -320,7 +320,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return int(await self._redis.scard(key))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.set_size(key)
 
@@ -328,7 +328,7 @@ class QuotaService:
         if self._redis is not None:
             try:
                 return sorted(str(m) for m in await self._redis.smembers(key))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return await self._mem.set_members(key)
 
@@ -408,7 +408,7 @@ class QuotaService:
         now = int(time.time())
         try:
             members = await self._set_members(runs_key)
-        except Exception:  # noqa: BLE001
+        except Exception:
             return
         for member in members:
             _, _, suffix = member.rpartition("@")
@@ -437,7 +437,7 @@ class QuotaService:
             for member in await self._set_members(runs_key):
                 if member.rpartition("@")[0] == run_id:
                     await self._set_remove(runs_key, member)
-        except Exception:  # noqa: BLE001 — release must never crash the caller
+        except Exception:
             pass
 
     # ---- post-usage accounting (NEVER trusts client totals) ----------------
@@ -629,7 +629,7 @@ def get_quota_service() -> QuotaService:
             from app.core.redis import get_redis
 
             redis_client = get_redis()
-        except Exception:  # noqa: BLE001 — fall back to in-process counters
+        except Exception:
             redis_client = None
         _quota_service_singleton = QuotaService(redis=redis_client)
     return _quota_service_singleton

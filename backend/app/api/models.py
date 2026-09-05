@@ -239,6 +239,6 @@ async def test_model(
     except ProviderError as exc:
         latency = int((time.perf_counter() - start) * 1000)
         return ModelTestResult(ok=False, latency_ms=latency, error=str(exc)[:300])
-    except Exception as exc:  # noqa: BLE001 — surface any failure to the caller
+    except Exception as exc:
         latency = int((time.perf_counter() - start) * 1000)
         return ModelTestResult(ok=False, latency_ms=latency, error=f"{type(exc).__name__}: {exc}"[:300])

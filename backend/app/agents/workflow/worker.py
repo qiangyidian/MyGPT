@@ -31,7 +31,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,7 +101,7 @@ class RunWorker:
             if processed is None:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=self._poll_interval)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
 
     # ------------------------------------------------------------------ #
@@ -125,7 +125,7 @@ class RunWorker:
                 return
             await LeaseStore(session).acquire(run_id, self._owner, self._ttl)
             run.status = "running"
-            run.started_at = run.started_at or datetime.now(timezone.utc)
+            run.started_at = run.started_at or datetime.now(UTC)
             await append_event_safe(session, run_id, "run.started", {
                 "run_id": str(run_id),
                 "owner": self._owner,
@@ -179,7 +179,7 @@ class RunWorker:
                         break
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — hand back to recovery (bounded retry)
+        except Exception as exc:
             # Flush whatever completed before the failure so replay/SSE keeps
             # the partial history, then release the lease WITHOUT acking and
             # WITHOUT marking the run failed: recovery requeues it under its
@@ -194,7 +194,7 @@ class RunWorker:
                 if batch:
                     await self._persist_event_batch(run_id, batch)
                     batch.clear()
-            except Exception:  # noqa: BLE001 — best-effort flush
+            except Exception:
                 pass
             await self._abandon_to_recovery(run_id, str(exc)[:500])
             return
@@ -204,7 +204,7 @@ class RunWorker:
                 renewal_task.cancel()
                 try:
                     await renewal_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except (asyncio.CancelledError, Exception):
                     pass
 
         # 3. Finalize.
@@ -303,7 +303,7 @@ class RunWorker:
             while not stop.is_set():
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self._renew_interval)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 if stop.is_set():
                     return
@@ -331,7 +331,7 @@ class RunWorker:
                 run = await session.get(AgentRun, run_id)
                 if run is not None and run.status not in ("completed", "failed", "cancelled"):
                     run.status = "completed"
-                    run.finished_at = datetime.now(timezone.utc)
+                    run.finished_at = datetime.now(UTC)
             await session.commit()
         await self._queue.ack(run_id, self._owner)
 
@@ -343,7 +343,7 @@ class RunWorker:
             run = await session.get(AgentRun, run_id)
             if run is not None and run.status not in ("completed", "failed", "cancelled"):
                 run.status = "failed"
-                run.finished_at = datetime.now(timezone.utc)
+                run.finished_at = datetime.now(UTC)
                 run.error_message = error
             await session.commit()
         await self._queue.ack(run_id, self._owner)

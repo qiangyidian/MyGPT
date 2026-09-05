@@ -31,7 +31,7 @@ try:  # pragma: no cover - import probe
     import tiktoken as _tiktoken_mod  # type: ignore
 
     _TIKTOKEN = _tiktoken_mod.get_encoding("cl100k_base")
-except Exception:  # noqa: BLE001 — optional dep
+except Exception:
     _TIKTOKEN = None
 
 
@@ -42,7 +42,7 @@ def estimate_tokens(text: str) -> int:
     if _TIKTOKEN is not None:
         try:
             return len(_TIKTOKEN.encode(text))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     cjk = sum(1 for c in text if "一" <= c <= "鿿")
     ascii_words = sum(1 for _ in text.replace("\n", " ").split(" ") if _.strip())

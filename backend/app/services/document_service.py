@@ -12,7 +12,7 @@ import asyncio
 import logging
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.storage import get_storage
@@ -78,7 +78,7 @@ async def _clear_existing(db: AsyncSession, doc: Document, collection: str) -> N
     store = get_vector_store()
     try:
         await store.delete_by_filter(collection, {"document_id": str(doc.id)})
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("delete_by_filter failed (ok on first index): %s", exc)
     # NB: must use the SQLAlchemy construct, not this module's own `delete()`
     # service function below — the module-level def shadows the import.
@@ -138,7 +138,7 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
                 token_count=tok,
                 metadata_={},
             )
-            for i, (txt, tok) in enumerate(zip(chunk_texts, token_counts))
+            for i, (txt, tok) in enumerate(zip(chunk_texts, token_counts, strict=False))
         ]
         db.add_all(chunk_rows)
         await db.flush()  # populate ids
@@ -170,7 +170,7 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
                         "text": c.content,
                     },
                 )
-                for c, vec in zip(batch, vectors)
+                for c, vec in zip(batch, vectors, strict=False)
             ]
             await store.upsert(collection, points)
 
@@ -215,12 +215,12 @@ async def delete(db: AsyncSession, document_id: uuid.UUID) -> bool:
     collection = collection_name(doc.knowledge_base_id)
     try:
         get_vector_store().delete_by_filter(collection, {"document_id": str(doc.id)})
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     # Also remove the stored file from disk.
     try:
         await get_storage().delete(doc.file_path)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     await db.delete(doc)
     await db.commit()

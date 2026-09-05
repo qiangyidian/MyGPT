@@ -33,7 +33,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Union
+from typing import Any
 
 from app.agents.hooks.schema import (
     HookInput,
@@ -45,7 +45,7 @@ from app.agents.hooks.schema import (
 # A handler's command is either an argv list (subprocess) or an in-process
 # callable taking the input dict and returning a decision (dict / JSON str /
 # HookResult subclass / None).
-HandlerCommand = Union[list[str], Callable[[dict[str, Any]], Any]]
+HandlerCommand = list[str] | Callable[[dict[str, Any]], Any]
 
 
 # --------------------------------------------------------------------------- #

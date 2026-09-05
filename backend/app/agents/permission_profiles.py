@@ -30,7 +30,7 @@ class CapabilityPolicy:
 
     def merge_override(self, **overrides: bool) -> CapabilityPolicy:
         """Child overrides win (True/False explicitly set on the child)."""
-        return replace(self, **{k: v for k, v in overrides.items()})
+        return replace(self, **dict(overrides))
 
 
 _BUILTINS: dict[str, CapabilityPolicy] = {
@@ -63,7 +63,7 @@ def resolve_profile(name: str, decls: dict[str, ProfileDecl]) -> CapabilityPolic
     cur: str | None = name
     while cur is not None:
         if cur in chain:
-            raise PermissionProfileError(f"permission profile cycle: {' -> '.join(chain + [cur])}")
+            raise PermissionProfileError(f"permission profile cycle: {' -> '.join((*chain, cur))}")
         chain.append(cur)
         if cur.startswith(_BUILTIN_PREFIX):
             if cur not in _BUILTINS:
@@ -112,7 +112,7 @@ def catalog(
 
     for name, pol in _BUILTINS.items():
         out.append(ProfileCatalogEntry(name, pol, _gate(name)))
-    for name, decl in decls.items():
+    for name, _decl in decls.items():
         out.append(ProfileCatalogEntry(name, resolve_profile(name, decls), _gate(name)))
     return out
 

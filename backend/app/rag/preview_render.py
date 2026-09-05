@@ -34,8 +34,11 @@ def _rows_to_gfm(rows: list[list[str]], max_rows: int = 200) -> str:
     rows = rows[: max_rows + 1]  # header + max_rows body rows
     header, *body = rows
     width = len(header)
-    norm = lambda r: (r + [""] * width)[:width]
-    cells = lambda r: [c.replace("|", "/").replace("\n", " ").strip() for c in r]
+    def norm(r: list[str]) -> list[str]:
+        return (r + [""] * width)[:width]
+
+    def cells(r: list[str]) -> list[str]:
+        return [c.replace("|", "/").replace("\n", " ").strip() for c in r]
     out = ["| " + " | ".join(cells(header)) + " |",
            "|" + "---|" * width]
     for r in body:
@@ -59,7 +62,7 @@ def _pipe_block_to_gfm(block: str, max_rows: int = 200) -> str:
     # Clean pandas "Unnamed: N" headers into something readable.
     header = rows[0]
     if any(_UNNAMED_COL.match(h.strip()) for h in header):
-        rows = [["列" + str(i + 1) for i in range(len(header))]] + rows[1:]
+        rows = [["列" + str(i + 1) for i in range(len(header))], *rows[1:]]
     return _rows_to_gfm(rows, max_rows)
 
 
@@ -111,7 +114,7 @@ def _render_table(parsed: ParsedDocument) -> str:
             continue
         header = rows[0]
         if any(_UNNAMED_COL.match(h.strip()) for h in header):
-            rows = [["列" + str(i + 1) for i in range(len(header))]] + rows[1:]
+            rows = [["列" + str(i + 1) for i in range(len(header))], *rows[1:]]
         title = f"# {name}" if name else ""
         gfm = _rows_to_gfm(rows)
         sections.append((title + "\n\n" if title else "") + gfm)

@@ -24,7 +24,7 @@ import io
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,7 +151,7 @@ class ArtifactService:
         if len(data) > max_bytes:
             try:
                 await storage.delete(storage_key)
-            except Exception:  # noqa: BLE001 — cleanup is best-effort
+            except Exception:
                 pass
             from app.core.exceptions import AppException
 
@@ -276,7 +276,7 @@ class ArtifactService:
             finally:
                 try:
                     handle.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
         return _gen()
@@ -333,7 +333,7 @@ class ArtifactService:
                 continue
             try:
                 await storage.delete(art.storage_key)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             await self._db.delete(art)
             count += 1
@@ -373,7 +373,7 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _is_expired(artifact: Artifact, now: datetime) -> bool:
@@ -381,5 +381,5 @@ def _is_expired(artifact: Artifact, now: datetime) -> bool:
         return False
     exp = artifact.expires_at
     if exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
+        exp = exp.replace(tzinfo=UTC)
     return exp <= now

@@ -21,7 +21,7 @@ import logging
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import select
@@ -195,7 +195,7 @@ class RedisStreamQueue:
             return
         try:
             await self._client.xgroup_create(self._stream, self._group, id="0", mkstream=True)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if "BUSYGROUP" not in str(exc):
                 logger.debug("xgroup_create %s: %s", self._stream, exc)
         self._initialized = True
@@ -220,7 +220,7 @@ class RedisStreamQueue:
             await self._client.xadd(
                 self._stream, {"run_id": str(uid)},
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("enqueue %s failed: %s", uid, exc)
 
     async def _has_pending(self, uid: uuid.UUID) -> bool:
@@ -238,7 +238,7 @@ class RedisStreamQueue:
                 for _mid, data in fields:
                     if data.get("run_id") == str(uid):
                         return True
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return False
 
@@ -262,7 +262,7 @@ class RedisStreamQueue:
                         except (ValueError, TypeError):
                             pass
             return result
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
 
     async def dequeue(self, owner: str, timeout: float = 0.0) -> uuid.UUID | None:
@@ -276,7 +276,7 @@ class RedisStreamQueue:
                 count=1,
                 block=block_ms,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("xreadgroup failed: %s", exc)
             return None
         if not resp:
@@ -310,7 +310,7 @@ class RedisStreamQueue:
                         await self._client.xack(self._stream, self._group, msg_id)
                         acked = True
             return acked
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("ack %s failed: %s", uid, exc)
             return False
 
@@ -318,7 +318,7 @@ class RedisStreamQueue:
         uid = _as_uuid(run_id)
         try:
             await self._client.xadd(self._stream, {"run_id": str(uid)})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("requeue %s failed: %s", uid, exc)
 
 
@@ -337,13 +337,13 @@ async def _has_live_lease(
             lease = result.scalar_one_or_none()
             if lease is None:
                 return False
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             # expires_at may be naive (SQLite) or aware (PG); normalise.
             exp = lease.expires_at
             if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
+                exp = exp.replace(tzinfo=UTC)
             return now < exp
-    except Exception:  # noqa: BLE001 — never crash on lease check
+    except Exception:
         return False
 
 
@@ -395,7 +395,7 @@ async def get_run_queue(*, retries: int = 3, retry_delay: float = 0.5) -> RunQue
             _queue_singleton = RedisStreamQueue(client)
             logger.info("run queue: Redis Streams transport (stream=%s)", settings.RUN_QUEUE_STREAM)
             return _queue_singleton
-        except Exception as exc:  # noqa: BLE001 — retried below, then fail fast
+        except Exception as exc:
             last_exc = exc
             if attempt + 1 < max(retries, 1):
                 await asyncio.sleep(retry_delay)

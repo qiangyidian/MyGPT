@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from app.agents.workflow import controls as control_writers
 from app.agents.workflow.repository import CommandStore, LeaseStore
@@ -263,7 +263,7 @@ async def test_lease_is_expired(db_session):
     # Default now is within the 60s TTL -> not expired.
     assert leases.is_expired(lease) is False
     # A moment later than expiry -> expired.
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
     assert leases.is_expired(lease, now=future) is True
 
 

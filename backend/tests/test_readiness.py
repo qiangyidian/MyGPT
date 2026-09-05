@@ -54,7 +54,7 @@ def test_repo_migration_head_constant_matches_alembic_head():
     cfg = Config()
     cfg.set_main_option("script_location", str(migrations_dir))
     script = ScriptDirectory.from_config(cfg)
-    assert REPO_MIGRATION_HEAD == script.get_current_head()
+    assert script.get_current_head() == REPO_MIGRATION_HEAD
 
 
 def test_classify_db_revision_semantics():

@@ -123,8 +123,13 @@ from app.services.attachment_service import (
     history_attachment_texts,
     resolve_and_bind_attachments,
 )
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
+
+# Strong references to fire-and-forget tasks: asyncio keeps only weak refs, so
+# an unreferenced created task can be garbage-collected before it completes.
+_BG_TASKS: set[asyncio.Task[None]] = set()
 
 # Fallback context budget when a config has no usable token limit configured.
 _DEFAULT_MAX_CONTEXT_TOKENS = 8192
@@ -364,7 +369,7 @@ async def _load_active_user_memories(
     answers. Falls back to the recency list when no embedding model / vector
     store is configured, and never fails the turn.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.core.datetime_utils import is_expired as _is_expired
     from app.models import UserMemory
@@ -391,7 +396,7 @@ async def _load_active_user_memories(
             .limit(top_k)
         )
     ).scalars().all()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [r.content for r in rows if not _is_expired(r.expires_at, now)]
 
 
@@ -792,7 +797,7 @@ async def _history_attachment_map(
             query,
             _inline_attachment_budget(cfg),
         )
-    except Exception as exc:  # noqa: BLE001 — context re-hydration is best-effort
+    except Exception as exc:
         logger.warning("history attachment re-hydration failed: %s", exc)
         return {}
 
@@ -1071,7 +1076,7 @@ class ChatService:
             if quota_ticket is not None:
                 try:
                     await quota_svc.release_run(tenant, quota_ticket)
-                except Exception:  # noqa: BLE001 — release must never break shutdown
+                except Exception:
                     pass
 
     async def _run(
@@ -1411,7 +1416,7 @@ class ChatService:
                 _image_parts = await collect_image_parts(
                     db, user.id, conversation.id, request.attachment_ids
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("collect_image_parts failed: %s", exc)
                 _image_parts = []
 
@@ -1426,7 +1431,7 @@ class ChatService:
                 _audio_parts = await collect_audio_parts(
                     db, user.id, conversation.id, request.attachment_ids
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("collect_audio_parts failed: %s", exc)
                 _audio_parts = []
 
@@ -1755,7 +1760,7 @@ class ChatService:
                     # session — the LLM call (1-3s) must not delay the SSE
                     # close; it uses its own DB session and skips
                     # conversations the user renamed in the meantime.
-                    asyncio.create_task(
+                    _title_task = asyncio.create_task(
                         _refine_title_after_answer(
                             str(conversation.id),
                             cfg,
@@ -1763,6 +1768,8 @@ class ChatService:
                             (assistant_msg.content or "")[:400],
                         )
                     )
+                    _BG_TASKS.add(_title_task)
+                    _title_task.add_done_callback(_BG_TASKS.discard)
                     # Rolling summary: if history grew past the budget, roll the
                     # older messages into a summary memory for future turns.
                     try:
@@ -2018,7 +2025,7 @@ class ChatService:
                     user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
                 except AppException:
                     raise
-                except Exception as exc:  # noqa: BLE001 — attachments are best-effort
+                except Exception as exc:
                     logger.warning("durable attachment binding failed: %s", exc)
 
         # 3. Create the pending assistant Message (same shape as _run).
@@ -2088,7 +2095,6 @@ class ChatService:
         # Redis is back (the old silent in-memory fallback left the run
         # stranded in a queue no worker process could see).
         from app.agents.workflow.queue import RunQueueUnavailable, get_run_queue
-        from app.core.exceptions import AppException
 
         try:
             queue = await get_run_queue()
@@ -2292,7 +2298,7 @@ async def run_durable_turn(
             rag_context, citations = await rag_service.retrieve(
                 db, user_content, kb_ids, top_k=5
             )
-        except Exception as exc:  # noqa: BLE001 — RAG is best-effort
+        except Exception as exc:
             logger.warning("durable RAG retrieval failed, continuing without context: %s", exc)
             rag_context, citations = "", []
             rag_skipped_reason = "retrieval_error"
@@ -2348,7 +2354,7 @@ async def run_durable_turn(
             _image_parts = await collect_image_parts(
                 db, user.id, conversation.id, attachment_ids
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("durable collect_image_parts failed: %s", exc)
             _image_parts = []
     _audio_parts: list[dict[str, Any]] = []
@@ -2357,7 +2363,7 @@ async def run_durable_turn(
             _audio_parts = await collect_audio_parts(
                 db, user.id, conversation.id, attachment_ids
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("durable collect_audio_parts failed: %s", exc)
             _audio_parts = []
     messages = _finalize_prompt_messages(

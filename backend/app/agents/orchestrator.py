@@ -39,7 +39,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -206,7 +206,7 @@ class ChatOrchestrator:
                     return  # engine handled the whole turn
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # noqa: BLE001 — mandatory fallback
+                except Exception as exc:
                     logger.warning(
                         "workflow engine routing failed for run %s, "
                         "falling back to %s: %s",
@@ -474,7 +474,7 @@ class ChatOrchestrator:
         async def _run_engine() -> None:
             try:
                 result_holder["result"] = await engine.run(plan)
-            except BaseException as exc:  # noqa: BLE001 — re-raised after drain
+            except BaseException as exc:
                 engine_exc.append(exc)
             finally:
                 await queue.put(None)
@@ -560,7 +560,7 @@ class ChatOrchestrator:
         """Lazily build the CrewAI runtime. Returns None if crewai isn't importable."""
         try:
             from app.agents.runtime.crewai_runtime import CrewAIRuntime  # type: ignore
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("CrewAI runtime unavailable, falling back to native: %s", exc)
             return None
         return CrewAIRuntime()
@@ -593,7 +593,7 @@ class ChatOrchestrator:
                 "knowledge_base_id": str(ctx.knowledge_base_id) if ctx.knowledge_base_id else None,
             },
             model_config_snapshot=snapshot,
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
         )
         ctx.db.add(run)
         await ctx.db.flush()
@@ -665,7 +665,7 @@ class ChatOrchestrator:
                     "terminal event append failed for run %s", run.id, exc_info=True
                 )
             return
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         run.output = {**(run.output or {}), **dict(evt.data)}
         if evt.kind == "done":
             # Preserve a user-initiated cancel instead of overwriting it with
@@ -726,7 +726,7 @@ class ChatOrchestrator:
                     "terminal event append failed for run %s", run.id, exc_info=True
                 )
             return
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         run.status = "failed"
         run.error_message = message
         await append_event_safe(db, run.id, "run.failed", {"message": message})
