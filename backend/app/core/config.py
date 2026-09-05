@@ -129,7 +129,12 @@ class Settings(BaseSettings):
     # Master switch for the CrewAI runtime. Even when True, the runtime is only
     # used when execution_mode="agent" and the `crewai` package is importable;
     # native chat is unaffected. Off => native-only, zero crewai imports.
-    CREWAI_ENABLED: bool = False
+    # Default True: crewai is a pinned hard dependency (requirements.txt), and
+    # the UI advertises 专家模式 = 多Agent协作 — a fresh install must not
+    # silently degrade expert mode to a single agent just because no .env set
+    # this. Environments without the package still fall back to native with a
+    # visible crewai_not_installed reason (orchestrator._crewai_status).
+    CREWAI_ENABLED: bool = True
     # python_exec is NOT a real sandbox (subprocess with process perms). In prod
     # it stays disabled unless one of these opts it in AND a sandbox is configured.
     ALLOW_PYTHON_EXEC: bool = False

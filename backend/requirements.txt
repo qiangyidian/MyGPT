@@ -65,10 +65,12 @@ Pillow>=10.0              # image decode/resize before OCR or vision injection
 # ---- Tokenization ----
 tiktoken>=0.6
 
-# ---- Agent orchestration (optional runtime; imported lazily, guarded) ----
+# ---- Agent orchestration (multi-agent runtime; imported lazily, guarded) ----
 # Pin crewai core only (NOT crewai[tools]) — we have our own tool layer and
 # want to avoid browser/vector/OTel dependency conflicts. The app boots fine
-# without this installed; set CREWAI_ENABLED=true to activate the CrewAI runtime.
+# without this installed: CREWAI_ENABLED defaults to true, and a missing
+# package degrades expert mode to native with a visible crewai_not_installed
+# fallback reason (set CREWAI_ENABLED=false to skip the import entirely).
 crewai==1.15.3
 
 # ---- Logging ----

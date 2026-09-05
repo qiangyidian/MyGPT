@@ -19,6 +19,9 @@
 
 - `.env` — 生产环境变量（已 chmod 600）。包含数据库密码、JWT_SECRET、FERNET_KEY、
   管理员初始密码（`admin` / 见 .env，首次登录后请改）。
+  注意：专家模式（多 Agent 协作）依赖 CrewAI 运行时，`CREWAI_ENABLED` 现默认
+  开启（crewai 已在 backend/requirements.txt 固定依赖中）。若服务器 `.env` 里
+  显式写过 `CREWAI_ENABLED=false`，专家模式会回退单 Agent（前端有回退提示）。
 - `/etc/nginx/sites-available/mychat` — 完整 https 配置（证书签发后由 watcher 自动启用）。
 - `/etc/nginx/sites-available/mychat-bootstrap` — 过渡用 80 端口配置（ACME challenge + 跳转）。
 - `/usr/local/bin/mychat-certbot-watch.sh` — DNS 等待 + certbot 签发 + nginx 切换。
