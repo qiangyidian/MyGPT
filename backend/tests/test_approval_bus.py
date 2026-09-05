@@ -11,10 +11,8 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-import pytest
-
-from app.agents.approval_bus import ApprovalBus, approval_bus
-from app.agents.approval_coordinator import ApprovalCoordinator, approval_coordinator
+from app.agents.approval_bus import ApprovalBus
+from app.agents.approval_coordinator import approval_coordinator
 
 
 async def test_publish_signals_local_coordinator_without_redis():

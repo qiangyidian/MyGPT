@@ -28,7 +28,7 @@ import json
 import logging
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.agents.token_budget import PromptAdmissionError
@@ -136,7 +136,7 @@ class GuardianService:
             return _DENY
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("guardian unexpected error -> deny")
             return _DENY
         return self._parse(result.content or "")

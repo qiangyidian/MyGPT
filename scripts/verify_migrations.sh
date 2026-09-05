@@ -20,8 +20,15 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
-REPO_HEAD="${REPO_HEAD:-0010_artifacts}"
-PRIOR_REV="${PRIOR_REV:-0009_connectors}"
+# Incremental path exercises "prior revision -> head"; derive the prior
+# revision from the head migration's down_revision instead of hardcoding it.
+resolve_prior_rev() {
+  local head_file
+  head_file="$(grep -rlE "^revision(:[^=]*)?= *['\"]${REPO_HEAD}['\"]" backend/migrations/versions 2>/dev/null | head -n1)"
+  [ -n "$head_file" ] || return 0
+  sed -nE "s/^down_revision(:[^=]*)?= *['\"]([^'\"]+)['\"].*/\2/p" "$head_file" | head -n1
+}
+PRIOR_REV="${PRIOR_REV:-$(resolve_prior_rev)}"
 PG_PORT="${PG_PORT:-55432}"
 PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
 CTR="mygpt-verify-pg-$$"
@@ -34,6 +41,17 @@ ALEMBIC_CMD=()
 if   [ -x "$REPO_DIR/backend/.venv/Scripts/python.exe" ]; then ALEMBIC_CMD=("$REPO_DIR/backend/.venv/Scripts/python.exe" -m alembic)
 elif [ -x "$REPO_DIR/backend/.venv/bin/python" ];        then ALEMBIC_CMD=("$REPO_DIR/backend/.venv/bin/python" -m alembic)
 else                                                          ALEMBIC_CMD=(alembic)
+fi
+
+# Resolve the repo's alembic head dynamically (a hardcoded head drifted from
+# reality once and broke /ready for every migration-carrying deploy).
+resolve_head() {
+  ( cd backend && "${ALEMBIC_CMD[@]}" heads 2>/dev/null | awk '{print $1}' | head -n1 )
+}
+REPO_HEAD="${REPO_HEAD:-$(resolve_head)}"
+if [ -z "$REPO_HEAD" ]; then
+  echo "[verify] FAIL: cannot resolve alembic head from backend/migrations" >&2
+  exit 1
 fi
 
 cleanup() {
@@ -91,6 +109,11 @@ run_alembic verify_empty head
 assert_head "empty" verify_empty
 
 # --- Path 2: incremental (prior revision -> head) ----------------------------
+if [ -z "$PRIOR_REV" ]; then
+  echo "[verify] SKIP path 2: head has no down_revision (single-migration repo)"
+  echo "[verify] PASS: empty path at head $REPO_HEAD"
+  exit 0
+fi
 docker exec "$CTR" createdb -U postgres verify_inc
 echo "[verify] path 2: incremental DB -> upgrade $PRIOR_REV then head"
 run_alembic verify_inc "$PRIOR_REV"

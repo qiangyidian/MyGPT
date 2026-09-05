@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import uuid
 
-import pytest
-
 from app.agents.planning import (
     build_plan,
     classify_intent,
@@ -15,12 +13,11 @@ from app.agents.planning import (
     should_summarize,
     summarize_history,
 )
-from app.agents.schemas import ExecutionMode
 from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.model_capabilities import ModelCapabilities
 from app.models import Conversation, ConversationMemory, Message, ModelConfig
-from app.services.chat_service import ChatService
 from app.providers.mock import MockProvider
+from app.services.chat_service import ChatService
 from tests.conftest import auth_headers
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")

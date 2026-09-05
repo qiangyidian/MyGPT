@@ -20,7 +20,7 @@ import asyncio
 import os
 import sys
 import uuid
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 # --------------------------------------------------------------------------- #
 # 1. Force the test DATABASE_URL + a stable FERNET key BEFORE importing the app.
@@ -64,16 +64,14 @@ if _BACKEND_DIR not in sys.path:
 # --------------------------------------------------------------------------- #
 import pytest
 import pytest_asyncio
-from sqlalchemy import event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.security import hash_password  # noqa: E402
-from app.db import Base  # noqa: E402
-from app.db import get_db as production_get_db  # noqa: E402
-from app.models import *  # noqa: E402,F401,F403  -- ensure all models register on metadata
+from app.core.config import get_settings
+from app.core.security import hash_password
+from app.db import Base
+from app.db import get_db as production_get_db
+from app.models import *
 
 
 def _install_global_uuid_compilation() -> None:
@@ -85,11 +83,11 @@ def _install_global_uuid_compilation() -> None:
     from sqlalchemy.ext.compiler import compiles
 
     @compiles(UUID, "sqlite")
-    def _compile_uuid_sqlite(type_, compiler, **kw):  # noqa: ANN001
+    def _compile_uuid_sqlite(type_, compiler, **kw):
         return "VARCHAR(36)"
 
     @compiles(JSONB, "sqlite")
-    def _compile_jsonb_sqlite(type_, compiler, **kw):  # noqa: ANN001
+    def _compile_jsonb_sqlite(type_, compiler, **kw):
         return "JSON"
 
 
@@ -155,8 +153,8 @@ def _crewai_in_process_locks():
     tests have no Redis. Swap the backend for a trivial in-process lock so
     building/running a Crew never blocks on a dead Redis connection.
     """
-    from contextlib import contextmanager
     import threading
+    from contextlib import contextmanager
 
     _lock = threading.Lock()
 
@@ -319,7 +317,7 @@ def offline_model(monkeypatch):
             base_url=cfg.api_base_url, api_key="", model=cfg.model_name
         )
 
-    import app.services.chat_service as _chat_svc
     import app.agents.runtime.native_runtime as _native_rt
+    import app.services.chat_service as _chat_svc
     monkeypatch.setattr(_chat_svc, "get_provider_for_config", _offline)
     monkeypatch.setattr(_native_rt, "get_provider_for_config", _offline)

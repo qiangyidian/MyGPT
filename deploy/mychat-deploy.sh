@@ -83,12 +83,18 @@ NEXT_TELEMETRY_DISABLED=1 \
     npm run build --silent
 cd "$REPO"
 
-# ---- 5. 数据库迁移（有 alembic 升级则跑；create_all 自愈兜底已在启动时） ----
+# ---- 5. 数据库迁移（迁移失败必须中止部署：带缺口 schema 上线必然不可用） ----
 log "applying alembic migrations (if any)..."
 cd backend
 set -a; . "$ENV_FILE"; set +a
-"$VENV/bin/alembic" upgrade head 2>&1 | tail -2 | while read -r line; do log "alembic: $line"; done || \
-    log "WARN: alembic upgrade failed (bootstrap 的 AUTO_CREATE_TABLES 兜底会在启动时补齐)"
+if ! MIG_OUT=$("$VENV/bin/alembic" upgrade head 2>&1); then
+    log "FATAL: alembic upgrade failed — services NOT restarted, aborting deploy:"
+    echo "$MIG_OUT" | tail -10 | while read -r line; do log "alembic: $line"; done
+    cd "$REPO"
+    git reset --hard "$OLD_HEAD" --quiet
+    exit 1
+fi
+log "alembic: $(echo "$MIG_OUT" | tail -1)"
 cd "$REPO"
 
 # ---- 6. 重启服务 ----
@@ -106,6 +112,10 @@ for i in $(seq 1 $HEALTH_RETRIES); do
 done
 
 if [ "$healthy" != "1" ]; then
+    # 回滚只回退代码，数据库保持在新 revision（expand-contract 约定：迁移只
+    # 做 additive 变更）。/ready 的迁移检查允许 DB 领先于代码 head，因此回滚
+    # 后健康检查可以通过；禁止在迁移里写破坏性 contract 变更（删列/删表必须
+    # 推迟到下一个版本）。
     log "UNHEALTHY after deploy — rolling back to $OLD_HEAD"
     ROLLBACK_TO=$(cat /var/lib/mychat-deploy/rollback_commit 2>/dev/null || echo "$OLD_HEAD")
     git reset --hard "$ROLLBACK_TO" --quiet

@@ -20,8 +20,9 @@ import asyncio
 import logging
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -352,13 +353,28 @@ async def _has_live_lease(
 _queue_singleton: RunQueue | None = None
 
 
-async def get_run_queue() -> RunQueue:
+class RunQueueUnavailable(RuntimeError):
+    """Durable mode requires Redis but it is unreachable.
+
+    Deliberately NOT a silent fallback: in durable mode the API process only
+    *enqueues* while a separate worker process *consumes*. Caching an
+    in-memory queue on a transient Redis outage stranded every newly created
+    run in a queue no worker could ever see — runs stayed ``pending`` forever
+    and the user's SSE hung. Failing fast leaves the run row persisted as
+    ``pending`` (the recovery scheduler re-enqueues it once Redis is back).
+    """
+
+
+async def get_run_queue(*, retries: int = 3, retry_delay: float = 0.5) -> RunQueue:
     """Return the process-wide run queue.
 
-    Returns :class:`RedisStreamQueue` when Redis is reachable AND
-    ``BACKGROUND_WORKER != "inprocess"``; otherwise degrades to
-    :class:`InMemoryQueue` (single-worker) like :mod:`app.agents.approval_bus`.
-    Never crashes: a Redis outage falls back silently.
+    ``BACKGROUND_WORKER == "inprocess"`` → :class:`InMemoryQueue` (runs execute
+    inside the API process; a memory queue is correct there).
+
+    Durable mode → :class:`RedisStreamQueue` is REQUIRED (it is the transport
+    between the API and the separate worker). A short retry window absorbs
+    transient blips; after that :class:`RunQueueUnavailable` is raised so
+    callers fail fast / the worker process exits and systemd restarts it.
     """
     global _queue_singleton
     if _queue_singleton is not None:
@@ -369,17 +385,23 @@ async def get_run_queue() -> RunQueue:
         _queue_singleton = InMemoryQueue()
         return _queue_singleton
 
-    try:
-        from app.core.redis import get_redis
-        client = get_redis()
-        await client.ping()
-        _queue_singleton = RedisStreamQueue(client)
-        logger.info("run queue: Redis Streams transport (stream=%s)", settings.RUN_QUEUE_STREAM)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("run queue: Redis unavailable (%s), falling back to InMemoryQueue", exc)
-        _queue_singleton = InMemoryQueue()
+    from app.core.redis import get_redis
 
-    return _queue_singleton
+    last_exc: Exception | None = None
+    for attempt in range(max(retries, 1)):
+        try:
+            client = get_redis()
+            await client.ping()
+            _queue_singleton = RedisStreamQueue(client)
+            logger.info("run queue: Redis Streams transport (stream=%s)", settings.RUN_QUEUE_STREAM)
+            return _queue_singleton
+        except Exception as exc:  # noqa: BLE001 — retried below, then fail fast
+            last_exc = exc
+            if attempt + 1 < max(retries, 1):
+                await asyncio.sleep(retry_delay)
+    raise RunQueueUnavailable(
+        f"durable run queue requires Redis but it is unreachable: {last_exc}"
+    ) from last_exc
 
 
 def set_run_queue(queue: RunQueue | None) -> None:

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, Iterable
+from typing import Any
 
 DEFAULT_COMPARISON_WINDOW = 4_096
 MAX_CONTINUATION_ROUNDS = 8
@@ -127,8 +128,7 @@ def continuation_novel_text(
         # deleting formatting from a genuinely new continuation.
         if len(repeated) >= 2:
             normalized_cut = continuation_ends[normalized_overlap - 1]
-            if normalized_cut > cut:
-                cut = normalized_cut
+            cut = max(cut, normalized_cut)
     return continuation[cut:]
 
 

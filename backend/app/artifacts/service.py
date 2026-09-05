@@ -29,6 +29,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.core.storage import get_storage
 from app.models.artifact import SOURCES, Artifact
@@ -143,6 +144,22 @@ class ArtifactService:
                 return fh.read()
 
         data = await asyncio.to_thread(_read)
+
+        # Post-save size enforcement (UploadFile.size can be absent): delete
+        # the just-saved blob rather than keeping an oversized artifact.
+        max_bytes = get_settings().MAX_ARTIFACT_UPLOAD_MB * 1024 * 1024
+        if len(data) > max_bytes:
+            try:
+                await storage.delete(storage_key)
+            except Exception:  # noqa: BLE001 — cleanup is best-effort
+                pass
+            from app.core.exceptions import AppException
+
+            raise AppException(
+                413,
+                "artifact_too_large",
+                f"artifact exceeds {get_settings().MAX_ARTIFACT_UPLOAD_MB}MB limit",
+            )
         checksum = hashlib.sha256(data).hexdigest()
         declared_mt = media_type or getattr(upload_file, "content_type", None) or ""
         if not declared_mt:
@@ -293,7 +310,7 @@ class ArtifactService:
         storage = get_storage()
         try:
             await storage.delete(artifact.storage_key)
-        except Exception:  # noqa: BLE001 — best-effort; the row goes regardless
+        except Exception:
             logger.warning("artifact %s storage delete failed", artifact_id, exc_info=True)
         await self._db.delete(artifact)
         await self._db.commit()

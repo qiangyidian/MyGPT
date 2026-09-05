@@ -53,14 +53,15 @@ import logging
 import os
 import re
 import time
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
 from app.providers.base import ChatDelta, ChatOptions, ProviderError
 from app.providers.openai_compatible import (
-    OpenAICompatibleProvider,
     _RETRYABLE_EXC,
+    OpenAICompatibleProvider,
     _to_provider_error,
 )
 
@@ -436,7 +437,7 @@ class HermesProvider(OpenAICompatibleProvider):
             await _collect()
         except ProviderError:
             raise
-        except Exception as exc:  # noqa: BLE001 — surface as provider failure
+        except Exception as exc:
             raise ProviderError(f"hermes fetch_file transport failed: {exc}") from exc
 
         text = "".join(c.content for c in chunks)

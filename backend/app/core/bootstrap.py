@@ -18,15 +18,14 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+# Make sure every model is imported so Base.metadata sees all tables
+# (create_all only emits tables already registered on the metadata).
+import app.models  # noqa: F401  (side effect: register models)
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import encrypt_secret, hash_password
 from app.db import AsyncSessionLocal, Base
 from app.models import ModelConfig, User
-
-# Make sure every model is imported so Base.metadata sees all tables
-# (create_all only emits tables already registered on the metadata).
-import app.models  # noqa: F401  (side effect: register models)
 
 logger = get_logger(__name__)
 

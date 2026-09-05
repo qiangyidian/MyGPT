@@ -34,7 +34,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -45,8 +45,8 @@ from app.schemas import ChatRequest, Citation
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids runtime DB imports
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from app.models import Conversation, Message, ModelConfig, User
     from app.agents.policies.budget_policy import BudgetGuard
+    from app.models import Conversation, Message, ModelConfig, User
 
 
 # --------------------------------------------------------------------------- #
@@ -458,10 +458,10 @@ class AgentTurnContext:
     model+tool loop and mutates ``assistant_msg.content`` as it streams.
     """
 
-    db: "AsyncSession"
-    user: "User"
-    conversation: "Conversation"
-    model_config: "ModelConfig"
+    db: AsyncSession
+    user: User
+    conversation: Conversation
+    model_config: ModelConfig
     request: ChatRequest
     user_content: str
     system_prompt: str
@@ -469,18 +469,18 @@ class AgentTurnContext:
     messages: list[dict[str, Any]]
     rag_context: str
     citations: list[Citation]
-    assistant_msg: "Message"
+    assistant_msg: Message
     run_id: uuid.UUID
     execution_mode: ExecutionMode = ExecutionMode.auto
     agent_profile: str = "general"
     enable_tools: bool = False
-    knowledge_base_id: Optional[uuid.UUID] = None
+    knowledge_base_id: uuid.UUID | None = None
     # Phase 1: the user-facing capability mode the UI sent (auto | search |
     # deep_research | create | data_analysis). Runtimes may read this for telemetry.
     mode: str = "auto"
     # One run-scoped guard shared by every runtime/stage/tool adapter. Runtimes
     # construct this from Settings when tests/orchestration did not inject one.
-    budget_guard: "BudgetGuard | None" = None
+    budget_guard: BudgetGuard | None = None
     # Populated by the orchestrator; runtimes may attach extra bookkeeping here.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -500,7 +500,7 @@ class ToolExecution:
     status: str
     result: Any = None
     error: str | None = None
-    approval_id: Optional[uuid.UUID] = None
+    approval_id: uuid.UUID | None = None
     truncated: bool = False
     # UNTRUNCATED stringified result (for the SSE tool_result → UI source
     # extraction). The model-facing content stays truncated (see to_openai_tool_message).

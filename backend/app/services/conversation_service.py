@@ -7,11 +7,10 @@ conversation still carries the default placeholder title.
 from __future__ import annotations
 
 import uuid
-from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import noload, selectinload
+from sqlalchemy.orm import noload
 
 from app.models import Conversation, Message
 from app.schemas import ConversationCreate, ConversationUpdate
@@ -50,7 +49,7 @@ async def list_for_user(
 
 async def get(
     db: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID
-) -> Optional[Conversation]:
+) -> Conversation | None:
     """Fetch a conversation, enforcing ownership.
 
     Returns None when the conversation does not exist or belongs to another user.
@@ -88,7 +87,7 @@ async def update(
     conversation_id: uuid.UUID,
     user_id: uuid.UUID,
     data: ConversationUpdate,
-) -> Optional[Conversation]:
+) -> Conversation | None:
     """Patch-update a conversation (only supplied fields). Ownership-enforced."""
     conv = await get(db, conversation_id, user_id)
     if conv is None:
@@ -181,7 +180,7 @@ async def maybe_autotitle(
     db: AsyncSession,
     conversation: Conversation,
     first_message_content: str,
-) -> Optional[str]:
+) -> str | None:
     """If the conversation still has the default title, derive one from content.
 
     Returns the new title (and persists it) or None if no change was made.

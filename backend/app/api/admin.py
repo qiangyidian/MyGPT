@@ -11,10 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_admin, get_current_user
+from app.core.deps import get_current_admin
 from app.db import get_db
 from app.models import AuditEvent, User
-from app.schemas import AdminUserUpdate, AuditLogOut, UsageStat, UserOut
+from app.schemas import AdminUserUpdate, AuditLogOut, UserOut
 from app.services import admin_service
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])

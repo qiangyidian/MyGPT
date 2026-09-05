@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,6 +75,11 @@ class RunWorker:
         self._renew_interval = self._settings.RUN_LEASE_RENEW_SECONDS
         self._poll_interval = self._settings.WORKER_POLL_INTERVAL_SECONDS
         self._block_timeout = self._settings.WORKER_BLOCK_TIMEOUT_SECONDS
+        # Event batching knobs (see _process): flush on N events or T seconds.
+        self._event_batch_size = max(int(getattr(self._settings, "RUN_EVENT_BATCH_SIZE", 32) or 32), 1)
+        self._event_flush_interval = max(
+            float(getattr(self._settings, "RUN_EVENT_FLUSH_SECONDS", 0.2) or 0.2), 0.02
+        )
 
     async def run_once(self) -> uuid.UUID | None:
         """Claim and process one run. Returns the run_id, or None if idle."""
@@ -81,7 +88,7 @@ class RunWorker:
             return None
         try:
             await self._process(run_id)
-        except Exception:  # noqa: BLE001 — never crash the worker
+        except Exception:
             logger.exception("worker %s: unhandled error processing %s", self._owner, run_id)
         return run_id
 
@@ -133,6 +140,14 @@ class RunWorker:
         )
         terminal = False
         lease_aborted = False
+        # Event batching: buffer streamed events and flush in batches (bounded
+        # by count and time). Persisting one session+commit PER TOKEN DELTA was
+        # a 3-orders-of-magnitude write amplification (a 2000-token reply =
+        # 2000+ rows, 6000+ round trips) that pinned the DB under load. The
+        # SSE replay path polls at ~150ms anyway, so a 200ms flush cadence is
+        # invisible to clients.
+        batch: list[tuple[str, dict]] = []
+        last_flush = time.monotonic()
         try:
             async with self._session_factory() as exec_session:
                 async for evt in self._execute_fn(run_id, exec_session):
@@ -145,16 +160,43 @@ class RunWorker:
                             "(recovery will requeue)", self._owner, run_id,
                         )
                         lease_aborted = True
+                        # Drop (don't flush) the buffer: the new lease holder
+                        # re-emits these events; interleaving two writers'
+                        # batches could corrupt sequence order.
+                        batch.clear()
                         break
-                    await self._persist_event(run_id, evt)
+                    batch.append((evt.kind, evt.data))
+                    due = (
+                        len(batch) >= self._event_batch_size
+                        or time.monotonic() - last_flush >= self._event_flush_interval
+                    )
+                    if evt.kind in _TERMINAL_EVENT_TYPES or due:
+                        await self._persist_event_batch(run_id, batch)
+                        batch.clear()
+                        last_flush = time.monotonic()
                     if evt.kind in _TERMINAL_EVENT_TYPES:
                         terminal = True
                         break
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — transient: requeue
-            logger.warning("worker %s: run %s failed transiently: %s", self._owner, run_id, exc)
-            await self._finalize_failure(run_id, str(exc)[:500])
+        except Exception as exc:  # noqa: BLE001 — hand back to recovery (bounded retry)
+            # Flush whatever completed before the failure so replay/SSE keeps
+            # the partial history, then release the lease WITHOUT acking and
+            # WITHOUT marking the run failed: recovery requeues it under its
+            # retry budget (RUN_MAX_RETRIES). Failing the run on the FIRST
+            # transient exception (one DB blip = a user-visible failed reply)
+            # contradicted the designed recovery path this worker ships with.
+            logger.warning(
+                "worker %s: run %s failed transiently, abandoning to recovery: %s",
+                self._owner, run_id, exc,
+            )
+            try:
+                if batch:
+                    await self._persist_event_batch(run_id, batch)
+                    batch.clear()
+            except Exception:  # noqa: BLE001 — best-effort flush
+                pass
+            await self._abandon_to_recovery(run_id, str(exc)[:500])
             return
         finally:
             renewal_stop.set()
@@ -174,6 +216,11 @@ class RunWorker:
                 self._owner, run_id,
             )
             return
+        # Generator exhausted (with or without a terminal event): flush any
+        # residual buffered events before success finalization.
+        if batch:
+            await self._persist_event_batch(run_id, batch)
+            batch.clear()
         await self._finalize_success(run_id, terminal)
 
     # ------------------------------------------------------------------ #
@@ -184,15 +231,63 @@ class RunWorker:
         event append from the runtime's ORM state on ``exec_session`` — a
         runtime intermediate write can never be flushed half-formed by the
         event-append commit. Best-effort: a failure is logged, not raised.
+
+        The streaming path prefers :meth:`_persist_event_batch` (one commit per
+        batch instead of per token delta).
         """
         try:
             async with self._session_factory() as session:
                 await append_event_safe(session, run_id, evt.kind, evt.data)
                 await session.commit()
-        except Exception:  # noqa: BLE001 — best-effort durability
+        except Exception:
             logger.debug(
                 "worker %s: durable event append failed (%s for run %s)",
                 self._owner, evt.kind, run_id, exc_info=True,
+            )
+
+    async def _persist_event_batch(
+        self, run_id: uuid.UUID, batch: list[tuple[str, dict]]
+    ) -> None:
+        """Persist a batch of buffered events in ONE session + commit.
+
+        One ``max(sequence)`` read covers the whole batch (EventStore
+        :meth:`~app.agents.events.EventStore.append_many`), so per-token
+        persistence drops from O(tokens) transactions to O(batches). The
+        short-lived session keeps the same isolation as ``_persist_event``.
+        Best-effort: a failure is logged and the batch is dropped (the run's
+        outcome rows/status carry the authoritative state).
+        """
+        if not batch:
+            return
+        try:
+            async with self._session_factory() as session:
+                from app.agents.events import EventStore
+
+                await EventStore(session).append_many(run_id, batch)
+                await session.commit()
+        except Exception:
+            logger.debug(
+                "worker %s: durable event batch append failed (%d events for run %s)",
+                self._owner, len(batch), run_id, exc_info=True,
+            )
+
+    async def _abandon_to_recovery(self, run_id: uuid.UUID, error: str) -> None:
+        """Release the lease on an execution failure WITHOUT failing the run.
+
+        Recovery's bounded retry budget (RUN_MAX_RETRIES) then owns the run:
+        the expired lease is detected, the run is requeued, and only after the
+        budget is exhausted is it marked failed. (The previous behaviour
+        ack'd + marked failed on the FIRST exception, so a single transient DB
+        blip surfaced to the user as a failed reply.)
+        """
+        try:
+            async with self._session_factory() as session:
+                await LeaseStore(session).release(run_id, self._owner)
+                await session.commit()
+        except Exception:
+            logger.debug(
+                "worker %s: lease release during abandon failed for run %s",
+                self._owner, run_id, exc_info=True,
             )
 
     async def _renewal_loop(

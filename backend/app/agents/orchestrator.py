@@ -37,9 +37,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,13 +51,13 @@ from app.agents.db_mutation import (
 )
 from app.agents.events import append_event_safe
 from app.agents.persistence import persist_terminal_run
+from app.agents.run_controls import drop as drop_run_control
+from app.agents.run_controls import get_or_create as get_run_control
 from app.agents.runtime.native_runtime import NativeChatRuntime
-from app.agents.run_controls import drop as drop_run_control, get_or_create as get_run_control
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
     BudgetExceeded,
-    ExecutionMode,
     RuntimeKind,
     ev_done,
     ev_error,
@@ -242,7 +243,7 @@ class ChatOrchestrator:
                 session_factory=persistence_session_factory,
             )
             raise
-        except Exception as exc:  # noqa: BLE001 — runtime should self-handle, but be safe
+        except Exception as exc:
             logger.exception("runtime %s crashed: %s", runtime.name, exc)
             await self._fail_run(
                 ctx.db,
@@ -528,7 +529,6 @@ class ChatOrchestrator:
         from app.agents.adapters.llm_adapter import CrewAILLMFactory
         from app.agents.crews import build_research_stages
         from app.agents.runtime.crewai_runtime import _guard_for_context
-        from app.agents.runtime.stage_executor import CrewAIStageExecutor
         from app.agents.stage_context import make_stage_context
         from app.agents.workflow.executor import StageAdapterExecutor
 

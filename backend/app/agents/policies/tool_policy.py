@@ -43,12 +43,23 @@ def should_require_approval(tool: BaseTool) -> bool:
     return tool.dangerous
 
 
-def is_tool_allowed(tool_name: str, user: "User | None", *, strict: bool | None = None) -> bool:
+def _has_admin_role(user: User | None) -> bool:
+    """True when ``user`` carries the admin role (None-safe)."""
+    return bool(user is not None and getattr(user, "role", "") == "admin")
+
+
+def is_tool_allowed(tool_name: str, user: User | None, *, strict: bool | None = None) -> bool:
     """Whether ``tool_name`` may run for ``user`` in the current environment.
 
     ``python_exec`` is disabled outside dev unless an explicit sandbox is
     configured (``ALLOW_PYTHON_EXEC=true``) — the subprocess "sandbox" is not a
     real isolation boundary, so we fail closed in production.
+
+    ``db_query`` reads the WHOLE application database — every tenant's rows
+    (users, conversations, messages). For a regular C-end user it is a
+    cross-tenant read primitive whether reached via /api/tools/test or via
+    their own agent's approval flow, so in production it is admin-only.
+    Dev/test keeps it open for development and the test-suite.
     """
     settings = get_settings()
     if strict is None:
@@ -59,6 +70,9 @@ def is_tool_allowed(tool_name: str, user: "User | None", *, strict: bool | None 
         sandbox_ok = bool(getattr(settings, "PYTHON_SANDBOX", "") or "")
         allowed = settings.is_dev or bool(getattr(settings, "ALLOW_PYTHON_EXEC", False)) or sandbox_ok
         if strict and not allowed:
+            return False
+    if tool_name == "db_query":
+        if strict and not _has_admin_role(user):
             return False
     return True
 

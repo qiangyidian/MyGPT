@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Optional
 
-_controls: dict[str, "RunControl"] = {}
+_controls: dict[str, RunControl] = {}
 # Soft cap so runs that crash/abort without reaching their drop() cleanup can't
 # leak RunControl objects (and their asyncio.Events) into the registry forever.
 _MAX_CONTROLS = 256
@@ -67,7 +66,7 @@ def get_or_create(run_id: str | object) -> RunControl:
     return ctl
 
 
-def get(run_id: str | object) -> Optional[RunControl]:
+def get(run_id: str | object) -> RunControl | None:
     return _controls.get(str(run_id))
 
 

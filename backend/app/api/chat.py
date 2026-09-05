@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -68,8 +69,16 @@ async def _event_generator(
         try:
             async for event in chat_service.stream(db=db, user=user, request=payload):
                 await queue.put(event)
-        except HTTPException:
-            await queue.put({"event": "error", "data": {"code": "chat_error", "message": "chat failed"}})
+        except HTTPException as exc:
+            # Preserve the actual reason (not_found vs quota vs validation…)
+            # instead of flattening every HTTPException to "chat failed".
+            detail = exc.detail if isinstance(exc.detail, str) else "chat failed"
+            await queue.put(
+                {
+                    "event": "error",
+                    "data": {"code": f"chat_{exc.status_code}", "message": detail},
+                }
+            )
         except AppException as exc:
             await queue.put(
                 {
@@ -78,6 +87,14 @@ async def _event_generator(
                 }
             )
         except Exception:  # noqa: BLE001 — never kill the stream silently
+            # Release the idempotency marker so the client's retry isn't
+            # blocked for the whole TTL after a failed first attempt.
+            from app.core.idempotency import release as idempotency_release
+
+            try:
+                await idempotency_release(request, user.id)
+            except Exception:  # noqa: BLE001
+                pass
             await queue.put(
                 {
                     "event": "error",

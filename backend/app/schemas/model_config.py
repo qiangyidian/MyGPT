@@ -4,8 +4,9 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.core.ssrf import check_url_shape
 from app.schemas.common import ORMModel
 
 
@@ -37,8 +38,20 @@ class ModelConfigBase(BaseModel):
     top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     is_embedding: bool = False
 
+    @field_validator("api_base_url")
+    @classmethod
+    def api_base_url_shape(cls, v: str) -> str:
+        # SSRF shape guard at the schema boundary: http/https only, no embedded
+        # credentials. (The private-address resolution check runs at the API
+        # layer where the caller's role / environment is known.)
+        try:
+            check_url_shape(v)
+        except Exception as exc:  # EndpointBlockedError is a ValueError subclass
+            raise ValueError(str(exc)) from exc
+        return v
+
     @model_validator(mode="after")
-    def parallel_tools_require_tools(self) -> "ModelConfigBase":
+    def parallel_tools_require_tools(self) -> ModelConfigBase:
         if self.supports_parallel_tools and not self.supports_tools:
             raise ValueError("parallel tool support requires tool support")
         return self
@@ -73,7 +86,7 @@ class ModelConfigUpdate(BaseModel):
     is_embedding: bool | None = None
 
     @model_validator(mode="after")
-    def reject_explicit_nulls_for_non_nullable_fields(self) -> "ModelConfigUpdate":
+    def reject_explicit_nulls_for_non_nullable_fields(self) -> ModelConfigUpdate:
         nullable_updates = {"api_key", "embedding_model_name"}
         explicit_nulls = [
             field

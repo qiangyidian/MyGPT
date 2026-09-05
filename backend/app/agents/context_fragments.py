@@ -19,8 +19,8 @@ Consumers:
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from app.agents.planning import deliverable_kind
 

@@ -1,7 +1,12 @@
 """Intent router: user-facing mode -> execution route mapping (pure unit tests)."""
 from __future__ import annotations
 
-from app.agents.intent_router import VALID_MODES, decide_route, decide_route_with_intent, filter_tool_names
+from app.agents.intent_router import (
+    VALID_MODES,
+    decide_route,
+    decide_route_with_intent,
+    filter_tool_names,
+)
 from app.agents.schemas import ExecutionMode, IntentDecision
 
 

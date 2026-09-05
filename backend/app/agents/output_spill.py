@@ -12,8 +12,8 @@ is injected.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from app.agents.context_compaction import estimate_tokens
 
@@ -254,7 +254,7 @@ async def spill_to_artifact(
     run_id=None,
     step_id=None,
     generator: dict | None = None,
-) -> tuple[str, "ArtifactHandle | None"]:
+) -> tuple[str, ArtifactHandle | None]:
     """Async spill that persists the blob via :class:`ArtifactService`.
 
     The Task-10 backing for the Task-7 ``ArtifactHandle`` seam: when ``text``

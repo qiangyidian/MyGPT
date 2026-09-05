@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,18 +16,18 @@ class ConnectorCreate(BaseModel):
     provider: str
     credentials: dict[str, Any]
     oauth_scopes: list[str] = Field(default_factory=list)
-    command_or_url: Optional[str] = None
-    transport: Optional[str] = None
+    command_or_url: str | None = None
+    transport: str | None = None
     enabled: bool = False
-    extra: Optional[dict[str, Any]] = None
+    extra: dict[str, Any] | None = None
 
 
 class ConnectorUpdate(BaseModel):
     """Body for updating a connector's mutable, non-credential fields."""
 
-    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
-    oauth_scopes: Optional[list[str]] = None
-    extra: Optional[dict[str, Any]] = None
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    oauth_scopes: list[str] | None = None
+    extra: dict[str, Any] | None = None
 
 
 class ConnectorRotate(BaseModel):
@@ -50,8 +50,8 @@ class ConnectorOut(BaseModel):
     command_or_url: str
     oauth_scopes: list[str]
     enabled: bool
-    extra: Optional[dict[str, Any]] = None
-    last_used_at: Optional[datetime] = None
+    extra: dict[str, Any] | None = None
+    last_used_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

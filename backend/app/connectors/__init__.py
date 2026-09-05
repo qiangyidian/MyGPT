@@ -15,7 +15,7 @@ from app.connectors.service import (
 
 __all__ = [
     "Connector",
-    "ConnectorService",
     "ConnectorNotFoundError",
+    "ConnectorService",
     "InsufficientScopesError",
 ]

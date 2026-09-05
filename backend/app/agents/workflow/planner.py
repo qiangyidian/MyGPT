@@ -14,8 +14,6 @@ carried over as ``skip``) and marks only the flagged steps for re-execution.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from app.agents.workflow.schemas import (
     Plan,
     PlanValidationError,

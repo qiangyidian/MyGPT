@@ -45,7 +45,7 @@ def list_tools() -> list[ToolInfo]:
 
 
 async def test_tool(
-    name: str, arguments: dict, user: "User | None" = None
+    name: str, arguments: dict, user: User | None = None
 ) -> ToolTestResult:
     """Run a tool with the given args and report success/latency/error.
 

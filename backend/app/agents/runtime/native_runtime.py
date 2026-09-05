@@ -24,29 +24,30 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any
 
 from app.agents.approval_coordinator import approval_coordinator
+from app.agents.context_manager import ContextManager
 from app.agents.continuation import (
     ContinuationBuffer,
     ContinuationPolicy,
     aggregate_usage,
 )
 from app.agents.db_mutation import db_mutation_scope
+from app.agents.events import append_event_safe
 from app.agents.gateway.tool_gateway import ToolGateway
-from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.graph import build_single_agent_graph
-from app.agents.planning import build_plan, classify_intent, summarize_prefix
-from app.agents.context_manager import ContextManager
 from app.agents.output_spill import production_spill_writer
+from app.agents.planning import build_plan, classify_intent, summarize_prefix
+from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.runtime.stage_executor import safe_positive_int
-from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
-from app.model_capabilities import capabilities_from_config
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
     ToolExecution,
+    bounded_json_observation,
     ev_agent_graph,
     ev_agent_status,
     ev_approval_required,
@@ -61,13 +62,13 @@ from app.agents.schemas import (
     ev_token,
     ev_tool_call,
     ev_tool_result,
-    bounded_json_observation,
 )
-from app.agents.events import append_event_safe
-from app.models import AgentRun
+from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.core.config import get_settings
 from app.core.pricing import usage_cost
 from app.db import AsyncSessionLocal
+from app.model_capabilities import capabilities_from_config
+from app.models import AgentRun
 from app.providers.base import (
     ChatOptions,
     ProviderError,
@@ -102,7 +103,7 @@ class NativeChatRuntime:
             if _conn_mgr is not None:
                 try:
                     await _conn_mgr.close_all()
-                except Exception:  # noqa: BLE001 — shutdown must never raise
+                except Exception:
                     logger.warning(
                         "connector session close failed for run %s", ctx.run_id,
                         exc_info=True,
@@ -154,7 +155,7 @@ class NativeChatRuntime:
                 merge_mcp_tools(registry, mcp_registry=_conn_registry)
                 # Stash so stream_turn's finally tears it down at run end.
                 ctx.extra["_connector_session_manager"] = _conn_mgr
-            except Exception:  # noqa: BLE001 — connector tools must never crash the run
+            except Exception:
                 logger.warning(
                     "connector→session merge failed for run %s; skipping",
                     ctx.run_id, exc_info=True,
@@ -422,7 +423,7 @@ class NativeChatRuntime:
                             "mid-run compaction fired: %d -> %d msgs (budget=%d)",
                             _pre_compact_n, len(working), _input_budget,
                         )
-                    except Exception:  # noqa: BLE001 — best-effort; never block
+                    except Exception:
                         logger.warning(
                             "mid-run compaction failed; falling back to FIFO trim",
                             exc_info=True,
@@ -734,7 +735,7 @@ class NativeChatRuntime:
                     for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
                         yield _evt
                     return
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     model_breaker().record_failure(_breaker_key)
                     if continuation_buffer is not None:
                         buffered_novel = continuation_buffer.flush()
@@ -1106,7 +1107,7 @@ class NativeChatRuntime:
             for _evt in _native_terminal_events(ctx, "failed", _assistant_started):
                 yield _evt
             return
-        except Exception as exc:  # noqa: BLE001 — never let the stream die silently
+        except Exception as exc:
             logger.exception("unexpected error in native run: %s", exc)
             yield ev_error(
                 code="internal",
@@ -1171,7 +1172,7 @@ class NativeChatRuntime:
                     existing = list(_meta.get("artifacts") or [])
                     _meta["artifacts"] = existing + delivered
                     ctx.extra["spilled_artifacts"] = _meta["artifacts"]
-            except Exception:  # noqa: BLE001 — never fail the turn on delivery
+            except Exception:
                 logger.warning("hermes file delivery failed", exc_info=True)
         assistant_msg.metadata_ = _meta
         if finish_reason == "budget":

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from types import SimpleNamespace
-import uuid
 
 import pytest
 from pydantic import ValidationError

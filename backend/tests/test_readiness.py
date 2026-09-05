@@ -42,8 +42,32 @@ async def test_readiness_returns_structured_components():
 
 
 def test_repo_migration_head_constant_matches_alembic_head():
-    # The head revision is 0010_artifacts (the artifacts migration).
-    assert REPO_MIGRATION_HEAD == "0010_artifacts"
+    # REPO_MIGRATION_HEAD is resolved dynamically from the versions directory;
+    # cross-check it against alembic's own graph view (the source of truth used
+    # at deploy time) so the two resolutions can never silently diverge.
+    from pathlib import Path
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+    cfg = Config()
+    cfg.set_main_option("script_location", str(migrations_dir))
+    script = ScriptDirectory.from_config(cfg)
+    assert REPO_MIGRATION_HEAD == script.get_current_head()
+
+
+def test_classify_db_revision_semantics():
+    # head / behind / ahead / unknown — "ahead" is the rolled-back-code-on-an-
+    # upgraded-DB case and MUST stay healthy or every rollback would 503.
+    from app.core.health import classify_db_revision
+
+    graph = {"0003": ("0002",), "0002": ("0001",), "0001": ()}
+    assert classify_db_revision("0003", "0003", graph) == "head"
+    assert classify_db_revision("0001", "0003", graph) == "behind"
+    assert classify_db_revision("0002", "0003", graph) == "behind"
+    assert classify_db_revision("0003", "0002", graph) == "ahead"
+    assert classify_db_revision("9x_unknown", "0003", graph) == "unknown"
 
 
 @pytest.mark.asyncio

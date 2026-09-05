@@ -28,7 +28,7 @@ class CapabilityPolicy:
     shell: bool = False
     danger_full_access: bool = False
 
-    def merge_override(self, **overrides: bool) -> "CapabilityPolicy":
+    def merge_override(self, **overrides: bool) -> CapabilityPolicy:
         """Child overrides win (True/False explicitly set on the child)."""
         return replace(self, **{k: v for k, v in overrides.items()})
 

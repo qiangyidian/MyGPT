@@ -16,7 +16,8 @@ This module ships:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol, runtime_checkable
 
 from app.agents.workflow.schemas import Step, StepObservation
 
@@ -110,7 +111,9 @@ class StageAdapterExecutor:
         self._stages = stages
         self._stage_ctx = stage_ctx
         # Lazy import so the workflow package imports cleanly without crewai.
-        from app.agents.runtime.stage_executor import CrewAIStageExecutor  # noqa: WPS433
+        from app.agents.runtime.stage_executor import (
+            CrewAIStageExecutor,  # noqa: WPS433
+        )
 
         self._inner = CrewAIStageExecutor()
 

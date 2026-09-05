@@ -1,0 +1,12 @@
+[Unit]
+Description=MyGPT nightly backup (Postgres + Qdrant + uploads)
+
+[Timer]
+# Nightly at 03:00 local time; catch up shortly after boot if the window was
+# missed (e.g. the server was down — backups are the last thing to skip).
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

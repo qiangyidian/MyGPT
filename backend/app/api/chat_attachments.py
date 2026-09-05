@@ -9,7 +9,16 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +27,11 @@ from app.core.deps import get_current_user
 from app.core.exceptions import AppException
 from app.db import get_db
 from app.models import Conversation, User
-from app.schemas.chat_attachment import AttachmentTextOut, ChatAttachmentOut, SaveToKbRequest
+from app.schemas.chat_attachment import (
+    AttachmentTextOut,
+    ChatAttachmentOut,
+    SaveToKbRequest,
+)
 from app.services import attachment_service
 
 router = APIRouter(prefix="/api/chat-attachments", tags=["chat-attachments"])

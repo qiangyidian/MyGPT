@@ -1,0 +1,14 @@
+[Unit]
+Description=MyGPT backup job (pg_dump + Qdrant snapshots + uploads tar)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Backups are only useful if they run as a real user against the real stores.
+# Storage dir matches the deployment's STORAGE_DIR so uploads are included.
+Environment=STORAGE_DIR=/data/uploads
+WorkingDirectory=/root/MyGPT
+ExecStart=/root/MyGPT/scripts/backup.sh
+# Give a large uploads tree / slow snapshot API time to finish.
+TimeoutStartSec=2h

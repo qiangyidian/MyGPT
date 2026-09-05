@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,8 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 class MessageFeedbackRequest(BaseModel):
     """POST /api/messages/{message_id}/feedback."""
     rating: Literal["up", "down"]
-    reason: Optional[str] = Field(default=None, max_length=64)
-    comment: Optional[str] = Field(default=None, max_length=2000)
+    reason: str | None = Field(default=None, max_length=64)
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 class MessageFeedbackOut(BaseModel):
@@ -20,7 +20,7 @@ class MessageFeedbackOut(BaseModel):
     message_id: uuid.UUID
     conversation_id: uuid.UUID
     rating: str
-    reason: Optional[str] = None
-    comment: Optional[str] = None
+    reason: str | None = None
+    comment: str | None = None
     created_at: datetime
     updated_at: datetime

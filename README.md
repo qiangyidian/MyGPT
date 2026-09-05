@@ -197,15 +197,26 @@ kubectl apply -n mygpt -f deploy/k8s/
 ### 5. 备份与恢复演练
 
 ```bash
-./scripts/backup.sh                          # 日常备份（cron）：pg_dump + Qdrant 快照 + uploads.tar
+./scripts/backup.sh                          # 日常备份：pg_dump + Qdrant 快照 + uploads.tar
 ./scripts/restore-drill.sh ./backups/<TS>     # 恢复演练：还原到隔离容器，校验迁移头 + 校验和
 ./scripts/verify_migrations.sh                # 迁移头验证
 ```
 
+**备份必须自动化排期**（未排期的备份等于没有备份）。systemd timer 已提供：
+
+```bash
+sudo cp deploy/mychat-backup.timer deploy/mychat-backup.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mychat-backup.timer
+```
+
+> `backup.sh` 会从仓库 `.env` 读取 `STORAGE_DIR`（docker 部署的附件实际写入位置，
+> 旧版硬编码 `./backend/data/uploads` 在 compose 拓扑下会静默漏备附件）；建议再用
+> `rclone` 把 `./backups` 异地同步一份。
+
 - **Postgres**：`pg_dump -F c`（并行恢复友好）。PITR（按时间点恢复）需额外开启 WAL 归档（`archive_mode=on` + `archive_command`）+ 基础备份，演练脚本用逻辑 dump 做一致性校验。
 - **Qdrant**：每集合快照 API 上传恢复。
 - **对象存储**：`uploads.tar`；恢复演练做 tar 往返校验和；若备份目录带 `MANIFEST.sha256` 则按清单校验。生产建议 `STORAGE_BACKEND=minio`（对象存储自带版本化）。
-- **演练目标隔离**：脚本启动一次性 postgres/qdrant 容器还原，**绝不**写真实库；校验 alembic current == `0010_artifacts` + Qdrant 集合数 + 校验和，PASS/FAIL 明确。
+- **演练目标隔离**：脚本启动一次性 postgres/qdrant 容器还原，**绝不**写真实库；校验 alembic current == 仓库迁移头（动态解析，新增迁移无需改脚本）+ Qdrant 集合数 + 校验和，PASS/FAIL 明确。
 
 > 脚本沿用仓库的 `.sh`（bash）约定（与 `backup.sh`/`restore.sh` 一致）；Task 13 计划提到 `.ps1`，此处按仓库惯例统一为 `.sh`。
 

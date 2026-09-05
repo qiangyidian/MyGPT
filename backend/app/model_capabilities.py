@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-
 OutputTokenParameter = Literal["max_tokens", "max_completion_tokens"]
 
 _DEFAULT_CONTEXT_WINDOW = 131072
@@ -42,7 +41,7 @@ class ModelCapabilities:
             raise ValueError("unsupported output token parameter")
 
     @classmethod
-    def from_model_config(cls, config: Any) -> "ModelCapabilities":
+    def from_model_config(cls, config: Any) -> ModelCapabilities:
         return capabilities_from_config(config)
 
 
@@ -93,9 +92,9 @@ get_model_capabilities = capabilities_from_config
 
 
 __all__ = [
+    "UNKNOWN_MODEL_CAPABILITIES",
     "ModelCapabilities",
     "OutputTokenParameter",
-    "UNKNOWN_MODEL_CAPABILITIES",
     "capabilities_from_config",
     "get_model_capabilities",
 ]

@@ -44,7 +44,6 @@ from app.agents.workflow.planner import revise_plan, validate_plan
 from app.agents.workflow.schemas import (
     Plan,
     Step,
-    StepError,
     StepObservation,
     VerificationVerdict,
     VerifierResult,
@@ -264,7 +263,7 @@ class WorkflowEngine:
         step: Step,
         observations: dict[str, StepObservation],
         semaphore: asyncio.Semaphore,
-        state: "_RunState",
+        state: _RunState,
     ) -> StepObservation | None:
         """Run ``step`` with retry + bounded concurrency + persistence.
 
@@ -287,8 +286,7 @@ class WorkflowEngine:
                     await self._open_attempt(step.id, attempt_number)
                     async with semaphore:
                         state.in_flight += 1
-                        if state.in_flight > state.peak:
-                            state.peak = state.in_flight
+                        state.peak = max(state.peak, state.in_flight)
                         try:
                             obs = await self._executor.execute(step, dict(observations))
                         finally:

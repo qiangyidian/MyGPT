@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.agents.agent_graph_store import JsonAgentGraphStore, new_node_id
 from app.agents.network_policy import (
     NetworkPolicy,
     NetworkRule,
@@ -10,7 +11,6 @@ from app.agents.network_policy import (
     normalize_host,
     validate_host,
 )
-from app.agents.agent_graph_store import JsonAgentGraphStore, new_node_id
 
 
 # ---- network_policy ----

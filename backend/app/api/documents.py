@@ -12,7 +12,14 @@ import mimetypes
 import os
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -169,7 +176,7 @@ async def preview_document(
         parsed = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
     except ValueError as exc:
         raise HTTPException(BAD, f"该格式暂不支持预览: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 — parser failures are user-facing
+    except Exception as exc:
         raise HTTPException(500, f"解析失败: {exc}") from exc
 
     ft = doc.file_type.lower()

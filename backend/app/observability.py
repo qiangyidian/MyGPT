@@ -23,8 +23,9 @@ import contextvars
 import re
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 # --------------------------------------------------------------------------- #
 # Optional dependency probes. The API is identical either way.
@@ -218,17 +219,17 @@ class _NoopSpan:
     def set_attribute(self, key: str, value: Any) -> None:
         self._attributes[key] = _sanitize(value)
 
-    def record_exception(self, exc: BaseException) -> None:  # noqa: D401
+    def record_exception(self, exc: BaseException) -> None:
         # No-op: nothing leaves the process.
         return None
 
     def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
         return None
 
-    def __enter__(self) -> "_NoopSpan":
+    def __enter__(self) -> _NoopSpan:
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+    def __exit__(self, exc_type, exc, tb) -> None:
         return None
 
 
@@ -260,7 +261,7 @@ class _OtelSpan(_NoopSpan):
         except Exception:  # noqa: BLE001
             pass
 
-    def __enter__(self) -> "_OtelSpan":
+    def __enter__(self) -> _OtelSpan:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -290,7 +291,7 @@ class _NoopCounter:
         self.name = name
         self.description = description
 
-    def inc(self, amount: float | int = 1, attributes: dict[str, Any] | None = None) -> None:
+    def inc(self, amount: float = 1, attributes: dict[str, Any] | None = None) -> None:
         return None
 
 
@@ -304,7 +305,7 @@ class _PromCounter(_NoopCounter):
         # the small fixed schema becomes Prom labels.
         self._c = _Counter(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
 
-    def inc(self, amount: float | int = 1, attributes: dict[str, Any] | None = None) -> None:
+    def inc(self, amount: float = 1, attributes: dict[str, Any] | None = None) -> None:
         try:
             self._c.labels(**_extract_labels(sanitize_attributes(attributes))).inc(amount)
         except Exception:  # noqa: BLE001 — metrics must never break the call
@@ -316,7 +317,7 @@ class _NoopHistogram:
         self.name = name
         self.description = description
 
-    def record(self, amount: float | int = 0, attributes: dict[str, Any] | None = None) -> None:
+    def record(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
         return None
 
 
@@ -327,7 +328,7 @@ class _PromHistogram(_NoopHistogram):
 
         self._h = _Histogram(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
 
-    def record(self, amount: float | int = 0, attributes: dict[str, Any] | None = None) -> None:
+    def record(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
         try:
             self._h.labels(**_extract_labels(sanitize_attributes(attributes))).observe(amount)
         except Exception:  # noqa: BLE001
@@ -363,8 +364,8 @@ def histogram(name: str, description: str = "") -> Any:
 # *exporter*. In production both recorders stay ``None`` so the helpers add only
 # the (already cheap, no-op when off) exporter call.
 # --------------------------------------------------------------------------- #
-_span_recorder: "list[dict[str, Any]] | None" = None
-_metric_recorder: "list[dict[str, Any]] | None" = None
+_span_recorder: list[dict[str, Any]] | None = None
+_metric_recorder: list[dict[str, Any]] | None = None
 
 # Module-level handle caches so a hot path does not rebuild the Prom handle per
 # call (Prometheus clients dedupe by name internally too, but caching avoids the
@@ -373,7 +374,7 @@ _counter_handles: dict[str, Any] = {}
 _histogram_handles: dict[str, Any] = {}
 
 
-def set_span_recorder(recorder: "list[dict[str, Any]] | None") -> None:
+def set_span_recorder(recorder: list[dict[str, Any]] | None) -> None:
     """Test injection: capture every ``observe_span`` open/close into ``recorder``.
 
     Pass ``None`` to clear (production path — zero overhead).
@@ -382,18 +383,18 @@ def set_span_recorder(recorder: "list[dict[str, Any]] | None") -> None:
     _span_recorder = recorder
 
 
-def set_metric_recorder(recorder: "list[dict[str, Any]] | None") -> None:
+def set_metric_recorder(recorder: list[dict[str, Any]] | None) -> None:
     """Test injection: capture every ``observe_counter`` / ``observe_histogram``
     call into ``recorder``. Pass ``None`` to clear."""
     global _metric_recorder
     _metric_recorder = recorder
 
 
-def get_span_recorder() -> "list[dict[str, Any]] | None":
+def get_span_recorder() -> list[dict[str, Any]] | None:
     return _span_recorder
 
 
-def get_metric_recorder() -> "list[dict[str, Any]] | None":
+def get_metric_recorder() -> list[dict[str, Any]] | None:
     return _metric_recorder
 
 
@@ -449,7 +450,7 @@ def observe_span(name: str, **attributes: Any) -> Iterator[Any]:
         with span(name, clean) as opened:
             sp = opened
             yield opened
-    except BaseException as exc:  # noqa: BLE001 — record + re-raise
+    except BaseException as exc:
         err = exc
         try:
             if sp is not None:
@@ -469,7 +470,7 @@ def observe_span(name: str, **attributes: Any) -> Iterator[Any]:
             rec_entry["error"] = type(err).__name__ if err is not None else None
 
 
-def observe_counter(name: str, value: float | int = 1, **attributes: Any) -> None:
+def observe_counter(name: str, value: float = 1, **attributes: Any) -> None:
     """Increment counter ``name`` by ``value`` with redacted attributes.
 
     Routes to the gated exporter (no-op when ``PROMETHEUS_ENABLED`` is off) and
@@ -491,7 +492,7 @@ def observe_counter(name: str, value: float | int = 1, **attributes: Any) -> Non
         )
 
 
-def observe_histogram(name: str, value: float | int, **attributes: Any) -> None:
+def observe_histogram(name: str, value: float, **attributes: Any) -> None:
     """Record ``value`` into histogram ``name`` with redacted attributes."""
     if not _emit_metrics() and _metric_recorder is None:
         return

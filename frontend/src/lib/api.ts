@@ -37,8 +37,21 @@ import { getAccessToken, setAccessToken } from "./auth";
 import { parseSSEStream } from "./sse-parser";
 import type { FinishReason } from "./types";
 
+// Browser-visible API base. MUST be baked at build time for any non-local
+// deployment (a build without NEXT_PUBLIC_API_BASE_URL once shipped to
+// production and every request silently hit http://localhost:8000 — the user
+// saw "Failed to fetch"). In the browser, a missing variable is a hard error
+// instead of a silent localhost fallback; on the server (SSR/prerender) the
+// fallback stays so static builds don't crash.
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  (typeof window !== "undefined"
+    ? (() => {
+        throw new Error(
+          "NEXT_PUBLIC_API_BASE_URL 未设置：请在前端构建时提供后端 API 地址"
+        );
+      })()
+    : "http://localhost:8000");
 
 export class ApiError extends Error {
   status: number;
@@ -110,12 +123,28 @@ async function request<T>(
     });
   };
 
-  let res = await doFetch(getAccessToken());
+  let res: Response;
+  try {
+    res = await doFetch(getAccessToken());
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    // fetch() rejects with a bare TypeError on network failure; surface a
+    // Chinese, actionable message instead of the browser's raw English.
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      throw new ApiError(0, "offline", "网络连接已断开，请检查网络后重试");
+    }
+    throw new ApiError(0, "network_error", "网络请求失败，请稍后重试");
+  }
 
   if (res.status === 401 && !CREDENTIAL_AUTH_PATHS.has(path)) {
     const ok = await refreshAccessToken();
-    if (ok) res = await doFetch(getAccessToken());
-    else {
+    if (ok) {
+      try {
+        res = await doFetch(getAccessToken());
+      } catch {
+        throw new ApiError(0, "network_error", "网络请求失败，请稍后重试");
+      }
+    } else {
       setAccessToken(null);
       throw new ApiError(401, "unauthorized", "会话已过期，请重新登录");
     }
@@ -175,6 +204,12 @@ export const api = {
   async me() {
     return request<User>("GET", "/api/auth/me");
   },
+  /** 账号注销：需要密码二次确认；成功后服务端清除内容并使所有 token 失效。 */
+  async deleteMyAccount(password: string) {
+    await request<void>("DELETE", "/api/auth/me", { password });
+    setAccessToken(null);
+  },
+
   async logout() {
     try {
       await request("POST", "/api/auth/logout");

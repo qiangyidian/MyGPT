@@ -22,7 +22,6 @@ Guardrails:
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,7 +104,7 @@ async def _generate_llm_title(
             ChatOptions(temperature=0.3, max_tokens=512),
         )
         return clean_llm_title(result.content or "")
-    except Exception:  # noqa: BLE001 — titling is best-effort, never fatal
+    except Exception:
         logger.debug("LLM title generation failed", exc_info=True)
         return None
 
@@ -157,7 +156,7 @@ async def maybe_autotitle(
     if changed and commit:
         try:
             await db.commit()
-        except Exception:  # noqa: BLE001 — never fail the turn on title commit
+        except Exception:
             logger.warning("auto-title commit failed", exc_info=True)
             await db.rollback()
     return changed
@@ -196,12 +195,13 @@ async def maybe_autotitle_after_answer(
     conversation.title = llm_title
     try:
         await db.commit()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("auto-title refine commit failed", exc_info=True)
         await db.rollback()
         return False
     return True
 
 
+def title_provenance(title: str) -> dict:
     """Optional provenance marker (unused for now; kept for future analytics)."""
     return {"auto_titled": title != DEFAULT_TITLE}

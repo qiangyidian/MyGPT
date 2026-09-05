@@ -16,13 +16,13 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import select
 
 from app.agents.events import EventStore
 from app.agents.workflow.execution import execute_run
 from app.agents.workflow.queue import InMemoryQueue
 from app.agents.workflow.worker import RunWorker
 from app.models import AgentRun, Conversation, Message, ModelConfig
-from sqlalchemy import select
 from tests.conftest import TestSessionLocal
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -202,6 +202,11 @@ async def test_durable_create_binds_attachments_and_persists_ids(db_session):
     chat_service._persistence_session_factory = TestSessionLocal
     try:
         run = await _seed_durable_run(db_session)
+        # The seeded run models the PREVIOUS turn; mark it terminal so the new
+        # per-conversation in-flight guard (which now correctly refuses a
+        # second concurrent run) doesn't reject the turn under test.
+        run.status = "completed"
+        await db_session.commit()
         conv_id = run.conversation_id
         user_msg_row = (
             await db_session.execute(

@@ -8,10 +8,10 @@ import base64
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
-from jose import JWTError, jwt
+from jose import jwt
 from passlib.context import CryptContext
 
 from app.core.config import get_settings

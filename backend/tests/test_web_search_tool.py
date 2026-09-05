@@ -112,7 +112,7 @@ class _StreamResp:
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *a: Any) -> bool:
+    async def __aexit__(self, *a: object) -> bool:
         return False
 
     async def aiter_raw(self):
@@ -138,7 +138,7 @@ def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch, payload: Any, *, raise_
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, *a: Any) -> bool:
+        async def __aexit__(self, *a: object) -> bool:
             return False
 
         def stream(self, method, url, **kwargs: Any):
@@ -251,7 +251,7 @@ async def test_duckduckgo_scrape_does_not_shadow_html_module(monkeypatch: pytest
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, *a: Any) -> bool:
+        async def __aexit__(self, *a: object) -> bool:
             return False
 
         def stream(self, method, url, **kwargs: Any):

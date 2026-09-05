@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -83,6 +83,40 @@ async def _validation_exception_handler(
     )
 
 
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Map Starlette/FastAPI ``HTTPException`` onto the same envelope.
+
+    The routers raise plain ``HTTPException`` in ~80 places; without this
+    handler those responses bypassed the envelope and used Starlette's
+    ``{"detail": ...}`` shape — the frontend needed two error parsers and the
+    machine-readable ``code`` was lost. ``detail`` is echoed inside ``message``
+    so no existing client reading ``detail`` breaks.
+    """
+    detail = exc.detail if isinstance(exc.detail, str) else "error"
+    headers = getattr(exc, "headers", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": _code_for_status(exc.status_code), "message": detail, "detail": detail},
+        headers=headers,
+    )
+
+
+_STATUS_CODES: dict[int, str] = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    413: "payload_too_large",
+    422: "validation",
+    429: "rate_limited",
+}
+
+
+def _code_for_status(status_code: int) -> str:
+    return _STATUS_CODES.get(status_code, f"http_{status_code}")
+
+
 async def _generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     # Never leak internal tracebacks to clients; the message is intentionally
     # generic. Structured logging elsewhere captures the real exception.
@@ -97,4 +131,5 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Attach all error-response handlers to ``app``. Idempotent."""
     app.add_exception_handler(AppException, _app_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
+    app.add_exception_handler(HTTPException, _http_exception_handler)
     app.add_exception_handler(Exception, _generic_exception_handler)

@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Awaitable
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -230,7 +231,7 @@ class MemoryService:
                     self._collection,
                     {"memory_id": str(memory_id)},
                 )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
+            except Exception:
                 logger.warning(
                     "failed to remove embedding for memory %s", memory_id, exc_info=True
                 )
@@ -302,4 +303,4 @@ class MemoryService:
         return memory
 
 
-__all__ = ["MemoryService", "EmbedFn"]
+__all__ = ["EmbedFn", "MemoryService"]

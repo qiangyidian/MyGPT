@@ -227,8 +227,8 @@ async def test_model_test_endpoint_ok(client, monkeypatch):
 
     # Offline stub: the /test endpoint's job under test is the ok/latency/sample
     # envelope around a provider call, not the network itself.
-    from app.providers.base import ChatResult
     from app.providers import registry as provider_registry
+    from app.providers.base import ChatResult
 
     class OkStub:
         async def chat(self, messages, options=None):

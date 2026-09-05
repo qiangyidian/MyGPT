@@ -9,15 +9,13 @@ exporter.
 """
 from __future__ import annotations
 
-import pytest
-
 from app.observability import (
+    bind_correlation_id,
     clear_correlation_id,
     counter,
     get_correlation_id,
     histogram,
     new_correlation_id,
-    bind_correlation_id,
     sanitize_attributes,
     span,
 )

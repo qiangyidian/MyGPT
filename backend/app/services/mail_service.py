@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from email.message import EmailMessage
 import smtplib
+from email.message import EmailMessage
 
 from app.core.config import get_settings
 
@@ -59,6 +59,6 @@ async def send_verification_email(to_email: str, code: str, purpose: str) -> Non
         await asyncio.to_thread(_send)
     except MailServiceError:
         raise
-    except Exception as exc:  # noqa: BLE001 — normalize, log detail
+    except Exception as exc:
         logger.warning("verification mail to %s failed: %s", to_email, exc)
         raise MailServiceError("验证码邮件发送失败，请稍后重试") from exc

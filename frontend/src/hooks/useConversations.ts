@@ -27,6 +27,10 @@ export function useConversations(opts: ListOpts = {}) {
   const list = useQuery<Conversation[]>({
     queryKey: [...CONVERSATIONS_QUERY_KEY, { archived: !!archived, q: q ?? "", limit: limit ?? 0, offset: offset ?? 0 }],
     queryFn: () => api.listConversations({ archived, q, limit, offset }),
+    // Keep the previous page visible while the next one loads — without this
+    // the query data went undefined between switches and consumers flashed
+    // their empty/loading states.
+    placeholderData: (prev) => prev,
   });
 
   const createMutation = useMutation({
@@ -92,5 +96,10 @@ export function useConversationDetail(id: string | null) {
       return api.getConversation(id);
     },
     enabled: !!id,
+    // Keep the PREVIOUS conversation's messages on screen while the newly
+    // selected one loads. Without this, opening an uncached conversation went
+    // through a `data === undefined → messages = []` frame and the UI flashed
+    // the "welcome" empty state before the real messages appeared.
+    placeholderData: (prev) => prev,
   });
 }

@@ -10,7 +10,6 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.catalog import PROVIDER_CATALOG
@@ -18,6 +17,7 @@ from app.connectors.service import (
     ConnectorNotFoundError,
     ConnectorService,
     InsufficientScopesError,
+    StdioConnectorForbiddenError,
 )
 from app.core.deps import get_current_user
 from app.db import get_db
@@ -74,11 +74,15 @@ async def create_connector(
             transport=payload.transport,
             enabled=payload.enabled,
             extra=payload.extra,
+            is_admin=user.role == "admin",
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     except InsufficientScopesError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    except StdioConnectorForbiddenError as exc:
+        # stdio spawns a server-side subprocess — admin-only (fail closed).
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
     await db.commit()
     await db.refresh(conn)
     await audit_service.log(

@@ -501,14 +501,14 @@ WORKSPACE_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
 
 
 __all__ = [
-    "resolve_under_root",
-    "WorkspaceReadTool",
-    "WorkspaceListTool",
-    "WorkspaceSearchTool",
-    "WorkspaceWriteTool",
-    "WorkspaceApplyPatchTool",
-    "WorkspaceShellTool",
-    "WorkspaceGitStatusTool",
-    "WorkspaceGitDiffTool",
     "WORKSPACE_TOOL_CLASSES",
+    "WorkspaceApplyPatchTool",
+    "WorkspaceGitDiffTool",
+    "WorkspaceGitStatusTool",
+    "WorkspaceListTool",
+    "WorkspaceReadTool",
+    "WorkspaceSearchTool",
+    "WorkspaceShellTool",
+    "WorkspaceWriteTool",
+    "resolve_under_root",
 ]

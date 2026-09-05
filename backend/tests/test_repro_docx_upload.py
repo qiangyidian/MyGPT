@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import io
 
-import pytest
-
 from tests.conftest import auth_headers
 from tests.test_attachments import _file, _make_conv
 

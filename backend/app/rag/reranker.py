@@ -91,6 +91,7 @@ class RemoteApiReranker(Reranker):
         if not hits:
             return []
         import asyncio
+
         import httpx
 
         documents = [h.payload.get("text") or h.payload.get("content") or "" for h in hits]

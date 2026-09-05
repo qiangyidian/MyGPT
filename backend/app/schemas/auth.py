@@ -25,6 +25,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class DeleteAccountRequest(BaseModel):
+    """Account self-deletion (账号注销) requires password re-authentication."""
+    password: str
+
+
 class UserOut(ORMModel):
     id: uuid.UUID
     email: EmailStr

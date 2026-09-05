@@ -23,8 +23,8 @@ The bus is a singleton; the subscriber task is started on first use.
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
+import logging
 from typing import Any
 
 from app.agents.approval_coordinator import approval_coordinator
@@ -69,7 +69,7 @@ class ApprovalBus:
                 approval_coordinator.reject(_to_uuid(approval_id), reason)
             elif decision == "cancelled":
                 approval_coordinator.cancel_run(_to_uuid(approval_id))
-        except Exception:  # noqa: BLE001 — local signal is best-effort
+        except Exception:
             logger.debug("local approval signal no-op for %s", approval_id, exc_info=True)
 
     # ------------------------------------------------------------------ #
@@ -116,7 +116,7 @@ class ApprovalBus:
                     logger.warning("approval bus: bad message %r", message.get("data"))
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — stay alive across transient errors
+        except Exception as exc:
             logger.exception("approval bus subscriber crashed: %s", exc)
         finally:
             try:

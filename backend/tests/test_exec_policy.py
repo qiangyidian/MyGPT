@@ -11,7 +11,6 @@ import pytest
 
 from app.agents.exec_policy import (
     DEFAULT_DECISION,
-    Decision,
     ExecPolicy,
     PrefixRule,
     RuleStore,

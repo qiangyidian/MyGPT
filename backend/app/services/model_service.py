@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Optional
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +44,7 @@ async def list_for_user(
 
 async def get(
     db: AsyncSession, config_id: uuid.UUID, user_id: uuid.UUID
-) -> Optional[ModelConfig]:
+) -> ModelConfig | None:
     """Fetch a config if it belongs to ``user_id`` or is system-wide."""
     result = await db.execute(
         select(ModelConfig).where(
@@ -95,7 +94,7 @@ async def update(
     config_id: uuid.UUID,
     user_id: uuid.UUID,
     data: ModelConfigUpdate,
-) -> Optional[ModelConfig]:
+) -> ModelConfig | None:
     """Patch a config. A blank/None ``api_key`` preserves the existing key."""
     cfg = await get(db, config_id, user_id)
     if cfg is None:

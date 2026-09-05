@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Process-local LRU cache of recent classifications, keyed by
 # (model, user_content, context-block) hash. Re-edits and repeated prompts hit
 # the cache for free instead of making another model call on the chat hot path.
-_INTENT_CACHE: "OrderedDict[str, IntentDecision]" = OrderedDict()
+_INTENT_CACHE: OrderedDict[str, IntentDecision] = OrderedDict()
 _INTENT_CACHE_MAX = 512
 
 
@@ -72,7 +72,7 @@ class IntentClassifierConfig:
     enabled: bool = True
 
     @staticmethod
-    def from_settings() -> "IntentClassifierConfig":
+    def from_settings() -> IntentClassifierConfig:
         """Build from app settings, falling back to defaults for missing keys.
 
         Reads are all best-effort getattr with coercion so an unset or
@@ -257,7 +257,7 @@ class IntentService:
                 continue
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — unexpected: log + abort (no retry)
+            except Exception:
                 logger.exception(
                     "intent classifier unexpected error (attempt %d/%d); aborting",
                     attempt + 1, self._config.max_retries + 1,

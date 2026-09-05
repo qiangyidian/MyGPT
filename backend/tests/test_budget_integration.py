@@ -647,8 +647,8 @@ async def test_native_runtime_charges_provider_usage_and_stops_explicitly(
     db_session, monkeypatch
 ):
     from tests.test_native_runtime_graph_events import (
-        _FakeProvider,
         _collect,
+        _FakeProvider,
         _find_all,
         _seed_native_ctx,
     )
@@ -784,9 +784,9 @@ async def test_native_runtime_bounds_tool_output_before_followup_model_dispatch(
     db_session, monkeypatch
 ):
     from tests.test_native_runtime_graph_events import (
+        _collect,
         _FakeExecution,
         _FakeProvider,
-        _collect,
         _seed_native_ctx,
     )
 
@@ -1053,9 +1053,9 @@ async def test_native_tool_await_is_bounded_by_remaining_runtime(
     db_session, monkeypatch
 ):
     from tests.test_native_runtime_graph_events import (
+        _collect,
         _FakeExecution,
         _FakeProvider,
-        _collect,
         _find_all,
         _seed_native_ctx,
     )

@@ -243,6 +243,28 @@ async def upload(
     return attachment
 
 
+async def parse_attachment_now(
+    session_factory=None, attachment_id: uuid.UUID | None = None
+) -> None:
+    """Parse one attachment with an INJECTED session factory.
+
+    Re-enqueue seam for :mod:`app.services.stale_job_recovery`: the boot/periodic
+    sweep calls this (from any process) instead of the module-global
+    ``AsyncSessionLocal``, so recovery works from the recovery process too.
+    """
+    if attachment_id is None:
+        raise ValueError("attachment_id is required")
+    global _session_factory_override
+    _session_factory_override = session_factory
+    try:
+        await _parse_attachment_bg(attachment_id)
+    finally:
+        _session_factory_override = None
+
+
+_session_factory_override = None
+
+
 async def _parse_attachment_bg(attachment_id: uuid.UUID) -> None:
     """Background parse with its own DB session + timeout. Never raises out.
 
@@ -251,8 +273,9 @@ async def _parse_attachment_bg(attachment_id: uuid.UUID) -> None:
     unaffected because each has its own task.
     """
     settings = get_settings()
+    factory = _session_factory_override or AsyncSessionLocal
     try:
-        async with AsyncSessionLocal() as db:
+        async with factory() as db:
             att = await db.get(ChatAttachment, attachment_id)
             if att is None:
                 return
@@ -286,7 +309,7 @@ async def _parse_attachment_bg(attachment_id: uuid.UUID) -> None:
                 preview = {**preview, "rag_indexed": await attachment_rag.ensure_index(db, attachment_id, text)}
                 att.preview_metadata = preview
             await db.commit()
-    except Exception:  # noqa: BLE001 — background; never propagate
+    except Exception:
         logger.exception("attachment parse task crashed for %s", attachment_id)
 
 
@@ -721,6 +744,28 @@ async def delete_for_conversation(db: AsyncSession, conversation_id: uuid.UUID) 
             pass
 
 
+async def delete_files_for_keys(
+    storage_keys: list[str], attachment_ids: list[uuid.UUID]
+) -> None:
+    """Delete blob files + RAG indexes by explicit key/id list.
+
+    Used by conversation deletion AFTER the DB rows are gone (the previous
+    order — files first, commit second — permanently lost the files if the
+    commit failed, leaving rows pointing at vanished blobs).
+    """
+    storage = get_storage()
+    for key in storage_keys:
+        try:
+            await storage.delete(key)
+        except Exception:  # noqa: BLE001 — file may already be gone
+            pass
+    for att_id in attachment_ids:
+        try:
+            await attachment_rag.drop(att_id)
+        except Exception:  # noqa: BLE001 — vector store may be unavailable
+            pass
+
+
 async def list_for_conversation(
     db: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID
 ) -> list[ChatAttachment]:
@@ -756,6 +801,7 @@ async def save_to_kb(
     # pipeline expects.
     data = await open_bytes(att)
     import io
+
     from fastapi import UploadFile
 
     upload_file = UploadFile(filename=att.original_filename, file=io.BytesIO(data))
@@ -778,7 +824,7 @@ async def _index_document_safe(document_id: uuid.UUID) -> None:
     try:
         async with AsyncSessionLocal() as db:
             await document_service.index_document(db, document_id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("save-to-kb indexing failed for document %s", document_id)
 
 

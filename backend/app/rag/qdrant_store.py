@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 def _import_qdrant():
     """Lazy import so the module loads even if qdrant_client isn't installed."""
-    from qdrant_client import AsyncQdrantClient  # type: ignore
-    from qdrant_client import models  # type: ignore
+    from qdrant_client import (
+        AsyncQdrantClient,  # type: ignore
+        models,  # type: ignore
+    )
     return AsyncQdrantClient, models
 
 
@@ -35,6 +37,14 @@ def _to_filter(filters: dict[str, Any] | None, models: Any):
             models.FieldCondition(key=key, match=models.MatchValue(value=str(value)))
         )
     return models.Filter(must=conditions) if conditions else None
+
+
+class CollectionDimMismatchError(RuntimeError):
+    """Raised when a collection's vector dim differs from the configured dim.
+
+    Deliberately NOT auto-healed: recreating the collection deletes every
+    stored vector (the whole knowledge base).
+    """
 
 
 class QdrantVectorStore(VectorStore):
@@ -64,8 +74,19 @@ class QdrantVectorStore(VectorStore):
                 else getattr(info.config.params.vectors, "size", None)
             )
             if existing_dim and existing_dim != dim:
+                # A dim mismatch means the embedding model changed. Silently
+                # DELETING the collection ("self-heal") wiped the entire KB's
+                # vectors — make it an explicit operator decision instead.
+                if not get_settings().QDRANT_AUTO_RECREATE_ON_DIM_MISMATCH:
+                    raise CollectionDimMismatchError(
+                        f"collection {collection!r} has dim {existing_dim} but the "
+                        f"configured embedding dim is {dim}. Re-index the knowledge "
+                        "base (or point QDRANT_EMBEDDING_DIM/embedding model back to "
+                        "the original), or set QDRANT_AUTO_RECREATE_ON_DIM_MISMATCH=true "
+                        "to allow destructive recreation."
+                    )
                 logger.warning(
-                    "Collection %s dim %s != required %s; recreating",
+                    "Collection %s dim %s != required %s; recreating (operator opt-in)",
                     collection, existing_dim, dim,
                 )
                 # delete + create: recreate_collection is deprecated in
@@ -88,6 +109,11 @@ class QdrantVectorStore(VectorStore):
             vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
         )
         self._known.add(collection)
+
+    async def drop_collection(self, collection: str) -> None:
+        """Remove an entire collection (KB deletion / account purge)."""
+        await self._client.delete_collection(collection_name=collection)
+        self._known.discard(collection)
 
     async def upsert(self, collection: str, points: list[VectorPoint]) -> None:
         _, models = _import_qdrant()

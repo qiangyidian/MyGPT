@@ -311,7 +311,7 @@ function LoginForm() {
                     <PasswordInput
                       id="reg-password"
                       autoComplete="new-password"
-                      placeholder="至少 6 位"
+                      placeholder="至少 8 位，含大小写字母和数字"
                       value={password}
                       onChange={(e) => {
                         setPassword(e.target.value);

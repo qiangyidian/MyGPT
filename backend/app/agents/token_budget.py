@@ -7,7 +7,6 @@ from math import floor, isfinite
 from app.core.exceptions import AppException
 from app.model_capabilities import ModelCapabilities
 
-
 INVALID_PROMPT_BUDGET = "invalid_prompt_budget"
 MESSAGE_TOO_LARGE = "message_too_large"
 PROMPT_TOO_LARGE = "prompt_too_large"

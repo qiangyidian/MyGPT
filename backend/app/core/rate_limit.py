@@ -17,9 +17,10 @@ Rate limiting is automatically disabled when ``ENV == "test"`` so the test suite
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from collections import defaultdict
-from typing import Callable
+from collections.abc import Callable
 
 from fastapi import Depends, HTTPException, Request, status
 
@@ -31,12 +32,74 @@ from app.models.user import User
 _memory: dict[str, list[float]] = defaultdict(list)
 _memory_lock = asyncio.Lock()
 
+# Single-round-trip INCR+EXPIRE (an INCR whose EXPIRE is lost would leave a
+# key with no TTL — a permanently throttled identity).
+_RATELimit_LUA = """
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c
+"""
+
+
+def _trusted_proxy_peers() -> list[ipaddress._BaseNetwork]:
+    """Networks whose X-Forwarded-For headers we believe.
+
+    Defaults cover the two real topologies: nginx on the same host (loopback)
+    and nginx in front of the compose network (RFC1918 + docker ranges). Ops
+    can override with TRUSTED_PROXIES (comma-separated CIDRs).
+    """
+    settings = get_settings()
+    raw = (getattr(settings, "TRUSTED_PROXIES", "") or "").strip()
+    if raw:
+        networks = []
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    networks.append(ipaddress.ip_network(part, strict=False))
+                except ValueError:
+                    continue
+        return networks
+    return [
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    ]
+
+
+def _ip_in_trusted(ip_str: str, networks: list[ipaddress._BaseNetwork]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in networks)
+
 
 def _ip_of(request: Request) -> str:
+    """Client IP for rate limiting — XFF honored ONLY from trusted proxies.
+
+    A client-supplied X-Forwarded-For is trivially spoofable; trusting it
+    unconditionally let attackers rotate the header to bypass every per-IP
+    limit (login brute force, registration floods, email-bombing). We only
+    consult XFF when the direct connection peer is itself a trusted proxy,
+    and then walk the chain right-to-left, skipping trusted hops, to the
+    first untrusted address.
+    """
+    peer = request.client.host if request.client else "unknown"
+    trusted = _trusted_proxy_peers()
+    if not _ip_in_trusted(peer, trusted):
+        return peer
     forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    if not forwarded:
+        return peer
+    chain = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+    for hop in reversed(chain):
+        if not _ip_in_trusted(hop, trusted):
+            return hop
+    # Every hop is a trusted proxy — fall back to the furthest-reported one.
+    return chain[0] if chain else peer
 
 
 async def _check(scope: str, identity: str, limit: int, window: int) -> None:
@@ -53,9 +116,12 @@ async def _check(scope: str, identity: str, limit: int, window: int) -> None:
         from app.core.redis import get_redis
 
         redis = get_redis()
-        count = await redis.incr(redis_rkey)
-        if count == 1:
-            await redis.expire(redis_rkey, window)
+        try:
+            count = int(await redis.eval(_RATELimit_LUA, 1, redis_rkey, window))
+        except Exception:  # noqa: BLE001 — eval unavailable (fakeredis/older) → 2-step
+            count = await redis.incr(redis_rkey)
+            if count == 1:
+                await redis.expire(redis_rkey, window)
         if count > limit:
             ttl = await redis.ttl(redis_rkey)
             raise HTTPException(

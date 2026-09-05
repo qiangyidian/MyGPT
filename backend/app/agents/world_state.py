@@ -18,7 +18,7 @@ The integration (which fragments get diffed into the prompt) lives in
 from __future__ import annotations
 
 import threading
-from typing import Iterable
+from collections.abc import Iterable
 
 from app.agents.context_fragments import ContextFragment
 
@@ -95,7 +95,7 @@ def _message_text(message: dict) -> str:
 # the baseline — correctness is preserved, only the first turn after a hop loses
 # the diffing benefit.
 # --------------------------------------------------------------------------- #
-_DIFFERS: dict[str, "WorldStateDiffer"] = {}
+_DIFFERS: dict[str, WorldStateDiffer] = {}
 _DIFFERS_LOCK = threading.Lock()
 
 

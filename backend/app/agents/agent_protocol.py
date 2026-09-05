@@ -25,7 +25,6 @@ from typing import Literal
 
 from app.agents.context_fragments import ContextFragment
 
-
 # --------------------------------------------------------------------------- #
 # Segment validation
 # --------------------------------------------------------------------------- #
@@ -83,12 +82,12 @@ class AgentPath:
         return tuple(segments)
 
     @classmethod
-    def parse(cls, path: str) -> "AgentPath":
+    def parse(cls, path: str) -> AgentPath:
         """Parse an absolute path string (``"/a/b"``) into an :class:`AgentPath`."""
         return cls(path)
 
     @classmethod
-    def _from_segments(cls, segments: tuple[str, ...]) -> "AgentPath":
+    def _from_segments(cls, segments: tuple[str, ...]) -> AgentPath:
         """Build from an already-validated tuple of segments (internal helper)."""
         out = cls.__new__(cls)
         out._segments = tuple(segments)
@@ -108,13 +107,13 @@ class AgentPath:
         return len(self._segments) == 0
 
     @property
-    def parent(self) -> "AgentPath | None":
+    def parent(self) -> AgentPath | None:
         """The parent address, or ``None`` for the root ``/``."""
         if self.is_root:
             return None
         return AgentPath._from_segments(self._segments[:-1])
 
-    def join(self, child: str) -> "AgentPath":
+    def join(self, child: str) -> AgentPath:
         """Return a new path with ``child`` appended as the last segment.
 
         ``child`` must be a single valid segment (no slashes).
@@ -122,7 +121,7 @@ class AgentPath:
         _validate_segment(child)
         return AgentPath._from_segments(self._segments + (child,))
 
-    def relative_to(self, other: "AgentPath | str") -> str:
+    def relative_to(self, other: AgentPath | str) -> str:
         """Return the portion of this path below ``other``.
 
         The result is a slash-joined string with no leading slash:

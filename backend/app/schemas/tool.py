@@ -4,8 +4,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.schemas.common import ORMModel
-
 
 class ToolParameter(BaseModel):
     name: str

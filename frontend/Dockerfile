@@ -22,8 +22,10 @@ RUN pnpm build
 FROM node:20-alpine AS prod
 WORKDIR /app
 ENV NODE_ENV=production
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
-COPY --from=builder /app/public ./public
+# Run as the unprivileged node user — the prod stage previously ran as root.
+USER node
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+COPY --from=builder --chown=node:node /app/public ./public
 EXPOSE 3000
 CMD ["node", "server.js"]

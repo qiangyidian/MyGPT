@@ -1,6 +1,12 @@
 """slash_commands: single-registry parse/help/dispatch + aliases."""
-from app.agents import slash_commands as sc
-from app.agents.slash_commands import CommandSpec, dispatch, help_text, parse, register, reset_registry
+from app.agents.slash_commands import (
+    CommandSpec,
+    dispatch,
+    help_text,
+    parse,
+    register,
+    reset_registry,
+)
 
 
 def setup_function(_fn):

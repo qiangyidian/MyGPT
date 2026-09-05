@@ -16,7 +16,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.providers.base import ChatOptions, ModelProvider, provider_output_token_parameter
+from app.providers.base import (
+    ChatOptions,
+    ModelProvider,
+    provider_output_token_parameter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +172,7 @@ class DebateSubjects:
     criteria: str = ""
 
 
-def _distinct_pair(a: str, b: str) -> "DebateSubjects | None":
+def _distinct_pair(a: str, b: str) -> DebateSubjects | None:
     a, b = a.strip().strip(".,;:()。"), b.strip().strip(".,;:()。")
     if len(a) < 2 or len(b) < 2:
         return None

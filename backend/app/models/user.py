@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, String, Text
+from sqlalchemy import Boolean, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,3 +21,6 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), default="user", nullable=False)  # user | admin
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Bumped to invalidate every previously issued access token (admin
+    # deactivation, "log out everywhere", future password-change flows).
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

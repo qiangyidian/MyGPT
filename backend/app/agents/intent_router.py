@@ -18,7 +18,6 @@ tests); see :func:`apply_route` in ``chat_service``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from app.agents.schemas import ExecutionMode
 
@@ -52,7 +51,7 @@ class RouteDecision:
     # When True, the CrewAI runtime may run the multi-agent graph.
     use_multi_agent: bool = False
     # None = all tools; otherwise restrict to this allowlist.
-    tool_allowlist: Optional[list[str]] = None
+    tool_allowlist: list[str] | None = None
     # When True, exclude web tools even if otherwise allowed (create mode).
     disable_web: bool = False
     # The effective user-facing mode after intent-aware adjustment (the value

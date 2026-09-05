@@ -206,7 +206,21 @@ export function MessageList({
             <div className="mb-4 flex justify-center">
               <button
                 type="button"
-                onClick={() => setRenderCount((c) => c + RENDER_STEP)}
+                onClick={() => {
+                  // Scroll anchoring: prepending N messages pushes the
+                  // current viewport content down; compensate by the height
+                  // delta so the user keeps their reading position.
+                  const el = containerRef.current;
+                  const prevHeight = el?.scrollHeight ?? 0;
+                  const prevTop = el?.scrollTop ?? 0;
+                  setRenderCount((c) => c + RENDER_STEP);
+                  requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                      const el2 = containerRef.current;
+                      if (el2) el2.scrollTop = el2.scrollHeight - prevHeight + prevTop;
+                    });
+                  });
+                }}
                 className="rounded-full border border-border bg-card px-4 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent"
               >
                 加载更早的 {Math.min(hiddenCount, RENDER_STEP)} 条消息（还有 {hiddenCount} 条）

@@ -15,12 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from types import SimpleNamespace
-from typing import Any
 
-import pytest
-from sqlalchemy import select
-
-from app.agents.crews.stage import StageSpec
 from app.agents.graph import (
     AgentEdgeStatus,
     AgentGraph,
@@ -32,8 +27,7 @@ from app.agents.lifecycle import AgentLifecycleEmitter
 from app.agents.runtime.crewai_runtime import CrewAIRuntime
 from app.agents.runtime.stage_executor import FakeStageExecutor
 from app.agents.schemas import AgentTurnContext, ExecutionMode
-from app.agents.stage_context import make_stage_context
-from app.models import AgentRun, AgentStep, Conversation, Message
+from app.models import AgentRun, Conversation, Message
 from tests.conftest import TestSessionLocal
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")

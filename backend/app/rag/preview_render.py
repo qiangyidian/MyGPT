@@ -34,8 +34,8 @@ def _rows_to_gfm(rows: list[list[str]], max_rows: int = 200) -> str:
     rows = rows[: max_rows + 1]  # header + max_rows body rows
     header, *body = rows
     width = len(header)
-    norm = lambda r: (r + [""] * width)[:width]  # noqa: E731 — pad/truncate
-    cells = lambda r: [c.replace("|", "/").replace("\n", " ").strip() for c in r]  # noqa: E731
+    norm = lambda r: (r + [""] * width)[:width]
+    cells = lambda r: [c.replace("|", "/").replace("\n", " ").strip() for c in r]
     out = ["| " + " | ".join(cells(header)) + " |",
            "|" + "---|" * width]
     for r in body:

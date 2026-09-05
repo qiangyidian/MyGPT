@@ -50,7 +50,16 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # requirepass: a reachable-but-unauthenticated Redis previously let anyone
+    # on the network read/overwrite rate-limit keys, refresh blacklists and
+    # quota counters. The app's REDIS_URL must include the same password.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-changeme-redis}"]
+    logging: &default_logging
+      # json-file default never rotates — a busy backend fills the disk.
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -122,8 +131,11 @@ services:
         condition: service_completed_successfully
     volumes:
       - uploads_data:${STORAGE_DIR:-/data/uploads}
+    logging: *default_logging
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      # Loopback-only: traffic must enter through the TLS reverse proxy; the
+      # previous 0.0.0.0 publish let anyone bypass nginx/TLS + security headers.
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     # No --reload, no source mount. Single worker per container; scale
     # horizontally (replicas / k8s) — BACKGROUND_WORKER=durable means the API
     # only enqueues; the separate `worker` service consumes the run queue.
@@ -232,8 +244,15 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    logging: *default_logging
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     init: true
     deploy:
       resources:

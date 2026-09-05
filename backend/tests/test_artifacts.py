@@ -9,11 +9,11 @@ sha256 checksum to detect corruption/tamper. Expired artifacts are hidden.
 from __future__ import annotations
 
 import datetime as _dt
+import io
 import uuid
 
 import pytest
 from fastapi import UploadFile
-import io
 
 from app.artifacts.service import ArtifactService
 from app.core.exceptions import AppException
@@ -239,8 +239,9 @@ async def test_spill_to_artifact_returns_none_when_under_budget(db_session):
 # Generated files (tool outputs, screenshots, ...) → first-class artifact.
 # ---------------------------------------------------------------------------
 async def test_artifact_for_generated_returns_opaque_id(db_session):
-    from app.services import attachment_service
     from types import SimpleNamespace
+
+    from app.services import attachment_service
 
     user = SimpleNamespace(id=SEEDED, role="user")
     art_id = await attachment_service.artifact_for_generated(

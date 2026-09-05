@@ -1,0 +1,17 @@
+{
+  "name": "AI 对话平台",
+  "short_name": "AI 对话",
+  "description": "私有化 AI 对话与知识库平台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#8b5cf6",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

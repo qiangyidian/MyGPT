@@ -8,7 +8,8 @@ yields :class:`AgentEvent` objects. Two implementations live alongside:
 """
 from __future__ import annotations
 
-from typing import AsyncIterator, Protocol
+from collections.abc import AsyncIterator
+from typing import Protocol
 
 from app.agents.schemas import AgentEvent, AgentTurnContext
 

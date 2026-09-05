@@ -8,16 +8,12 @@ spill writer are injected, mirroring ``context_compaction.compact_messages``'s
 """
 from __future__ import annotations
 
-import pytest
-
-from app.agents.context_compaction import estimate_tokens
 from app.agents.context_manager import (
     ArtifactHandle,
     BudgetPartition,
     ContextManager,
 )
 from app.agents.token_budget import TokenBudget
-from app.model_capabilities import ModelCapabilities
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,7 @@ limits to exercise the logic.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -45,6 +46,8 @@ class _RedisLike(Protocol):
     async def sadd(self, name: str, *values: str) -> int: ...
     async def srem(self, name: str, *values: str) -> int: ...
     async def scard(self, name: str) -> int: ...
+    async def smembers(self, name: str) -> set: ...
+    async def expire(self, name: str, seconds: int) -> int: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +66,7 @@ class QuotaLimits:
     max_tools_per_run: int = 40
 
     @classmethod
-    def from_settings(cls, settings: Any | None = None) -> "QuotaLimits":
+    def from_settings(cls, settings: Any | None = None) -> QuotaLimits:
         s = settings or get_settings()
         # Quotas are disabled in test (mirrors rate_limit) so the suite never
         # blocks on a counter. Production deployments opt in via env.
@@ -94,8 +97,8 @@ class QuotaExceeded(Exception):
         self,
         reason: str,
         *,
-        limit: float | int,
-        used: float | int,
+        limit: float,
+        used: float,
         quota_type: str,
         tenant: str,
         **extra: Any,
@@ -193,6 +196,10 @@ class _MemoryCounters:
         async with self._lock:
             return len(self._sets[key])
 
+    async def set_members(self, key: str) -> list[str]:
+        async with self._lock:
+            return sorted(self._sets.get(key, set()))
+
 
 # --------------------------------------------------------------------------- #
 # Service.
@@ -218,7 +225,22 @@ class QuotaService:
         return bool(self.limits.enabled)
 
     def _k(self, axis: str, tenant: str) -> str:
+        # Token/cost counters are PERIOD-scoped: the bucket index is part of
+        # the key, so a period rolls over automatically without any reset job
+        # (the old single eternal key made "per period" mean "per lifetime" —
+        # users hit the cap once and stayed blocked until ops cleared Redis).
+        if axis in ("tokens", "cost"):
+            return f"quota:{axis}:{tenant}:{self._period_bucket()}"
         return f"quota:{axis}:{tenant}"
+
+    @staticmethod
+    def _period_seconds() -> int:
+        seconds = int(getattr(get_settings(), "QUOTA_PERIOD_SECONDS", 2_592_000) or 0)
+        return max(seconds, 60)
+
+    @classmethod
+    def _period_bucket(cls) -> int:
+        return int(time.time()) // cls._period_seconds()
 
     async def _incr_int(self, key: str, amount: int = 1) -> int:
         if self._redis is not None:
@@ -243,6 +265,15 @@ class QuotaService:
             except Exception:  # noqa: BLE001
                 pass
         return await self._mem.incr_float(key, amount)
+
+    async def _expire_period_key(self, key: str) -> None:
+        """Best-effort TTL so stale period buckets don't accumulate in Redis."""
+        if self._redis is None:
+            return
+        try:
+            await self._redis.expire(key, self._period_seconds() * 2)
+        except Exception:  # noqa: BLE001 — housekeeping must never break charging
+            pass
 
     async def _get_int(self, key: str) -> int:
         if self._redis is not None:
@@ -293,6 +324,14 @@ class QuotaService:
                 pass
         return await self._mem.set_size(key)
 
+    async def _set_members(self, key: str) -> list[str]:
+        if self._redis is not None:
+            try:
+                return sorted(str(m) for m in await self._redis.smembers(key))
+            except Exception:  # noqa: BLE001
+                pass
+        return await self._mem.set_members(key)
+
     # ---- admission: concurrent-run + token + cost --------------------------
     async def admit_run(self, tenant: str) -> RunTicket:
         """Reserve a run slot. Raises :class:`QuotaExceeded` if any axis is full.
@@ -328,24 +367,53 @@ class QuotaService:
             )
         # Concurrent-run quota: reserve via the active-runs set. The set is the
         # source of truth — its size is the live concurrent count — so release
-        # is an idempotent set remove (never a counter decrement).
+        # is an idempotent set remove (never a counter decrement). Members carry
+        # a deadline suffix ("<run_id>@<expiry>") and stale members are purged
+        # on admission, so a release lost to a Redis outage cannot wedge the
+        # tenant at "limit reached" forever.
         runs_key = self._k("runs", tenant)
         import uuid as _uuid
 
         run_id = _uuid.uuid4().hex
-        await self._set_add(runs_key, run_id)
+        member = self._run_member(run_id)
+        await self._set_add(runs_key, member)
         size = await self._set_size(runs_key)
         if size > self.limits.max_concurrent_runs:
-            # Over cap: roll back the member we just added and refuse.
-            await self._set_remove(runs_key, run_id)
-            raise QuotaExceeded(
-                f"concurrent-run limit ({self.limits.max_concurrent_runs}) reached",
-                limit=self.limits.max_concurrent_runs,
-                used=size - 1,
-                quota_type="concurrent_runs",
-                tenant=tenant,
-            )
+            # Over cap: purge expired members, then re-count before refusing.
+            await self._purge_expired_runs(runs_key)
+            size = await self._set_size(runs_key)
+            if size > self.limits.max_concurrent_runs:
+                # Still over cap: roll back the member we just added and refuse.
+                await self._set_remove(runs_key, member)
+                raise QuotaExceeded(
+                    f"concurrent-run limit ({self.limits.max_concurrent_runs}) reached",
+                    limit=self.limits.max_concurrent_runs,
+                    used=size - 1,
+                    quota_type="concurrent_runs",
+                    tenant=tenant,
+                )
         return RunTicket(tenant=tenant, run_id=run_id)
+
+    @staticmethod
+    def _run_member(run_id: str) -> str:
+        deadline = int(time.time()) + QuotaService._run_ttl_seconds()
+        return f"{run_id}@{deadline}"
+
+    @staticmethod
+    def _run_ttl_seconds() -> int:
+        return max(int(getattr(get_settings(), "QUOTA_RUN_TTL_SECONDS", 3600) or 0), 60)
+
+    async def _purge_expired_runs(self, runs_key: str) -> None:
+        """Remove active-run members whose deadline has passed."""
+        now = int(time.time())
+        try:
+            members = await self._set_members(runs_key)
+        except Exception:  # noqa: BLE001
+            return
+        for member in members:
+            _, _, suffix = member.rpartition("@")
+            if suffix.isdigit() and int(suffix) < now:
+                await self._set_remove(runs_key, member)
 
     async def release_run(self, tenant: str, ticket: RunTicket | str | None) -> None:
         """Return a run slot to the pool. Idempotent; never raises.
@@ -362,7 +430,13 @@ class QuotaService:
         if not run_id or run_id == "disabled":
             return
         try:
-            await self._set_remove(self._k("runs", tenant), run_id)
+            runs_key = self._k("runs", tenant)
+            # Members are stored as "<run_id>@<deadline>"; remove every member
+            # whose run_id prefix matches (idempotent — a duplicate release
+            # matches nothing, so the count can never underflow).
+            for member in await self._set_members(runs_key):
+                if member.rpartition("@")[0] == run_id:
+                    await self._set_remove(runs_key, member)
         except Exception:  # noqa: BLE001 — release must never crash the caller
             pass
 
@@ -421,8 +495,12 @@ class QuotaService:
             )
 
         total = prompt_tokens + completion_tokens  # server-recomputed; never trusted
-        await self._incr_int(self._k("tokens", tenant), total)
-        await self._incr_float(self._k("cost", tenant), float(cost_usd))
+        tokens_key = self._k("tokens", tenant)
+        cost_key = self._k("cost", tenant)
+        await self._incr_int(tokens_key, total)
+        await self._incr_float(cost_key, float(cost_usd))
+        await self._expire_period_key(tokens_key)
+        await self._expire_period_key(cost_key)
 
     async def get_usage(self, tenant: str) -> dict[str, Any]:
         """Read the authoritative server-side counters for a tenant."""
@@ -536,10 +614,24 @@ _quota_service_singleton: QuotaService | None = None
 
 
 def get_quota_service() -> QuotaService:
-    """Return the process-wide :class:`QuotaService`, building it on first use."""
+    """Return the process-wide :class:`QuotaService`, building it on first use.
+
+    The app-wide Redis client is injected so counters are atomic across
+    workers/replicas. Without injection every process counted into its own
+    memory — multi-replica deployments oversold every limit N-fold while
+    single-process users hit an eternal cap (no period reset). Injection is
+    best-effort: with Redis unreachable the in-memory fallback applies.
+    """
     global _quota_service_singleton
     if _quota_service_singleton is None:
-        _quota_service_singleton = QuotaService()
+        redis_client = None
+        try:
+            from app.core.redis import get_redis
+
+            redis_client = get_redis()
+        except Exception:  # noqa: BLE001 — fall back to in-process counters
+            redis_client = None
+        _quota_service_singleton = QuotaService(redis=redis_client)
     return _quota_service_singleton
 
 

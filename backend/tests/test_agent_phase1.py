@@ -18,7 +18,7 @@ from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.orchestrator import ChatOrchestrator
 from app.agents.runtime.crewai_runtime import CrewAIRuntime
 from app.agents.runtime.native_runtime import NativeChatRuntime
-from app.agents.schemas import ExecutionMode, ev_token, ev_tool_call
+from app.agents.schemas import ExecutionMode
 from app.core.security import encrypt_secret
 from app.models import ModelConfig, ToolCall
 from app.tools.builtin import DateTimeNowTool
@@ -188,8 +188,8 @@ async def test_crewai_tool_adapter_run_bridges_to_gateway(db_session, monkeypatc
     await db_session.flush()
 
     # Point the adapter's fresh-session factory at the in-memory test DB.
-    from tests.conftest import TestSessionLocal
     import app.db as db_mod
+    from tests.conftest import TestSessionLocal
 
     monkeypatch.setattr(db_mod, "AsyncSessionLocal", TestSessionLocal)
 

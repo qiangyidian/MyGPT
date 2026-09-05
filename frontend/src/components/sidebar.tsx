@@ -36,6 +36,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { api } from "@/lib/api";
+import { setAccessToken } from "@/lib/auth";
+import { DeleteAccountDialog } from "@/components/delete-account-dialog";
 import type { Conversation, Project, User } from "@/lib/types";
 
 interface SidebarProps {
@@ -126,6 +129,7 @@ export function Sidebar({
   className,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState("");
   const [focusedIndex, setFocusedIndex] = useState(0);
@@ -216,7 +220,7 @@ export function Sidebar({
           {/* Doubao-style pastel bubble avatar, color derived from the id. */}
           <span
             className={cn(
-              "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+              "flex h-8 w-8 max-sm:h-9 max-sm:w-9 shrink-0 items-center justify-center rounded-full",
               bubbleColorOf(conv.id)
             )}
           >
@@ -254,7 +258,7 @@ export function Sidebar({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-6 w-6 text-muted-foreground"
+                className="h-8 w-8 max-sm:h-9 max-sm:w-9 text-muted-foreground"
                 aria-label={`对话 ${conv.title} 操作`}
               >
                 <Settings className="h-3.5 w-3.5" />
@@ -351,6 +355,7 @@ export function Sidebar({
         <div className="relative mt-2">
           <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
+            id="conversation-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索对话"
@@ -446,10 +451,30 @@ export function Sidebar({
                 <LogOut className="h-4 w-4" />
                 退出登录
               </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="gap-2 text-destructive focus:text-destructive"
+                onSelect={() => setDeleteAccountOpen(true)}
+              >
+                <Trash2 className="h-4 w-4" />
+                注销账号
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
           <ThemeToggle />
         </div>
+        <DeleteAccountDialog
+          open={deleteAccountOpen}
+          onOpenChange={setDeleteAccountOpen}
+          onDeleted={() => {
+            // Session cleared server-side; hard navigation re-runs the auth gate.
+            window.location.href = "/login";
+          }}
+          deleteAccount={async (password: string) => {
+            await api.deleteMyAccount(password);
+            setAccessToken(null);
+          }}
+        />
       </div>
     </aside>
   );

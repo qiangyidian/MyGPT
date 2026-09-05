@@ -31,7 +31,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.agents.lifecycle import AgentLifecycleEmitter
@@ -62,9 +62,9 @@ class ApprovalBridge:
         self,
         *,
         loop: asyncio.AbstractEventLoop,
-        stage_ctx: "StageContext",
-        emitter: Optional["AgentLifecycleEmitter"] = None,
-        run_id: Optional[uuid.UUID] = None,
+        stage_ctx: StageContext,
+        emitter: AgentLifecycleEmitter | None = None,
+        run_id: uuid.UUID | None = None,
     ) -> None:
         self.loop = loop
         self.stage_ctx = stage_ctx
@@ -157,7 +157,7 @@ class ApprovalBridge:
                 if node is not None and node.status == AgentNodeStatus.waiting:
                     node.status = AgentNodeStatus.running
                     self.emitter.emit_run_status("running")
-        except Exception:  # noqa: BLE001 — never leave the caller stuck
+        except Exception:
             logger.exception("approval pause handler failed for %s", req.approval_id)
             req.decision = "cancelled"
             req.reason = "internal error"

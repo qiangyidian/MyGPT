@@ -1,6 +1,5 @@
 """Reasoning-effort resolution (three-layer + Custom escape hatch)."""
 from app.agents.reasoning import (
-    CANONICAL_EFFORTS,
     ModelReasoningCatalog,
     ReasoningPreset,
     parse_effort,

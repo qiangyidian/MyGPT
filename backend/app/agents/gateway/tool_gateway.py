@@ -38,12 +38,10 @@ from app.agents.policies import (
     is_tool_allowed,
     preview,
     risk_level_for,
-    risk_summary,
     should_require_approval,
     validate_readonly_sql,
 )
 from app.agents.schemas import (
-    RiskLevel,
     ToolExecution,
     _bounded_text,
     bounded_json_preview,
@@ -76,10 +74,10 @@ class ToolGateway:
         run_id: uuid.UUID | None,
         user: User | None = None,
         registry: ToolRegistry | None = None,
-        guardian_service: "object | None" = None,
-        guardian_provider: "object | None" = None,
-        guardian_breaker: "object | None" = None,
-        pre_tool_use_handlers: "list | None" = None,
+        guardian_service: object | None = None,
+        guardian_provider: object | None = None,
+        guardian_breaker: object | None = None,
+        pre_tool_use_handlers: list | None = None,
         max_result_chars: int = _MAX_RESULT_CHARS,
     ) -> None:
         self.db = db
@@ -213,7 +211,7 @@ class ToolGateway:
                     tool_name, args, self._pre_tool_use_handlers,
                     session_id=str(self.run_id or ""), turn_id=self._task_id or "", cwd="",
                 )
-            except Exception:  # noqa: BLE001 — hooks must never block execution
+            except Exception:
                 logger.warning("pre_tool_use hook execution failed; continuing", exc_info=True)
                 folded = None
             if folded is not None:
@@ -264,10 +262,10 @@ class ToolGateway:
         ):
             try:
                 verdict = await self._guardian.judge(
-                    action={"tool": tool_name, "arguments_preview": preview(arguments)},
+                    action={"tool": tool_name, "arguments_preview": args},
                     provider=self._guardian_provider,
                 )
-            except Exception:  # noqa: BLE001 — judge must never block the execution path
+            except Exception:
                 logger.warning("guardian judge raised; treating as deny", exc_info=True)
                 verdict = None
             if verdict is not None:
@@ -319,7 +317,7 @@ class ToolGateway:
                 tool_call_id, tool_name, args, started,
                 ok=False, status="error", error=f"tool error: {exc}",
             )
-        except Exception as exc:  # noqa: BLE001 — isolate per-tool failures
+        except Exception as exc:
             logger.exception("Tool %s raised unexpectedly", tool_name)
             return await self._finalize(
                 tool_call_id, tool_name, args, started,
@@ -370,7 +368,7 @@ class ToolGateway:
                         f"用户可下载查看全文]"
                     )
                     self._spilled_handles.append(spilled_handle)
-            except Exception:  # noqa: BLE001 — spill is best-effort
+            except Exception:
                 logger.debug("tool-result spill failed for %s", tool_name, exc_info=True)
 
         return await self._finalize(

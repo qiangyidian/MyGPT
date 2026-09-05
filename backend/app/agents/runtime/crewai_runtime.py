@@ -30,35 +30,35 @@ import asyncio
 import inspect
 import json
 import logging
-import uuid
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 
 from sqlalchemy import select
 
-from app.agents.approval_bridge import ApprovalBridge
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
+from app.agents.approval_bridge import ApprovalBridge
 from app.agents.continuation import aggregate_usage
-from app.agents.db_mutation import db_mutation_scope
-from app.agents.events import append_event_safe
-from app.agents.persistence import persist_graph_snapshot, persist_research_plan
 from app.agents.crews import (
     build_debate_stages,
     build_parallel_research_stages,
     build_research_stages,
 )
 from app.agents.crews.stage import StageSpec
-from app.agents.graph import AgentGraph
+from app.agents.db_mutation import db_mutation_scope
+from app.agents.events import append_event_safe
 from app.agents.lifecycle import AgentLifecycleEmitter
+from app.agents.persistence import persist_graph_snapshot, persist_research_plan
 from app.agents.planning import build_plan, classify_intent
+from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
+from app.agents.run_controls import get as get_run_control
 from app.agents.runtime.stage_executor import (
     CrewAIStageExecutor,
     StageExecutor,
     StageResult,
     _extract_usage_rounds,
 )
-from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
@@ -71,7 +71,6 @@ from app.agents.schemas import (
     ev_run_resumed,
     ev_token,
 )
-from app.agents.run_controls import get as get_run_control
 from app.agents.stage_context import StageContext, make_stage_context
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.agents.token_budget import PromptAdmissionError
@@ -121,7 +120,7 @@ def _guard_for_context(ctx: Any) -> BudgetGuard:
             allow_increase=bool(extra.get("budget_policy_authorized", False)),
         )
     )
-    setattr(ctx, "budget_guard", guard)
+    ctx.budget_guard = guard
     return guard
 
 
@@ -310,7 +309,7 @@ class CrewAIRuntime:
             if _conn_mgr is not None:
                 try:
                     await _conn_mgr.close_all()
-                except Exception:  # noqa: BLE001 — shutdown must never raise
+                except Exception:
                     logger.warning(
                         "crewai connector session close failed for run %s",
                         ctx.run_id, exc_info=True,
@@ -328,7 +327,7 @@ class CrewAIRuntime:
             llm = CrewAILLMFactory.from_model_config(
                 ctx.model_config, budget_guard=guard
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("crewai LLM build failed: %s", exc)
             yield ev_error(code="crewai_llm_error", message=str(exc))
             return
@@ -383,7 +382,7 @@ class CrewAIRuntime:
                 agent=agent,
             )
             crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, memory=False, verbose=False)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("crewai setup failed: %s", exc)
             yield ev_error(code="crewai_setup_error", message=str(exc))
             return
@@ -469,7 +468,7 @@ class CrewAIRuntime:
                 budget=ctx.extra.get("budget"),
             )
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             failure_usage = aggregate_usage(_extract_usage_rounds(exc))
             if failure_usage:
                 # Providers without cumulative summary APIs may still attach
@@ -581,7 +580,7 @@ class CrewAIRuntime:
                 graph, stages = build_research_stages(
                     llm=llm, tools=tools, question=ctx.user_content
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("crewai multi-agent setup failed: %s", exc)
             yield ev_error(code="crewai_setup_error", message=str(exc))
             return
@@ -650,7 +649,7 @@ class CrewAIRuntime:
                     )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — plan is best-effort
+        except Exception:
             logger.warning("research plan emission failed", exc_info=True)
 
         # ---- concurrent run + drain ----
@@ -668,7 +667,7 @@ class CrewAIRuntime:
             except asyncio.CancelledError:
                 emitter.emit_run_status("cancelled")
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 run_exc = exc
                 logger.exception("multi-agent flow failed: %s", exc)
                 emitter.emit_run_status("failed")
@@ -813,7 +812,7 @@ class CrewAIRuntime:
                     return True
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — poll is best-effort
+            except Exception:
                 logger.debug("plan-status poll failed", exc_info=True)
             await asyncio.sleep(1.0)
         return False
@@ -904,7 +903,7 @@ class CrewAIRuntime:
                     await session.commit()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — durable drain is best-effort
+        except Exception:
             logger.debug("durable command drain failed", exc_info=True)
 
     async def _walk_stages(
@@ -1024,7 +1023,7 @@ class CrewAIRuntime:
         except asyncio.CancelledError:
             emitter.emit_agent_cancelled(spec.agent_id)
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("stage %s failed: %s", spec.agent_id, exc)
             emitter.emit_agent_failed(spec.agent_id, error=str(exc))
             # Fail-fast: cancel everything downstream of this node.
@@ -1068,7 +1067,7 @@ class CrewAIRuntime:
                 else:
                     _conn_registry = await _stashed_mgr.open_for_user(user_id)
                     merge_mcp_tools(registry, mcp_registry=_conn_registry)
-            except Exception:  # noqa: BLE001 — connector tools must never crash the run
+            except Exception:
                 logger.warning(
                     "crewai connector→session merge failed for run %s; skipping",
                     ctx.run_id, exc_info=True,

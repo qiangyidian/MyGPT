@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -102,6 +101,11 @@ class Settings(BaseSettings):
     BACKGROUND_WORKER: str = "inprocess"
 
     # ---- Durable worker (Task 5) ----
+    # Event batching: streamed run events flush to run_events in batches of
+    # RUN_EVENT_BATCH_SIZE or every RUN_EVENT_FLUSH_SECONDS, whichever first
+    # (per-token transactions were a 3-orders-of-magnitude write amplification).
+    RUN_EVENT_BATCH_SIZE: int = 32
+    RUN_EVENT_FLUSH_SECONDS: float = 0.2
     # Redis stream + consumer group names for the durable run queue.
     RUN_QUEUE_STREAM: str = "agent-run-queue"
     RUN_QUEUE_GROUP: str = "workers"
@@ -130,6 +134,27 @@ class Settings(BaseSettings):
     # it stays disabled unless one of these opts it in AND a sandbox is configured.
     ALLOW_PYTHON_EXEC: bool = False
     PYTHON_SANDBOX: str = ""  # e.g. "docker" | "e2b" | "gvisor" — reserved for Phase 5
+    # User-configured model endpoints are SSRF-guarded: regular (non-admin)
+    # users may only point at hosts that resolve to PUBLIC addresses. Set true
+    # only for trusted single-tenant deployments where end users must reach
+    # self-hosted in-cluster models (vLLM/Ollama) over private addresses.
+    ALLOW_PRIVATE_MODEL_ENDPOINTS: bool = False
+    # Proxy networks whose X-Forwarded-For headers are believed for client-IP
+    # resolution (rate limiting keys on this). Comma-separated CIDRs; empty =
+    # loopback + RFC1918/docker defaults (nginx-on-host and nginx-in-compose).
+    # Only set this to the exact proxy networks in front of the app — a client
+    # must never be able to choose its own rate-limit identity via the header.
+    TRUSTED_PROXIES: str = ""
+    # Hard cap for user-uploaded artifacts (MB). The artifacts endpoint
+    # previously had NO size/type/frequency limit — any logged-in user could
+    # fill the disk unbounded.
+    MAX_ARTIFACT_UPLOAD_MB: int = 50
+    # When the existing Qdrant collection's dim differs from the configured
+    # embedding dim: False (default) raises a clear, actionable error at
+    # indexing time; True restores the old behaviour of DELETING and
+    # recreating the collection — which silently wiped the whole KB's vectors
+    # whenever the embedding model changed without updating the env var.
+    QDRANT_AUTO_RECREATE_ON_DIM_MISMATCH: bool = False
     # Optional JSON file of network-egress allow/forbid rules consulted by the
     # http_get / web_search tools (Codex-style NetworkPolicy, see
     # app.agents.network_policy.NetworkRuleStore). Empty = no policy (allow-all,
@@ -270,7 +295,7 @@ class Settings(BaseSettings):
     # ---- Email verification codes (registration) ----
     # SMTP sender for one-time registration codes. MAIL_ENABLED=false disables
     # real sending — in that mode request_email_code returns the code in the
-    # response ONLY when ENV != "production" (dev convenience), and register
+    # response ONLY when not is_prod (dev convenience), and register
     # falls back to no-code (also non-production only). Production requires a
     # complete SMTP configuration.
     MAIL_ENABLED: bool = False
@@ -285,6 +310,7 @@ class Settings(BaseSettings):
     EMAIL_CODE_RESEND_INTERVAL: int = 60    # min seconds between sends
     EMAIL_CODE_BURST_LIMIT: int = 5         # max sends per email per hour
     EMAIL_CODE_BURST_WINDOW: int = 3600
+    EMAIL_CODE_MAX_ATTEMPTS: int = 5        # failed verifications before the code is invalidated
 
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
@@ -369,10 +395,21 @@ class Settings(BaseSettings):
     QUOTA_MAX_COST_USD: float = 50.0
     QUOTA_MAX_STORAGE_BYTES: int = 10 * 1024 * 1024 * 1024  # 10 GiB
     QUOTA_MAX_CONNECTORS: int = 25
+    # Accounting period for token/cost quotas (seconds; default 30 days). The
+    # period index is part of the Redis key, so a period rolls over without a
+    # reset job.
+    QUOTA_PERIOD_SECONDS: int = 2_592_000
+    # How long a reserved concurrent-run slot lives before other admissions
+    # may reclaim it (protects against a release lost to a Redis outage).
+    QUOTA_RUN_TTL_SECONDS: int = 3600
+    # ---- Data retention (app.services.retention) ----
+    AUDIT_RETENTION_DAYS: int = 365
+    RUN_EVENT_RETENTION_DAYS: int = 90
+    ORPHAN_SWEEP_ENABLED: bool = True
 
     # ---- Derived ----
     @property
-    def cors_origins(self) -> List[str]:
+    def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
 
     @property
@@ -383,13 +420,20 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         return self.ENV == "dev"
 
+    @property
+    def is_prod(self) -> bool:
+        # Single source of truth for "am I running in production" — code must
+        # check this instead of comparing ENV against a hand-typed string (a
+        # "production" vs "prod" mismatch once made prod echo email codes).
+        return self.ENV == "prod"
+
     @field_validator("STORAGE_DIR")
     @classmethod
     def _abs_storage(cls, v: str) -> str:
         return str(Path(v))
 
     @model_validator(mode="after")
-    def _guard_default_secrets(self) -> "Settings":
+    def _guard_default_secrets(self) -> Settings:
         # Refuse to boot a real deployment with the publicly-known default JWT
         # secret or admin password — either enables trivial takeover. Dev/test
         # keep the defaults so the demo login and the test suite work as-is.

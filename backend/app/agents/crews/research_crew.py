@@ -20,13 +20,12 @@ real and the handoff edges fire exactly when the data is available.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 from app.agents.crews.stage import StageSpec
-from app.agents.graph import build_deep_research_graph
-from app.agents.graph import AgentGraph
+from app.agents.graph import AgentGraph, build_deep_research_graph
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +267,7 @@ def build_research_crew(
 # --------------------------------------------------------------------------- #
 # Reviewer quality gate (post-run, lightweight)
 # --------------------------------------------------------------------------- #
-def review_crew_output(raw_answer: str, evidence: Optional[ResearchEvidence]) -> dict[str, Any]:
+def review_crew_output(raw_answer: str, evidence: ResearchEvidence | None) -> dict[str, Any]:
     """Lightweight reviewer: does the answer cite sources and avoid obvious gaps?
 
     This is a structural check (not an LLM call) so it's deterministic and fast:

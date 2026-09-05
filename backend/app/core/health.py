@@ -8,8 +8,11 @@ meaningful for load-balancer / k8s readiness and for ops dashboards.
 Task 11 extends this to a STRICT readiness probe used by ``GET /ready``:
 
   * ``db``           — DB reachable;
-  * ``db_migration`` — the DB's alembic revision equals the repo migration head
-                       (catches a stale image that skipped a migration);
+  * ``db_migration`` — the DB's alembic revision is compatible with the repo
+                       migration head: at head → ok; behind head (a migration
+                       was skipped / stale image) → FAIL; ahead of head
+                       (rolled-back code on an upgraded DB, the expand-
+                       contract rollback path) → ok; unknown revision → FAIL;
   * ``redis``        — Redis reachable (concurrent quota counters, refresh-token
                        revocation, durable run queue);
   * ``qdrant``       — Qdrant reachable AND the client/server pair is a known-
@@ -32,7 +35,10 @@ import asyncio
 import importlib.metadata
 import logging
 import os
+import re
 import tempfile
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
@@ -43,10 +49,109 @@ logger = logging.getLogger(__name__)
 # health endpoint itself unresponsive.
 _PROBE_TIMEOUT = 2.0
 
+# The repo's alembic versions directory (backend/migrations/versions), resolved
+# relative to this file so it works from the repo, the venv and the Docker image.
+_MIGRATIONS_VERSIONS_DIR = (
+    Path(__file__).resolve().parents[2] / "migrations" / "versions"
+)
+
+_REV_ASSIGN_RE = re.compile(r"^revision(?::\s*[^=\n]+)?\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+_DOWN_ASSIGN_RE = re.compile(r"^down_revision(?::\s*[^=\n]+)?\s*=\s*(.+)$", re.MULTILINE)
+
+
+@lru_cache(maxsize=1)
+def _migration_graph() -> dict[str, tuple[str, ...]]:
+    """Parse the versions directory into ``{revision: (down_revisions...)}``.
+
+    Mirrors alembic's graph so readiness can classify the DB's revision
+    relative to the repo head without importing alembic at app runtime.
+    """
+    graph: dict[str, tuple[str, ...]] = {}
+    for path in sorted(_MIGRATIONS_VERSIONS_DIR.glob("*.py")):
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        rev_match = _REV_ASSIGN_RE.search(source)
+        if not rev_match:
+            continue
+        revision = rev_match.group(1)
+        downs: tuple[str, ...] = ()
+        down_match = _DOWN_ASSIGN_RE.search(source)
+        if down_match:
+            downs = tuple(re.findall(r"['\"]([^'\"]+)['\"]", down_match.group(1)))
+        graph[revision] = downs
+    if not graph:
+        raise RuntimeError(
+            f"no alembic revisions found in {_MIGRATIONS_VERSIONS_DIR}"
+        )
+    return graph
+
+
+@lru_cache(maxsize=1)
+def _resolve_migration_head() -> str:
+    """Resolve the repo's alembic head revision from the versions directory.
+
+    Computed dynamically instead of a hand-maintained constant: a hardcoded
+    head drifted from reality once already (health compared against
+    ``0010_artifacts`` while ``0011`` was the real head), which failed
+    ``/ready`` for every deployment that shipped a migration. The resolver
+    walks each migration file's ``revision`` / ``down_revision`` assignments
+    (mirroring alembic's graph) so adding a migration requires no edits here.
+    """
+    graph = _migration_graph()
+    referenced = {d for downs in graph.values() for d in downs}
+    heads = sorted(r for r in graph if r not in referenced)
+    if not heads:
+        raise RuntimeError(
+            "cannot resolve alembic head: no unreferenced revision found in "
+            f"{_MIGRATIONS_VERSIONS_DIR}"
+        )
+    if len(heads) > 1:
+        raise RuntimeError(
+            f"multiple alembic heads detected: {heads} — the migration chain "
+            "has branched; merge the heads before deploying"
+        )
+    return heads[0]
+
+
 # The repo's alembic head. Readiness asserts the DB's current revision == this.
-# Bump this when a new migration is added (the gate will then require the DB to
-# have caught up before /ready returns 200).
-REPO_MIGRATION_HEAD = "0010_artifacts"
+# Resolved from the versions directory at import (see _resolve_migration_head);
+# a resolution failure is a hard boot error because alembic-based deploys would
+# be equally broken.
+REPO_MIGRATION_HEAD: str = _resolve_migration_head()
+
+
+def classify_db_revision(current: str, head: str, graph: dict[str, tuple[str, ...]]) -> str:
+    """Classify the DB's revision relative to the repo head (pure, testable).
+
+    Returns one of:
+      * ``"head"``     — DB is exactly at the repo head (normal post-deploy);
+      * ``"behind"``   — DB revision is an ancestor of head (a migration was
+                         skipped — the stale-image case this gate exists to
+                         catch; an ``alembic upgrade head`` is required);
+      * ``"ahead"``    — DB revision is known to the repo but NOT an ancestor
+                         of head, i.e. the DB has migrated *beyond* this
+                         checkout. This is the code-rollback-on-an-upgraded-DB
+                         case (expand-contract); it must NOT fail readiness or
+                         every rollback would be unhealthy;
+      * ``"unknown"``  — revision absent from the repo chain (the migration
+                         was deleted, or the DB was built elsewhere).
+    """
+    if current == head:
+        return "head"
+    if current not in graph:
+        return "unknown"
+    # Walk head's ancestry via down_revision links.
+    seen: set[str] = set()
+    stack = [head]
+    while stack:
+        rev = stack.pop()
+        if rev in seen:
+            continue
+        seen.add(rev)
+        stack.extend(graph.get(rev, ()))
+    return "behind" if current in seen else "ahead"
 
 # Qdrant client/server compatibility pairs. The server is pinned to
 # qdrant/qdrant:v1.12.x and the client to 1.12.x/1.13.x (see requirements.txt);
@@ -77,8 +182,9 @@ def _fail(reason: str) -> dict[str, Any]:
 
 async def _check_db() -> bool:
     try:
-        from app.db import AsyncSessionLocal
         from sqlalchemy import text
+
+        from app.db import AsyncSessionLocal
 
         async with AsyncSessionLocal() as db:
             await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=_PROBE_TIMEOUT)
@@ -89,14 +195,23 @@ async def _check_db() -> bool:
 
 
 async def _check_db_migration() -> dict[str, Any]:
-    """Assert the DB's alembic revision equals :data:`REPO_MIGRATION_HEAD`.
+    """Assert the DB's alembic revision is compatible with the repo head.
 
-    Falls back to ok=True with a clear reason when the DB is the test/dev
+    Semantics (see :func:`classify_db_revision`):
+
+      * at head          → ok;
+      * behind head      → FAIL (a migration was skipped — stale image);
+      * ahead of head    → ok (rolled-back code on an upgraded DB — must stay
+                           healthy or every rollback would 503);
+      * unknown revision → FAIL.
+
+    Falls back to fail with a clear reason when the DB is the test/dev
     in-memory store (no ``alembic_version`` table — built via ``create_all``).
     """
     try:
-        from app.db import AsyncSessionLocal
         from sqlalchemy import text
+
+        from app.db import AsyncSessionLocal
 
         async with AsyncSessionLocal() as db:
             try:
@@ -105,7 +220,7 @@ async def _check_db_migration() -> dict[str, Any]:
                     timeout=_PROBE_TIMEOUT,
                 )
                 current = row.scalar_one_or_none()
-            except Exception as inner:  # noqa: BLE001 — table missing etc.
+            except Exception:  # noqa: BLE001 — table missing etc.
                 # Dev/test DBs built via create_all have no alembic_version.
                 return _fail(
                     "alembic_version table not present "
@@ -113,11 +228,27 @@ async def _check_db_migration() -> dict[str, Any]:
                 )
             if current is None:
                 return _fail("alembic_version row is empty")
-            if str(current) != REPO_MIGRATION_HEAD:
+            current = str(current)
+            relation = classify_db_revision(
+                current, REPO_MIGRATION_HEAD, _migration_graph()
+            )
+            if relation == "head":
+                return _ok(f"head={current}")
+            if relation == "behind":
                 return _fail(
-                    f"migration head mismatch: db={current!r} repo={REPO_MIGRATION_HEAD!r}"
+                    f"migration head mismatch: db={current!r} is behind repo "
+                    f"head={REPO_MIGRATION_HEAD!r} (run alembic upgrade head)"
                 )
-            return _ok(f"head={current}")
+            if relation == "ahead":
+                return _ok(
+                    f"db={current} is ahead of repo head={REPO_MIGRATION_HEAD!r} "
+                    "(rolled-back code on an upgraded DB; allowed under "
+                    "expand-contract)"
+                )
+            return _fail(
+                f"migration head mismatch: db={current!r} is not a revision in "
+                f"this repo's migration chain (repo head={REPO_MIGRATION_HEAD!r})"
+            )
     except Exception as exc:  # noqa: BLE001
         return _fail(f"migration check error: {exc}")
 
@@ -231,9 +362,10 @@ async def _check_runner() -> dict[str, Any]:
 async def _check_chat_model() -> dict[str, Any]:
     """At least one eligible (non-embedding) chat ModelConfig must exist."""
     try:
+        from sqlalchemy import func, select
+
         from app.db import AsyncSessionLocal
         from app.models.model_config import ModelConfig
-        from sqlalchemy import select, func
 
         async with AsyncSessionLocal() as db:
             count = await asyncio.wait_for(

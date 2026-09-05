@@ -30,20 +30,19 @@ pattern. Nothing here reaches for a live LLM, DB, or Qdrant.
 """
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 from app.agents.context_compaction import (
     _assemble_compacted,
     _split_for_compaction,
     compact_messages,
     estimate_messages_tokens,
-    estimate_tokens,
     should_compact,
 )
-from app.agents.output_spill import ArtifactHandle, spill as _spill_text
+from app.agents.output_spill import ArtifactHandle
+from app.agents.output_spill import spill as _spill_text
 from app.agents.token_budget import TokenBudget
-
 
 # Default body-after-prefix compaction threshold (fraction of input budget).
 _AUTO_COMPACT_FRACTION = 0.8

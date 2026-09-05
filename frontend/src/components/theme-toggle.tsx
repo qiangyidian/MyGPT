@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
  * Renders a stable placeholder until mounted to avoid hydration mismatch.
  */
 export function ThemeToggle() {
-  const { theme, setTheme } = useTheme();
+  const { theme, setTheme, resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => setMounted(true), []);
@@ -24,7 +24,9 @@ export function ThemeToggle() {
     );
   }
 
-  const isDark = theme === "dark";
+  // resolvedTheme accounts for theme === "system" (a system-dark user with
+  // the toggle showing `theme === "dark"` got inverted labels/actions).
+  const isDark = (resolvedTheme ?? theme) === "dark";
 
   return (
     <Button

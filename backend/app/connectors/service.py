@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.connectors.catalog import get_manifest
 from app.connectors.models import Connector
 from app.core.exceptions import AppException
-from app.core.security import encrypt_secret, decrypt_secret
+from app.core.security import decrypt_secret, encrypt_secret
 from app.observability import observe_counter, observe_span
 
 logger = logging.getLogger(__name__)
@@ -56,11 +56,39 @@ class ConnectorNotFoundError(Exception):
     """Raised when a tenant-scoped lookup misses (no row OR wrong tenant)."""
 
 
+class StdioConnectorForbiddenError(Exception):
+    """Raised when a non-admin tries to register a ``stdio`` connector.
+
+    A stdio connector's ``command_or_url`` is executed server-side via
+    ``asyncio.create_subprocess_exec`` — handing that to every C-end user is
+    an arbitrary-program-execution primitive on the host. stdio is therefore
+    admin-only; regular users are limited to remote (``http``) transports.
+    """
+
+
+# Transports the MCP layer can actually open (see McpServerConfig.transport).
+_ALLOWED_TRANSPORTS = frozenset({"stdio", "http", "sse"})
+
+
 class ConnectorService:
     """Encrypted, tenant-scoped connector CRUD."""
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
+
+    async def _owner_is_admin(self, user_id: uuid.UUID) -> bool:
+        """Whether the connector's owner carries the admin role.
+
+        Synchronous by design: callers sit inside async flows that already
+        hold a session, and the check runs against the identity-scoped role
+        column (no cache — a demoted admin must lose stdio immediately).
+        """
+        from sqlalchemy import select
+
+        from app.models import User
+
+        role = await self._db.scalar(select(User.role).where(User.id == user_id))
+        return bool(role == "admin")
 
     # ------------------------------------------------------------------ #
     # Create
@@ -77,12 +105,15 @@ class ConnectorService:
         transport: str | None = None,
         enabled: bool = False,
         extra: dict[str, Any] | None = None,
+        is_admin: bool = False,
     ) -> Connector:
         """Create a connector for ``user_id`` with credentials encrypted.
 
         The provider must exist in the catalog; the manifest is snapshotted
         onto the row. ``command_or_url``/``transport`` default to the
-        manifest's values.
+        manifest's values. ``stdio`` transports require ``is_admin`` (the
+        command would run as a server-side subprocess — see
+        :class:`StdioConnectorForbiddenError`).
         """
         manifest = get_manifest(provider)
         if manifest is None:
@@ -90,6 +121,16 @@ class ConnectorService:
 
         cmd = command_or_url or manifest.command_or_url
         txn = (transport or manifest.transport).lower()
+
+        if txn == "stdio" and not is_admin:
+            raise StdioConnectorForbiddenError(
+                "stdio connectors execute a program on the server and are "
+                "restricted to administrators; use a remote (http) connector"
+            )
+        if txn not in _ALLOWED_TRANSPORTS:
+            raise ValueError(
+                f"unsupported transport {txn!r} (allowed: {sorted(_ALLOWED_TRANSPORTS)})"
+            )
 
         if enabled:
             self._check_scopes(oauth_scopes, manifest.required_scopes)
@@ -119,7 +160,7 @@ class ConnectorService:
             if svc.enabled:
                 try:
                     await svc.record_connector(str(user_id))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.debug("record_connector failed for %s", user_id, exc_info=True)
         return conn
 
@@ -241,7 +282,7 @@ class ConnectorService:
             if svc.enabled:
                 try:
                     await svc.record_connector(str(user_id))
-                except Exception:  # noqa: BLE001 — quota accounting must never block enable
+                except Exception:
                     logger.debug("record_connector failed for %s", user_id, exc_info=True)
         observe_counter("connector.enables", 1, outcome="ok")
         return conn
@@ -304,7 +345,7 @@ class ConnectorService:
     # ------------------------------------------------------------------ #
     # Connector → McpServerConfig seam (per-tenant session wiring hook)
     # ------------------------------------------------------------------ #
-    def build_server_config(self, connector: Connector) -> Any:
+    async def build_server_config(self, connector: Connector) -> Any:
         """Materialize an :class:`McpServerConfig` for this connector row.
 
         The decrypted credentials are placed in the ``env`` under
@@ -314,8 +355,21 @@ class ConnectorService:
         manager would call this, hand the result to :class:`McpSession`, and
         register the discovered tools into that user's run-scoped registry via
         :func:`merge_mcp_tools`.
+
+        Defense in depth: a ``stdio`` connector owned by a non-admin is
+        refused here too (not just at create time) — the config build is the
+        last stop before ``create_subprocess_exec``, so a stdio row that
+        predates the create-time gate or was flipped by direct DB access
+        cannot spawn a process.
         """
         from app.agents.mcp_client import McpServerConfig  # local: avoid import cycle
+
+        if (connector.transport or "").lower() == "stdio" and not await self._owner_is_admin(
+            connector.user_id
+        ):
+            raise StdioConnectorForbiddenError(
+                f"stdio connector {connector.id} is admin-only; skipping"
+            )
 
         creds = self.decrypted_credentials(connector)
         env: dict[str, str] = {"MCP_CREDENTIALS": json.dumps(creds, sort_keys=True)}

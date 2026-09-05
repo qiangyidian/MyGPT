@@ -259,7 +259,7 @@ class FakeStageExecutor:
         # emits a success tool_result. {"tool": "db_query", "approval_id": <uuid>}
         approval: dict[str, Any] | None = None
 
-    def __init__(self, behaviors: dict[str, "FakeStageExecutor.Behavior"] | None = None) -> None:
+    def __init__(self, behaviors: dict[str, FakeStageExecutor.Behavior] | None = None) -> None:
         self.behaviors = behaviors or {}
         # Track which agents started/finished, for assertion helpers in tests.
         self.started: list[str] = []
@@ -397,7 +397,7 @@ async def _llm_usage_snapshot(agent: Any) -> dict[str, int | float] | None:
             value = await value
         mappings = _extract_usage_rounds(SimpleUsageSource(value))
         return aggregate_usage(mappings)
-    except Exception:  # noqa: BLE001 - usage collection is best-effort
+    except Exception:
         logger.debug("could not read CrewAI LLM usage summary", exc_info=True)
         return None
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import io
-import os
 import uuid
 from types import SimpleNamespace
 
@@ -157,7 +156,7 @@ async def test_extract_parses_text(db_session):
     conv = Conversation(user_id=_SEEDED, title="extract test")
     db_session.add(conv)
     await db_session.flush()
-    uf = UploadFile(filename="note.txt", file=io.BytesIO("the quick brown fox".encode("utf-8")))
+    uf = UploadFile(filename="note.txt", file=io.BytesIO(b"the quick brown fox"))
     att = await attachment_service.upload(
         db_session, user=SimpleNamespace(id=_SEEDED), conversation_id=conv.id, upload_file=uf
     )

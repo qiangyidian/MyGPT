@@ -25,8 +25,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.agents.policies.budget_policy import BudgetGuard
@@ -134,12 +135,12 @@ class StageContext:
 
     run_id: str
     loop: asyncio.AbstractEventLoop
-    budget_guard: "BudgetGuard | None" = None
+    budget_guard: BudgetGuard | None = None
     # Bounded but generous: structural events (agent_status/edge/run_status) are
     # few; tool events are the only high-frequency source. If this ever fills
     # (thousands of tool calls in one run), we coalesce + drop noisily-once
     # rather than block a worker thread.
-    queue: "asyncio.Queue[AgentEvent | None]" = field(
+    queue: asyncio.Queue[AgentEvent | None] = field(
         default_factory=lambda: asyncio.Queue(maxsize=_QUEUE_MAX)
     )
     # Set by the executor before each stage; read by adapters at tool-call time.
@@ -187,7 +188,7 @@ class StageContext:
         self.agent_id = agent_id
         self.task_id = task_id
 
-    def emit(self, event: "AgentEvent") -> None:
+    def emit(self, event: AgentEvent) -> None:
         """Thread-safe forward to the main-loop queue. Never blocks."""
         if getattr(event, "kind", None) == "tool_call" and self.budget_guard is not None:
             self.budget_guard.enter_tool_call()
@@ -238,7 +239,7 @@ class StageContext:
                     safe_usage, cost_usd=cost, usage_id=record_key
                 )
 
-    def _put_nowait(self, event: "AgentEvent") -> None:
+    def _put_nowait(self, event: AgentEvent) -> None:
         try:
             self.queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -262,7 +263,7 @@ class StageContext:
 
 
 def make_stage_context(
-    run_id: str, *, budget_guard: "BudgetGuard | None" = None
+    run_id: str, *, budget_guard: BudgetGuard | None = None
 ) -> StageContext:
     """Build a StageContext bound to the currently-running event loop."""
     return StageContext(

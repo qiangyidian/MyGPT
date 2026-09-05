@@ -21,8 +21,10 @@ import sys
 
 import structlog
 
+from app.core.config import get_settings
 
-def _redact_processor(logger, method_name, event_dict):  # noqa: ANN001
+
+def _redact_processor(logger, method_name, event_dict):
     """structlog processor: redact sensitive keys/values before rendering.
 
     Routes the event dict through :func:`sanitize_attributes` so a leaked
@@ -37,7 +39,21 @@ def _redact_processor(logger, method_name, event_dict):  # noqa: ANN001
         return event_dict
 
 
-def configure_logging(level: str = "INFO") -> None:
+def configure_logging(level: str = "INFO", *, json_output: bool | None = None) -> None:
+    """Configure structlog for the API, worker and recovery processes.
+
+    ``json_output`` defaults to "on in non-dev": human-readable console output
+    in development, machine-parseable JSON in production (the previous
+    unconditional ConsoleRenderer left production logs in three different
+    plain-text formats across the three processes — uncollectable/uncorrelatable).
+    """
+    if json_output is None:
+        json_output = not get_settings().is_dev
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if json_output
+        else structlog.dev.ConsoleRenderer()
+    )
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
     structlog.configure(
         processors=[
@@ -47,7 +63,7 @@ def configure_logging(level: str = "INFO") -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer(),
+            renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level, logging.INFO)),
         cache_logger_on_first_use=True,

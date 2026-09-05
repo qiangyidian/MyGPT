@@ -110,7 +110,7 @@ def parse_patch(text: str) -> list[FileOp]:
                 continue
             if current.action == "add":
                 # Add-file bodies are '+' lines (strip a single leading '+').
-                current.content.append(raw[1:] if raw.startswith("+") else raw)
+                current.content.append(raw.removeprefix("+"))
             else:  # update — classify by leading marker
                 if hunk is None:
                     hunk = Hunk()

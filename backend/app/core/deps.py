@@ -5,7 +5,6 @@ import uuid
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import ACCESS_TOKEN_TYPE, decode_token
@@ -36,6 +35,22 @@ async def get_current_user(
     user = await db.get(User, uuid.UUID(user_id))
     if user is None:
         raise HTTPException(CRED, "User not found")
+    # Disabled accounts lose access IMMEDIATELY (previously a deactivation
+    # only blocked new logins — already-issued access tokens kept working for
+    # their full 30-minute lifetime).
+    if not user.is_active:
+        raise HTTPException(CRED, "Account is disabled")
+    # Global kill-switch: bumping the user's token_version invalidates every
+    # access token issued before it.
+    if "ver" in payload and int(payload.get("ver") or 0) != int(
+        getattr(user, "token_version", 0) or 0
+    ):
+        raise HTTPException(CRED, "Token revoked")
+    # Logout/kill-switch blacklist (per-token jti; best-effort).
+    from app.services.auth_service import is_access_revoked
+
+    if await is_access_revoked(payload):
+        raise HTTPException(CRED, "Token revoked")
     return user
 
 

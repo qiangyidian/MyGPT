@@ -1,0 +1,64 @@
+[project]
+name = "mygpt-backend"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness-first default set (E/F + common bugbear/pyupgrade). Stylistic
+# rules that fight patterns deliberately used throughout this codebase are
+# ignored below — each with the reason, so re-enabling later is a decision,
+# not an accident.
+select = ["E", "F", "W", "B", "UP", "SIM", "RUF", "TRY", "C4", "RET", "PL"]
+ignore = [
+    # FastAPI's canonical pattern: Depends(...) in parameter defaults.
+    "B008",
+    # Deliberate "best-effort, never raise" guards around logging/audit/quota
+    # side channels (documented in each site).
+    "S110",
+    "BLE001",
+    # Legacy stylistic debt: kept as-is until a dedicated cleanup pass.
+    "RUF012",
+    "RUF022",
+    "RUF059",
+    "F841",
+    "TRY401",
+    "TRY004",
+    "TRY201",
+    "TRY203",
+    "TRY300",
+    "TRY301",
+    "TRY002",
+    "TRY003",
+    "SIM103",
+    "SIM102",
+    "SIM105",
+    "SIM108",
+    "SIM115",
+    "SIM117",
+    "RET504",
+    "RET505",
+    "RET507",
+    "RET508",
+    "PLR2004",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "PLW1510",
+    "PLW2901",
+    "PLR5501",
+    "PLB003",
+    "C408",
+    "UP038",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are the point; long fixtures are fine.
+"tests/*" = ["B011", "B017", "PLW0603"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20

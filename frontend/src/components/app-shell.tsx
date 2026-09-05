@@ -2,15 +2,18 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Menu, X } from "lucide-react";
+import { Menu, WifiOff, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Sidebar } from "@/components/sidebar";
 import { AgentGlobalProgress } from "@/components/agents/agent-global-progress";
 import { useAuth } from "@/hooks/useAuth";
 import { useConversationDetail, useConversations } from "@/hooks/useConversations";
 import { useProjects } from "@/hooks/useProjects";
+import { useOnlineStatus } from "@/hooks/useOnlineStatus";
+import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useModels } from "@/hooks/useModels";
 import { ApiError } from "@/lib/api";
 import {
@@ -50,6 +53,7 @@ export function AppShell({ children }: AppShellProps) {
   const searchParams = useSearchParams();
   const { user, isLoading: authLoading, logout } = useAuth();
 
+  const online = useOnlineStatus();
   const [viewMode, setViewMode] = useState<"active" | "archived">("active");
   const {
     conversations,
@@ -204,10 +208,44 @@ export function AppShell({ children }: AppShellProps) {
     await logout();
   };
 
+  // Desktop power-user shortcuts: Cmd/Ctrl+K search, Cmd/Ctrl+Shift+O new chat.
+  useKeyboardShortcuts({
+    onNewChat: () => {
+      void handleNewChat();
+    },
+    onSearch: () => {
+      document.getElementById("conversation-search")?.focus();
+    },
+    onCloseSidebar: () => setSidebarOpen(false),
+  });
+
   if (!mounted || authLoading) {
+    // Structure-matched skeleton: previews the two-pane layout so the flash
+    // of "everything moved" after auth resolves is much smaller than a bare
+    // centered spinner.
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <p className="text-sm text-muted-foreground">加载中…</p>
+      <div className="app-shell-height flex overflow-hidden bg-background">
+        <div className="hidden w-72 shrink-0 border-r border-border p-3 md:block">
+          <Skeleton className="h-9 w-full" />
+          <div className="mt-4 space-y-2">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <Skeleton key={i} className="h-7 w-full" style={{ opacity: 1 - i * 0.12 }} />
+            ))}
+          </div>
+        </div>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="border-b border-border px-4 py-3">
+            <Skeleton className="h-5 w-28" />
+          </div>
+          <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-6">
+            <Skeleton className="h-24 w-3/4" />
+          </div>
+          <div className="px-4 pb-6">
+            <div className="mx-auto w-full max-w-3xl">
+              <Skeleton className="h-14 w-full rounded-xl" />
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -262,6 +300,17 @@ export function AppShell({ children }: AppShellProps) {
           </Button>
           <span className="text-sm font-medium">AI 对话</span>
         </div>
+
+        {!online && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center justify-center gap-2 bg-amber-500/15 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+          >
+            <WifiOff className="h-3.5 w-3.5" />
+            网络连接已断开，正在显示缓存内容 — 恢复联网后可继续对话
+          </div>
+        )}
 
         {children({ activeConversationId: activeId, setActiveConversationId })}
       </div>

@@ -20,11 +20,11 @@ if settings.DATABASE_URL.startswith("sqlite"):
     from sqlalchemy.ext.compiler import compiles
 
     @compiles(UUID, "sqlite")
-    def _compile_uuid_sqlite(type_, compiler, **kw):  # noqa: ANN001
+    def _compile_uuid_sqlite(type_, compiler, **kw):
         return "VARCHAR(36)"
 
     @compiles(JSONB, "sqlite")
-    def _compile_jsonb_sqlite(type_, compiler, **kw):  # noqa: ANN001
+    def _compile_jsonb_sqlite(type_, compiler, **kw):
         return "JSON"
 
 

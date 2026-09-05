@@ -1,9 +1,10 @@
 """Pydantic schemas (request/response DTOs). Re-exported for convenient imports."""
+from app.schemas.admin import AdminUserUpdate, AuditLogOut, SystemStatus, UsageStat
 from app.schemas.agent import (
+    ActionResult,
     AgentRunOut,
     AgentStepOut,
     ApproveRequest,
-    ActionResult,
     PlanStepIn,
     PlanUpdateRequest,
     RejectRequest,
@@ -11,8 +12,8 @@ from app.schemas.agent import (
     ToolApprovalOut,
     ToolCallAuditOut,
 )
-from app.schemas.admin import AuditLogOut, AdminUserUpdate, SystemStatus, UsageStat
 from app.schemas.auth import (
+    DeleteAccountRequest,
     EmailCodeRequest,
     LoginRequest,
     RefreshResponse,
@@ -20,6 +21,9 @@ from app.schemas.auth import (
     TokenResponse,
     UserOut,
 )
+from app.schemas.chat import ChatRequest, Citation
+from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
+from app.schemas.common import ORMModel
 from app.schemas.connector import (
     ConnectorCreate,
     ConnectorOut,
@@ -27,9 +31,6 @@ from app.schemas.connector import (
     ConnectorUpdate,
     ProviderManifestOut,
 )
-from app.schemas.chat import ChatRequest, Citation
-from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
-from app.schemas.common import ORMModel
 from app.schemas.conversation import (
     ConversationBranchRequest,
     ConversationCreate,
@@ -44,12 +45,6 @@ from app.schemas.knowledge_base import (
     KnowledgeBaseOut,
 )
 from app.schemas.memory import MemoryOut, MemoryUpdate
-from app.schemas.user_memory import (
-    UserMemoryBulkAction,
-    UserMemoryEdit,
-    UserMemoryOut,
-    UserMemoryPropose,
-)
 from app.schemas.message import MessageOut
 from app.schemas.model_config import (
     ModelConfigCreate,
@@ -64,6 +59,12 @@ from app.schemas.tool import (
     ToolTestRequest,
     ToolTestResult,
 )
+from app.schemas.user_memory import (
+    UserMemoryBulkAction,
+    UserMemoryEdit,
+    UserMemoryOut,
+    UserMemoryPropose,
+)
 
 __all__ = [
     # common
@@ -74,6 +75,7 @@ __all__ = [
     "PlanStepIn", "PlanUpdateRequest", "RunInstructionRequest",
     # auth
     "RegisterRequest", "LoginRequest", "TokenResponse", "RefreshResponse", "UserOut",
+    "DeleteAccountRequest",
     "EmailCodeRequest",
     # model config
     "ModelConfigCreate", "ModelConfigUpdate", "ModelConfigOut", "ModelTestResult",

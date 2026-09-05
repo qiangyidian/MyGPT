@@ -17,7 +17,6 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +84,7 @@ class ApprovalCoordinator:
     def release(self, approval_id: uuid.UUID) -> None:
         self._waiting.pop(approval_id, None)
 
-    def waiting_for_run(self, run_id: uuid.UUID) -> Optional[WaitingRun]:
+    def waiting_for_run(self, run_id: uuid.UUID) -> WaitingRun | None:
         for wr in self._waiting.values():
             if wr.run_id == run_id and wr.decision == "pending":
                 return wr

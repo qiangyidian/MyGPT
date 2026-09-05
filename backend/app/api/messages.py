@@ -15,7 +15,6 @@ from app.core.deps import get_current_user
 from app.db import get_db
 from app.models import Conversation, Message, MessageFeedback, User
 from app.schemas.feedback import MessageFeedbackOut, MessageFeedbackRequest
-from sqlalchemy import select
 
 router = APIRouter(prefix="/api/messages", tags=["messages"])
 

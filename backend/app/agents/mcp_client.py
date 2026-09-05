@@ -37,7 +37,7 @@ class McpServerConfig:
     transport: str = "stdio"  # "stdio" | "sse" | "http"
 
 
-def _default_session_factory(config: "McpServerConfig") -> McpSession:
+def _default_session_factory(config: McpServerConfig) -> McpSession:
     """Default session builder: a real :class:`McpSession` over the config."""
     return McpSession(config)
 
@@ -49,7 +49,7 @@ class McpClientRegistry:
         self,
         servers: list[McpServerConfig] | None = None,
         *,
-        session_factory: "Any | None" = None,
+        session_factory: Any | None = None,
     ) -> None:
         self._servers = list(servers or [])
         self._catalog = McpCatalog()
@@ -82,7 +82,7 @@ class McpClientRegistry:
         for srv in self._servers:
             try:
                 await self._connect_one(srv)
-            except Exception:  # noqa: BLE001 — isolate per-server failures
+            except Exception:
                 logger.warning(
                     "mcp server %s failed to connect; skipped", srv.name, exc_info=True
                 )
@@ -128,7 +128,7 @@ class McpClientRegistry:
         for name, session in list(self._sessions.items()):
             try:
                 await session.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("mcp disconnect %s failed", name, exc_info=True)
         self._sessions.clear()
         self._connected = False
@@ -138,7 +138,9 @@ class McpClientRegistry:
 # Gateway routing: wrap each catalogued MCP tool as a BaseTool so it flows
 # through ToolGateway (approval, audit, truncation, budget) like a builtin.
 # --------------------------------------------------------------------------- #
-from app.tools.base import BaseTool as _BaseTool  # noqa: E402  (late to keep the cycle clean)
+from app.tools.base import (
+    BaseTool as _BaseTool,
+)
 
 
 class McpToolWrapper(_BaseTool):
@@ -234,7 +236,7 @@ def build_gateway_tools(
 
 def merge_mcp_tools(
     target: Any,
-    mcp_registry: "McpClientRegistry | None" = None,
+    mcp_registry: McpClientRegistry | None = None,
 ) -> int:
     """Register every catalogued MCP tool into ``target`` (a ToolRegistry).
 
@@ -254,7 +256,7 @@ def merge_mcp_tools(
         try:
             target.register(wrapper)
             count += 1
-        except Exception:  # noqa: BLE001 — registration must not break the turn
+        except Exception:
             logger.warning("failed to register mcp tool %s", getattr(wrapper, "name", "?"), exc_info=True)
     return count
 
@@ -263,21 +265,21 @@ def merge_mcp_tools(
 # Process singleton for the live (static) MCP registry, populated by main.py
 # lifespan and read by the runtimes. Mirrors the approval_bus singleton pattern.
 # --------------------------------------------------------------------------- #
-_LIVE_MCP_REGISTRY: "McpClientRegistry | None" = None
+_LIVE_MCP_REGISTRY: McpClientRegistry | None = None
 
 
-def set_live_mcp_registry(registry: "McpClientRegistry | None") -> None:
+def set_live_mcp_registry(registry: McpClientRegistry | None) -> None:
     """Populate the process-wide live MCP registry (called from main lifespan)."""
     global _LIVE_MCP_REGISTRY
     _LIVE_MCP_REGISTRY = registry
 
 
-def get_live_mcp_registry() -> "McpClientRegistry | None":
+def get_live_mcp_registry() -> McpClientRegistry | None:
     """Return the live MCP registry set by main.py, or None (no-op guard)."""
     return _LIVE_MCP_REGISTRY
 
 
-def _live_mcp_registry() -> "McpClientRegistry | None":
+def _live_mcp_registry() -> McpClientRegistry | None:
     return _LIVE_MCP_REGISTRY
 
 

@@ -4,9 +4,8 @@ handoff shape, the reviewer logic, and that plain chat never spawns a crew.
 """
 from __future__ import annotations
 
+import types
 import uuid
-
-import pytest
 
 from app.agents.crews import (
     AnalystFinding,
@@ -23,7 +22,6 @@ from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.schemas import ExecutionMode
 from app.core.security import encrypt_secret
 from app.models import ModelConfig
-import types
 
 
 # --------------------------------------------------------------------------- #

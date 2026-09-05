@@ -1,10 +1,12 @@
 """Import every model so SQLAlchemy registers them on Base.metadata
 (matters for create_all and alembic autogenerate)."""
+# Task 9: encrypted tenant-scoped MCP connectors.
+from app.connectors.models import Connector
 from app.models.agent_attempt import AgentAttempt
-from app.models.artifact import Artifact
-from app.models.audit_event import AuditEvent
 from app.models.agent_run import AgentRun
 from app.models.agent_step import AgentStep
+from app.models.artifact import Artifact
+from app.models.audit_event import AuditEvent
 from app.models.chat_attachment import ChatAttachment
 from app.models.conversation import Conversation
 from app.models.conversation_memory import ConversationMemory
@@ -22,9 +24,6 @@ from app.models.tool_approval import ToolApproval
 from app.models.tool_call import ToolCall
 from app.models.user import User
 from app.models.user_memory import UserMemory
-
-# Task 9: encrypted tenant-scoped MCP connectors.
-from app.connectors.models import Connector
 
 __all__ = [
     "AuditEvent",

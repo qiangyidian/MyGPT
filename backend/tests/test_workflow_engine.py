@@ -15,7 +15,6 @@ injected stubs (deterministic, no model calls). Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 

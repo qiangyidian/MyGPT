@@ -306,7 +306,7 @@ async def test_build_server_config_materializes_decrypted_creds(db_session, two_
     )
     await db_session.commit()
 
-    cfg = svc.build_server_config(conn)
+    cfg = await svc.build_server_config(conn)
     assert isinstance(cfg, _Cfg)
     assert cfg.transport == conn.transport
     assert cfg.command == conn.command_or_url

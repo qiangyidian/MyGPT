@@ -10,7 +10,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncIterator, Literal
+from collections.abc import AsyncIterator
+from typing import Any, Literal
 
 import httpx
 from tenacity import (
@@ -23,13 +24,13 @@ from tenacity import (
 from app.core.config import get_settings
 from app.observability import observe_counter, observe_histogram, observe_span
 from app.providers.base import (
+    PROVIDER_ERR_NETWORK,
+    PROVIDER_ERR_TIMEOUT,
     ChatDelta,
     ChatOptions,
     ChatResult,
     FinishReason,
     ModelProvider,
-    PROVIDER_ERR_NETWORK,
-    PROVIDER_ERR_TIMEOUT,
     ProviderError,
     ToolCallDef,
     admit_provider_payload,

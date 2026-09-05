@@ -219,8 +219,9 @@ async def test_worker_executes_and_acks(db_session):
 
         # Lease released.
         leases = LeaseStore(s)
-        from app.models import RunLease
         from sqlalchemy import select
+
+        from app.models import RunLease
         row = (
             await s.execute(select(RunLease).where(RunLease.run_id == run.id))
         ).scalar_one_or_none()
@@ -228,8 +229,14 @@ async def test_worker_executes_and_acks(db_session):
 
 
 @pytest.mark.asyncio
-async def test_worker_transient_failure_marks_failed(db_session):
-    """A transient exception in the executor marks the run failed + acks."""
+async def test_worker_transient_failure_hands_run_to_recovery(db_session):
+    """A transient exception releases the lease WITHOUT failing/acking the run.
+
+    Recovery's bounded retry budget owns the run from here: the expired lease
+    is requeued and only marked failed after RUN_MAX_RETRIES. (The old
+    behaviour failed the run on the FIRST exception — one DB blip surfaced to
+    the user as a failed reply.)
+    """
     from tests.conftest import TestSessionLocal
 
     run = await _make_run(db_session, status="pending")
@@ -250,11 +257,11 @@ async def test_worker_transient_failure_marks_failed(db_session):
     assert processed == run.id
 
     async with TestSessionLocal() as s:
-        failed = await s.get(AgentRun, run.id)
-        assert failed.status == "failed"
-        assert "transient boom" in (failed.error_message or "")
-    # Queue is empty (acked, not requeued by the worker).
-    assert await queue.pending_ids() == []
+        not_failed = await s.get(AgentRun, run.id)
+        assert not_failed.status != "failed", not_failed.status
+    # Queue: the message was NOT acked — it stays in-flight until recovery's
+    # lease-expiry path requeues it.
+    assert run.id in queue._in_flight
 
 
 @pytest.mark.asyncio

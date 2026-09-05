@@ -94,9 +94,9 @@ def other_user_id():
 async def _persist_user(db_session, uid):
     """Ensure a user row exists for the FK (seeded user already exists in
     conftest; only create for ad-hoc ids)."""
-    from app.models import User
-
     from sqlalchemy import select
+
+    from app.models import User
 
     row = await db_session.execute(select(User).where(User.id == uid))
     if row.scalar_one_or_none() is None:

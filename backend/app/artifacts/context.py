@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import contextvars
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # token type from ContextVar.set; opaque to callers.
 _ArtifactCtx = dict | None
-_ARTIFACT_SPILL_CTX: "contextvars.ContextVar[_ArtifactCtx]" = contextvars.ContextVar(
+_ARTIFACT_SPILL_CTX: contextvars.ContextVar[_ArtifactCtx] = contextvars.ContextVar(
     "artifact_spill_ctx", default=None
 )
 

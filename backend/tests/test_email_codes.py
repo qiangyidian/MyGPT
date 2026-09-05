@@ -55,6 +55,10 @@ class FakeRedis:
             return True
         return False
 
+    async def incr(self, key):
+        self.kv[key] = str(int(self.kv.get(key, "0")) + 1)
+        return int(self.kv[key])
+
     async def zcard(self, key):
         return len(self.zsets.get(key, {}))
 

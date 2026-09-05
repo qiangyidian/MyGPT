@@ -22,8 +22,9 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -34,23 +35,23 @@ from app.agents.approval_bus import approval_bus
 from app.agents.events import EventStore
 from app.agents.run_controls import get as get_run_control
 from app.agents.workflow import controls as durable_controls
-from app.services import audit_service
 from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import AgentRun, AgentStep, ToolApproval, ToolCall, User
 from app.schemas import (
+    ActionResult,
     AgentRunOut,
     AgentStepOut,
     ApproveRequest,
-    ActionResult,
     PlanUpdateRequest,
     RejectRequest,
     RunInstructionRequest,
     ToolApprovalOut,
     ToolCallAuditOut,
 )
+from app.services import audit_service
 
 router = APIRouter(prefix="/api/agent-runs", tags=["agent-runs"])
 

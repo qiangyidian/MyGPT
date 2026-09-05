@@ -11,8 +11,9 @@ Kept separate from the runtime so the discipline is unit-testable with no LLM.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable, Literal
+from typing import Literal
 
 StepStatus = Literal["pending", "in_progress", "completed"]
 _VALID = {"pending", "in_progress", "completed"}

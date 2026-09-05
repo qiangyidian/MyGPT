@@ -13,9 +13,7 @@ M1 — A client disconnecting from the events stream does NOT cancel the run —
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
@@ -26,7 +24,7 @@ from app.agents.workflow.queue import InMemoryQueue, set_run_queue
 from app.agents.workflow.repository import LeaseStore
 from app.agents.workflow.worker import RunWorker
 from app.core.config import get_settings
-from app.models import AgentRun, Conversation, Message, RunLease
+from app.models import AgentRun, Conversation, Message
 from tests.conftest import TestSessionLocal, auth_headers
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -181,7 +179,7 @@ async def test_inline_mode_unchanged_by_dispatch(client, db_session, monkeypatch
 async def test_lease_loss_aborts_execution_without_acking(db_session):
     """When the renewal loop detects lease loss, the worker stops appending
     events, does NOT finalize, and does NOT ack — recovery owns the run."""
-    from app.models import AgentRun, Conversation, Message
+    from app.models import AgentRun
 
     conv = Conversation(user_id=_SEEDED_USER, title="lease-loss-test")
     db_session.add(conv)

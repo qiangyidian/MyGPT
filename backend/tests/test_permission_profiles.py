@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import pytest
 
+from app.agents.environments import (
+    Environment,
+    EnvironmentSet,
+)
 from app.agents.permission_profiles import (
     PermissionProfileError,
     ProfileDecl,
@@ -12,10 +16,6 @@ from app.agents.permission_profiles import (
     workspace_requires_approval,
     workspace_requires_write_capability,
     workspace_risk_level,
-)
-from app.agents.environments import (
-    Environment,
-    EnvironmentSet,
 )
 
 

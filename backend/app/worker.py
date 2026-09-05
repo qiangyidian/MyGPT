@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 
 async def main() -> None:
     settings = get_settings()
-    logging.basicConfig(
-        level="DEBUG" if settings.is_dev else "INFO",
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Structured logging shared with the API process (JSON in prod) so all
+    # three processes emit one parseable, correlation-id-capable format.
+    from app.core.logging import configure_logging
+
+    configure_logging("DEBUG" if settings.is_dev else "INFO")
     logger.info(
         "worker starting (BACKGROUND_WORKER=%s, stream=%s)",
         settings.BACKGROUND_WORKER,

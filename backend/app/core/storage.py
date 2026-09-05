@@ -8,7 +8,6 @@ without touching call sites.
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path

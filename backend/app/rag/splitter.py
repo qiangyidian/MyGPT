@@ -8,7 +8,6 @@ mid-sentence more than necessary.
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 import tiktoken
 

@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 # The live-golden credential gate. Present => run; absent => skip.
 _LIVE_CREDENTIAL_ENV = "EVAL_LIVE_MODEL_API_KEY"

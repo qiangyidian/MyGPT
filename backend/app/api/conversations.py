@@ -6,6 +6,7 @@ is not leaked. Admins may access any conversation.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -112,21 +113,26 @@ async def create_conversation(
 @router.get("/{conv_id}", response_model=ConversationDetail)
 async def get_conversation(
     conv_id: uuid.UUID,
+    before: datetime | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationDetail:
     conv = await _load_owned(db, conv_id, user)
     # Load a bounded window of recent messages (oldest-first) rather than
     # selectinload-ing the entire history, which could serialize thousands of
-    # rows for a long conversation.
-    msg_rows = (
-        await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conv.id)
-            .order_by(Message.created_at.desc(), Message.id.desc())
-            .limit(_DETAIL_MESSAGE_WINDOW)
-        )
-    ).scalars().all()
+    # rows for a long conversation. ``before`` (ISO timestamp cursor) pages
+    # BACKWARD through history: the response's first message's created_at can
+    # be passed as ``before`` to fetch the next older window — previously
+    # messages beyond the newest 200 were unreachable through the API.
+    stmt = (
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(_DETAIL_MESSAGE_WINDOW)
+    )
+    if before is not None:
+        stmt = stmt.where(Message.created_at < before)
+    msg_rows = (await db.execute(stmt)).scalars().all()
     # Build from the flat ConversationOut dump — validating the ORM object
     # directly would touch the lazy `messages` relationship.
     detail = ConversationDetail(
@@ -242,11 +248,29 @@ async def delete_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     conv = await _load_owned(db, conv_id, user)
-    # Clean up attachment file bytes + per-attachment RAG vectors BEFORE the FK
-    # CASCADE removes the rows — otherwise deleting a conversation leaks every
-    # attachment's file on disk forever (cascade only deletes DB rows).
+    # Commit the DB deletion FIRST, then clean up files/vectors. The previous
+    # order (delete files → then commit rows) lost the files permanently if
+    # the commit failed or the process died in between: the rows survived
+    # pointing at vanished blobs. Now a crash leaves orphan FILES (harmless,
+    # reclaimable by the retention sweeper) instead of orphan rows.
+    from sqlalchemy import select as _select
+
+    from app.models.chat_attachment import ChatAttachment
     from app.services import attachment_service
 
-    await attachment_service.delete_for_conversation(db, conv.id)
+    atts = (
+        await db.execute(
+            _select(ChatAttachment.id, ChatAttachment.storage_key).where(
+                ChatAttachment.conversation_id == conv.id
+            )
+        )
+    ).all()
+    attachment_ids = [row[0] for row in atts]
+    storage_keys = [row[1] for row in atts]
+
     await db.delete(conv)
     await db.commit()
+    try:
+        await attachment_service.delete_files_for_keys(storage_keys, attachment_ids)
+    except Exception:  # noqa: BLE001 — rows are gone; files are swept later
+        pass

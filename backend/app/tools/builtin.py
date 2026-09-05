@@ -646,7 +646,10 @@ class DbQueryTool(BaseTool):
         # Defense in depth: the ToolGateway also validates, but this path is
         # reached directly by /api/tools/test, so enforce the same hardening
         # here. Rejects multi-statement, DML/DDL, and session-control keywords.
-        from app.agents.policies.tool_policy import UnsafeSQLError, validate_readonly_sql
+        from app.agents.policies.tool_policy import (
+            UnsafeSQLError,
+            validate_readonly_sql,
+        )
 
         try:
             sql = validate_readonly_sql(sql)
@@ -780,9 +783,9 @@ def _jsonable(value: Any) -> Any:
 
 __all__ = [
     "DateTimeNowTool",
-    "HttpGetTool",
-    "WebSearchTool",
-    "PythonExecTool",
     "DbQueryTool",
     "FileAnalyzeTool",
+    "HttpGetTool",
+    "PythonExecTool",
+    "WebSearchTool",
 ]

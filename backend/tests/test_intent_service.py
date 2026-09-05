@@ -12,8 +12,8 @@ import pytest
 
 from app.agents.context_fragments import IntentContextInput, assemble_context_fragments
 from app.agents.intent_service import IntentClassifierConfig, IntentService
-from app.providers.base import ChatResult, ProviderError
 from app.model_capabilities import ModelCapabilities
+from app.providers.base import ChatResult, ProviderError
 from app.providers.mock import MockProvider
 
 

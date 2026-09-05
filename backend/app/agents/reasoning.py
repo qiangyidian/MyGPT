@@ -7,8 +7,8 @@ erroring, so a newer backend never breaks an older client.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 # Canonical effort tiers (Codex's ladder). Anything else parses to a custom tier.
 CANONICAL_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")

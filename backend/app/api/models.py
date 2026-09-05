@@ -13,11 +13,17 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.deps import get_current_user
 from app.core.security import decrypt_secret, encrypt_secret, mask_secret
+from app.core.ssrf import EndpointBlockedError, assert_public_http_url
 from app.db import get_db
 from app.models import ModelConfig, User
-from app.schemas import ModelConfigCreate, ModelConfigOut, ModelConfigUpdate, ModelTestResult
-from app.core.deps import get_current_user
+from app.schemas import (
+    ModelConfigCreate,
+    ModelConfigOut,
+    ModelConfigUpdate,
+    ModelTestResult,
+)
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -30,6 +36,30 @@ def _looks_like_vision_model(model_name: str) -> bool:
     kws = (get_settings().VISION_MODEL_KEYWORDS or "").lower().split(",")
     name = (model_name or "").lower()
     return any(k.strip() and k.strip() in name for k in kws)
+
+
+def _validate_endpoint_url(url: str, user: User) -> None:
+    """SSRF guard for a user-supplied ``api_base_url`` (400 on violation).
+
+    Shape rules (scheme / no embedded credentials) always apply. The private-
+    address resolution check is skipped for admins, dev/test, and the
+    ``ALLOW_PRIVATE_MODEL_ENDPOINTS`` opt-in — self-hosted in-cluster models
+    (vLLM/Ollama on private addresses) are an admin deployment concern.
+    """
+    settings = get_settings()
+    try:
+        assert_public_http_url(
+            url,
+            is_admin=user.role == "admin",
+            allow_private=(
+                # dev/test bypass: local Ollama/vLLM on private addresses is
+                # the documented workflow and the test suite is offline.
+                settings.ENV in ("dev", "test")
+                or bool(settings.ALLOW_PRIVATE_MODEL_ENDPOINTS)
+            ),
+        )
+    except EndpointBlockedError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
 
 def _to_out(cfg: ModelConfig) -> ModelConfigOut:
@@ -100,6 +130,7 @@ async def create_model(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ModelConfigOut:
+    _validate_endpoint_url(payload.api_base_url, user)
     cfg = ModelConfig(
         user_id=user.id,
         name=payload.name,
@@ -143,6 +174,8 @@ async def update_model(
         raise HTTPException(FORBID, "Only admins can edit system-wide configs")
 
     data = payload.model_dump(exclude_unset=True)
+    if data.get("api_base_url"):
+        _validate_endpoint_url(data["api_base_url"], user)
     if data.get("supports_tools") is False:
         data["supports_parallel_tools"] = False
     # api_key is write-only and never echoed; empty string means "leave unchanged".
@@ -184,10 +217,11 @@ async def test_model(
 ) -> ModelTestResult:
     """Smoke-test a config by issuing a tiny chat completion against the provider."""
     cfg = await _load_owned_or_shared(db, cfg_id, user)
+    _validate_endpoint_url(cfg.api_base_url, user)
 
     # Imported lazily so a missing contract at import time never blocks the router.
-    from app.providers.registry import get_provider_for_config
     from app.providers.base import ChatOptions, ProviderError
+    from app.providers.registry import get_provider_for_config
 
     start = time.perf_counter()
     try:
@@ -204,7 +238,7 @@ async def test_model(
         return ModelTestResult(ok=True, latency_ms=latency, sample=(result.content or "")[:200])
     except ProviderError as exc:
         latency = int((time.perf_counter() - start) * 1000)
-        return ModelTestResult(ok=False, latency_ms=latency, error=str(exc))
+        return ModelTestResult(ok=False, latency_ms=latency, error=str(exc)[:300])
     except Exception as exc:  # noqa: BLE001 — surface any failure to the caller
         latency = int((time.perf_counter() - start) * 1000)
-        return ModelTestResult(ok=False, latency_ms=latency, error=str(exc))
+        return ModelTestResult(ok=False, latency_ms=latency, error=f"{type(exc).__name__}: {exc}"[:300])

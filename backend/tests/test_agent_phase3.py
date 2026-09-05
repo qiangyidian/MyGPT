@@ -10,21 +10,17 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 
 import pytest
 
 from app.agents.approval_coordinator import (
     ApprovalCoordinator,
-    WaitingRun,
-    approval_coordinator,
 )
 from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.policies.approval_policy import arguments_hash, expiry_from_now
 from app.models import (
     AgentRun,
-    AgentStep,
     Conversation,
     Message,
     ToolApproval,
@@ -49,6 +45,14 @@ async def test_coordinator_approve_resumes_wait():
     asyncio.create_task(_decide())
     wr = await coord.wait(ap_id, timeout=2)
     assert wr.decision == "approved"
+
+
+
+def _admin_principal():
+    """Admin stand-in for gateway tests: db_query is admin-only in prod, and
+    these tests exercise the approval machinery, not the environment gate."""
+    from types import SimpleNamespace
+    return SimpleNamespace(role="admin", id=_SEEDED_USER)
 
 
 async def test_coordinator_reject():
@@ -107,7 +111,7 @@ async def test_gateway_resume_after_approval(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     args = {"sql": "SELECT 1"}
     first = await gw.execute(tool_call_id="c", tool_name="db_query", arguments=args)

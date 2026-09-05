@@ -15,13 +15,14 @@ import secrets
 
 from app.core.config import get_settings
 from app.core.redis import get_redis
-from app.services.mail_service import MailServiceError, send_verification_email
+from app.services.mail_service import send_verification_email
 
 logger = logging.getLogger(__name__)
 
 _CODE_NAMESPACE = "mychat:email_code"
 _INTERVAL_NAMESPACE = "mychat:email_code_interval"
 _BURST_NAMESPACE = "mychat:email_code_burst"
+_ATTEMPT_NAMESPACE = "mychat:email_code_attempts"
 
 
 class EmailCodeError(Exception):
@@ -87,15 +88,25 @@ async def request_code(email: str, purpose: str = "register") -> dict:
 
     payload: dict = {"sent": True}
     # Dev/test only: echo the code when SMTP is off (never in production).
-    if not settings.MAIL_ENABLED and settings.ENV != "production":
+    # MUST key off is_prod — ENV values are dev|test|prod, and comparing
+    # against a hand-typed "production" once silently disabled this guard.
+    if not settings.MAIL_ENABLED and not settings.is_prod:
         payload["debug_code"] = code
     return payload
 
 
 async def verify_and_consume(email: str, code: str, purpose: str = "register") -> bool:
-    """Constant-time compare + single-use consumption. True when valid."""
+    """Constant-time compare + single-use consumption. True when valid.
+
+    Brute-force guard: failed comparisons are counted per address (counter
+    lives as long as the code). At ``EMAIL_CODE_MAX_ATTEMPTS`` failures the
+    pending code is invalidated and :class:`EmailCodeError` is raised — the
+    user must request a fresh code, so a 6-digit code cannot be swept within
+    its TTL window.
+    """
     import hmac
 
+    settings = get_settings()
     email_n = _normalize(email)
     redis = get_redis()
     key = _key(_CODE_NAMESPACE, email_n)
@@ -108,7 +119,17 @@ async def verify_and_consume(email: str, code: str, purpose: str = "register") -
         # Clear the resend interval so a fresh code can be requested soon
         # after a successful registration (the address is verified now).
         await redis.delete(_key(_INTERVAL_NAMESPACE, email_n))
-    return ok
+        await redis.delete(_key(_ATTEMPT_NAMESPACE, email_n))
+        return True
+    # Failed attempt: count it; invalidate the code past the attempt cap.
+    attempts_key = _key(_ATTEMPT_NAMESPACE, email_n)
+    attempts = await redis.incr(attempts_key)
+    await redis.expire(attempts_key, settings.EMAIL_CODE_TTL_SECONDS)
+    if attempts >= settings.EMAIL_CODE_MAX_ATTEMPTS:
+        await redis.delete(key)
+        await redis.delete(attempts_key)
+        raise EmailCodeError("验证码错误次数过多，已失效，请重新获取")
+    return False
 
 
 async def has_pending_code(email: str) -> bool:

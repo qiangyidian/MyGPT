@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields, replace
 from numbers import Real
 from threading import RLock
-from typing import Any, Mapping
+from typing import Any
 
 from app.agents.schemas import BudgetExceeded
 
@@ -69,7 +70,7 @@ class BudgetLimits:
         overrides: Mapping[str, Any] | None = None,
         *,
         allow_increase: bool = False,
-    ) -> "BudgetLimits":
+    ) -> BudgetLimits:
         limits = cls(
             max_agent_steps=settings.AGENT_MAX_STEPS,
             max_tool_calls=settings.AGENT_MAX_TOOL_CALLS,
@@ -86,7 +87,7 @@ class BudgetLimits:
         overrides: Mapping[str, Any],
         *,
         allow_increase: bool = False,
-    ) -> "BudgetLimits":
+    ) -> BudgetLimits:
         valid = {item.name for item in fields(self)}
         unknown = set(overrides) - valid
         if unknown:

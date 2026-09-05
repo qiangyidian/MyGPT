@@ -27,7 +27,6 @@ if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-REPO_HEAD="${REPO_HEAD:-0010_artifacts}"
 PG_PORT="${PG_PORT:-55433}"
 QDRANT_PORT="${QDRANT_PORT:-6334}"
 PG_CTR="mygpt-drill-pg-$$"
@@ -39,6 +38,17 @@ ALEMBIC_CMD=()
 if   [ -x "$REPO_DIR/backend/.venv/Scripts/python.exe" ]; then ALEMBIC_CMD=("$REPO_DIR/backend/.venv/Scripts/python.exe" -m alembic)
 elif [ -x "$REPO_DIR/backend/.venv/bin/python" ];        then ALEMBIC_CMD=("$REPO_DIR/backend/.venv/bin/python" -m alembic)
 else                                                          ALEMBIC_CMD=(alembic)
+fi
+
+# Resolve the repo's alembic head dynamically (a hardcoded head drifted from
+# reality once and broke /ready for every migration-carrying deploy).
+resolve_head() {
+  ( cd backend && "${ALEMBIC_CMD[@]}" heads 2>/dev/null | awk '{print $1}' | head -n1 )
+}
+REPO_HEAD="${REPO_HEAD:-$(resolve_head)}"
+if [ -z "$REPO_HEAD" ]; then
+  echo "[verify] FAIL: cannot resolve alembic head from backend/migrations" >&2
+  exit 1
 fi
 
 cleanup() {

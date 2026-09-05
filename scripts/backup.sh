@@ -9,6 +9,13 @@
 #   RETAIN_DAYS (default 14)  — prune backups older than this
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Pull DATABASE/STORAGE config from the repo .env when present (permissions 600).
+if [ -f "${REPO_DIR}/.env" ]; then
+  STORAGE_DIR="${STORAGE_DIR:-$(grep -E '^STORAGE_DIR=' "${REPO_DIR}/.env" | cut -d= -f2- | tr -d '"' || true)}"
+  PG_HOST="${PG_HOST:-$(grep -E '^PG_HOST=' "${REPO_DIR}/.env" | cut -d= -f2- | tr -d '"' || true)}"
+fi
+
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 RETAIN_DAYS="${RETAIN_DAYS:-14}"
@@ -35,8 +42,12 @@ done
 echo "[backup] qdrant OK (${COLLECTIONS:-no collections})"
 
 # 3. Object-storage uploads (local backend only; S3/MinIO version themselves).
-if [ -d "./backend/data/uploads" ]; then
-  tar -cf "${DEST}/uploads.tar" -C ./backend/data uploads 2>/dev/null || true
+# Respect STORAGE_DIR: under docker-compose the backend writes uploads to
+# ${STORAGE_DIR:-/data/uploads}, and the old hardcoded ./backend/data/uploads
+# check silently skipped the attachment backup in that topology.
+UPLOADS_DIR="${STORAGE_DIR:-./backend/data/uploads}"
+if [ -d "${UPLOADS_DIR}" ]; then
+  tar -cf "${DEST}/uploads.tar" -C "$(dirname "${UPLOADS_DIR}")" "$(basename "${UPLOADS_DIR}")" 2>/dev/null || true
 fi
 
 # 4. Prune old backups.

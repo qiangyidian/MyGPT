@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 
-from app.models import Conversation, Message, User
+from app.models import Conversation, Message
 from tests.conftest import auth_headers
 
 _SEEDED = uuid.UUID("00000000-0000-0000-0000-000000000001")

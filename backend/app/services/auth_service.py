@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.security import (
+    ACCESS_TOKEN_TYPE,
     REFRESH_TOKEN_TYPE,
     create_access_token,
     create_refresh_token,
@@ -37,6 +38,8 @@ settings = get_settings()
 
 # Refresh-token revocation set name in Redis.
 REFRESH_BLACKLIST_KEY = "refresh:blacklist"
+# Access-token revocation set name in Redis (logout / emergency kill).
+ACCESS_BLACKLIST_KEY = "access:blacklist"
 
 # ---------------------------------------------------------------------------
 # Redis helper (lazy, optional)
@@ -125,7 +128,53 @@ async def _blacklist_has(jti: str) -> bool:
         return False
     client = await _get_redis()
     if client is not None:
-        return bool(await client.sismember(REFRESH_BLACKLIST_KEY, jti))
+        return bool(
+            await client.sismember(REFRESH_BLACKLIST_KEY, jti)
+            or await client.sismember(ACCESS_BLACKLIST_KEY, jti)
+        )
+    return jti in _mem_blacklist
+
+
+async def blacklist_access_token(token: str) -> None:
+    """Blacklist a presented ACCESS token by its jti (logout / admin kill).
+
+    TTL-bounded: the entry is only meaningful until the token would expire
+    anyway, so the set self-cleans. With jti missing (legacy tokens) this is a
+    no-op — the ``token_version`` claim check in ``get_current_user`` covers
+    those.
+    """
+    try:
+        payload = decode_token(token)
+    except Exception:
+        return
+    if payload.get("type") != ACCESS_TOKEN_TYPE:
+        return
+    jti = payload.get("jti")
+    if not jti:
+        return
+    client = await _get_redis()
+    ttl = settings.JWT_ACCESS_EXPIRE_MINUTES * 60 + 60
+    if client is not None:
+        try:
+            await client.sadd(ACCESS_BLACKLIST_KEY, jti)
+            await client.expire(ACCESS_BLACKLIST_KEY, ttl)
+        except Exception:  # noqa: BLE001 — best-effort; memory fallback below
+            _mem_blacklist.add(jti)
+    else:
+        _mem_blacklist.add(jti)
+
+
+async def is_access_revoked(token_payload: dict) -> bool:
+    """True when an access-token payload's jti has been blacklisted."""
+    jti = token_payload.get("jti")
+    if not jti:
+        return False
+    client = await _get_redis()
+    if client is not None:
+        try:
+            return bool(await client.sismember(ACCESS_BLACKLIST_KEY, jti))
+        except Exception:  # noqa: BLE001 — Redis down: fall through to memory
+            pass
     return jti in _mem_blacklist
 
 
@@ -169,7 +218,7 @@ async def register(db: AsyncSession, email: str, username: str, password: str) -
     return user
 
 
-async def authenticate(db: AsyncSession, email: str, password: str) -> Optional[User]:
+async def authenticate(db: AsyncSession, email: str, password: str) -> User | None:
     """Return the User if credentials match and the account is active, else None."""
     email_l = email.strip().lower()
     result = await db.execute(select(User).where(User.email == email_l))
@@ -189,12 +238,17 @@ def issue_tokens(user: User) -> dict[str, Any]:
     """Issue a fresh access token (and refresh token) for ``user``.
 
     Returns a dict with ``access_token``, ``expires_in`` (seconds), and
-    ``refresh_token``. The refresh JTI is embedded in the token payload so the
-    revocation check can identify it.
+    ``refresh_token``. Both tokens embed a unique ``jti`` (so logout can
+    revoke them) and the access token embeds ``ver`` (the user's
+    ``token_version``) so bumping the version instantly invalidates every
+    previously issued access token for that user.
     """
-    # Embed a unique jti so individual refresh tokens can be revoked.
     refresh_jti = uuid.uuid4().hex
-    access = create_access_token(subject=str(user.id))
+    access_jti = uuid.uuid4().hex
+    access = create_access_token(
+        subject=str(user.id),
+        extra={"jti": access_jti, "ver": int(getattr(user, "token_version", 0) or 0)},
+    )
     refresh = create_refresh_token(subject=str(user.id), extra={"jti": refresh_jti})
     expires_in = settings.JWT_ACCESS_EXPIRE_MINUTES * 60
     return {
@@ -219,7 +273,7 @@ async def is_refresh_valid(token: str) -> bool:
     return True
 
 
-async def decode_refresh(token: str) -> Optional[dict[str, Any]]:
+async def decode_refresh(token: str) -> dict[str, Any] | None:
     """Decode and validate a refresh token, returning its payload or None."""
     if not await is_refresh_valid(token):
         return None
@@ -241,9 +295,13 @@ async def revoke_refresh(token: str) -> None:
         await _blacklist_add(jti)
 
 
+async def rotate_refresh(db: AsyncSession, token: str) -> dict[str, Any] | None:
     """Validate the old refresh token, revoke it, and mint a new pair.
 
     Returns the new token bundle, or None if the supplied token is invalid.
+    (A merge accident once left this function's body orphaned inside
+    ``revoke_refresh`` — referencing an undefined ``db`` — which would have
+    500'd the logout/refresh paths on legacy no-jti tokens.)
     """
     payload = await decode_refresh(token)
     if payload is None:

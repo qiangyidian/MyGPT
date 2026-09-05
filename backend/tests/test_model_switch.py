@@ -1,11 +1,11 @@
 """model_switch: comp_hash gating + downshift detection."""
+from app.agents.context_manager import ContextManager
 from app.agents.model_switch import (
     comp_hash,
     is_downshift,
     recompact_on_downshift,
     should_recompact_on_switch,
 )
-from app.agents.context_manager import ContextManager
 
 
 def test_comp_hash_stable_and_sensitive():

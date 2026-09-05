@@ -23,8 +23,11 @@ from app.agents.runtime.crewai_runtime import (
     _aggregate_crewai_usage,
     _writer_usage,
 )
-from app.agents.runtime.stage_executor import CrewAIStageExecutor, FakeStageExecutor
-from app.agents.runtime.stage_executor import StageResult
+from app.agents.runtime.stage_executor import (
+    CrewAIStageExecutor,
+    FakeStageExecutor,
+    StageResult,
+)
 from app.agents.schemas import (
     AgentTurnContext,
     ExecutionMode,
@@ -33,8 +36,8 @@ from app.agents.schemas import (
     ev_tool_result,
 )
 from app.agents.stage_context import make_stage_context
-from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.agents.streaming_writer import StreamingWriterExecutor
+from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun, Conversation, Message
 from app.providers.base import ChatDelta, ProviderError
@@ -484,7 +487,7 @@ async def test_crewai_aggregate_includes_every_stage_and_emitted_tool_usage():
         "tool_units": 4,
     }
 
-def _stage_ctx_with_provider(msg: Message) -> "make_stage_context":  # type: ignore[name-defined]
+def _stage_ctx_with_provider(msg: Message) -> make_stage_context:  # type: ignore[name-defined]
     stage_ctx = make_stage_context(uuid.uuid4())
     stage_ctx.provider = MockProvider(base_url="http://x/v1", model="mock")
     stage_ctx.assistant_msg = msg

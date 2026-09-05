@@ -100,7 +100,7 @@ def _make_epub(title: str, body_html: str) -> bytes:
 # Plain-text family
 # ---------------------------------------------------------------------------
 def test_parse_txt(tmp_path: Path):
-    p = _write(tmp_path / "n.txt", "hello world".encode())
+    p = _write(tmp_path / "n.txt", b"hello world")
     r = default_parser.parse(p, ".txt")
     assert isinstance(r, ParsedDocument)
     assert "hello world" in r.text

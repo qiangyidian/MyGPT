@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -179,7 +178,7 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         doc.chunk_count = len(chunk_rows)
         doc.error_message = None
         await db.commit()
-    except Exception as exc:  # noqa: BLE001 — surface failure on the row
+    except Exception as exc:
         logger.exception("indexing failed for document %s", document_id)
         doc.status = "failed"
         doc.error_message = str(exc)[:500]
@@ -205,7 +204,7 @@ async def list_for_kb(db: AsyncSession, kb_id: uuid.UUID) -> list[Document]:
     return list(result.scalars().all())
 
 
-async def get(db: AsyncSession, document_id: uuid.UUID) -> Optional[Document]:
+async def get(db: AsyncSession, document_id: uuid.UUID) -> Document | None:
     return await db.get(Document, document_id)
 
 

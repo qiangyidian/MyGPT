@@ -8,12 +8,10 @@ against a ``tmp_path`` workspace root.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 
 import pytest
 
-from app.agents.apply_patch import PatchError
 from app.agents.sandbox.local import LocalRunner
 from app.tools.base import ToolError
 from app.tools.workspace import (

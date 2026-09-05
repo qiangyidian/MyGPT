@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.artifacts.service import ArtifactService
 from app.core.deps import get_current_user
 from app.core.exceptions import AppException
+from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import User
 
@@ -24,12 +25,8 @@ router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 NOT_FOUND = status.HTTP_404_NOT_FOUND
 
 
-def _envelope_status(exc: AppException) -> HTTPException:
-    """Re-raise an AppException as the uniform HTTPException for routers."""
-    return HTTPException(exc.status_code, exc.message, headers={"X-Code": exc.code})
-
-
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(rate_limit_user(30, 60, "artifact-upload"))])
 async def create_artifact(
     file: UploadFile = File(...),
     source: str = Form("upload"),
@@ -37,6 +34,17 @@ async def create_artifact(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    # Hard size cap (checked against the declared size BEFORE reading, and
+    # enforced again after save by the service) — the endpoint used to accept
+    # unbounded uploads from any logged-in user.
+    from app.core.config import get_settings as _gs
+
+    max_bytes = _gs().MAX_ARTIFACT_UPLOAD_MB * 1024 * 1024
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"文件过大，最大 {_gs().MAX_ARTIFACT_UPLOAD_MB}MB",
+        )
     """Create an artifact from an upload. Returns the opaque id + metadata.
 
     ``source`` must be one of ``upload | tool_output | spill | generation``.
@@ -52,7 +60,7 @@ async def create_artifact(
             run_id=run_id,
         )
     except AppException as exc:
-        raise _envelope_status(exc)
+        raise exc
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     return {
@@ -86,7 +94,7 @@ async def download_artifact(
         meta = await svc.get(artifact_id, user)
         body = await svc.open_stream(artifact_id, user)
     except AppException as exc:
-        raise _envelope_status(exc)
+        raise exc
     # HTTP headers are latin-1 — a CJK filename crashes the response with
     # UnicodeEncodeError. RFC 5987: ASCII fallback + filename*=UTF-8''percent-
     # encoded original. Browsers prefer filename*; curl keeps the fallback.
@@ -135,7 +143,7 @@ async def preview_artifact(
     try:
         origin = await svc.get(artifact_id, user)
     except AppException as exc:
-        raise _envelope_status(exc)
+        raise exc
     if not is_convertible(origin.filename, origin.media_type):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -178,7 +186,7 @@ async def get_artifact_meta(
     try:
         meta = await svc.get(artifact_id, user)
     except AppException as exc:
-        raise _envelope_status(exc)
+        raise exc
     return {
         "id": str(meta.id),
         "media_type": meta.media_type,
@@ -221,4 +229,4 @@ async def delete_artifact(
     try:
         await svc.delete(artifact_id, user)
     except AppException as exc:
-        raise _envelope_status(exc)
+        raise exc

@@ -22,10 +22,15 @@ from app.agents.policies.tool_policy import (
     is_tool_allowed,
     validate_readonly_sql,
 )
-from app.agents.schemas import ExecutionMode
-from app.models import AgentRun, AgentStep, Conversation, Message, ToolApproval, ToolCall
+from app.models import (
+    AgentRun,
+    AgentStep,
+    Conversation,
+    Message,
+    ToolApproval,
+    ToolCall,
+)
 from app.tools.base import BaseTool, ToolRegistry
-from app.tools.registry_init import get_default_registry
 from tests.conftest import auth_headers
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -113,6 +118,14 @@ async def _seed_run(db_session):
     return conv, msg, run
 
 
+
+def _admin_principal():
+    """Admin stand-in for gateway tests: db_query is admin-only in prod, and
+    these tests exercise the approval machinery, not the environment gate."""
+    from types import SimpleNamespace
+    return SimpleNamespace(role="admin", id=_SEEDED_USER)
+
+
 async def test_gateway_safe_tool_executes(db_session):
     _, msg, run = await _seed_run(db_session)
     gw = ToolGateway(
@@ -120,7 +133,7 @@ async def test_gateway_safe_tool_executes(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     exec_ = await gw.execute(
         tool_call_id="c1", tool_name="datetime_now", arguments={}
@@ -159,7 +172,7 @@ async def test_gateway_separates_and_sanitizes_tool_usage_from_model_content(db_
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
         registry=registry,
     )
 
@@ -182,7 +195,7 @@ async def test_gateway_dangerous_tool_requires_approval(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     exec_ = await gw.execute(
         tool_call_id="c2", tool_name="db_query", arguments={"sql": "SELECT 1"}
@@ -219,7 +232,7 @@ async def test_gateway_dangerous_tool_runs_when_pre_approved(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     exec_ = await gw.execute(
         tool_call_id="c3", tool_name="db_query", arguments=args
@@ -237,7 +250,7 @@ async def test_gateway_reports_real_error_status(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     exec_ = await gw.execute(
         tool_call_id="c4", tool_name="web_search", arguments={"query": ""}
@@ -254,7 +267,7 @@ async def test_gateway_blocks_bad_sql_before_execution(db_session):
         conversation_id=msg.conversation_id,
         assistant_message_id=msg.id,
         run_id=run.id,
-        user=None,
+        user=_admin_principal(),
     )
     # Even with a pre-approval, the SQL hardening gate runs first and blocks.
     exec_ = await gw.execute(

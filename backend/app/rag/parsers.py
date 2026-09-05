@@ -17,7 +17,8 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from app.core.config import get_settings
 from app.rag.base import DocumentParser, ParsedDocument
@@ -299,9 +300,9 @@ def _parse_epub(path: str, _ext: str) -> ParsedDocument:
         from ebooklib import epub  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dep
         raise ValueError(f"EbookLib 未安装，无法解析 EPUB: {exc}") from exc
-    from bs4 import BeautifulSoup  # type: ignore
-
     import warnings
+
+    from bs4 import BeautifulSoup  # type: ignore
     with warnings.catch_warnings():
         # ebooklib spams an EPUB-3 future-warning on every read; silence it.
         warnings.simplefilter("ignore")

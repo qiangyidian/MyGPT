@@ -338,8 +338,8 @@ async def test_tool_call_blocked_by_quota(
     """With quotas enabled and max_tools_per_run=0, a tool call is refused with a
     quota_exceeded tool result (admin-visible reason in the error)."""
     from app.agents.gateway.tool_gateway import ToolGateway
-    from app.models import AgentRun, Conversation, Message, User
     from app.core.security import hash_password
+    from app.models import AgentRun, Conversation, Message, User
 
     # The quota service keys on user id, so the gateway needs a real user.
     user_id = uuid.UUID("00000000-0000-0000-0000-00000000000e")
@@ -452,12 +452,11 @@ async def test_rag_retrieval_span_emitted(db_session, span_recorder):
 async def test_artifact_create_span_emitted(db_session, span_recorder, tmp_path):
     """ArtifactService.create_from_bytes emits an ``artifact.create`` span +
     counter; open() emits ``artifact.open``."""
+
+
     from app.artifacts.service import ArtifactService
-    from app.core import storage as storage_mod
-    from app.models.user import User
     from app.core.security import hash_password
-    from fastapi import UploadFile
-    import io
+    from app.models.user import User
 
     # Seed a user.
     user_id = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
@@ -492,10 +491,13 @@ async def test_artifact_create_span_emitted(db_session, span_recorder, tmp_path)
 
 def test_workflow_engine_span_emitted(span_recorder):
     """The workflow engine emits ``workflow.step`` spans as steps execute."""
-    import asyncio
     from app.agents.workflow.engine import WorkflowEngine
     from app.agents.workflow.schemas import (
-        Plan, Step, StepObservation, VerificationVerdict, VerifierResult,
+        Plan,
+        Step,
+        StepObservation,
+        VerificationVerdict,
+        VerifierResult,
     )
 
     class _StubExecutor:

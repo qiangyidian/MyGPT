@@ -21,10 +21,10 @@ from app.core.config import Settings
 from app.core.pricing import reset_pricing_cache
 from app.models import AgentRun, Conversation, Message
 from app.services.chat_service import (
+    ChatService,
     _apply_usage_accounting,
     _persist_continuation_checkpoint,
 )
-from app.services.chat_service import ChatService
 from tests.conftest import TestSessionLocal
 
 

@@ -64,6 +64,12 @@ export function Composer({
   const mode = useChatUiStore((s) => s.mode);
   const modeMeta = getModeMeta(mode);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Re-focus the composer when the user switches/creates a conversation —
+  // previously the input stayed blurred and typing went nowhere.
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, [conversationId]);
   const { drafts, upload, remove, allReady } = useChatAttachments(
     conversationId,
     ensureConversationId
@@ -166,6 +172,9 @@ export function Composer({
 
             <Textarea
               ref={textareaRef}
+              autoFocus
+              // Mobile软键盘回车键显示"发送"而非"换行"。
+              enterKeyHint="send"
               value={value}
               onChange={(e) => {
                 setValue(e.target.value);
@@ -182,7 +191,7 @@ export function Composer({
               <Button
                 variant="destructive"
                 size="icon"
-                className="h-8 w-8 shrink-0"
+                className="h-9 w-9 max-sm:h-11 max-sm:w-11 shrink-0"
                 onClick={onStop}
                 title="停止生成"
                 aria-label="停止生成"
@@ -192,7 +201,7 @@ export function Composer({
             ) : (
               <Button
                 size="icon"
-                className="h-8 w-8 shrink-0"
+                className="h-9 w-9 max-sm:h-11 max-sm:w-11 shrink-0"
                 onClick={handleSend}
                 disabled={!canSend}
                 title="发送"

@@ -7,7 +7,6 @@ and a sleep-past-timeout case.
 """
 from __future__ import annotations
 
-import json
 import sys
 
 from app.agents.hooks import (

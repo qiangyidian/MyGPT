@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Index as _sa_Index
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +18,9 @@ class Message(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    __table_args__ = (
+        _sa_Index("ix_messages_conversation_created", "conversation_id", "created_at"),
     )
     # Override the mixin's created_at with a PER-ROW Python default. The mixin
     # uses server_default=func.now(), which on Postgres resolves to the

@@ -30,5 +30,5 @@ async def log(
                 AuditEvent(actor_id=actor_id, action=action, target=target, detail=detail)
             )
             await session.commit()
-    except Exception:  # noqa: BLE001 — audit must not break the observed feature
+    except Exception:
         logger.warning("audit log failed for action=%s target=%s", action, target, exc_info=True)

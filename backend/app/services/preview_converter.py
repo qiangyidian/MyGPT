@@ -14,7 +14,6 @@ the download-only panel.
 from __future__ import annotations
 
 import logging
-from urllib.parse import quote
 
 import httpx
 from sqlalchemy import select
@@ -41,7 +40,7 @@ def is_convertible(filename: str | None, media_type: str | None) -> bool:
     return any(name.endswith(ext) for ext in CONVERTIBLE_EXTENSIONS)
 
 
-async def _find_cached(db: AsyncSession, origin_id) -> Artifact | None:
+async def _find_cached(db, origin_id) -> Artifact | None:
     """A previously converted preview artifact for this origin, if any."""
     result = await db.execute(
         select(Artifact)
@@ -117,5 +116,6 @@ def _read_artifact_bytes(origin: Artifact) -> bytes:
         return fh.read()
 
 
+def preview_path(artifact_id) -> str:
     """Frontend-facing endpoint path for an artifact's converted PDF."""
     return f"/api/artifacts/{artifact_id}/preview"

@@ -15,8 +15,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.observability import observe_histogram, observe_span
 from app.models import KnowledgeBase, ModelConfig
+from app.observability import observe_histogram, observe_span
 from app.providers.registry import get_provider_for_config
 from app.rag.embedder import ProviderEmbedder
 from app.rag.fusion import compress_context, rrf_fuse

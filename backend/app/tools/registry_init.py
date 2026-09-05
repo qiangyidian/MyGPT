@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.tools.base import ToolRegistry, ToolError
+from app.tools.base import ToolError, ToolRegistry
 from app.tools.builtin import (
     DateTimeNowTool,
     DbQueryTool,
@@ -44,7 +44,7 @@ def register_workspace_tools(
     registry: ToolRegistry,
     workspace_root: str | Path,
     *,
-    runner: "object | None" = None,
+    runner: object | None = None,
     output_limit: int | None = None,
 ) -> ToolRegistry:
     """Register the workspace-confined tools onto ``registry``.
@@ -83,9 +83,7 @@ def register_workspace_tools(
     for cls in WORKSPACE_TOOL_CLASSES:
         if cls in (WorkspaceShellTool, WorkspaceGitStatusTool, WorkspaceGitDiffTool):
             registry.register(cls(root, runner=r, output_limit=out))
-        elif cls is WorkspaceWriteTool:
-            registry.register(cls(root))
-        elif cls is WorkspaceApplyPatchTool:
+        elif cls is WorkspaceWriteTool or cls is WorkspaceApplyPatchTool:
             registry.register(cls(root))
         else:
             registry.register(cls(root))
@@ -96,7 +94,7 @@ def get_workspace_registry(
     workspace_root: str | Path,
     *,
     include_builtins: bool = True,
-    runner: "object | None" = None,
+    runner: object | None = None,
     output_limit: int | None = None,
 ) -> ToolRegistry:
     """A fresh registry with the workspace tools bound to ``workspace_root``.

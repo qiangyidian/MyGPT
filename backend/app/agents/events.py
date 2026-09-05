@@ -91,6 +91,44 @@ class EventStore:
         assert last_exc is not None
         raise last_exc
 
+    async def append_many(
+        self,
+        run_id: uuid.UUID | str,
+        events: list[tuple[str, dict[str, Any] | None]],
+    ) -> list[RunEvent]:
+        """Append a batch of events with ONE max(sequence) read for the whole batch.
+
+        Token-level streaming previously persisted each delta in its own
+        session+commit with its own ``max(sequence)`` SELECT — a 2000-token
+        reply cost ~6000 DB round trips and one ``run_events`` row per token.
+        Batching allocates the batch's sequences in-memory off a single
+        ``max(sequence)`` read and flushes once per batch (same transaction),
+        preserving per-run monotonic order under the same single-writer
+        (lease-holder) invariant as :meth:`append`.
+        """
+        if not events:
+            return []
+        run_id = _as_uuid(run_id)
+        result = await self._session.execute(
+            select(func.coalesce(func.max(RunEvent.sequence), 0))
+            .where(RunEvent.run_id == run_id)
+        )
+        next_sequence = int(result.scalar_one())
+        rows: list[RunEvent] = []
+        for event_type, data in events:
+            next_sequence += 1
+            rows.append(
+                RunEvent(
+                    run_id=run_id,
+                    sequence=next_sequence,
+                    event_type=event_type,
+                    data=dict(data) if data else {},
+                )
+            )
+        self._session.add_all(rows)
+        await self._session.flush()
+        return rows
+
     async def replay(
         self,
         run_id: uuid.UUID | str,
@@ -123,7 +161,7 @@ async def append_event_safe(
     try:
         async with session.begin_nested():
             return await EventStore(session).append(run_id, event_type, data)
-    except Exception:  # noqa: BLE001 -- best-effort durability
+    except Exception:
         logger.debug(
             "durable event append failed (%s for run %s)", event_type, run_id,
             exc_info=True,

@@ -14,11 +14,10 @@ from app.agents.behavior_fragments import (
 from app.agents.context_fragments import (
     IntentContextInput,
     assemble_context_fragments,
+    recognized_intent_fragment,
     render_fragments,
 )
 from app.agents.schemas import IntentDecision
-from app.agents.context_fragments import recognized_intent_fragment
-
 from tests._snapshot import assert_snapshot
 
 

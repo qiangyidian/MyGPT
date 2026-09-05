@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -20,14 +20,14 @@ class UserMemoryOut(BaseModel):
     user_id: uuid.UUID
     memory_type: str
     content: str
-    structured_value: Optional[dict[str, Any]] = None
+    structured_value: dict[str, Any] | None = None
     confidence: float
     active: bool
     confirmed_by_user: bool
-    source_message_id: Optional[uuid.UUID] = None
-    source_conversation_id: Optional[uuid.UUID] = None
-    expires_at: Optional[datetime] = None
-    embedding_id: Optional[str] = None
+    source_message_id: uuid.UUID | None = None
+    source_conversation_id: uuid.UUID | None = None
+    expires_at: datetime | None = None
+    embedding_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -38,8 +38,8 @@ class UserMemoryPropose(BaseModel):
     content: str
     memory_type: str = "fact"
     confidence: float = 0.5
-    source_message_id: Optional[uuid.UUID] = None
-    source_conversation_id: Optional[uuid.UUID] = None
+    source_message_id: uuid.UUID | None = None
+    source_conversation_id: uuid.UUID | None = None
 
 
 class UserMemoryEdit(BaseModel):

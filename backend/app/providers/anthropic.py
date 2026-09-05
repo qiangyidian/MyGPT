@@ -35,19 +35,20 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
 from app.core.config import get_settings
 from app.observability import observe_counter, observe_histogram, observe_span
 from app.providers.base import (
+    PROVIDER_ERR_NETWORK,
+    PROVIDER_ERR_TIMEOUT,
     ChatDelta,
     ChatOptions,
     ChatResult,
     ModelProvider,
-    PROVIDER_ERR_NETWORK,
-    PROVIDER_ERR_TIMEOUT,
     ProviderError,
     ToolCallDef,
     admit_provider_payload,

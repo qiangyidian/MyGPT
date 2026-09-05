@@ -11,9 +11,8 @@ never cross tenants.
 from __future__ import annotations
 
 import uuid
-from typing import Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.schemas import ConversationFlowState
@@ -21,7 +20,7 @@ from app.models import ConversationMemory
 
 
 async def load_state(
-    db: AsyncSession, conversation_id: uuid.UUID, user_id: Optional[uuid.UUID]
+    db: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID | None
 ) -> ConversationFlowState:
     """Rebuild the flow state from persisted memories."""
     mems = (
@@ -57,9 +56,9 @@ async def load_state(
 async def upsert_goal(
     db: AsyncSession,
     conversation_id: uuid.UUID,
-    user_id: Optional[uuid.UUID],
+    user_id: uuid.UUID | None,
     goal: str,
-    source_message_id: Optional[uuid.UUID] = None,
+    source_message_id: uuid.UUID | None = None,
 ) -> None:
     """Set the conversation's current goal (single 'task' memory, updated)."""
     if not goal.strip():
@@ -93,9 +92,9 @@ async def upsert_goal(
 async def save_summary(
     db: AsyncSession,
     conversation_id: uuid.UUID,
-    user_id: Optional[uuid.UUID],
+    user_id: uuid.UUID | None,
     summary: str,
-    source_message_id: Optional[uuid.UUID] = None,
+    source_message_id: uuid.UUID | None = None,
 ) -> None:
     """Append a rolling summary memory (the latest one wins on load)."""
     if not summary.strip():

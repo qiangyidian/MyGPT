@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -11,17 +11,17 @@ class ChatAttachmentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     conversation_id: uuid.UUID
-    message_id: Optional[uuid.UUID] = None
+    message_id: uuid.UUID | None = None
     filename: str
     original_filename: str
     mime_type: str
     size_bytes: int
     status: str
     parse_status: str
-    preview_metadata: Optional[dict[str, Any]] = None
-    error_message: Optional[str] = None
+    preview_metadata: dict[str, Any] | None = None
+    error_message: str | None = None
     is_temporary: bool
-    knowledge_base_id: Optional[uuid.UUID] = None
+    knowledge_base_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -43,7 +43,7 @@ class AttachmentTextOut(BaseModel):
     filename: str
     mime_type: str
     parse_status: str
-    preview_metadata: Optional[dict[str, Any]] = None
+    preview_metadata: dict[str, Any] | None = None
     text: str = ""
     truncated: bool = False
     total_chars: int = 0

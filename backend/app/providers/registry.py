@@ -7,8 +7,8 @@ get_provider_for_config(cfg) and never touches raw HTTP itself.
 from __future__ import annotations
 
 from app.core.security import decrypt_secret
-from app.models.model_config import ModelConfig
 from app.model_capabilities import capabilities_from_config
+from app.models.model_config import ModelConfig
 from app.providers.anthropic import AnthropicProvider
 from app.providers.base import ModelProvider, ProviderError
 from app.providers.hermes import HermesProvider

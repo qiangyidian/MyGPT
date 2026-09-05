@@ -19,7 +19,6 @@ Real-time tool events + agent attribution (multi-agent visualization):
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from typing import Any
 
@@ -203,9 +202,8 @@ def build_crewai_tool(
     attribution). When ``None`` (legacy/test path) the adapter still works but
     emits no live events and attributes to the empty agent.
     """
-    from pydantic import PrivateAttr
-
     from crewai.tools import BaseTool
+    from pydantic import PrivateAttr
 
     schema = _build_args_schema(source)
     tool_name = source.name

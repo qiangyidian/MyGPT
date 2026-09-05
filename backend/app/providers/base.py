@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, Literal
 
 from app.agents.token_budget import (
     INVALID_PROMPT_BUDGET,
@@ -16,8 +17,7 @@ from app.agents.token_budget import (
     PromptAdmissionError,
     calculate_prompt_budget,
 )
-from app.model_capabilities import ModelCapabilities, UNKNOWN_MODEL_CAPABILITIES
-
+from app.model_capabilities import UNKNOWN_MODEL_CAPABILITIES, ModelCapabilities
 
 # Canonical termination reasons carried end-to-end (provider → runtime → SSE →
 # persistence → UI). Extend this, never pass arbitrary strings.

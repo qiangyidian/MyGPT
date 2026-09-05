@@ -30,9 +30,10 @@ import hashlib
 import json
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Union
+from typing import Any, Union
 
 from app.agents.hooks.schema import (
     HookInput,

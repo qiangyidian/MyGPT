@@ -32,11 +32,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.agents.graph import (
+    AgentEdgeStatus,
     AgentGraph,
-    AgentGraphNode,
     AgentGraphEdge,
     AgentNodeStatus,
-    AgentEdgeStatus,
 )
 from app.agents.schemas import (
     AgentEvent,

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import sqlalchemy as sa
 
 from app.core.bootstrap import _sync_columns
 from app.models.model_config import ModelConfig
-
 
 CAPABILITY_DEFAULTS = {
     "supports_parallel_tools": "0",
@@ -66,7 +65,9 @@ def test_model_capability_migration_upgrades_legacy_rows(tmp_path: Path):
     alembic("upgrade", "head")
     with sqlite3.connect(database_path) as conn:
         revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert revision == "0011_cleanup_and_indexes"
+        from app.core.health import REPO_MIGRATION_HEAD  # dynamic, never hardcoded
+
+        assert revision == REPO_MIGRATION_HEAD
         info = {row[1]: row for row in conn.execute("PRAGMA table_info(model_configs)")}
         for name in CAPABILITY_DEFAULTS:
             assert info[name][3] == 1  # NOT NULL

@@ -72,7 +72,7 @@ class McpTransport(Protocol):
     """The transport contract a :class:`McpSession` relies on."""
 
     @property
-    def closed(self) -> bool:  # noqa: D401
+    def closed(self) -> bool:
         ...
 
     async def start(self) -> None: ...
@@ -440,7 +440,7 @@ class HttpTransport:
         else:
             try:
                 msg = response.json()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 raise McpProtocolError(f"mcp http non-JSON response: {exc}") from exc
         if not isinstance(msg, dict):
             raise McpProtocolError("mcp http response is not a JSON object")
@@ -494,7 +494,7 @@ class HttpTransport:
 # --------------------------------------------------------------------------- #
 # Transport factory + session
 # --------------------------------------------------------------------------- #
-def build_transport(config: "McpServerConfig") -> McpTransport:
+def build_transport(config: McpServerConfig) -> McpTransport:
     """Construct the right transport for a :class:`McpServerConfig`."""
     t = (getattr(config, "transport", "stdio") or "stdio").lower()
     if t == "stdio":
@@ -518,7 +518,7 @@ class McpSession:
 
     def __init__(
         self,
-        config: "McpServerConfig | None" = None,
+        config: McpServerConfig | None = None,
         *,
         transport: McpTransport | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -617,7 +617,7 @@ class McpSession:
             # caller's task is cancelled as expected.
             try:
                 await self._transport.cancel(req_id, reason="caller cancelled")
-            except Exception:  # noqa: BLE001 — cancellation notify must not mask CancelledError
+            except Exception:
                 logger.debug("mcp cancel notify failed", exc_info=True)
             raise
 
@@ -628,7 +628,7 @@ class McpSession:
         """
         try:
             await self._transport.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("mcp reconnect: close failed", exc_info=True)
         # Build a fresh transport of the same kind. We can't re-construct from
         # a bare protocol object portably, so each transport implements its own
@@ -653,5 +653,5 @@ class McpSession:
         self._initialized = False
         try:
             await self._transport.close()
-        except Exception:  # noqa: BLE001 — close must never raise
+        except Exception:
             logger.debug("mcp close failed", exc_info=True)

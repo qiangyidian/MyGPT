@@ -29,20 +29,23 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import replace
-from typing import Any, AsyncIterator
+from typing import Any
 
 import tiktoken
 from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agents.context_manager import ContextManager
 from app.agents.db_mutation import (
     commit_with_rollback,
     db_mutation_scope,
 )
 from app.agents.intent_router import decide_route, decide_route_with_intent
 from app.agents.orchestrator import chat_orchestrator
+from app.agents.output_spill import production_spill_writer
 from app.agents.persistence import persist_continuation_checkpoint
 from app.agents.planning import (
     extract_goal,
@@ -56,8 +59,6 @@ from app.agents.schemas import (
     AgentTurnContext,
     ExecutionMode,
 )
-from app.agents.context_manager import ContextManager
-from app.agents.output_spill import production_spill_writer
 from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.agents.token_budget import (
     PROMPT_TOO_LARGE,
@@ -68,10 +69,18 @@ from app.agents.token_budget import (
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.db import AsyncSessionLocal
-from app.quotas import QuotaExceeded, get_quota_service
-from app.models import AgentRun, Conversation, KnowledgeBase, Message, ModelConfig, ToolCall, User
 from app.model_capabilities import capabilities_from_config
+from app.models import (
+    AgentRun,
+    Conversation,
+    KnowledgeBase,
+    Message,
+    ModelConfig,
+    ToolCall,
+    User,
+)
 from app.providers.registry import get_provider_for_config
+from app.quotas import QuotaExceeded, get_quota_service
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
@@ -106,7 +115,7 @@ async def _refine_title_after_answer(
                 first_user_message=first_user_message,
                 assistant_prefix=assistant_prefix,
             )
-    except Exception:  # noqa: BLE001 — cosmetic; never surface
+    except Exception:
         logger.debug("background title refinement failed", exc_info=True)
 from app.services.attachment_service import (
     collect_audio_parts,
@@ -341,17 +350,35 @@ _CONTEXT_MANAGER = ContextManager(
 
 
 async def _load_active_user_memories(
-    db: AsyncSession, user_id: uuid.UUID
+    db: AsyncSession, user_id: uuid.UUID, *, query: str | None = None, top_k: int = 12
 ) -> list[str]:
     """Return the user's active, non-expired USER-level memory contents.
 
     These are the opt-in semantic memories (Task 7) folded into the effective
-    system prompt each turn. Pure read — no embedding round-trip. Tenant-scoped
-    by user_id; never crosses users.
+    system prompt each turn. Tenant-scoped by user_id; never crosses users.
+
+    Injection is now SEMANTIC: when the turn's text is available, retrieve the
+    top-k memories closest to it (the same retrieval the /memories API uses).
+    The previous behaviour crammed the 50 most-recently-updated memories into
+    the prompt unfiltered — prompt bloat plus off-topic memories degrading
+    answers. Falls back to the recency list when no embedding model / vector
+    store is configured, and never fails the turn.
     """
     from datetime import datetime, timezone
 
+    from app.core.datetime_utils import is_expired as _is_expired
     from app.models import UserMemory
+
+    if query:
+        try:
+            from app.api.memories import get_memory_service
+
+            svc = await get_memory_service(db)
+            rows = await svc.retrieve_for_prompt(db, user_id, query, top_k=top_k)
+            if rows:
+                return [r.content for r in rows]
+        except Exception:
+            logger.debug("semantic memory retrieval failed; using recency fallback", exc_info=True)
 
     rows = (
         await db.execute(
@@ -361,12 +388,10 @@ async def _load_active_user_memories(
                 UserMemory.active.is_(True),
             )
             .order_by(UserMemory.updated_at.desc())
-            .limit(50)
+            .limit(top_k)
         )
     ).scalars().all()
     now = datetime.now(timezone.utc)
-    from app.core.datetime_utils import is_expired as _is_expired
-
     return [r.content for r in rows if not _is_expired(r.expires_at, now)]
 
 
@@ -633,7 +658,7 @@ def _estimate_available_tool_schema_tokens(
         return _estimate_tokens(
             json.dumps(schemas, ensure_ascii=False, default=str), model_name
         )
-    except Exception:  # noqa: BLE001 - estimation is best-effort
+    except Exception:
         logger.warning("tool schema token estimation failed", exc_info=True)
         return 0
 
@@ -897,6 +922,16 @@ async def _delete_last_assistant_message(
 
     last = tail[0]
     if last.role == "assistant":
+        # Never delete a reply that is still being generated: the trailing
+        # assistant message starts as metadata status "pending" and only gets
+        # its final status/finish_reason when the stream completes. (This used
+        # to race: a regenerate arriving while another tab's reply was
+        # streaming deleted THAT in-flight reply mid-generation.)
+        meta = last.metadata_ or {}
+        if meta.get("status") == "pending" and not meta.get("finish_reason"):
+            raise AppException(
+                409, "turn_in_progress", "上一条回复还在生成中，请先停止再重新生成"
+            )
         # Cascade should handle ToolCall rows, but be explicit to be safe.
         await db.execute(delete(ToolCall).where(ToolCall.message_id == last.id))
         await db.delete(last)
@@ -943,6 +978,42 @@ async def _persist_continuation_checkpoint(
         metadata=dict(assistant_msg.metadata_ or {}),
         checkpoint=checkpoint,
     )
+
+
+class _ConversationTurnGuard:
+    """Process-local per-conversation in-flight turn registry.
+
+    One concurrent turn per conversation: a second overlapping send (double
+    click / two tabs / regenerate mid-stream) previously interleaved freely —
+    duplicated user+assistant rows, clobbered ``last_message_preview``, and
+    regenerate deleting the OTHER turn's still-generating reply. Registry
+    entries die with the process, so a crash can never wedge a conversation.
+    (Cross-replica enforcement for the durable path is a DB-level check on
+    pending/running runs — see ``create_and_enqueue_durable_run``.)
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[uuid.UUID, int] = {}
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, conversation_id: uuid.UUID) -> bool:
+        async with self._lock:
+            count = self._counts.get(conversation_id, 0)
+            if count >= 1:
+                return False
+            self._counts[conversation_id] = count + 1
+            return True
+
+    async def release(self, conversation_id: uuid.UUID) -> None:
+        async with self._lock:
+            count = self._counts.get(conversation_id, 0)
+            if count <= 1:
+                self._counts.pop(conversation_id, None)
+            else:
+                self._counts[conversation_id] = count - 1
+
+
+_conversation_turn_guard = _ConversationTurnGuard()
 
 
 class ChatService:
@@ -1033,6 +1104,30 @@ class ChatService:
         turn_started = time.monotonic()  # for per-message latency accounting
         # 1. Resolve conversation + model.
         conversation = await _get_or_create_conversation(db, user, request)
+        # Per-conversation turn guard: a second overlapping turn on the SAME
+        # conversation (double-click send / two tabs / regenerate during
+        # streaming) used to interleave freely — duplicate replies, clobbered
+        # previews, and regenerate deleting a message that was still
+        # generating. The registry is process-local (single-node deploy);
+        # the durable path enforces the same invariant via a DB check.
+        if not await _conversation_turn_guard.acquire(conversation.id):
+            raise AppException(
+                409, "turn_in_progress", "上一条回复还在生成中，请先停止或稍候再发送"
+            )
+        try:
+            async for evt in self._run_turn_locked(db, user, request, conversation):
+                yield evt
+        finally:
+            await _conversation_turn_guard.release(conversation.id)
+
+    async def _run_turn_locked(
+        self,
+        db: AsyncSession,
+        user: User,
+        request: ChatRequest,
+        conversation: Conversation,
+    ) -> AsyncIterator[dict[str, Any]]:
+        turn_started = time.monotonic()  # for per-message latency accounting
         cfg = await _resolve_model_config(db, request, conversation, user=user)
 
         # 1b. Resolve the execution route from the user-facing mode. The UI sends
@@ -1141,8 +1236,20 @@ class ChatService:
                         user_msg.metadata_ = {**(user_msg.metadata_ or {}), "attachments": summaries}
                     except AppException:
                         raise
-                    except Exception as exc:  # noqa: BLE001 — attachments are best-effort
+                    except Exception as exc:
+                        # Attachments are best-effort, but a SILENT failure used
+                        # to leave the user's message with no attachment card
+                        # and no trace — "I sent a file" with nothing to show.
+                        # Record the failure on the message so the UI can show
+                        # a placeholder and support can diagnose.
                         logger.warning("attachment binding failed: %s", exc)
+                        user_msg.metadata_ = {
+                            **(user_msg.metadata_ or {}),
+                            "attachment_error": {
+                                "failed_ids": [str(a) for a in request.attachment_ids],
+                                "reason": str(exc)[:200],
+                            },
+                        }
                 # Cheap sidebar preview (last user message text).
                 conversation.last_message_preview = (user_content or "").strip()[:280]
 
@@ -1158,7 +1265,7 @@ class ChatService:
                             cfg,
                             first_user_message=request.content or "",
                         )
-                    except Exception:  # noqa: BLE001 — titling never blocks
+                    except Exception:
                         logger.debug("auto-title (fallback) failed", exc_info=True)
 
                 # Auto memory proposal (B7): extract 0-3 candidate memories
@@ -1166,7 +1273,9 @@ class ChatService:
                 # review in settings. Best-effort — never blocks the turn.
                 if get_settings().MEMORY_AUTO_PROPOSE:
                     try:
-                        from app.agents.memory_auto_propose import extract_memory_candidates
+                        from app.agents.memory_auto_propose import (
+                            extract_memory_candidates,
+                        )
 
                         for cand in extract_memory_candidates(request.content or ""):
                             try:
@@ -1179,9 +1288,9 @@ class ChatService:
                                     source_message_id=user_msg.id,
                                     source_conversation_id=conversation.id,
                                 )
-                            except Exception:  # noqa: BLE001 — per-candidate
+                            except Exception:
                                 logger.debug("memory candidate rejected", exc_info=True)
-                    except Exception:  # noqa: BLE001 — feature is optional
+                    except Exception:
                         logger.debug("auto memory proposal skipped", exc_info=True)
 
         # 3. System prompt + optional RAG retrieval.
@@ -1232,7 +1341,9 @@ class ChatService:
         # process-local mutable world state). The tool-use preamble, rolling
         # summary, ongoing goal, and the user's opt-in semantic memories are
         # all folded in here; the single-model honesty backstop closes it.
-        active_user_memories = await _load_active_user_memories(db, user.id)
+        active_user_memories = await _load_active_user_memories(
+            db, user.id, query=request.content or None
+        )
         behavior_blocks: list[str] = []
         if enable_tools:
             behavior_blocks.append(_AGENT_TASK_PREAMBLE)
@@ -1356,7 +1467,7 @@ class ChatService:
                     fragments=_ctx_fragments,
                     provider=get_provider_for_config(cfg),
                 )
-            except Exception:  # noqa: BLE001 — intent is an enhancement, never fatal
+            except Exception:
                 logger.warning("intent recognition raised; using keyword route", exc_info=True)
                 intent_decision = None
 
@@ -1436,7 +1547,7 @@ class ChatService:
                 system_prompt = system_prompt + "\n\n" + _enrich
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = (messages[0].get("content") or "") + "\n\n" + _enrich
-        except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+        except Exception:
             logger.warning("context enrichment failed; continuing without it", exc_info=True)
 
         # 6c. Final authoritative admission sees the final intent route, all
@@ -1845,10 +1956,31 @@ class ChatService:
         recognition, enrichment) is deferred to :func:`run_durable_turn` which
         the worker invokes — it is NOT duplicated here.
         """
-        from datetime import datetime, timezone
 
         # 1. Resolve conversation + model (same helpers as _run).
         conversation = await _get_or_create_conversation(db, user, request)
+
+        # Cross-replica turn guard: refuse a second run while one is already
+        # pending/running for this conversation (the process-local inline guard
+        # cannot see runs executing in the durable worker).
+        from sqlalchemy import func as _func
+        from sqlalchemy import select as _select
+
+        in_flight = await db.execute(
+            _select(_func.count())
+            .select_from(AgentRun)
+            .where(
+                AgentRun.conversation_id == conversation.id,
+                AgentRun.status.in_(["pending", "running"]),
+            )
+        )
+        if int(in_flight.scalar_one()) > 0:
+            from app.core.exceptions import AppException as _AppException
+
+            raise _AppException(
+                409, "turn_in_progress", "上一条回复还在生成中，请先停止或稍候再发送"
+            )
+
         cfg = await _resolve_model_config(db, request, conversation, user=user)
         # Ownership (same guard as _run).
         if cfg.user_id is not None and cfg.user_id != user.id:
@@ -1946,15 +2078,32 @@ class ChatService:
                 await maybe_autotitle(
                     db, conversation, None, first_user_message=user_content, commit=False
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("durable auto-title failed", exc_info=True)
         await commit_with_rollback(db)
 
-        # 5. Enqueue for the background worker.
-        from app.agents.workflow.queue import get_run_queue
+        # 5. Enqueue for the background worker. The run row is already
+        # committed as ``pending`` — if the queue transport is down we surface
+        # a clear error and let the recovery scheduler re-enqueue the run once
+        # Redis is back (the old silent in-memory fallback left the run
+        # stranded in a queue no worker process could see).
+        from app.agents.workflow.queue import RunQueueUnavailable, get_run_queue
+        from app.core.exceptions import AppException
 
-        queue = await get_run_queue()
-        await queue.enqueue(run.id, db_session_factory=self._persistence_session_factory)
+        try:
+            queue = await get_run_queue()
+            await queue.enqueue(run.id, db_session_factory=self._persistence_session_factory)
+        except RunQueueUnavailable as exc:
+            logger.error(
+                "durable dispatch: run %s enqueued nowhere (queue unavailable); "
+                "recovery will re-enqueue it",
+                run.id, exc_info=True,
+            )
+            raise AppException(
+                code="run_queue_unavailable",
+                message="服务繁忙，请求已排队稍后自动执行",
+                status_code=503,
+            ) from exc
         logger.info(
             "durable dispatch: enqueued run %s for conversation %s (user %s)",
             run.id, conversation.id, user.id,
@@ -2158,7 +2307,9 @@ async def run_durable_turn(
     # (M-2). Summary / goal remain deferred on the durable path (no flow-state
     # re-hydration), matching the prior behavior.
     history = await _load_history(db, conversation.id)
-    _active_user_memories = await _load_active_user_memories(db, user.id)
+    _active_user_memories = await _load_active_user_memories(
+        db, user.id, query=run_input.get("content") or None
+    )
     system_prompt = _build_system_prompt(conversation, rag_context=rag_context)
     system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
         base=system_prompt,

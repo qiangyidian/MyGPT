@@ -98,7 +98,7 @@ class ConnectorSessionManager:
 
         try:
             connectors = await self._service.list_for_user(user_id)
-        except Exception:  # noqa: BLE001 — DB failure must not crash the run
+        except Exception:
             logger.warning(
                 "connector list for user %s failed; no connector tools",
                 user_id,
@@ -117,8 +117,8 @@ class ConnectorSessionManager:
         configs: list[Any] = []
         for conn in enabled:
             try:
-                configs.append(self._service.build_server_config(conn))
-            except Exception:  # noqa: BLE001 — isolate per-connector build failure
+                configs.append(await self._service.build_server_config(conn))
+            except Exception:
                 logger.warning(
                     "connector %s (%s) config build failed; skipped",
                     conn.id, conn.provider, exc_info=True,
@@ -138,7 +138,7 @@ class ConnectorSessionManager:
         # breaks the others or the run.
         try:
             await registry.connect_all()
-        except Exception:  # noqa: BLE001 — defensive: connect_all already isolates
+        except Exception:
             logger.warning(
                 "connector connect_all failed for user %s; partial tools",
                 user_id, exc_info=True,
@@ -161,7 +161,7 @@ class ConnectorSessionManager:
                     .values(last_used_at=datetime.now(timezone.utc))
                 )
                 await self._db.commit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("last_used_at stamp failed", exc_info=True)
         logger.info(
             "connector sessions opened for user %s: %d server(s), %d tool(s)",
@@ -184,7 +184,7 @@ class ConnectorSessionManager:
             return
         try:
             await reg.disconnect_all()
-        except Exception:  # noqa: BLE001 — shutdown must never raise
+        except Exception:
             logger.warning("connector session close failed", exc_info=True)
         finally:
             self._registry = None

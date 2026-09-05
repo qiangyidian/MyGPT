@@ -14,7 +14,7 @@ hard cap on a single command's stdout/stderr.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 class RunnerError(RuntimeError):
@@ -58,4 +58,4 @@ class Runner(Protocol):
         ...  # pragma: no cover
 
 
-__all__ = ["Runner", "RunnerError", "RunResult"]
+__all__ = ["RunResult", "Runner", "RunnerError"]

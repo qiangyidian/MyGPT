@@ -117,7 +117,7 @@ function CopyButton({ text }: { text: string }) {
     <Button
       variant="ghost"
       size="sm"
-      className="h-7 gap-1 px-2 text-xs text-muted-foreground"
+      className="h-9 max-sm:h-11 gap-1 px-2 text-xs text-muted-foreground"
       onClick={handleCopy}
       aria-label={copied ? "已复制" : "复制"}
     >
@@ -203,7 +203,7 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
       <Button
         variant="ghost"
         size="icon"
-        className={cn("h-7 w-7 text-muted-foreground", up && "text-green-600 dark:text-green-400")}
+        className={cn("h-9 w-9 text-muted-foreground max-sm:h-11 max-sm:w-11", up && "text-green-600 dark:text-green-400")}
         disabled={isLoading}
         onClick={() => (up ? void clear() : void set("up"))}
         aria-label="有帮助"
@@ -214,7 +214,7 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
       <Button
         variant="ghost"
         size="icon"
-        className={cn("h-7 w-7 text-muted-foreground", down && "text-destructive")}
+        className={cn("h-9 w-9 text-muted-foreground max-sm:h-11 max-sm:w-11", down && "text-destructive")}
         disabled={isLoading}
         onClick={() => (down ? void clear() : void set("down"))}
         aria-label="无帮助"
@@ -224,6 +224,20 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
       </Button>
     </div>
   );
+}
+
+function formatMessageTime(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (sameDay) return hm;
+  return `${d.toLocaleDateString([], { month: "numeric", day: "numeric" })} ${hm}`;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -459,17 +473,29 @@ export const MessageBubble = memo(function MessageBubble({
         {!editing && (
           <div
             className={cn(
-              "mt-1 flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
+              // Touch devices have no hover: the row must be always-visible
+              // there, or copy/regenerate/feedback are undiscoverable. On
+              // pointer devices the hover/focus reveal stays.
+              "mt-1 flex items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100",
               isUser ? "flex-row-reverse" : "flex-row"
             )}
           >
+            {!isUser && (
+              <time
+                className="mr-1 text-[11px] text-muted-foreground/70"
+                dateTime={message.created_at}
+                title={message.created_at}
+              >
+                {formatMessageTime(message.created_at)}
+              </time>
+            )}
             {!isUser && message.content && <CopyButton text={safeContent} />}
             {!isUser && !isStreaming && <FeedbackButtons messageId={message.id} />}
             {!isUser && isLast && canRegenerate && !isStreaming && (
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 gap-1 px-2 text-xs text-muted-foreground"
+                className="h-9 max-sm:h-11 gap-1 px-2 text-xs text-muted-foreground"
                 onClick={onRegenerate}
               >
                 <RefreshCw className="h-3 w-3" />
@@ -480,7 +506,7 @@ export const MessageBubble = memo(function MessageBubble({
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 gap-1 px-2 text-xs text-muted-foreground"
+                className="h-9 max-sm:h-11 gap-1 px-2 text-xs text-muted-foreground"
                 onClick={() => {
                   setDraft(message.content);
                   setEditing(true);
