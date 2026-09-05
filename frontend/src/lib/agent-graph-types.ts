@@ -94,6 +94,11 @@ export interface RuntimeSelection {
   /** True only when the answer came from the deterministic demo executor
    *  (canned, non-real content). The UI MUST show a persistent warning. */
   isDemo: boolean;
+  /** User-facing mode requested for the turn vs the mode actually in effect
+   *  (both from the backend route). Lets the panel flag "专家模式 ran native"
+   *  even when the route itself degraded — not only on a runtime fallback. */
+  requestedMode?: string;
+  effectiveMode?: string;
 }
 
 // A monotonic status rank — used to prevent regressions (a completed node can't

@@ -94,6 +94,17 @@ export function AgentRunHeader({
           {elapsed(graph, now) || "—"}
         </span>
       </div>
+      {graph.selection?.requestedMode === "expert" &&
+        graph.selection.effectiveRuntime === "native" &&
+        !graph.selection.multiAgentExecuted && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-amber-700 dark:text-amber-400">
+            专家模式本次未走多 Agent 协作，已按原生单 Agent 执行
+            {graph.selection.fallbackReason
+              ? `（原因：${graph.selection.fallbackReason}）`
+              : ""}
+            。可让管理员访问 <code>/api/admin/agent-runtime</code> 查看运行时诊断。
+          </div>
+        )}
     </div>
   );
 }

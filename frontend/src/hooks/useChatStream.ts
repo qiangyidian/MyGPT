@@ -350,11 +350,13 @@ export function useChatStream(): ChatStreamState {
           multiAgentExecuted: e.multiAgentExecuted,
           fallbackReason: e.fallbackReason,
           isDemo: e.isDemo,
+          requestedMode: e.requestedMode,
+          effectiveMode: e.effectiveMode,
         });
         if (e.multiAgentRequested && !e.multiAgentExecuted) {
           const reason = e.fallbackReason || "不可用";
           toast.warning("多 Agent 运行时当前不可用，本次已回退为普通模式", {
-            description: `原因：${reason}。请在根目录 .env 启用 CREWAI_ENABLED=true 或 AGENT_DEMO_MODE=true 并重启后端。`,
+            description: `原因：${reason}。请检查服务器 .env 的 CREWAI_ENABLED 设置并重启后端（管理后台「Agent 运行时」诊断：/api/admin/agent-runtime）。`,
           });
         }
       },
