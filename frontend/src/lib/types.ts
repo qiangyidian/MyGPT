@@ -673,3 +673,77 @@ export interface RunActionResult {
   status: string;
   message: string | null;
 }
+
+// ===========================================================================
+// Credits / redeem codes
+// ===========================================================================
+
+export interface CreditAccountInfo {
+  balance: number;
+  lifetime_granted: number;
+  lifetime_consumed: number;
+  /** 观察模式开关：false 表示余额不足不会拦截。 */
+  enforced: boolean;
+}
+
+export interface CreditLedgerEntry {
+  id: string;
+  delta: number;
+  balance_after: number;
+  reason: "redeem" | "admin_adjust" | "usage" | "signup_bonus" | string;
+  ref_type: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export interface CreditLedgerPage {
+  entries: CreditLedgerEntry[];
+  next_cursor: string | null;
+}
+
+export interface RedeemResult {
+  credits_added: number;
+  balance: number;
+  batch_name: string;
+}
+
+export interface RedeemBatchInfo {
+  id: string;
+  name: string;
+  credits_per_code: number;
+  expires_at: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export interface RedeemBatchProgress {
+  batch: RedeemBatchInfo;
+  total: number;
+  redeemed: number;
+  void: number;
+  active: number;
+}
+
+export interface RedeemBatchCreateResult {
+  batch: RedeemBatchInfo;
+  /** 明文码，仅创建响应返回一次。 */
+  codes: string[];
+}
+
+export interface RedeemCodeInfo {
+  id: string;
+  code_prefix: string;
+  status: "active" | "redeemed" | "void" | string;
+  redeemed_by: string | null;
+  redeemed_at: string | null;
+  created_at: string;
+}
+
+export interface CreditAccountRow {
+  user_id: string;
+  email: string;
+  username: string;
+  balance: number;
+  lifetime_granted: number;
+  lifetime_consumed: number;
+}

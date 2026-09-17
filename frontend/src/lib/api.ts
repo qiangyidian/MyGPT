@@ -13,6 +13,9 @@ import {
   ConnectorUpdateInput,
   Conversation,
   ConversationDetail,
+  CreditAccountInfo,
+  CreditAccountRow,
+  CreditLedgerPage,
   DocFile,
   DocumentPreview,
   KnowledgeBase,
@@ -25,6 +28,10 @@ import {
   Project,
   ProjectInput,
   ProviderManifest,
+  RedeemBatchCreateResult,
+  RedeemBatchProgress,
+  RedeemCodeInfo,
+  RedeemResult,
   ResearchPlanStep,
   RunActionResult,
   ToolInfo,
@@ -419,6 +426,54 @@ export const api = {
         created_at: string | null;
       }>
     >("GET", `/api/admin/audit?limit=${limit}`),
+
+  // ---- Credits（积分） ----
+  fetchCredits: () => request<CreditAccountInfo>("GET", "/api/credits/me"),
+
+  redeemCode: (code: string) =>
+    request<RedeemResult>("POST", "/api/credits/redeem", { code }),
+
+  fetchCreditLedger: (limit = 50, cursor?: string | null) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (cursor) qs.set("cursor", cursor);
+    return request<CreditLedgerPage>("GET", `/api/credits/ledger?${qs.toString()}`);
+  },
+
+  // ---- Credits（管理端） ----
+  adminListRedeemBatches: () =>
+    request<RedeemBatchProgress[]>("GET", "/api/admin/redeem-batches"),
+
+  adminCreateRedeemBatch: (body: {
+    name: string;
+    credits_per_code: number;
+    count: number;
+    expires_at?: string | null;
+    note?: string | null;
+  }) => request<RedeemBatchCreateResult>("POST", "/api/admin/redeem-batches", body),
+
+  adminListRedeemCodes: (batchId: string, limit = 200, offset = 0) =>
+    request<RedeemCodeInfo[]>(
+      "GET",
+      `/api/admin/redeem-batches/${batchId}/codes?limit=${limit}&offset=${offset}`
+    ),
+
+  adminVoidRedeemBatch: (batchId: string) =>
+    request<{ voided: number }>(
+      "POST",
+      `/api/admin/redeem-batches/${batchId}/void`
+    ),
+
+  adminListCreditAccounts: (search?: string) => {
+    const qs = new URLSearchParams();
+    if (search) qs.set("search", search);
+    return request<CreditAccountRow[]>(
+      "GET",
+      `/api/admin/credits/accounts${qs.toString() ? `?${qs.toString()}` : ""}`
+    );
+  },
+
+  adminAdjustCredits: (body: { user_id: string; delta: number; note?: string | null }) =>
+    request<CreditAccountRow>("POST", "/api/admin/credits/adjust", body),
 
   // ---- Agent runs (Phase 3) ----
   getAgentRun: (runId: string) => request<AgentRun>("GET", `/api/agent-runs/${runId}`),
