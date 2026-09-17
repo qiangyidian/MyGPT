@@ -10,6 +10,8 @@ from app.models.audit_event import AuditEvent
 from app.models.chat_attachment import ChatAttachment
 from app.models.conversation import Conversation
 from app.models.conversation_memory import ConversationMemory
+from app.models.credit_account import CreditAccount
+from app.models.credit_ledger import CreditLedger
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
@@ -17,6 +19,8 @@ from app.models.message import Message
 from app.models.message_feedback import MessageFeedback
 from app.models.model_config import ModelConfig
 from app.models.project import Project
+from app.models.redeem_code import RedeemCode
+from app.models.redeem_code_batch import RedeemCodeBatch
 from app.models.run_command import RunCommand
 from app.models.run_event import RunEvent
 from app.models.run_lease import RunLease
@@ -59,4 +63,9 @@ __all__ = [
     "Artifact",
     # ---- WeChat Official Account scan-to-login ----
     "WechatIdentity",
+    # ---- Credits / redeem codes (预付费积分) ----
+    "CreditAccount",
+    "CreditLedger",
+    "RedeemCodeBatch",
+    "RedeemCode",
 ]

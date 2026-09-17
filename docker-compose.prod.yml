@@ -12,7 +12,7 @@
 #   * A one-shot `migrate` service runs `alembic upgrade head` BEFORE the API,
 #     worker, and recovery start (depends_on: service_completed_successfully).
 #     The runtime readiness gate (/ready, see app/core/health.py) additionally
-#     returns 503 if the DB revision != repo head (0010_artifacts) — so a stale
+#     returns 503 if the DB revision != repo head (0014_credits_redeem) — so a stale
 #     image that skipped a migration can never receive traffic.
 #   * Non-root containers (backend Dockerfile runs as uid 1001).
 #   * Resource limits + reservations on every service.
@@ -98,7 +98,7 @@ services:
           memory: 512M
 
   # ------------------------------------------------------- migration one-shot
-  # Runs `alembic upgrade head` to the repo head (0010_artifacts) before any app
+  # Runs `alembic upgrade head` to the repo head (0014_credits_redeem) before any app
   # service starts. This is the DEPLOY-TIME migration gate; the API/worker
   # additionally refuse readiness (/ready → 503) if the DB revision drifts.
   migrate:
