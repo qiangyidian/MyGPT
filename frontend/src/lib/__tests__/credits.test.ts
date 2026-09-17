@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   REDEEM_ERROR_MESSAGES,
   formatCredits,
+  formatCreditsRaw,
   normalizeRedeemCodeInput,
   redeemErrorMessage,
 } from "@/lib/credits";
@@ -66,6 +67,23 @@ describe("formatCredits", () => {
     expect(formatCredits(0)).toBe("0");
     expect(formatCredits(1234)).toBe("1,234");
     expect(formatCredits(1000000)).toBe("1,000,000");
+  });
+});
+
+describe("formatCreditsRaw", () => {
+  it("负数原样保留（管理侧负余额是超扣信号，不能被钳位成 0）", () => {
+    expect(formatCreditsRaw(-300)).toBe("-300");
+  });
+
+  it("与 formatCredits 对同一输入行为相反，防止两者被静默合并", () => {
+    expect(formatCredits(-300)).toBe("0");
+    expect(formatCreditsRaw(-300)).toBe("-300");
+  });
+
+  it("正数带千分位、null / undefined 显示为 0（与 formatCredits 一致）", () => {
+    expect(formatCreditsRaw(1234)).toBe("1,234");
+    expect(formatCreditsRaw(null)).toBe("0");
+    expect(formatCreditsRaw(undefined)).toBe("0");
   });
 });
 

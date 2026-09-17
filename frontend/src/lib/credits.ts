@@ -47,6 +47,18 @@ export function formatCredits(value: number | null | undefined): string {
   return safe.toLocaleString("zh-CN");
 }
 
+/**
+ * 余额展示（管理后台 / 运营视角专用）。
+ *
+ * 与上面的 `formatCredits` 相对：那边做负数钳位，是因为在用户侧余额是
+ * 平台负债、显示为负只会造成困惑；而管理侧的负数余额是一个真实信号 ——
+ * 它意味着账户超扣（消耗多于获得）或调分过量，运营需要看到它来诊断和
+ * 补偿。这里不做钳位，只做同样的取整与千分位格式化。
+ */
+export function formatCreditsRaw(value: number | null | undefined): string {
+  return Math.floor(Number(value) || 0).toLocaleString("zh-CN");
+}
+
 /** 后端稳定错误码 → 用户可读文案。 */
 export const REDEEM_ERROR_MESSAGES: Record<string, string> = {
   redeem_code_not_found: "兑换码不存在，请检查是否输入有误",

@@ -6,7 +6,11 @@ import { ShieldCheck, ShieldOff } from "lucide-react";
 import { useState } from "react";
 
 import { api, ApiError } from "@/lib/api";
-import { redeemErrorMessage, formatCredits } from "@/lib/credits";
+import {
+  redeemErrorMessage,
+  // 管理侧不钳位：负余额是超扣信号，必须原样显示给运营。
+  formatCreditsRaw as formatCredits,
+} from "@/lib/credits";
 import type { User } from "@/lib/types";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { AppPageShell } from "@/components/navigation/app-page-shell";
@@ -687,7 +691,9 @@ function CreditsPanel() {
         note: note.trim() || null,
       }),
     onSuccess: (updated) => {
-      toast.success(`${updated.username} 当前余额 ${updated.balance}`);
+      toast.success(
+        `${updated.username} 当前余额 ${formatCredits(updated.balance)}`
+      );
       setTarget(null);
       setDelta("");
       setNote("");
