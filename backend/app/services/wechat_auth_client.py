@@ -33,12 +33,19 @@ class WechatAuthUnavailable(Exception):
     """
 
 
-def _headers() -> dict[str, str]:
+def _headers(client_ip: str | None = None) -> dict[str, str]:
     settings = get_settings()
-    return {
+    headers = {
         "X-App-Id": settings.WECHAT_AUTH_APP_ID,
         "X-App-Secret": settings.WECHAT_AUTH_APP_SECRET,
     }
+    # The service sees every application call arrive over loopback, so it
+    # cannot tell users apart on its own — without this header its per-IP
+    # brute-force counter becomes one bucket shared by everyone, and ten wrong
+    # codes anywhere would lock out scan login for the whole platform.
+    if client_ip:
+        headers["X-Client-IP"] = client_ip
+    return headers
 
 
 def _base_url() -> str:
@@ -49,8 +56,10 @@ def _timeout() -> float:
     return get_settings().WECHAT_AUTH_TIMEOUT_SECONDS
 
 
-async def verify_code(code: str) -> str:
+async def verify_code(code: str, client_ip: str | None = None) -> str:
     """Redeem ``code`` and return the WeChat openid behind it.
+
+    ``client_ip`` is the END USER's address (see ``_headers``).
 
     Raises:
         WechatAuthError: the code is not valid for this application.
@@ -59,7 +68,9 @@ async def verify_code(code: str) -> str:
     url = f"{_base_url()}/api/v1/verify"
     try:
         async with httpx.AsyncClient(timeout=_timeout()) as client:
-            resp = await client.post(url, json={"code": code}, headers=_headers())
+            resp = await client.post(
+                url, json={"code": code}, headers=_headers(client_ip)
+            )
     except httpx.HTTPError as exc:
         # logger.exception, not logger.error: inside an except block the
         # traceback is the useful part.

@@ -88,14 +88,19 @@ async def _create_user_for_openid(db: AsyncSession, openid: str) -> User:
     return user
 
 
-async def login_with_code(db: AsyncSession, code: str) -> User:
+async def login_with_code(
+    db: AsyncSession, code: str, *, client_ip: str | None = None
+) -> User:
     """Redeem a scan code for the account it belongs to, registering if new.
+
+    ``client_ip`` is the end user's address, forwarded so the service can
+    throttle that one user rather than everyone.
 
     Raises:
         WechatLoginError: the code is wrong/expired/already used/not for us.
         WechatLoginUnavailable: wechat-auth is down or our credentials failed.
     """
-    openid = await wechat_auth_client.verify_code(code)
+    openid = await wechat_auth_client.verify_code(code, client_ip)
 
     user = await _user_for_openid(db, openid)
     if user is None:
@@ -114,14 +119,16 @@ async def get_binding(db: AsyncSession, user: User) -> str | None:
     return identity.openid if identity else None
 
 
-async def bind_openid(db: AsyncSession, user: User, code: str) -> str:
+async def bind_openid(
+    db: AsyncSession, user: User, code: str, *, client_ip: str | None = None
+) -> str:
     """Attach the WeChat behind ``code`` to ``user``.
 
     Without this, an existing account (an admin, anyone who registered by email)
     that scans would be handed a brand-new empty account instead of logging back
     into its own.
     """
-    openid = await wechat_auth_client.verify_code(code)
+    openid = await wechat_auth_client.verify_code(code, client_ip)
 
     existing = (
         await db.execute(select(WechatIdentity).where(WechatIdentity.openid == openid))

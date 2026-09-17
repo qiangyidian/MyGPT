@@ -29,7 +29,7 @@ from tests.conftest import auth_headers
 def redeem_as(monkeypatch):
     """Make every code redeem to ``openid``. Returns the openid."""
     def _set(openid: str) -> str:
-        async def _verify(_code: str) -> str:
+        async def _verify(_code: str, _client_ip: str | None = None) -> str:
             return openid
 
         monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
@@ -40,7 +40,7 @@ def redeem_as(monkeypatch):
 
 @pytest.fixture
 def rejecting(monkeypatch):
-    async def _verify(_code: str) -> str:
+    async def _verify(_code: str, _client_ip: str | None = None) -> str:
         raise WechatAuthError("公众号验证码错误或已过期")
 
     monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
@@ -48,7 +48,7 @@ def rejecting(monkeypatch):
 
 @pytest.fixture
 def unreachable(monkeypatch):
-    async def _verify(_code: str) -> str:
+    async def _verify(_code: str, _client_ip: str | None = None) -> str:
         raise WechatAuthUnavailable("微信登录服务暂时不可用，请稍后再试")
 
     monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
@@ -359,3 +359,38 @@ async def test_qrcode_reports_unavailable_rather_than_serving_a_broken_image(
 
     monkeypatch.setattr(wechat_auth_client, "fetch_qr_image", _none)
     assert (await client.get("/api/wechat/qrcode")).status_code == 503
+
+
+async def test_login_forwards_the_end_user_ip_to_the_service(
+    client, wechat_enabled, monkeypatch
+):
+    """不转发 IP，服务端就没法区分用户。
+
+    所有应用都从回环调用中央服务，它看到的 client host 永远是 127.0.0.1；
+    按那个计次会把所有产品、所有用户塞进同一个桶——任何一个人连输 10 个错码
+    就能把所有人的扫码登录锁 15 分钟。真实用户 IP 只有应用看得到。
+    """
+    seen: list[str | None] = []
+
+    async def _verify(_code: str, client_ip: str | None = None) -> str:
+        seen.append(client_ip)
+        return "oFORWARDED00000000000000001"
+
+    monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
+
+    await client.post("/api/auth/login/wechat", json={"wechat_code": "123456"})
+
+    assert seen and seen[0], "终端用户 IP 没有被转发给 wechat-auth"
+
+
+def test_the_end_user_ip_actually_lands_on_the_outgoing_request():
+    """只断言"参数传下去了"是不够的。
+
+    上面那条测试收集的是传给 verify_code 的实参；真正要保证的是这个头出现在
+    **发出去的请求**上——把 _headers 里的转发删掉，实参照样是对的。
+    """
+    from app.services.wechat_auth_client import _headers
+
+    assert _headers("203.0.113.9")["X-Client-IP"] == "203.0.113.9"
+    # 没有 IP 时不发这个头：服务端会退回到 socket peer 那个共享桶（偏严但不是没有限流）。
+    assert "X-Client-IP" not in _headers(None)

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
-from app.core.rate_limit import rate_limit_ip
+from app.core.rate_limit import client_ip, rate_limit_ip
 from app.core.security import (
     REFRESH_TOKEN_TYPE,
     build_cookie_params,
@@ -162,6 +162,7 @@ async def me(current: User = Depends(get_current_user)) -> User:
              dependencies=[Depends(rate_limit_ip(30, 60, "wechat_login"))])
 async def login_with_wechat_code(
     payload: WechatCodeLoginRequest,
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
@@ -175,7 +176,9 @@ async def login_with_wechat_code(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "公众号登录未启用")
 
     try:
-        user = await wechat_login_service.login_with_code(db, payload.wechat_code)
+        user = await wechat_login_service.login_with_code(
+            db, payload.wechat_code, client_ip=client_ip(request)
+        )
     except WechatAuthUnavailable as exc:
         # Our credentials are wrong or the service is down — an operator
         # problem, never reported to the user as "your code is wrong".
@@ -208,6 +211,7 @@ async def get_wechat_binding(
 @router.post("/wechat/binding", response_model=WechatBindingOut)
 async def bind_wechat(
     payload: WechatCodeLoginRequest,
+    request: Request,
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WechatBindingOut:
@@ -225,7 +229,9 @@ async def bind_wechat(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "公众号登录未启用")
 
     try:
-        openid = await wechat_login_service.bind_openid(db, current, payload.wechat_code)
+        openid = await wechat_login_service.bind_openid(
+            db, current, payload.wechat_code, client_ip=client_ip(request)
+        )
     except WechatAuthUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except WechatAuthError as exc:
