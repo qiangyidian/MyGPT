@@ -168,7 +168,11 @@ async def login_with_wechat_code(
 ) -> TokenResponse:
     """Redeem a scan code; auto-registers a first-time follower."""
     from app.services import wechat_login_service
-    from app.services.wechat_auth_client import WechatAuthError, WechatAuthUnavailable
+    from app.services.wechat_auth_client import (
+        WechatAuthError,
+        WechatAuthThrottled,
+        WechatAuthUnavailable,
+    )
 
     # Read at request time, not from the module-level `settings` snapshot:
     # a cleared get_settings() cache leaves that snapshot stale.
@@ -183,6 +187,9 @@ async def login_with_wechat_code(
         # Our credentials are wrong or the service is down — an operator
         # problem, never reported to the user as "your code is wrong".
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except WechatAuthThrottled as exc:
+        # 429, 不是 401：这位用户只是试得太快，不是凭据错了。
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
     except WechatAuthError as exc:
         await audit_service.log(
             actor_id=None,

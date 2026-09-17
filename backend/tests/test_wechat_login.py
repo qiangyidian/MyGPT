@@ -21,7 +21,11 @@ from sqlalchemy import select
 
 from app.models import User, WechatIdentity
 from app.services import wechat_auth_client, wechat_login_service
-from app.services.wechat_auth_client import WechatAuthError, WechatAuthUnavailable
+from app.services.wechat_auth_client import (
+    WechatAuthError,
+    WechatAuthThrottled,
+    WechatAuthUnavailable,
+)
 from tests.conftest import auth_headers
 
 
@@ -50,6 +54,14 @@ def rejecting(monkeypatch):
 def unreachable(monkeypatch):
     async def _verify(_code: str, _client_ip: str | None = None) -> str:
         raise WechatAuthUnavailable("微信登录服务暂时不可用，请稍后再试")
+
+    monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
+
+
+@pytest.fixture
+def throttled(monkeypatch):
+    async def _verify(_code: str, _client_ip: str | None = None) -> str:
+        raise WechatAuthThrottled("验证码错误次数过多，请稍后再试")
 
     monkeypatch.setattr(wechat_auth_client, "verify_code", _verify)
 
@@ -394,3 +406,16 @@ def test_the_end_user_ip_actually_lands_on_the_outgoing_request():
     assert _headers("203.0.113.9")["X-Client-IP"] == "203.0.113.9"
     # 没有 IP 时不发这个头：服务端会退回到 socket peer 那个共享桶（偏严但不是没有限流）。
     assert "X-Client-IP" not in _headers(None)
+
+
+async def test_throttling_surfaces_as_429_not_as_a_credential_error(
+    client, wechat_enabled, throttled
+):
+    """限流不是凭据错误。
+
+    把服务端的 429 合并进 401，会让「只是试得太快」的客户端以为自己密码错了——
+    重试策略和提示都会错。
+    """
+    r = await client.post("/api/auth/login/wechat", json={"wechat_code": "1"})
+    assert r.status_code == 429
+    assert "次数过多" in r.json()["message"]

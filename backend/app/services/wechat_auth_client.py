@@ -24,6 +24,15 @@ class WechatAuthError(Exception):
     """The code could not be redeemed (bad/expired/already used/wrong app)."""
 
 
+class WechatAuthThrottled(Exception):
+    """This END USER has failed too many codes; slow down.
+
+    Deliberately not a subclass of :class:`WechatAuthError`: the two map to
+    different HTTP statuses (429 vs 401), and collapsing them would tell a
+    client that is merely going too fast that its credentials are wrong.
+    """
+
+
 class WechatAuthUnavailable(Exception):
     """wechat-auth could not be reached, or rejected our credentials.
 
@@ -89,7 +98,7 @@ async def verify_code(code: str, client_ip: str | None = None) -> str:
         logger.error("wechat-auth rejected us: %s %s", resp.status_code, resp.text[:200])
         raise WechatAuthUnavailable("微信登录服务暂时不可用，请稍后再试")
     if resp.status_code == 429:
-        raise WechatAuthError("验证码错误次数过多，请稍后再试")
+        raise WechatAuthThrottled("验证码错误次数过多，请稍后再试")
     raise WechatAuthError("公众号验证码错误或已过期")
 
 
