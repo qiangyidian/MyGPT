@@ -116,6 +116,25 @@ async def register(
     await db.commit()
     await db.refresh(user)
 
+    # 积分账户：注册即建行（余额 0，或配置的注册赠送）。不建的话
+    # "余额为 0" 和 "账户不存在" 在排查时会变成两件事。
+    from app.credits import get_credit_policy
+    from app.services import credit_service
+
+    await credit_service.get_or_create_account(db, user.id)
+    _credit_policy = get_credit_policy()
+    if _credit_policy.signup_bonus > 0:
+        await credit_service.grant(
+            db,
+            user.id,
+            amount=_credit_policy.signup_bonus,
+            reason="signup_bonus",
+            ref_type="user",
+            ref_id=str(user.id),
+            note="注册赠送",
+        )
+    await db.commit()
+
     await audit_service.log(actor_id=user.id, action="auth:register", target=f"user:{user.id}")
     return _issue_tokens(user, response)
 

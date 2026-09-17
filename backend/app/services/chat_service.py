@@ -80,6 +80,7 @@ from app.models import (
     User,
 )
 from app.providers.registry import get_provider_for_config
+from app.credits import get_credit_policy
 from app.quotas import QuotaExceeded, get_quota_service
 from app.services import credit_service
 from app.rag.citations import sanitize_unbacked_source_markers
@@ -1114,6 +1115,21 @@ class ChatService:
                         },
                     )
                     return
+            # 积分准入：余额 <= 0 时在调用模型之前拒绝，避免已产生成本。
+            # CREDITS_ENFORCED 关闭时只记账不拦截（观察模式）。
+            credit_policy = get_credit_policy()
+            if credit_policy.enforced:
+                account = await credit_service.read_account(db, user.id)
+                if account is None or int(account.balance) <= 0:
+                    yield _event(
+                        "error",
+                        {
+                            "code": "insufficient_credits",
+                            "message": "积分不足，请先兑换后再继续对话",
+                            "balance": int(account.balance) if account else 0,
+                        },
+                    )
+                    return
             async for evt in self._run(db, user, request):
                 yield evt
         except asyncio.CancelledError:
@@ -2027,6 +2043,22 @@ class ChatService:
         recognition, enrichment) is deferred to :func:`run_durable_turn` which
         the worker invokes — it is NOT duplicated here.
         """
+
+        # 积分准入：与内联路径同款规则，但不走 SSE —— 这个端点返回 run_id，
+        # 所以用 HTTP 状态码拒绝。必须放在最前面：_get_or_create_conversation
+        # 会真的建一个会话行，拦在它后面就"已经产生了副作用"。
+        credit_policy = get_credit_policy()
+        if credit_policy.enforced:
+            account = await credit_service.read_account(db, user.id)
+            if account is None or int(account.balance) <= 0:
+                from app.core.exceptions import AppException as _AppException
+
+                raise _AppException(
+                    402,
+                    "insufficient_credits",
+                    "积分不足，请先兑换后再继续对话",
+                    {"balance": int(account.balance) if account else 0},
+                )
 
         # 1. Resolve conversation + model (same helpers as _run).
         conversation = await _get_or_create_conversation(db, user, request)
