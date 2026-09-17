@@ -6,7 +6,7 @@ import { ShieldCheck, ShieldOff } from "lucide-react";
 import { useState } from "react";
 
 import { api, ApiError } from "@/lib/api";
-import { redeemErrorMessage } from "@/lib/credits";
+import { redeemErrorMessage, formatCredits } from "@/lib/credits";
 import type { User } from "@/lib/types";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { AppPageShell } from "@/components/navigation/app-page-shell";
@@ -119,6 +119,7 @@ function AdminContent() {
         <TabsTrigger value="status">系统状态</TabsTrigger>
         <TabsTrigger value="usage">用量</TabsTrigger>
         <TabsTrigger value="redeem">兑换码</TabsTrigger>
+        <TabsTrigger value="credits">积分</TabsTrigger>
         <TabsTrigger value="audit">审计日志</TabsTrigger>
         <TabsTrigger value="tools">工具</TabsTrigger>
       </TabsList>
@@ -333,6 +334,11 @@ function AdminContent() {
       {/* Redeem codes — 批次生成、导出、作废 */}
       <TabsContent value="redeem" className="space-y-3">
         <RedeemCodesPanel />
+      </TabsContent>
+
+      {/* Credits — 用户余额与手动调分 */}
+      <TabsContent value="credits" className="space-y-3">
+        <CreditsPanel />
       </TabsContent>
     </Tabs>
   );
@@ -638,6 +644,179 @@ function RedeemCodesPanel() {
               下载 CSV
             </Button>
             <Button onClick={() => setIssued(null)}>我已保存</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+interface CreditRow {
+  user_id: string;
+  email: string;
+  username: string;
+  balance: number;
+  lifetime_granted: number;
+  lifetime_consumed: number;
+}
+
+/**
+ * 用户积分面板。
+ *
+ * 手动调分是客服必备：支付成功但码没发出去、需要赔偿用户、测试账号充值 ——
+ * 这些都不该逼管理员去生成一个一次性兑换码。调分与兑换码走同一套账本，
+ * 并写一条 `credits:adjust` 审计事件。
+ */
+function CreditsPanel() {
+  const qc = useQueryClient();
+  const [search, setSearch] = useState("");
+  const [target, setTarget] = useState<CreditRow | null>(null);
+  const [delta, setDelta] = useState("");
+  const [note, setNote] = useState("");
+
+  const accountsQ = useQuery({
+    queryKey: ["admin-credit-accounts", search],
+    queryFn: () => api.adminListCreditAccounts(search.trim() || undefined),
+  });
+
+  const adjustMut = useMutation({
+    mutationFn: (row: CreditRow) =>
+      api.adminAdjustCredits({
+        user_id: row.user_id,
+        delta: Number(delta),
+        note: note.trim() || null,
+      }),
+    onSuccess: (updated) => {
+      toast.success(`${updated.username} 当前余额 ${updated.balance}`);
+      setTarget(null);
+      setDelta("");
+      setNote("");
+      qc.invalidateQueries({ queryKey: ["admin-credit-accounts"] });
+    },
+    onError: (err) => {
+      const apiErr = err as ApiError;
+      toast.error(apiErr.message || "调分失败");
+    },
+  });
+
+  return (
+    <>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          查看用户余额，或手动加 / 扣积分（会留审计记录）。
+        </p>
+        <Input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="搜索邮箱或用户名"
+          className="max-w-56"
+        />
+      </div>
+
+      {accountsQ.isError ? (
+        <ErrorState onRetry={() => accountsQ.refetch()} />
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-secondary/50 text-left text-xs text-muted-foreground">
+              <tr>
+                <th className="p-3">用户</th>
+                <th className="hidden p-3 sm:table-cell">邮箱</th>
+                <th className="p-3 text-right">余额</th>
+                <th className="hidden p-3 text-right md:table-cell">累计获得</th>
+                <th className="hidden p-3 text-right md:table-cell">累计消耗</th>
+                <th className="p-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {accountsQ.isLoading ? (
+                <tr>
+                  <td colSpan={6} className="p-6 text-center text-muted-foreground">
+                    加载中…
+                  </td>
+                </tr>
+              ) : !accountsQ.data?.length ? (
+                <tr>
+                  <td colSpan={6} className="p-6 text-center text-muted-foreground">
+                    没有匹配的用户。
+                  </td>
+                </tr>
+              ) : (
+                accountsQ.data.map((row: CreditRow) => (
+                  <tr key={row.user_id} className="border-t border-border">
+                    <td className="p-3 font-medium">{row.username}</td>
+                    <td className="hidden p-3 text-muted-foreground sm:table-cell">
+                      {row.email}
+                    </td>
+                    <td className="p-3 text-right tabular-nums">
+                      {formatCredits(row.balance)}
+                    </td>
+                    <td className="hidden p-3 text-right tabular-nums text-muted-foreground md:table-cell">
+                      {row.lifetime_granted}
+                    </td>
+                    <td className="hidden p-3 text-right tabular-nums text-muted-foreground md:table-cell">
+                      {row.lifetime_consumed}
+                    </td>
+                    <td className="p-3 text-right">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setTarget(row);
+                          setDelta("");
+                          setNote("");
+                        }}
+                      >
+                        调整
+                      </Button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Dialog open={!!target} onOpenChange={(next) => !next && setTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>调整积分</DialogTitle>
+            <DialogDescription>
+              {target?.username}（当前 {formatCredits(target?.balance)}）
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <Label htmlFor="adjust-delta">变动数量（正数增加，负数扣减）</Label>
+              <Input
+                id="adjust-delta"
+                type="number"
+                value={delta}
+                onChange={(e) => setDelta(e.target.value)}
+                placeholder="例如 1000 或 -500"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="adjust-note">备注</Label>
+              <Input
+                id="adjust-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="例如 客服补偿"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTarget(null)}>
+              取消
+            </Button>
+            <Button
+              disabled={!delta || Number(delta) === 0 || adjustMut.isPending}
+              onClick={() => target && adjustMut.mutate(target)}
+            >
+              {adjustMut.isPending ? "提交中…" : "确认"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
