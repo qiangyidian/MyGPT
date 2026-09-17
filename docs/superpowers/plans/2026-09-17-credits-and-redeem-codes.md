@@ -31,7 +31,7 @@
 **Files:**
 - Create: `backend/app/credits.py`
 - Modify: `backend/app/core/config.py`（在 `QUOTA_RUN_TTL_SECONDS` 之后追加）
-- Modify: `backend/.env.example`
+- Modify: `.env.example`（仓库根，不是 backend/：config.py:24 读的是 `_REPO_ROOT / ".env"`）
 - Test: `backend/tests/test_credits.py`
 
 **Interfaces:**
@@ -219,7 +219,7 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'app.credits'`
     REDEEM_MAX_CODES_PER_BATCH: int = 5000
 ```
 
-在 `backend/.env.example` 末尾追加：
+在仓库根的 `.env.example` 末尾追加（**不是** `backend/.env.example` —— 那个文件不存在，`config.py:24` 读的是 `_REPO_ROOT / ".env"`）：
 
 ```bash
 # ---- Credits / redeem codes (预付费积分) ----
@@ -415,12 +415,12 @@ __all__ = [
 cd backend && python -m pytest tests/test_credits.py -v
 ```
 
-Expected: PASS —— 全部 17 个用例
+Expected: PASS —— 全部 18 个用例
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/app/credits.py backend/app/core/config.py backend/.env.example backend/tests/test_credits.py
+git add backend/app/credits.py backend/app/core/config.py .env.example backend/tests/test_credits.py
 git commit -m "feat(credits): 积分扣分公式与兑换码编解码
 
 扣分优先按服务端实测成本换算，成本未知或为 0 时回落到 token 计价 ——
