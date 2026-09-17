@@ -1694,7 +1694,7 @@ git commit -m "feat(credits): credit_service 账户、账本、扣分与调分
   - `async def redeem(db, *, user_id, raw_code) -> RedeemResult`（失败抛 `credit_service.CreditError`）
   - `async def list_batches(db, *, limit=100) -> list[BatchProgress]`
   - `async def list_codes(db, *, batch_id, limit=200, offset=0) -> list[RedeemCode]`
-  - `async def void_batch(db, *, batch_id, actor_id) -> int`
+  - `async def void_batch(db, *, batch_id) -> int`（**无 `actor_id`** —— 审计事件由 Task 5 的路由写，不在服务层；Task 4 的实现者发现了这处 Interface 列表与代码体不一致，按代码体做的，判断正确）
 
 - [ ] **Step 1: 写失败测试**
 
