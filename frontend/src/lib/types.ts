@@ -28,6 +28,20 @@ export interface User {
   created_at: string;
 }
 
+/** Public login-page hints for Official Account scan login. */
+export interface WechatLoginInfo {
+  /** False when the deployment has no QR image set — show a text hint instead. */
+  configured: boolean;
+  qrcode_url: string;
+  /** Keyword an already-following user sends to the account to get a code. */
+  keyword: string;
+}
+
+export interface WechatBinding {
+  bound: boolean;
+  openid: string | null;
+}
+
 export interface TokenResponse {
   access_token: string;
   token_type: string;

@@ -24,6 +24,7 @@ from app.models.tool_approval import ToolApproval
 from app.models.tool_call import ToolCall
 from app.models.user import User
 from app.models.user_memory import UserMemory
+from app.models.wechat_identity import WechatIdentity
 
 __all__ = [
     "AuditEvent",
@@ -56,4 +57,6 @@ __all__ = [
     "Connector",
     # ---- Task 10: first-class artifacts ----
     "Artifact",
+    # ---- WeChat Official Account scan-to-login ----
+    "WechatIdentity",
 ]

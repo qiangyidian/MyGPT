@@ -32,6 +32,8 @@ import {
   UserMemory,
   UserMemoryEditInput,
   UserMemoryProposeInput,
+  WechatBinding,
+  WechatLoginInfo,
 } from "./types";
 import { getAccessToken, setAccessToken } from "./auth";
 import { parseSSEStream } from "./sse-parser";
@@ -64,9 +66,14 @@ export class ApiError extends Error {
 }
 
 // These endpoints answer 401 with *credential* errors ("Invalid email or
-// password"), not session expiry — running the refresh dance on them would
-// mask the real message behind "会话已过期", so they bypass the retry below.
-const CREDENTIAL_AUTH_PATHS = new Set(["/api/auth/login", "/api/auth/register"]);
+// password", a bad scan code), not session expiry — running the refresh dance
+// on them would mask the real message behind "会话已过期", so they bypass the
+// retry below.
+const CREDENTIAL_AUTH_PATHS = new Set([
+  "/api/auth/login",
+  "/api/auth/register",
+  "/api/auth/login/wechat",
+]);
 
 let refreshing: Promise<boolean> | null = null;
 
@@ -203,6 +210,42 @@ export const api = {
   },
   async me() {
     return request<User>("GET", "/api/auth/me");
+  },
+
+  // ---- WeChat Official Account scan login (公众号验证码登录) ----
+  /**
+   * Public login-page hints. Unauthenticated, so it must not 401 the caller.
+   * `configured` is false when the deployment has no QR image set — the panel
+   * then shows a text hint instead of a broken image.
+   */
+  async fetchWechatLoginInfo() {
+    const res = await request<{ data: WechatLoginInfo }>(
+      "GET",
+      "/api/wechat/login-info"
+    );
+    return res.data;
+  },
+  /** Redeem the code the Official Account sent, for a session. */
+  async loginWithWechatCode(wechatCode: string) {
+    const data = await request<{
+      access_token: string;
+      expires_in: number;
+      user: User;
+    }>("POST", "/api/auth/login/wechat", { wechat_code: wechatCode });
+    setAccessToken(data.access_token);
+    return data;
+  },
+  async fetchWechatBinding() {
+    return request<WechatBinding>("GET", "/api/auth/wechat/binding");
+  },
+  /** Attach the WeChat that produced `wechatCode` to the account already logged in. */
+  async bindWechat(wechatCode: string) {
+    return request<WechatBinding>("POST", "/api/auth/wechat/binding", {
+      wechat_code: wechatCode,
+    });
+  },
+  async unbindWechat() {
+    return request<WechatBinding>("DELETE", "/api/auth/wechat/binding");
   },
   /** 账号注销：需要密码二次确认；成功后服务端清除内容并使所有 token 失效。 */
   async deleteMyAccount(password: string) {

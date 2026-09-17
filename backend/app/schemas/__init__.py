@@ -20,6 +20,8 @@ from app.schemas.auth import (
     RegisterRequest,
     TokenResponse,
     UserOut,
+    WechatBindingOut,
+    WechatCodeLoginRequest,
 )
 from app.schemas.chat import ChatRequest, Citation
 from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
@@ -75,6 +77,7 @@ __all__ = [
     "PlanStepIn", "PlanUpdateRequest", "RunInstructionRequest",
     # auth
     "RegisterRequest", "LoginRequest", "TokenResponse", "RefreshResponse", "UserOut",
+    "WechatCodeLoginRequest", "WechatBindingOut",
     "DeleteAccountRequest",
     "EmailCodeRequest",
     # model config

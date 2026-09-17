@@ -9,6 +9,7 @@ import { api, ApiError } from "@/lib/api";
 import { resolveReturnTo } from "@/lib/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { NavSuspense } from "@/components/navigation/page-loading";
+import { WechatLoginPanel } from "@/components/wechat-login-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/ui/password-input";
@@ -27,8 +28,9 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
+import type { WechatLoginInfo } from "@/lib/types";
 
-type Mode = "login" | "register";
+type Mode = "login" | "register" | "wechat";
 
 export default function LoginPage() {
   return (
@@ -56,6 +58,28 @@ function LoginForm() {
   const [verificationCode, setVerificationCode] = useState("");
   const [codeSending, setCodeSending] = useState(false);
   const [codeCountdown, setCodeCountdown] = useState(0);
+
+  // WeChat Official Account tab. `wechatInfo` stays null until login-info
+  // answers; the panel renders its text fallback for null, so an unreachable
+  // or unconfigured deployment never shows a broken QR.
+  const [wechatCode, setWechatCode] = useState("");
+  const [wechatInfo, setWechatInfo] = useState<WechatLoginInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .fetchWechatLoginInfo()
+      .then((info) => {
+        if (!cancelled) setWechatInfo(info);
+      })
+      .catch(() => {
+        // Not fatal: the email/password tabs still work, and the panel already
+        // renders the no-QR fallback.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Countdown for the send-code button (60s resend interval mirrors the backend).
   useEffect(() => {
@@ -165,6 +189,24 @@ function LoginForm() {
     }
   }
 
+  async function handleWechatLogin() {
+    setError(null);
+    if (!/^\d{6}$/.test(wechatCode.trim())) {
+      setError("请输入公众号回复的 6 位验证码");
+      return;
+    }
+    setLoading(true);
+    try {
+      const { user } = await api.loginWithWechatCode(wechatCode.trim());
+      toast.success(`欢迎，${user.username}`);
+      router.replace(next);
+    } catch (err) {
+      setError(toMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-gradient-to-b from-muted/40 to-background px-4 py-10">
       <div className="w-full max-w-md">
@@ -193,9 +235,10 @@ function LoginForm() {
                 resetError();
               }}
             >
-              <TabsList className="grid w-full grid-cols-2">
+              <TabsList className="grid w-full grid-cols-3">
                 <TabsTrigger value="login">登录</TabsTrigger>
                 <TabsTrigger value="register">注册</TabsTrigger>
+                <TabsTrigger value="wechat">公众号验证码</TabsTrigger>
               </TabsList>
 
               {/* ---------------- Login ---------------- */}
@@ -342,6 +385,21 @@ function LoginForm() {
                     注册并登录
                   </Button>
                 </form>
+              </TabsContent>
+
+              {/* ---------------- WeChat Official Account ---------------- */}
+              <TabsContent value="wechat" className="mt-4">
+                <WechatLoginPanel
+                  info={wechatInfo}
+                  code={wechatCode}
+                  onCodeChange={(v) => {
+                    setWechatCode(v);
+                    resetError();
+                  }}
+                  onSubmit={() => void handleWechatLogin()}
+                  loading={loading}
+                  error={error}
+                />
               </TabsContent>
             </Tabs>
           </CardContent>

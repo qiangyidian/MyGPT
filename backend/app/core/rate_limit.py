@@ -102,6 +102,17 @@ def _ip_of(request: Request) -> str:
     return chain[0] if chain else peer
 
 
+def client_ip(request: Request) -> str:
+    """Public alias for the trusted-proxy-aware client IP.
+
+    Anything that keys per-client state (rate-limit counters, login-failure
+    counters) MUST use this rather than ``request.client.host``: behind nginx
+    the raw peer is the proxy, so keying on it lumps every user into one bucket
+    and turns per-client throttling into a global lockout.
+    """
+    return _ip_of(request)
+
+
 async def _check(scope: str, identity: str, limit: int, window: int) -> None:
     """Raise HTTP 429 if ``identity`` has exceeded ``limit`` calls in ``window`` s."""
     # Disabled in test env so the suite (many requests/test) never trips a limit.

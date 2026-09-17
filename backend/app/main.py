@@ -41,6 +41,7 @@ from app.api import (
     projects,
     retrieval,
     tools,
+    wechat,
 )
 from app.api import (
     models as models_api,
@@ -193,6 +194,7 @@ def create_app() -> FastAPI:
     app.include_router(memories.user_router)
     app.include_router(connectors.router)
     app.include_router(artifacts.router)
+    app.include_router(wechat.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> JSONResponse:

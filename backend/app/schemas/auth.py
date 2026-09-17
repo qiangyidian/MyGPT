@@ -25,6 +25,19 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class WechatCodeLoginRequest(BaseModel):
+    """The 6-digit code the Official Account sent to the follower."""
+
+    # Bounded like every other pre-auth body field: this value goes into a Redis
+    # key, so it must not be attacker-unbounded.
+    wechat_code: str = Field(min_length=1, max_length=32)
+
+
+class WechatBindingOut(BaseModel):
+    bound: bool
+    openid: str | None = None
+
+
 class DeleteAccountRequest(BaseModel):
     """Account self-deletion (账号注销) requires password re-authentication."""
     password: str
@@ -32,7 +45,13 @@ class DeleteAccountRequest(BaseModel):
 
 class UserOut(ORMModel):
     id: uuid.UUID
-    email: EmailStr
+    # Plain `str`, NOT `EmailStr`: accounts created through WeChat (and accounts
+    # anonymized by self-deletion) carry synthetically generated addresses on
+    # special-use domains — `wx_xxx@wechat.local`, `deleted-xxx@deleted.invalid`
+    # — which email-validator REJECTS. Validation on the way out bought nothing
+    # and 500'd the admin user list as soon as one such row existed. Inbound
+    # addresses are still `EmailStr` on RegisterRequest/LoginRequest.
+    email: str
     username: str
     role: str
     is_active: bool

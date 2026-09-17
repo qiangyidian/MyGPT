@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useSearchParams, useRouter } from "next/navigation";
 import { Suspense, useEffect, useState, type ReactNode } from "react";
-import { Boxes, Brain, Cpu, Plug } from "lucide-react";
+import { Boxes, Brain, Cpu, Plug, ShieldCheck } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { buildLoginUrl, buildReturnTo, resolveChatHome, withReturnTo } from "@/lib/navigation";
@@ -37,6 +37,12 @@ const NAV = [
     href: "/settings/knowledge-bases",
     icon: Boxes,
     description: "管理向量知识库与文档",
+  },
+  {
+    label: "账号安全",
+    href: "/settings/account",
+    icon: ShieldCheck,
+    description: "微信绑定与登录方式",
   },
 ] as const;
 
