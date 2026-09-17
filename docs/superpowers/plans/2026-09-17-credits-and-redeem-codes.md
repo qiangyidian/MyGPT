@@ -3854,6 +3854,22 @@ describe("normalizeRedeemCodeInput", () => {
     expect(normalizeRedeemCodeInput("")).toBe("");
     expect(normalizeRedeemCodeInput("   ")).toBe("");
   });
+
+  it("全角字母数字折叠回 ASCII（与后端 normalize_code 一致）", () => {
+    // 全角码必须被折叠而不是被 [A-Z0-9] 丢弃 —— 否则粘贴全角码会在
+    // 16 位长度校验上卡住，用户永远提交不出去。
+    const wide = "ＡＢ１２ＣＤ３４ＥＦ５６ＧＨ７８";
+    expect(normalizeRedeemCodeInput(wide)).toBe("AB12-CD34-EF56-GH78");
+    expect(normalizeRedeemCodeInput(wide)).toBe(
+      normalizeRedeemCodeInput("ab12cd34ef56gh78")
+    );
+  });
+
+  it("全角字符不会被静默丢弃（回归：曾因过滤顺序而截断）", () => {
+    const out = normalizeRedeemCodeInput("ＡＢ１２");
+    expect(out.replace(/-/g, "")).toHaveLength(4);
+    expect(out).toBe("AB12");
+  });
 });
 
 describe("formatCredits", () => {
@@ -3933,7 +3949,11 @@ const CHAR_FIXES: Record<string, string> = { I: "1", L: "1", O: "0" };
  */
 export function normalizeRedeemCodeInput(raw: string): string {
   const chars: string[] = [];
-  for (const ch of (raw || "").toUpperCase()) {
+  // NFKC 必须放在最前，且必须与后端 app/credits.py 的 normalize_code 一致。
+  // 少了它，全角字母/数字会被下面的 [A-Z0-9] 过滤直接**丢弃** —— 用户粘贴一个
+  // 全角码会得到被截断的短串，卡在"兑换码应为 16 位字符"上，永远提交不出去，
+  // 后端那侧的全角兼容就形同虚设。
+  for (const ch of (raw || "").normalize("NFKC").toUpperCase()) {
     if (!/[A-Z0-9]/.test(ch)) continue;
     chars.push(CHAR_FIXES[ch] ?? ch);
     if (chars.length >= CODE_LENGTH) break;
