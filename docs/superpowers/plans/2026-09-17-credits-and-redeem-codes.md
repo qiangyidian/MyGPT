@@ -3430,11 +3430,15 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import sqlalchemy as sa
 
 from app.core.config import get_settings
 from app.credits import CreditPolicy, get_credit_policy, set_credit_policy
+from app.models import CreditAccount, CreditLedger
 from app.services import credit_service
 from tests.conftest import auth_headers
+
+SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 @pytest.fixture
@@ -3477,6 +3481,22 @@ async def _fund(db, user_id, amount=10_000):
     await db.commit()
 
 
+async def _drain(db, user_id):
+    """把这个用户的积分账户清掉，让它回到"余额为 0 / 无账户行"的状态。
+
+    为什么必须有这个：测试库是 session 级共享的（conftest 的 seeded_db），而
+    `test_durable_path_passes_when_funded` 会给**种子用户**加 10000 分并且提交。
+    下面那些"余额 0 应当被拦截"的用例如果依赖种子用户天然是 0，就只是在靠
+    **定义顺序**侥幸通过 —— 一旦有人调整用例顺序、插入新用例，或者别的文件
+    动了这个用户的余额，它们就会失败，而且失败原因极难定位。
+
+    显式清一次，把前提写进用例本身，而不是依赖执行顺序。
+    """
+    await db.execute(sa.delete(CreditLedger).where(CreditLedger.user_id == user_id))
+    await db.execute(sa.delete(CreditAccount).where(CreditAccount.user_id == user_id))
+    await db.commit()
+
+
 async def test_observation_mode_reports_not_enforced(client, auth_token, observing):
     me = (await client.get("/api/credits/me", headers=auth_headers(auth_token))).json()
     assert me["enforced"] is False
@@ -3490,8 +3510,10 @@ async def test_enforcing_mode_reports_enforced(client, auth_token, enforcing):
 # ---- 内联路径：SSE error 事件 ---------------------------------------------- #
 
 async def test_inline_path_blocks_zero_balance_when_enforcing(
-    client, auth_token, enforcing, offline_model
+    client, auth_token, enforcing, db_session, offline_model
 ):
+    # 显式把种子用户清成"无账户行" —— 不靠定义顺序侥幸（见 _drain 的说明）。
+    await _drain(db_session, SEEDED_USER)
     h = auth_headers(auth_token)
     model_id = await _create_mock_model(client, h)
 
@@ -3509,8 +3531,9 @@ async def test_inline_path_blocks_zero_balance_when_enforcing(
 
 
 async def test_inline_path_allows_zero_balance_when_observing(
-    client, auth_token, observing, offline_model
+    client, auth_token, observing, db_session, offline_model
 ):
+    await _drain(db_session, SEEDED_USER)
     h = auth_headers(auth_token)
     model_id = await _create_mock_model(client, h)
 
@@ -3537,6 +3560,8 @@ async def test_durable_path_blocks_zero_balance_before_creating_any_record(
     `_get_or_create_conversation` 前面，否则被拒的请求仍会留下一个空会话。
     """
     monkeypatch.setattr(get_settings(), "BACKGROUND_WORKER", "durable")
+    # 显式清空，不依赖定义顺序（见 _drain 的说明）。
+    await _drain(db_session, SEEDED_USER)
     h = auth_headers(auth_token)
     model_id = await _create_mock_model(client, h)
 
@@ -3569,9 +3594,11 @@ async def test_durable_path_passes_when_funded(
 ):
     """有余额时不得 402。只断言响应头就退出 —— 没有 worker 时后续事件永远不来。"""
     monkeypatch.setattr(get_settings(), "BACKGROUND_WORKER", "durable")
+    # 先清再充，保证这个用例的前提与其他用例无关。
+    await _drain(db_session, SEEDED_USER)
     h = auth_headers(auth_token)
     model_id = await _create_mock_model(client, h)
-    await _fund(db_session, uuid.UUID("00000000-0000-0000-0000-000000000001"))
+    await _fund(db_session, SEEDED_USER)
 
     async with client.stream(
         "POST",
