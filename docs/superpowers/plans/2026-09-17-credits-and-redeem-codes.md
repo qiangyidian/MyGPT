@@ -5129,12 +5129,13 @@ git commit -m "feat(credits): 管理后台用户积分面板
 **Files:**
 - Create: `docs/credits-operations.md`
 - Modify: `README.md`（如存在环境变量章节则补一行指向运维文档）
+- Modify: `scripts/verify_migrations.sh` 与 `scripts/restore-drill.sh`（**只改注释**，见 Step 1b）
 
 **Interfaces:**
 - Consumes: 前 11 个 Task 的全部产出
 - Produces: 上线操作手册
 
-- [ ] **Step 1: 写运维文档**
+- [ ] **Step 1a: 写运维文档**
 
 创建 `docs/credits-operations.md`：
 
@@ -5293,6 +5294,16 @@ VALUES (gen_random_uuid(), :uid, -10, 0, 'usage', 'message', :msg_id, now());
 `insufficient_credits`）。
 ```
 
+- [ ] **Step 1b: 修掉运维脚本里过期的迁移 head 注释**
+
+`scripts/verify_migrations.sh:5` 和 `scripts/restore-drill.sh:7` 的注释都还写着 repo head 是
+`0010_artifacts`。两个脚本**本身是正确的**（它们动态解析 head，见各自脚本内的
+"Resolve the repo's alembic head dynamically" 注释），只有说明文字过期了 —— 而这类注释正是
+运维在事故中会照着读的东西。把它们改成当前 head `0014_credits_redeem`。
+
+**只改注释，不要改脚本逻辑。** 顺带一提 `backend/app/core/health.py:97` 也提到 `0010_artifacts`，
+但那是在解释一个历史 bug 的成因，属于正确保留，不要动。
+
 - [ ] **Step 2: 在 README 里加指引**
 
 在 `README.md` 的环境变量或功能章节附近加一句：
@@ -5322,15 +5333,46 @@ cd frontend && npx tsc --noEmit && npx vitest run && npm run build
 
 Expected: 全部通过
 
-- [ ] **Step 5: 端到端手工验收**
+- [ ] **Step 5: 端到端验收 —— 由 controller 亲自执行，不是子代理能做的**
 
-1. 管理员生成一批 3 张 10000 分的码
-2. 普通用户兑换一张 → 余额 10000，流出流水 `+10000 兑换码`
-3. 该用户发一条对话 → 流水出现 `-N 对话消耗`，余额下降，且 N 与模型成本相称
+本步骤**不能交给子代理**（没有浏览器会话）。controller 必须真的把应用跑起来看画面，
+因为 Task 9 与 Task 10 的用户界面至今**从未被渲染过** —— 它们的批准只建立在静态阅读上。
+
+**在 2026-09-17 的这台机器上，依赖服务都不可用**（Postgres/Redis/Qdrant 都没起，Docker 守护进程
+也不可达），所以按下面的方式跑：
+
+```bash
+# 后端：用 SQLite 起在 8001（config.py/db.py 原生支持 sqlite 方言，AUTO_CREATE_TABLES 会建全表，
+# 含四张积分表与带 sqlite_where 的部分唯一索引）。不要改 backend/.env，也不要替用户启动 Docker。
+cd backend && DATABASE_URL="sqlite+aiosqlite:///./data/verify.db" AUTO_CREATE_TABLES=true \
+  ./.venv/Scripts/python.exe -m uvicorn app.main:app --port 8001
+
+# 前端：起在 3001 并指向 8001
+cd frontend && NEXT_PUBLIC_API_BASE_URL=http://localhost:8001 npx next dev -p 3001
+```
+
+然后逐项确认（前七项是功能验收，后四项是 Task 9/10 审查累积下来、只有渲染才能确认的点）：
+
+1. 管理员在后台「兑换码」Tab 生成一批 3 张 10000 分的码 → 弹窗显示明文、可复制、可下载 CSV
+2. 关掉弹窗后列表显示 3/0（剩余 3），且页面上再也找不到明文
+3. 普通用户在「设置 → 积分」兑换一张 → toast 成功、余额 10000、流水出现 `+10000 兑换码`
 4. 同一张码再兑 → 「该兑换码已被使用」
-5. 把余额调到 0（管理员调分）→ 打开 `CREDITS_ENFORCED=true` 重启 → 用户发对话 → 「积分不足」
-6. 兑换第二张码 → 用户发对话 → 正常
-7. 跑对账 SQL → 无输出
+5. 侧边栏底部的积分余额同步更新（与积分页一致）
+6. 后台对某用户调分 → 该用户积分页余额随之变化
+7. 后台「积分」Tab 搜索、调分、审计日志里出现 `credits:adjust`
+8. **观察模式提示条**在 `CREDITS_ENFORCED` 未开时可见，且文案与真实行为一致
+9. **侧边栏余额的布局**：`Button` 的 `w-full justify-start` 配 `<Link className="w-full">` 时余额是否
+   真的右对齐、窄宽度下是否换行
+10. **明文弹窗在 500 个码时**的观感：`max-h-64 overflow-auto` 是否够用、footer 按钮在小屏是否拥挤、
+    那条 destructive 警告的对比度是否真的够"显眼"
+11. **失败态**：把后端停掉 → 积分页应显示「余额加载失败 + 重试」而**不是 `0`**；点重试能恢复
+
+**必须明说的局限（不要含糊过去）：**
+- SQLite **验证不了** Postgres 特有的并发保证（行锁、兑换 CAS 在真实多写者争抢下的行为）。
+  那些仍只有 `docs/credits-operations.md` 里的 Postgres 演练覆盖。本步骤证明的是**功能端到端可用**，
+  不是重新验证并发设计。
+- 聊天扣分那一步需要可达的模型端点。若 `MODEL_API_BASE_URL` 指向的地址不可用，**如实报告这一步
+  无法验证**，不要假装跑过、也不要因此判定功能有问题。
 
 - [ ] **Step 6: 提交**
 
