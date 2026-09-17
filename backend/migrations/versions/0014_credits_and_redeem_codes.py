@@ -153,12 +153,9 @@ def upgrade() -> None:
             ),
             sa.Column("redeemed_by", postgresql.UUID(as_uuid=True), nullable=True),
             sa.Column("redeemed_at", sa.DateTime(timezone=True), nullable=True),
-            sa.Column(
-                "created_at",
-                sa.DateTime(timezone=True),
-                server_default=sa.func.now(),
-                nullable=False,
-            ),
+            # created_at 不给 server_default：Postgres 的 now() 取事务开始时间，
+            # create_batch 同事务插整批码会同时间戳；由应用层提供（datetime.now(UTC)）。
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
             sa.ForeignKeyConstraint(
                 ["batch_id"],
                 ["redeem_code_batches.id"],
@@ -175,18 +172,18 @@ def upgrade() -> None:
             "ix_redeem_codes_batch_status", "redeem_codes", ["batch_id", "status"]
         )
 
-    # 回填：每个存量用户一行账户（余额 0）。幂等，重复执行安全。
-    # `WHERE true` 在 INSERT...SELECT + ON CONFLICT 里不可省：SQLite 的解析器
-    # 会把 ON 误认成 JOIN 子句（官方文档明确要求加 WHERE 消歧），Postgres 上无影响。
-    if not _has_table("__never__"):
-        op.execute(
-            """
-            INSERT INTO credit_accounts
-                (user_id, balance, lifetime_granted, lifetime_consumed)
-            SELECT id, 0, 0, 0 FROM users WHERE true
-            ON CONFLICT (user_id) DO NOTHING
-            """
-        )
+    # 回填：每个存量用户一行账户（余额 0）。幂等（ON CONFLICT DO NOTHING），
+    # 重复执行安全。`WHERE true` 在 INSERT...SELECT + ON CONFLICT 里不可省：
+    # SQLite 的解析器会把 ON 误认成 JOIN 子句（官方文档明确要求加 WHERE 消歧），
+    # Postgres 上无影响。
+    op.execute(
+        """
+        INSERT INTO credit_accounts
+            (user_id, balance, lifetime_granted, lifetime_consumed)
+        SELECT id, 0, 0, 0 FROM users WHERE true
+        ON CONFLICT (user_id) DO NOTHING
+        """
+    )
 
 
 def downgrade() -> None:

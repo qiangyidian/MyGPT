@@ -12,9 +12,9 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,8 +45,12 @@ class RedeemCode(Base):
     redeemed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Python 侧默认（微秒精度），理由同 CreditLedger.created_at：server_default
+    # 在 Postgres 上取的是事务开始时间，redeem_service.create_batch 把一整批码
+    # 插进同一事务，会给批里所有码同一个时间戳，list_codes 按 created_at 排序
+    # 就变成任意顺序。
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
     __table_args__ = (Index("ix_redeem_codes_batch_status", "batch_id", "status"),)
