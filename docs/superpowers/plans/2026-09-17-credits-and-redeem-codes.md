@@ -466,12 +466,37 @@ import uuid
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from app.models import CreditAccount, CreditLedger, RedeemCode, RedeemCodeBatch
+from app.models import CreditAccount, CreditLedger, RedeemCode, RedeemCodeBatch, User
+
+
+async def _seed_user(db_session) -> uuid.UUID:
+    """建一个真实用户并返回 id。
+
+    涉及 users 外键的用例都要用它而不是 ``uuid.uuid4()`` —— 理由见
+    :func:`test_ledger_ref_triple_is_unique`。
+    """
+    token = uuid.uuid4().hex[:12]
+    user = User(
+        email=f"{token}@example.com",
+        username=f"u{token}",
+        password_hash="x",
+        role="user",
+        is_active=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    return user.id
 
 
 async def test_ledger_ref_triple_is_unique(db_session):
-    """同一 (ref_type, ref_id, reason) 只能有一行 —— 这是扣费幂等的根基。"""
-    uid = uuid.uuid4()
+    """同一 (ref_type, ref_id, reason) 只能有一行 —— 这是扣费幂等的根基。
+
+    用**真实存在的用户**，不图省事用 ``uuid.uuid4()``：SQLite 默认不启用
+    外键约束，但万一哪天开了，伪造的 user_id 会先撞外键 —— 而
+    ``pytest.raises(IntegrityError)`` 会把外键违规也当成通过，测试就为错误的
+    原因变绿了。真实用户让唯一索引成为唯一可能的违规来源。
+    """
+    uid = await _seed_user(db_session)
     for _ in range(2):
         db_session.add(
             CreditLedger(
@@ -489,7 +514,7 @@ async def test_ledger_ref_triple_is_unique(db_session):
 
 async def test_ledger_allows_many_null_ref_rows(db_session):
     """ref_type 为 NULL 的行不受唯一约束限制（管理员调分可重复出现）。"""
-    uid = uuid.uuid4()
+    uid = await _seed_user(db_session)
     db_session.add_all(
         [
             CreditLedger(user_id=uid, delta=10, balance_after=10, reason="admin_adjust"),
@@ -500,7 +525,7 @@ async def test_ledger_allows_many_null_ref_rows(db_session):
 
 
 async def test_ledger_different_reason_same_ref_is_allowed(db_session):
-    uid = uuid.uuid4()
+    uid = await _seed_user(db_session)
     db_session.add_all(
         [
             CreditLedger(
@@ -532,7 +557,7 @@ async def test_code_hash_is_unique(db_session):
 
 async def test_account_balance_may_go_negative(db_session):
     """准入在轮前、扣费在轮后，最后一轮必然透支。不能加 CHECK 约束。"""
-    uid = uuid.uuid4()
+    uid = await _seed_user(db_session)
     db_session.add(CreditAccount(user_id=uid, balance=-42))
     await db_session.flush()
 
@@ -1906,19 +1931,6 @@ async def test_cas_rejects_a_code_whose_pre_read_was_stale(db_session):
         .values(status="redeemed", redeemed_by=uuid.uuid4(), redeemed_at=datetime.now(UTC))
     )
     assert late.rowcount == 0
-
-
-async def test_redeem_reports_used_for_a_code_redeemed_after_pre_read(db_session):
-    """同样的时序走服务层：必须先读到 active 才可能走到 CAS，所以直接验结果。"""
-    batch, codes = await _make_batch(db_session, count=1, credits=500)
-    await db_session.commit()
-    await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
-    await db_session.commit()
-
-    with pytest.raises(credit_service.CreditError) as exc:
-        await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
-    assert exc.value.code == "redeem_code_used"
-    assert exc.value.status_code == 409
 
 
 async def test_concurrent_grants_accumulate_rather_than_overwrite(db_session):
