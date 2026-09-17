@@ -2,7 +2,7 @@
 #
 # image: replace `mygpt/backend:v1.0.0` with your registry tag (built from
 # backend/Dockerfile). Readiness is the STRICT /ready gate (Task 11): 200 only
-# when the DB revision == repo head (0010_artifacts), Qdrant client/server skew
+# when the DB revision == repo head (0014_credits_redeem), Qdrant client/server skew
 # <= 1, storage writable, a runner available, and an eligible chat model
 # configured. Liveness is the lenient /health (DB up).
 ---

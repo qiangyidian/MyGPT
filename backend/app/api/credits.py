@@ -115,8 +115,8 @@ async def create_redeem_batch(
 ) -> RedeemBatchCreateOut:
     """生成一批兑换码。
 
-    响应里的 ``codes`` 是明文，**只在这一次返回**。库里只写 SHA-256 哈希，
-    此后再无法取回明文 —— 管理员必须当场导出。
+    响应里的 ``codes`` 是明文，**只在这一次返回**。库里只写 peppered
+    HMAC-SHA256 哈希，此后再无法取回明文 —— 管理员必须当场导出。
     """
     try:
         batch, codes = await redeem_service.create_batch(
@@ -215,6 +215,35 @@ async def list_credit_accounts(
         )
         for user, account in rows
     ]
+
+
+@admin_router.get("/credits/ledger", response_model=LedgerPageOut)
+async def admin_user_ledger(
+    user_id: uuid.UUID = Query(...),
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    admin: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+) -> LedgerPageOut:
+    """查看某个用户的流水 —— 计费争议的关键证据。
+
+    与用户侧 ``/api/credits/ledger`` 同构（同样的游标分页与行形状），只是
+    ``user_id`` 由管理员指定。计费投诉（"一条消息扣了我 3000 分"）时运营
+    通过它看到 reason / ref / note / actor，而不是去倒临时 SQL。
+    """
+    target = (
+        await db.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if target is None:
+        raise AppException(404, "user_not_found", "用户不存在")
+
+    rows, next_cursor = await credit_service.ledger_page(
+        db, user_id, limit=limit, cursor=cursor
+    )
+    return LedgerPageOut(
+        entries=[LedgerEntryOut.model_validate(r) for r in rows],
+        next_cursor=next_cursor,
+    )
 
 
 @admin_router.post("/credits/adjust", response_model=CreditAccountRowOut)

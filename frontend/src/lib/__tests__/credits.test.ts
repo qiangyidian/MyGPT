@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   REDEEM_ERROR_MESSAGES,
+  expiryFromDateInput,
   formatCredits,
   formatCreditsRaw,
   normalizeRedeemCodeInput,
@@ -109,5 +110,50 @@ describe("redeemErrorMessage", () => {
 
   it("已知码优先用映射文案而不是后端 message", () => {
     expect(redeemErrorMessage("redeem_code_used", "raw")).toContain("已被使用");
+  });
+});
+
+describe("expiryFromDateInput", () => {
+  it("返回所选日期本地时间的最后一刻，而不是 UTC 午夜", () => {
+    const iso = expiryFromDateInput("2026-09-30")!;
+    expect(iso).not.toBeNull();
+    const d = new Date(iso);
+    // 结束在本地 23:59:59.999 —— 用本地字段断言，不依赖运行时区。
+    expect(d.getFullYear()).toBe(2026);
+    expect(d.getMonth()).toBe(8);
+    expect(d.getDate()).toBe(30);
+    expect(d.getHours()).toBe(23);
+    expect(d.getMinutes()).toBe(59);
+    expect(d.getSeconds()).toBe(59);
+    expect(d.getMilliseconds()).toBe(999);
+  });
+
+  it("日期串绝不会被当成 UTC 午夜解析（new Date('2026-09-30') 的陷阱）", () => {
+    // new Date("2026-09-30") 是 2026-09-30T00:00:00Z = 北京时间 08:00。
+    // helper 的结果必须不等于那个 UTC 午夜。
+    const utcMidnight = new Date("2026-09-30").toISOString(); // "2026-09-30T00:00:00.000Z"
+    expect(expiryFromDateInput("2026-09-30")).not.toBe(utcMidnight);
+  });
+
+  it("结果是本地午夜起一整天减一毫秒", () => {
+    const end = new Date(expiryFromDateInput("2026-09-30")!).getTime();
+    const localMidnight = new Date(2026, 8, 30).getTime();
+    expect(end - localMidnight).toBe(24 * 3600_000 - 1);
+  });
+
+  it("非 UTC 时区下，结果晚于当日 UTC 午夜 16 小时（北京时间场景）", () => {
+    // 北京时间运行时的核心场景：new Date("2026-09-30") 是北京时间 08:00，
+    // 而我们的结果应晚它近一整天 —— 这正是"提前 8 小时过期"陷阱的反向断言。
+    const utcMidnight = new Date("2026-09-30").getTime();
+    const localMidnight = new Date(2026, 8, 30).getTime();
+    const offset = localMidnight - utcMidnight; // 该日本地午夜相对 UTC 午夜的偏移
+    if (offset === 0) return; // UTC 运行环境下两指相同，无差异可断言
+    const end = new Date(expiryFromDateInput("2026-09-30")!).getTime();
+    expect(end - utcMidnight).toBe(offset + 24 * 3600_000 - 1);
+  });
+
+  it("空输入返回 null（永久有效）", () => {
+    expect(expiryFromDateInput("")).toBeNull();
+    expect(expiryFromDateInput("   ")).toBeNull();
   });
 });

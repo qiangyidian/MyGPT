@@ -205,6 +205,7 @@ async def test_chat_error_finalization_persists_budget_snapshot(db_session):
         finish_reason="budget",
         code="agent_budget_exceeded",
         budget=snapshot,
+        user_id=conversation.user_id,
     )
 
     assert message.metadata_["finish_reason"] == "budget"

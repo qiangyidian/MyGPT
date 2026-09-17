@@ -210,7 +210,7 @@ export default function CreditsSettingsPage() {
                           {entry.delta >= 0 ? `+${entry.delta}` : entry.delta}
                         </td>
                         <td className="p-3 text-right tabular-nums">
-                          {entry.balance_after}
+                          {formatCredits(entry.balance_after)}
                         </td>
                       </tr>
                     ))}

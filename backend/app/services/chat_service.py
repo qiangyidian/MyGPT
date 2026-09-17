@@ -1939,7 +1939,7 @@ class ChatService:
         usage: dict[str, Any] | None = None,
         model_name: str | None = None,
         budget: dict[str, Any] | None = None,
-        user_id: uuid.UUID | None = None,
+        user_id: uuid.UUID,
     ) -> None:
         # Preserve partial content (assistant_msg.content is mutated by the
         # runtime as tokens stream) — only record why it stopped.
@@ -1954,15 +1954,7 @@ class ChatService:
         if budget is not None:
             md["budget"] = dict(budget)
         assistant_msg.metadata_ = md
-        if user_id is not None:
-            await settle_turn_usage(db, user_id, assistant_msg, model_name, usage)
-        else:
-            # 没有 user 上下文（例如运维脚本直接调用）时退化为只记账，
-            # 不静默漏计费 —— 记一条警告便于排查。
-            logger.warning(
-                "_finalize_error called without user_id; usage was recorded but not charged"
-            )
-            _apply_usage_accounting(assistant_msg, model_name, usage)
+        await settle_turn_usage(db, user_id, assistant_msg, model_name, usage)
         await commit_with_rollback(db)
 
     async def _finalize_interrupted(
@@ -1973,20 +1965,25 @@ class ChatService:
         finish_reason: str,
         usage: dict[str, Any] | None,
         model_name: str | None,
-        user_id: uuid.UUID | None = None,
+        user_id: uuid.UUID,
     ) -> None:
         assistant_msg.metadata_ = {
             **(assistant_msg.metadata_ or {}),
             "finish_reason": finish_reason,
             "status": _status_for_finish(finish_reason),
         }
-        if user_id is not None:
+        # 已断线的路径，robustness 优先：扣费失败不能吞掉 partial answer。
+        # 未扣费的被打断轮是可接受失败（与唯一索引的取向一致），丢掉部分
+        # 回复不是。done / error 分支仍然响亮失败 —— 那里消息与扣费必须
+        # 同事务。
+        try:
             await settle_turn_usage(db, user_id, assistant_msg, model_name, usage)
-        else:
+        except Exception:
             logger.warning(
-                "_finalize_interrupted called without user_id; usage was recorded but not charged"
+                "interrupted-turn credit settlement failed; partial answer kept, "
+                "turn possibly uncharged",
+                exc_info=True,
             )
-            _apply_usage_accounting(assistant_msg, model_name, usage)
         await _persist_partial(db, assistant_msg)
 
     async def _maybe_summarize(
@@ -2613,13 +2610,21 @@ async def run_durable_turn(
         assistant_msg.metadata_ = ChatService._meta(
             cfg, [], "stream_disconnected", assistant_msg.metadata_
         )
-        await settle_turn_usage(
-            db,
-            user.id,
-            assistant_msg,
-            cfg.model_name,
-            ctx.extra.get("usage"),
-        )
+        # 与 _finalize_interrupted 同理：扣费失败不能让 partial answer 丢失。
+        try:
+            await settle_turn_usage(
+                db,
+                user.id,
+                assistant_msg,
+                cfg.model_name,
+                ctx.extra.get("usage"),
+            )
+        except Exception:
+            logger.warning(
+                "cancelled durable-run credit settlement failed; partial answer kept, "
+                "turn possibly uncharged",
+                exc_info=True,
+            )
         await _persist_partial(db, assistant_msg)
         raise
 

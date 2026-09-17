@@ -11,6 +11,7 @@ import {
   // 管理侧不钳位：负余额是超扣信号，必须原样显示给运营。
   formatCreditsRaw as formatCredits,
 } from "@/lib/credits";
+import { expiryFromDateInput } from "@/lib/credits";
 import type { User } from "@/lib/types";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { AppPageShell } from "@/components/navigation/app-page-shell";
@@ -416,7 +417,7 @@ function RedeemCodesPanel() {
         name: name.trim(),
         credits_per_code: Number(credits),
         count: Number(count),
-        expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+        expires_at: expiryFromDateInput(expiresAt),
         note: note.trim() || null,
       }),
     onSuccess: (result) => {

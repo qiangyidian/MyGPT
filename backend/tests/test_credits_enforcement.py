@@ -171,7 +171,7 @@ async def test_durable_path_blocks_zero_balance_before_creating_any_record(
 async def test_durable_path_passes_when_funded(
     client, auth_token, enforcing, db_session, offline_model, monkeypatch
 ):
-    """有余额时不得 402。只断言响应头就退出 —— 没有 worker 时后续事件永远不来。"""
+    """有余额时不得 402。注入内存队列后顺手驱动 worker 到终态，断言完整跑完。"""
     monkeypatch.setattr(get_settings(), "BACKGROUND_WORKER", "durable")
     # 先清再充，保证这个用例的前提与其他用例无关。
     await _drain(db_session, SEEDED_USER)

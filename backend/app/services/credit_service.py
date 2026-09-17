@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, UTC
+from datetime import datetime
 
 from sqlalchemy import select, tuple_
 from sqlalchemy.exc import IntegrityError

@@ -38,6 +38,24 @@ HAVING a.balance <> COALESCE(SUM(l.delta), 0);
 
 建议把这条查询挂进日常巡检（例如随备份脚本一起跑）。
 
+## 查某个用户的流水（计费争议排查）
+
+用户投诉"一条消息扣了我 XXX 分"时，先看这个用户的流水行（reason / ref /
+note / actor），优先用后台接口：
+`GET /api/admin/credits/ledger?user_id=<uuid>&limit=50`（管理员鉴权，支持
+`cursor` 分页，与用户侧 `/api/credits/ledger` 行形状一致）。应急时也可以直接：
+
+```sql
+SELECT created_at, delta, balance_after, reason, ref_type, ref_id, note
+  FROM credit_ledger
+ WHERE user_id = '<uuid>'
+ ORDER BY created_at DESC
+ LIMIT 50;
+```
+
+流程 Expectation：找到对应那一轮的 `turn_charge` 行，`ref_id` 指向 run /
+message，可对照 `runs` 表核对当轮的 usage 与成本。
+
 ## 并发演练（首次上线前做一次）
 
 测试套件跑在内存 SQLite 上，而 SQLite 是单写者模型 —— **它无法验证真并发**。
@@ -98,7 +116,7 @@ VALUES (gen_random_uuid(), :uid, -10, 0, 'usage', 'message', :msg_id, now());
 
 ### 兑换码明文丢了
 
-**无法找回。** 库里只存 SHA-256 哈希，这是有意设计（兑换码是不记名凭证，
+**无法找回。** 库里只存 peppered HMAC-SHA256 哈希，这是有意设计（兑换码是不记名凭证，
 等价于现金；明文入库意味着一次库泄露就等于漏钱）。处理方式：把该批作废，
 重新生成一批。已兑换出去的分数不受影响。
 
@@ -106,8 +124,7 @@ VALUES (gen_random_uuid(), :uid, -10, 0, 'usage', 'message', :msg_id, now());
 
 正常现象，不是 bug。准入检查在对话开始前、扣费在对话结束后，所以最后一轮
 会把余额扣成负数 —— 平台确实为那一轮付了钱。用户侧显示为 0，后台显示真实
-负值。下一位用户兑换后会自然补正。
-
+负值。该用户下次兑换 / 获得积分后会自然补正。
 ### 想给某个用户补分
 
 后台「积分」Tab → 搜索该用户 → 「调整」→ 填正数 + 备注。会写一条
@@ -123,6 +140,7 @@ VALUES (gen_random_uuid(), :uid, -10, 0, 'usage', 'message', :msg_id, now());
 | `CREDITS_SIGNUP_BONUS` | `0` | 注册赠送积分，0 = 不送 |
 | `CREDITS_MAX_ADJUST` | `10000000` | 单次管理员调分上限 |
 | `REDEEM_MAX_CODES_PER_BATCH` | `5000` | 单批生成上限 |
+| `REDEEM_CODE_PEPPER` | 空 | 兑换码哈希的 HMAC pepper；留空回落到由 `JWT_SECRET` 派生，任何部署都不会退化成无密钥哈希 |
 
 ### 定价与积分的关系
 

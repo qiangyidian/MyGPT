@@ -5328,10 +5328,24 @@ Expected: 通过。**已知的环境相关失败可以接受**（不是本次改
 - [ ] **Step 4: 全量前端检查**
 
 ```bash
-cd frontend && npx tsc --noEmit && npx vitest run && npm run build
+cd frontend && npx tsc --noEmit && npx vitest run && npm run lint && npm run build
 ```
 
 Expected: 全部通过
+
+- [ ] **Step 4b: 后端 lint（CI 门禁，别漏）**
+
+```bash
+cd backend && ./.venv/Scripts/python.exe -m ruff check app tests
+```
+
+Expected: `All checks passed!`
+
+**这一步是补记的教训，不是形式。** `.github/workflows/ci.yml:40` 用**钉死版本的 `ruff==0.15.17`** 跑 `ruff check app tests`，而且它是**门禁**步骤（红了会挡住部署信号）。最初的验证清单只覆盖 pytest / tsc / vitest / build，**两边都没有 lint** —— 结果整个分支带着 7 条 ruff 报错（4 个 F401 未使用导入、1 个 UP037、2 个 W292 文件末尾缺换行，全部可 `--fix`）走完了 12 个任务的逐任务审查和一次端到端验收，直到最终全分支审查才发现。**跑测试不会发现 lint 问题，逐任务审查也不会有人去跑仓库级的 lint 命令。**
+
+ruff 的版本必须与 CI 一致：`pip install "ruff==0.15.17"`（`pyproject.toml:16-17` 说明了为什么钉版本 —— 浮动版本会在上游删规则时把门禁弄坏）。
+
+`migrations/` 不在 CI 的 lint 路径里，可以不管。
 
 - [ ] **Step 5: 端到端验收 —— 由 controller 亲自执行，不是子代理能做的**
 

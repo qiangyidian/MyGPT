@@ -1431,6 +1431,7 @@ async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
         finish_reason="cancelled",
         usage=ctx.extra["usage"],
         model_name="mock",
+        user_id=ctx.user.id,
     )
     async with TestSessionLocal() as verify:
         durable_run = await verify.get(AgentRun, ctx.run_id)

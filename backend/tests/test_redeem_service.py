@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, UTC
 import pytest
 
 from app.credits import normalize_code, hash_code
-from app.models import RedeemCode, RedeemCodeBatch
+from app.models import RedeemCode
 from app.services import credit_service, redeem_service
 
 ADMIN = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
@@ -121,12 +121,52 @@ async def test_redeem_empty_code(db_session):
 
 
 async def test_redeem_expired_code(db_session):
+    from sqlalchemy import update
+
+    from app.models import RedeemCodeBatch
+
+    past_batch, codes = await _make_batch(db_session, count=1, credits=500)
+    # 直接把批次改成已过期 —— create_batch 本身拒绝过去的有效期。
     past = datetime.now(UTC) - timedelta(days=1)
-    _, codes = await _make_batch(db_session, count=1, credits=500, expires_at=past)
+    await db_session.execute(
+        update(RedeemCodeBatch)
+        .where(RedeemCodeBatch.id == past_batch.id)
+        .values(expires_at=past)
+    )
     with pytest.raises(credit_service.CreditError) as exc:
         await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
     assert exc.value.code == "redeem_code_expired"
     assert exc.value.status_code == 410
+
+
+async def test_create_batch_rejects_past_expiry(db_session):
+    past = datetime.now(UTC) - timedelta(hours=1)
+    with pytest.raises(credit_service.CreditError) as exc:
+        await _make_batch(db_session, count=1, expires_at=past)
+    assert exc.value.code == "redeem_batch_invalid_expiry"
+    assert exc.value.status_code == 400
+
+
+async def test_create_batch_rejects_current_moment_expiry(db_session):
+    # 提前一点点构造，保证执行断言时它已过期。
+    just_now = datetime.now(UTC) - timedelta(seconds=1)
+    with pytest.raises(credit_service.CreditError) as exc:
+        await _make_batch(db_session, count=1, expires_at=just_now)
+    assert exc.value.code == "redeem_batch_invalid_expiry"
+
+
+async def test_create_batch_accepts_future_expiry(db_session):
+    future = datetime.now(UTC) + timedelta(days=30)
+    batch, codes = await _make_batch(db_session, count=1, expires_at=future)
+    assert batch.expires_at is not None
+    assert len(codes) == 1
+
+
+async def test_create_batch_allows_none_expiry_means_never(db_session):
+    batch, codes = await _make_batch(db_session, count=1, expires_at=None)
+    assert batch.expires_at is None
+    result = await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
+    assert result.credits_added == 500
 
 
 async def test_redeem_code_expiring_in_the_future_works(db_session):

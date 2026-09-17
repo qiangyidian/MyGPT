@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 
 from tests.conftest import auth_headers
 
@@ -134,11 +133,17 @@ async def test_ledger_paginates_without_overlap(client, admin_token):
 
 # ---- 管理端 --------------------------------------------------------------- #
 
-async def test_admin_endpoints_reject_non_admin(client, auth_token):
+async def test_admin_endpoints_reject_non_admin(client, auth_token, admin_token):
+    # 建一个真实批次，让批次级路由（codes / void）也进这个守卫循环。
+    created = await _create_batch(client, admin_token, count=1, credits=10)
+    batch_id = created["batch"]["id"]
     for method, path in [
         ("post", "/api/admin/redeem-batches"),
         ("get", "/api/admin/redeem-batches"),
+        ("get", f"/api/admin/redeem-batches/{batch_id}/codes"),
+        ("post", f"/api/admin/redeem-batches/{batch_id}/void"),
         ("get", "/api/admin/credits/accounts"),
+        ("get", f"/api/admin/credits/ledger?user_id={uuid.uuid4()}"),
         ("post", "/api/admin/credits/adjust"),
     ]:
         res = await getattr(client, method)(path, headers=auth_headers(auth_token))
@@ -323,3 +328,51 @@ async def test_admin_can_search_accounts_by_email(client, admin_token):
     ).json()
     assert len(rows) == 1
     assert rows[0]["user_id"] == user["id"]
+
+
+async def test_admin_can_view_another_users_ledger(client, admin_token):
+    """计费争议的关键证据：管理员必须能看到别的用户的流水行。"""
+    user_headers, user = await _fresh_user(client)
+    admin_h = auth_headers(admin_token)
+    await client.post(
+        "/api/admin/credits/adjust",
+        json={"user_id": user["id"], "delta": 500, "note": "争议排查"},
+        headers=admin_h,
+    )
+
+    res = await client.get(
+        f"/api/admin/credits/ledger?user_id={user['id']}", headers=admin_h
+    )
+    assert res.status_code == 200, res.text
+    entries = res.json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["delta"] == 500
+    assert entries[0]["reason"] == "admin_adjust"
+    assert entries[0]["note"] == "争议排查"
+
+
+async def test_admin_ledger_unknown_user_returns_404(client, admin_token):
+    res = await client.get(
+        f"/api/admin/credits/ledger?user_id={uuid.uuid4()}",
+        headers=auth_headers(admin_token),
+    )
+    assert res.status_code == 404
+    assert res.json()["code"] == "user_not_found"
+
+
+async def test_admin_ledger_hides_other_users_rows(client, admin_token):
+    """不带 user_id 参数 / 带别人的 id —— 分页只含目标用户的行。"""
+    headers, user = await _fresh_user(client)
+    await client.post(
+        "/api/admin/credits/adjust",
+        json={"user_id": user["id"], "delta": 300},
+        headers=auth_headers(admin_token),
+    )
+    _, other = await _fresh_user(client)
+    body = (
+        await client.get(
+            f"/api/admin/credits/ledger?user_id={other['id']}",
+            headers=auth_headers(admin_token),
+        )
+    ).json()
+    assert body["entries"] == []

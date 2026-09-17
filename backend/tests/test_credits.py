@@ -1,7 +1,6 @@
 """积分核心逻辑测试：扣分公式与兑换码编解码。纯函数，不碰数据库。"""
 from __future__ import annotations
 
-import pytest
 
 from app.credits import (
     CROCKFORD_ALPHABET,
@@ -158,3 +157,78 @@ def test_policy_overrides_are_injectable():
         assert get_credit_policy().enforced is True
     finally:
         set_credit_policy(None)
+
+
+# ---- 兑换码哈希的 pepper ------------------------------------------------ #
+def test_hash_is_deterministic_for_the_same_settings(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.credits as credits_mod
+
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="pepper-a", JWT_SECRET="sk"),
+    )
+    assert credits_mod.hash_code("AB12CD34EF56GH78") == credits_mod.hash_code(
+        "AB12CD34EF56GH78"
+    )
+    assert len(credits_mod.hash_code("AB12CD34EF56GH78")) == 64
+
+
+def test_hash_differs_across_peppers(monkeypatch):
+    """同一张码在两个 pepper 下必须得到不同摘要 —— 否则 pepper 是摆设。"""
+    from types import SimpleNamespace
+
+    import app.credits as credits_mod
+
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="pepper-a", JWT_SECRET="sk"),
+    )
+    a = credits_mod.hash_code("AB12CD34EF56GH78")
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="pepper-b", JWT_SECRET="sk"),
+    )
+    b = credits_mod.hash_code("AB12CD34EF56GH78")
+    assert a != b
+
+
+def test_hash_is_not_a_bare_sha256_of_the_code(monkeypatch):
+    """防回归：不能退化回裸 SHA-256 —— 那正是 6 字符前缀可被暴力的形态。"""
+    import hashlib
+    from types import SimpleNamespace
+
+    import app.credits as credits_mod
+
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="pepper-a", JWT_SECRET="sk"),
+    )
+    bare = hashlib.sha256(b"AB12CD34EF56GH78").hexdigest()
+    assert credits_mod.hash_code("AB12CD34EF56GH78") != bare
+
+
+def test_hash_falls_back_to_secret_key_derivation_when_pepper_empty(monkeypatch):
+    """pepper 缺省时必须仍与 SECRET_KEY 相关，不许静默退化为无密钥哈希。"""
+    from types import SimpleNamespace
+
+    import app.credits as credits_mod
+
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="", JWT_SECRET="sk-1"),
+    )
+    h1 = credits_mod.hash_code("AB12CD34EF56GH78")
+    monkeypatch.setattr(
+        credits_mod,
+        "get_settings",
+        lambda: SimpleNamespace(REDEEM_CODE_PEPPER="", JWT_SECRET="sk-2"),
+    )
+    h2 = credits_mod.hash_code("AB12CD34EF56GH78")
+    assert h1 != h2

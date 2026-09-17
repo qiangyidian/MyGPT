@@ -242,6 +242,7 @@ async def test_chat_service_terminal_paths_persist_usage_and_cost_once(
             code="provider_error",
             usage=usage,
             model_name="gpt-test",
+            user_id=conversation.user_id,
         )
     else:
         await service._finalize_interrupted(
@@ -250,6 +251,7 @@ async def test_chat_service_terminal_paths_persist_usage_and_cost_once(
             finish_reason="cancelled",
             usage=usage,
             model_name="gpt-test",
+            user_id=conversation.user_id,
         )
 
     assert cost_calls == [("gpt-test", usage)]
@@ -387,6 +389,7 @@ async def test_independent_checkpoint_rollback_keeps_request_objects_usable(
         finish_reason="cancelled",
         usage=usage,
         model_name="gpt-test",
+        user_id=user_id,
     )
 
     async with checkpoint_sessions() as verify:

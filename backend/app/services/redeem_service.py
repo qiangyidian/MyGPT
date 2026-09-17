@@ -78,12 +78,23 @@ async def create_batch(
             f"单批最多生成 {policy.max_codes_per_batch} 个兑换码",
         )
 
+    if expires_at is not None:
+        expiry = expires_at
+        if expiry.tzinfo is None:  # naive 输入按 UTC 处理
+            expiry = expiry.replace(tzinfo=UTC)
+        if expiry <= datetime.now(UTC):
+            raise CreditError(
+                "redeem_batch_invalid_expiry",
+                "有效期必须晚于当前时间",
+                400,
+            )
+
     batch = RedeemCodeBatch(
         name=(name or "").strip() or "未命名批次",
         credits_per_code=int(credits_per_code),
-        expires_at=expires_at,
         note=note,
         created_by=admin_id,
+        expires_at=expires_at,
     )
     db.add(batch)
     await db.flush()

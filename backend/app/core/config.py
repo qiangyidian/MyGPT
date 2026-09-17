@@ -442,6 +442,11 @@ class Settings(BaseSettings):
     CREDITS_MAX_ADJUST: int = 10_000_000
     # 单批兑换码生成上限。
     REDEEM_MAX_CODES_PER_BATCH: int = 5000
+    # 兑换码哈希的 HMAC pepper。留空会回落到由 JWT_SECRET 派生的键 ——
+    # 任何部署都不会静默退化成无 pepper 的裸哈希。只有数据库 dump、没有
+    # 应用层秘密的攻击者无法从 6 字符明文前缀 + 哈希暴力反推全码。
+    # 显式配置的收益：轮换 JWT_SECRET 不影响已存的兑换码哈希。
+    REDEEM_CODE_PEPPER: str = ""
     # ---- Data retention (app.services.retention) ----
     AUDIT_RETENTION_DAYS: int = 365
     RUN_EVENT_RETENTION_DAYS: int = 90

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import unicodedata
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ class CreditPolicy:
     max_codes_per_batch: int = 5000
 
     @classmethod
-    def from_settings(cls, settings: Any | None = None) -> "CreditPolicy":
+    def from_settings(cls, settings: Any | None = None) -> CreditPolicy:
         s = settings or get_settings()
         # 与 QuotaLimits.from_settings 同款：测试环境强制关闭拦截，
         # 否则整个套件会在余额为 0 的种子用户上全线失败。
@@ -123,12 +124,31 @@ def normalize_code(raw: str) -> str:
 
 
 def hash_code(normalized: str) -> str:
-    """规范化后的码的 SHA-256 hex（64 字符）。
+    """规范化后的码的 HMAC-SHA256 hex（64 字符），密钥来自服务端 pepper。
 
     库里只存哈希不存明文：兑换码是不记名凭证，等价于现金，明文入库意味着
     任何一次库泄露 / 备份外泄都等于直接漏钱。
+
+    为什么是 HMAC 而不是裸 SHA-256、为什么需要 pepper？库里还存了 6 字符
+    明文前缀供管理员辨认卡片，这给了掌握数据库 dump 的攻击者 30 bit 已知
+    明文 —— 裸哈希下未知空间只剩 2^50（80-30），暴力破解一张码的量级是单卡
+    GPU 天，且可对全部 active 码并行。HMAC 把服务端秘密掺进密钥，**只有
+    数据库而没有应用层秘密的攻击者拿不到任何可验证的候选**；有了应用层
+    秘密也仍需逐码暴力，且受 HMAC 构造的抗长度扩展性质保护。
+
+    pepper 来源：优先 ``settings.REDEEM_CODE_PEPPER``；为空时回落到由
+    ``settings.JWT_SECRET`` 派生，确保任何部署都不会静默退化成无 pepper 的
+    裸哈希。显式配置独立 pepper 的好处是轮换 JWT_SECRET（会话签名）时
+    不影响兑换码存储。
     """
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    settings = get_settings()
+    pepper = getattr(settings, "REDEEM_CODE_PEPPER", "") or ""
+    if not pepper:
+        # 回落键：标注用途域，避免与其他由 JWT_SECRET 派生的密钥撞车。
+        pepper = f"redeem-code-pepper:{settings.JWT_SECRET}"
+    return hmac.new(
+        pepper.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def code_prefix(normalized: str) -> str:

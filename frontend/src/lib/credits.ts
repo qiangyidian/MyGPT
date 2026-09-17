@@ -72,3 +72,26 @@ export const REDEEM_ERROR_MESSAGES: Record<string, string> = {
 export function redeemErrorMessage(code: string, fallback?: string): string {
   return REDEEM_ERROR_MESSAGES[code] || fallback || "兑换失败，请稍后重试";
 }
+
+/**
+ * 把 `<input type="date">` 的日期串转成"当天最后一刻"的 ISO 即时。
+ *
+ * 关键陷阱：`new Date("2026-09-30")` 按日期时间字符串规则解析为 **UTC 午夜**，
+ * 在北京时间是 9/30 早上 8 点 —— 后端拿它做过期判断，批次的码会在
+ * 运营以为的"有效期至 9/30"整整提前 16 小时作废；选当天更是当场作废。
+ *
+ * 所以这里必须 (a) 用 Date 构造器在**本地**时区造 23:59:59.999，
+ * (b) 绝不能把日期串直接喂给 `new Date(...)`。
+ *
+ * 返回 null 表示输入为空（永久有效）。
+ */
+export function expiryFromDateInput(value: string): string | null {
+  if (!value) return null;
+  const [y, m, d] = value.split("-").map(Number);
+  if (!y || !m || !d) return null;
+  // 本地时区的当天 23:59:59.999。陷阱提醒：不能用 new Date(value) ——
+  // 日期串会被解析为 UTC 午夜而非本地午夜。
+  const end = new Date(y, m - 1, d, 23, 59, 59, 999);
+  if (Number.isNaN(end.getTime())) return null;
+  return end.toISOString();
+}
