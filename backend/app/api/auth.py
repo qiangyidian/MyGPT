@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
-from app.core.rate_limit import client_ip, rate_limit_ip
+from app.core.rate_limit import rate_limit_ip
 from app.core.security import (
     REFRESH_TOKEN_TYPE,
     build_cookie_params,
@@ -152,37 +152,35 @@ async def me(current: User = Depends(get_current_user)) -> User:
     return current
 
 
-# ---- WeChat Official Account scan login (公众号验证码登录) -------------------
+# ---- WeChat scan login (公众号验证码登录) ------------------------------------
 #
-# The code the user types was shown to them by the Official Account. It is
-# derived (not stored) from the follower's openid, so it is identical on both
-# backends sharing that account — see app/core/wechat_mp.py.
+# MyChat does not talk to WeChat: the callback, the reply text and the code
+# issuance all live in the standalone wechat-auth service, because WeChat allows
+# exactly one callback URL per Official Account while several products share the
+# account. Here we only redeem a code for an openid. See docs/wechat-login.md.
 @router.post("/login/wechat", response_model=TokenResponse,
              dependencies=[Depends(rate_limit_ip(30, 60, "wechat_login"))])
 async def login_with_wechat_code(
     payload: WechatCodeLoginRequest,
-    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     """Redeem a scan code; auto-registers a first-time follower."""
-    from app.services import wechat_mp_service
-    from app.services.wechat_mp_service import WechatLoginError
+    from app.services import wechat_login_service
+    from app.services.wechat_auth_client import WechatAuthError, WechatAuthUnavailable
 
     # Read at request time, not from the module-level `settings` snapshot:
     # a cleared get_settings() cache leaves that snapshot stale.
-    if not get_settings().WECHAT_MP_ENABLED:
+    if not get_settings().WECHAT_AUTH_ENABLED:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "公众号登录未启用")
 
     try:
-        user = await wechat_mp_service.login_with_code(
-            db,
-            payload.wechat_code,
-            # Trusted-proxy-aware: behind nginx the raw peer is the proxy, which
-            # would collapse every user's failure counter into one bucket.
-            ip_address=client_ip(request),
-        )
-    except WechatLoginError as exc:
+        user = await wechat_login_service.login_with_code(db, payload.wechat_code)
+    except WechatAuthUnavailable as exc:
+        # Our credentials are wrong or the service is down — an operator
+        # problem, never reported to the user as "your code is wrong".
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except WechatAuthError as exc:
         await audit_service.log(
             actor_id=None,
             action="auth:login_wechat_failed",
@@ -201,9 +199,9 @@ async def get_wechat_binding(
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WechatBindingOut:
-    from app.services import wechat_mp_service
+    from app.services import wechat_login_service
 
-    openid = await wechat_mp_service.get_binding(db, current)
+    openid = await wechat_login_service.get_binding(db, current)
     return WechatBindingOut(bound=openid is not None, openid=openid)
 
 
@@ -218,17 +216,19 @@ async def bind_wechat(
     Without this, an existing account that scans the Official Account would be
     handed a brand-new empty account instead of logging back into its own.
     """
-    from app.services import wechat_mp_service
-    from app.services.wechat_mp_service import WechatLoginError
+    from app.services import wechat_login_service
+    from app.services.wechat_auth_client import WechatAuthError, WechatAuthUnavailable
 
     # Read at request time, not from the module-level `settings` snapshot:
     # a cleared get_settings() cache leaves that snapshot stale.
-    if not get_settings().WECHAT_MP_ENABLED:
+    if not get_settings().WECHAT_AUTH_ENABLED:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "公众号登录未启用")
 
     try:
-        openid = await wechat_mp_service.bind_openid(db, current, payload.wechat_code)
-    except WechatLoginError as exc:
+        openid = await wechat_login_service.bind_openid(db, current, payload.wechat_code)
+    except WechatAuthUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except WechatAuthError as exc:
         # An openid owned by somebody else is a conflict, not a bad request —
         # and it is never silently re-pointed at the caller.
         raise HTTPException(CONF, str(exc)) from exc
@@ -244,9 +244,9 @@ async def unbind_wechat(
     current: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WechatBindingOut:
-    from app.services import wechat_mp_service
+    from app.services import wechat_login_service
 
-    removed = await wechat_mp_service.unbind(db, current)
+    removed = await wechat_login_service.unbind(db, current)
     if removed:
         await audit_service.log(
             actor_id=current.id, action="auth:wechat_unbound", target=f"user:{current.id}"

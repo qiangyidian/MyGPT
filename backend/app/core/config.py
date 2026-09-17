@@ -18,11 +18,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # URL (localhost) still overrides the docker service-name URL in the root .env.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# WeChat's console asks for a 32-character Token; keeping to that length makes
-# "the value in .env" and "the value in the console" trivially comparable, and
-# 32 hex chars (secrets.token_hex(16)) is the documented way to generate one.
-WECHAT_MP_TOKEN_LENGTH = 32
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -322,29 +317,24 @@ class Settings(BaseSettings):
     EMAIL_CODE_BURST_WINDOW: int = 3600
     EMAIL_CODE_MAX_ATTEMPTS: int = 5        # failed verifications before the code is invalidated
 
-    # ---- WeChat Official Account scan-to-login (公众号验证码登录) ----
-    # Opt-in: with this false the callback routes refuse and the login page
-    # simply shows no QR guide, so a deployment that has no Official Account
-    # is unaffected.
-    WECHAT_MP_ENABLED: bool = False
-    # MUST equal the Token configured in the Official Account console
-    # ("设置与开发 → 服务器配置"), and MUST equal sql2er's SQL2ER_WECHAT_TOKEN:
-    # both backends share one account. This value is also the HMAC secret the
-    # login code is derived from, so the two backends agree on the code —
-    # see app/core/wechat_mp.py.
-    WECHAT_MP_TOKEN: str = ""
-    # Official Account QR image shown on the login page. Empty = no QR guide.
-    WECHAT_MP_LOGIN_QR_URL: str = ""
-    # Keyword an already-following user sends to get a fresh code ("登录"
-    # always works too — a follower who scanned after subscribing never sees
-    # the subscribe event).
-    WECHAT_MP_KEYWORD: str = "验证码"
-    # How long an issued code stays redeemable.
-    WECHAT_MP_CODE_TTL_SECONDS: int = 300
-    # Failed-code attempts tolerated per IP before a lockout. 6 digits is only a
-    # 1e6 space, so without this the whole space can be swept.
-    WECHAT_MP_LOGIN_MAX_ATTEMPTS: int = 10
-    WECHAT_MP_LOGIN_LOCKOUT_SECONDS: int = 900
+    # ---- WeChat scan login (via the wechat-auth service) ----
+    # MyChat does NOT talk to WeChat: the callback, the reply and the code
+    # issuance all live in the standalone wechat-auth service, because WeChat
+    # allows exactly one callback URL per Official Account while several
+    # products share the account. Here we only redeem a code for an openid.
+    # See docs/wechat-login.md.
+    WECHAT_AUTH_ENABLED: bool = False
+    # Loopback: the service's application-facing endpoints are deliberately
+    # unpublished, so this must stay a private address.
+    WECHAT_AUTH_BASE_URL: str = "http://127.0.0.1:8020"
+    WECHAT_AUTH_APP_ID: str = "mychat"
+    # Issued by wechat-auth's registry (/etc/wxauth/apps.json). Must match.
+    WECHAT_AUTH_APP_SECRET: str = ""
+    # Official Account QR shown when the service runs without AppID/AppSecret
+    # (keyword mode). Empty = the login page shows text instructions only.
+    WECHAT_AUTH_LOGIN_QR_URL: str = "/images/wechat-account-qrcode.jpg"
+    WECHAT_AUTH_DEFAULT_KEYWORD: str = "验证码"
+    WECHAT_AUTH_TIMEOUT_SECONDS: float = 5.0
 
     # ---- Bootstrap admin ----
     ADMIN_EMAIL: str = "admin@example.com"
@@ -492,22 +482,16 @@ class Settings(BaseSettings):
                     "python -c \"from cryptography.fernet import Fernet; "
                     "print(Fernet.generate_key().decode())\""
                 )
-            # A weak/default WeChat Token is not a cosmetic problem: the Token
-            # is the ONLY credential on the public callback, so anyone who can
-            # guess it can forge a message push for any openid and mint a login
-            # code for that account. It doubles as the code-derivation secret,
-            # so it must be unguessable for a second reason. Fail startup rather
-            # than run with a forgeable callback.
-            if self.WECHAT_MP_ENABLED and (
-                self.WECHAT_MP_TOKEN in ("", "changeme", "wechat-token")
-                or len(self.WECHAT_MP_TOKEN) != WECHAT_MP_TOKEN_LENGTH
-            ):
+            # Without the shared secret every scan login fails at runtime with
+            # an opaque 503 — and the tempting "fix" is to disable the check.
+            # Refuse to boot instead, so the misconfiguration is impossible to
+            # miss. The secret itself lives in wechat-auth's registry, not here.
+            if self.WECHAT_AUTH_ENABLED and not self.WECHAT_AUTH_APP_SECRET:
                 raise ValueError(
-                    f"WECHAT_MP_TOKEN must be a random {WECHAT_MP_TOKEN_LENGTH}-"
-                    "character string in non-dev environments when "
-                    "WECHAT_MP_ENABLED is on (it must match the Official Account "
-                    "console AND sql2er's SQL2ER_WECHAT_TOKEN). Generate one with: "
-                    'python -c "import secrets; print(secrets.token_hex(16))"'
+                    "WECHAT_AUTH_APP_SECRET must be set when WECHAT_AUTH_ENABLED "
+                    "is on in non-dev environments — copy it from wechat-auth's "
+                    "/etc/wxauth/apps.json for app "
+                    f"{self.WECHAT_AUTH_APP_ID!r}"
                 )
         return self
 

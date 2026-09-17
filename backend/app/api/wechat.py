@@ -1,166 +1,90 @@
-"""WeChat Official Account callback (公众号扫码登录).
+"""Login-page support for WeChat scan login.
 
-Two things here are protocol-mandated and easy to get wrong:
+MyChat no longer hosts the WeChat callback. The ``wechat-auth`` service owns it
+(because WeChat allows exactly one callback URL per Official Account, and every
+product here shares one account). What remains here is what the browser needs:
 
-* The GET handshake must echo `echostr` as **plain text**. FastAPI serializes a
-  bare ``str`` return as a QUOTED JSON string, which the WeChat console rejects
-  — hence :class:`PlainTextResponse`.
-* The POST reply must be **raw XML** with ``text/xml``. An empty body (no reply
-  owed) is the correct response to a message we do not act on.
+* :func:`wechat_login_info` — public, no credentials, feeds the login panel.
+* :func:`wechat_qrcode` — the QR image, proxied so the page stays same-origin
+  and never shows another product's hostname.
 
-Signature verification runs on BOTH methods. The Token is the only credential
-on this public endpoint, so an unverified POST would let anyone forge a message
-push for an arbitrary openid and mint a login code for that account.
-
-This router is also what a second deployment mirrors to, so it must be correct
-whether or not it is the one WeChat is pointed at.
+The verification call lives in ``app.api.auth`` (``/api/auth/login/wechat``).
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi import APIRouter, HTTPException, Response, status
 
 from app.core.config import get_settings
-from app.core.wechat_mp import build_text_reply, parse_wechat_xml, sha1_signature
-from app.services import wechat_mp_service
+from app.services import wechat_auth_client
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/wechat", tags=["wechat"])
 
-# `登录` is accepted alongside the configured keyword: a follower who scanned
-# after already subscribing never sees the subscribe event, and "登录" is what
-# people actually type.
-ALWAYS_ACCEPTED_KEYWORDS = ("登录",)
-
-# WeChat pushes small text-only XML. The cap is not about "enough room" — it
-# stops this public endpoint from reading an arbitrarily large body into memory
-# (and handing it to an XML parser) before any validation.
-MAX_CALLBACK_BODY_BYTES = 64 * 1024
-
 
 def _require_enabled() -> None:
-    if not get_settings().WECHAT_MP_ENABLED:
-        raise HTTPException(status_code=503, detail="公众号登录未启用")
-
-
-def _verify(signature: str, timestamp: str, nonce: str) -> None:
-    expected = sha1_signature(get_settings().WECHAT_MP_TOKEN, timestamp, nonce)
-    if not signature or signature != expected:
-        raise HTTPException(status_code=403, detail="微信回调验签失败")
-
-
-async def _read_bounded_body(request: Request) -> bytes:
-    """Read the callback body with a hard cap (pre-reject, then stream-count)."""
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > MAX_CALLBACK_BODY_BYTES:
-                raise HTTPException(status_code=413, detail="回调内容过大")
-        except ValueError:
-            pass
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_CALLBACK_BODY_BYTES:
-            raise HTTPException(status_code=413, detail="回调内容过大")
-        chunks.append(chunk)
-    return b"".join(chunks)
+    if not get_settings().WECHAT_AUTH_ENABLED:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "公众号登录未启用")
 
 
 @router.get("/login-info")
 async def wechat_login_info() -> dict:
-    """Public login-page hints: whether to show a QR guide, and the keyword."""
+    """Hints for the login page.
+
+    Deliberately public and credential-free: the login page is unauthenticated.
+
+    Two shapes, decided by the upstream service:
+
+    * ``mode == "qr"`` — a per-application parameterized QR exists; the page
+      shows it and polling is not needed (the code arrives via WeChat).
+    * ``mode == "keyword"`` — no AppID/AppSecret upstream; the page shows the
+      Official Account's static QR plus "send <keyword>".
+    """
     settings = get_settings()
+    if not settings.WECHAT_AUTH_ENABLED:
+        return {"data": {"configured": False, "qrcode_url": "", "keyword": ""}}
+
+    info = await wechat_auth_client.fetch_login_info()
+    mode = str(info.get("mode") or "")
+    keyword = str(info.get("keyword") or "")
+
+    if mode == "qr":
+        return {
+            "data": {
+                "configured": True,
+                "qrcode_url": "/api/wechat/qrcode",
+                "keyword": keyword,
+                "mode": "qr",
+                "display_name": info.get("display_name", ""),
+            }
+        }
+
+    # Keyword mode: the static account QR is MyChat's own published asset, so
+    # the page keeps working even if wechat-auth is unreachable.
+    qr_url = settings.WECHAT_AUTH_LOGIN_QR_URL
     return {
         "data": {
-            "configured": bool(settings.WECHAT_MP_LOGIN_QR_URL),
-            "qrcode_url": settings.WECHAT_MP_LOGIN_QR_URL,
-            "keyword": settings.WECHAT_MP_KEYWORD,
+            "configured": bool(qr_url),
+            "qrcode_url": qr_url,
+            "keyword": keyword or settings.WECHAT_AUTH_DEFAULT_KEYWORD,
+            "mode": "keyword",
+            "display_name": info.get("display_name", ""),
         }
     }
 
 
-@router.get("/callback")
-async def verify_callback(
-    signature: str = Query(""),
-    timestamp: str = Query(...),
-    nonce: str = Query(...),
-    echostr: str = Query(...),
-) -> PlainTextResponse:
-    """WeChat's server-config handshake."""
+@router.get("/qrcode")
+async def wechat_qrcode() -> Response:
+    """The parameterized QR image, re-served from MyChat's own origin."""
     _require_enabled()
-    _verify(signature, timestamp, nonce)
-    # Plain text, NOT JSON — the console compares this byte-for-byte.
-    return PlainTextResponse(echostr)
-
-
-@router.post("/callback")
-async def receive_message(
-    request: Request,
-    signature: str = Query(""),
-    timestamp: str = Query(...),
-    nonce: str = Query(...),
-) -> Response:
-    """Message push: subscribe events and keyword texts get a login code."""
-    _require_enabled()
-    _verify(signature, timestamp, nonce)
-
-    raw = (await _read_bounded_body(request)).decode("utf-8", errors="replace")
-    try:
-        message = parse_wechat_xml(raw)
-    except Exception:
-        # Malformed XML is not worth a 500: WeChat would retry the same body.
-        logger.warning("wechat callback carried unparseable XML")
-        return Response(content="", media_type="text/xml")
-
-    from_user = message.get("FromUserName", "")
-    to_user = message.get("ToUserName", "")
-    msg_type = message.get("MsgType", "")
-
-    reply_text = ""
-    if msg_type == "event" and message.get("Event", "").lower() == "subscribe":
-        # Scanning to follow delivers the code without any extra step.
-        reply_text = "欢迎关注！" + await _code_reply(from_user, message)
-    elif msg_type == "text":
-        content = message.get("Content", "").strip()
-        if content == get_settings().WECHAT_MP_KEYWORD or content in ALWAYS_ACCEPTED_KEYWORDS:
-            reply_text = await _code_reply(from_user, message)
-
-    if not reply_text:
-        # Nothing owed: an empty body is the correct reply.
-        return Response(content="", media_type="text/xml")
+    image = await wechat_auth_client.fetch_qr_image()
+    if not image:
+        # The login page falls back to the keyword instructions on a non-200.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "二维码暂不可用")
     return Response(
-        content=build_text_reply(from_user, to_user, reply_text), media_type="text/xml"
+        content=image,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
-
-
-async def _code_reply(openid: str, message: dict[str, str]) -> str:
-    """Issue the follower's login code, or the busy notice when withheld."""
-    settings = get_settings()
-    try:
-        create_time = int(message.get("CreateTime", "") or 0)
-    except ValueError:
-        create_time = 0
-    if create_time <= 0:
-        # Without the message's own timestamp the two backends cannot agree on
-        # a bucket, so refuse rather than emit a code only this side accepts.
-        logger.warning("wechat callback without a usable CreateTime")
-        return "验证码服务繁忙，请稍后重试。"
-
-    code = await wechat_mp_service.issue_login_code(openid, create_time)
-    if code is None:
-        # Either the feature is unconfigured or this window's code collided with
-        # another follower's. Never hand out a code we did not register.
-        return "验证码服务繁忙，请稍后重试。"
-    ttl = settings.WECHAT_MP_CODE_TTL_SECONDS
-    # Deliberately NAMES NO APPLICATION. The same code signs the follower in to
-    # every service sharing this Official Account, so naming one of them would
-    # mislead anyone who scanned from the other. It is also not a wording
-    # preference: WeChat shows only the primary callback's single passive reply,
-    # and the message body carries nothing about which site the user wants — so
-    # the text cannot be made application-specific in the first place.
-    return f"您的验证码是：{code}，{max(ttl // 60, 1)} 分钟内有效。"

@@ -1,5 +1,12 @@
 # 微信公众号扫码登录（跨 MyGPT / sql2er 共用同一公众号）
 
+> **⚠️ 已被取代（2026-09-17 当天）。** 本文描述的「两个后端各自派生同一个码 + nginx mirror」
+> 方案已经下线，取而代之的是独立的 `wechat-auth` 服务（唯一的回调方与发码方）。
+> 本方案的复杂度**全部**来自「多个应用共用一个回调」这一件事，拆出中央服务后已不复存在。
+> 现行文档见 [`docs/wechat-login.md`](../../wechat-login.md) 与
+> [`wechat-auth` 的设计文档](https://github.com/qiangyidian/wechat-auth/blob/main/docs/design.md)。
+> 保留本文是为了记录当时的取舍与教训（尤其是「随机码在共用回调下必然失效」这个推导）。
+
 日期：2026-09-17
 状态：已批准，实施中
 
