@@ -34,6 +34,7 @@ from app.api import (
     chat_attachments,
     connectors,
     conversations,
+    credits,
     documents,
     knowledge_bases,
     memories,
@@ -195,6 +196,8 @@ def create_app() -> FastAPI:
     app.include_router(connectors.router)
     app.include_router(artifacts.router)
     app.include_router(wechat.router)
+    app.include_router(credits.router)
+    app.include_router(credits.admin_router)
 
     @app.get("/health", tags=["health"])
     async def health() -> JSONResponse:

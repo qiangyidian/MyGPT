@@ -33,6 +33,21 @@ from app.schemas.connector import (
     ConnectorUpdate,
     ProviderManifestOut,
 )
+from app.schemas.credit import (
+    CreditAccountOut,
+    CreditAccountRowOut,
+    CreditAdjustRequest,
+    LedgerEntryOut,
+    LedgerPageOut,
+    RedeemBatchCreate,
+    RedeemBatchCreateOut,
+    RedeemBatchOut,
+    RedeemBatchProgressOut,
+    RedeemCodeOut,
+    RedeemRequest,
+    RedeemResultOut,
+    VoidBatchOut,
+)
 from app.schemas.conversation import (
     ConversationBranchRequest,
     ConversationCreate,
@@ -106,4 +121,10 @@ __all__ = [
     "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult",
     # admin
     "AdminUserUpdate", "UsageStat", "SystemStatus", "AuditLogOut",
+    # credits + redeem codes
+    "CreditAccountOut", "RedeemRequest", "RedeemResultOut",
+    "LedgerEntryOut", "LedgerPageOut",
+    "RedeemBatchCreate", "RedeemBatchCreateOut", "RedeemBatchOut",
+    "RedeemBatchProgressOut", "RedeemCodeOut", "VoidBatchOut",
+    "CreditAccountRowOut", "CreditAdjustRequest",
 ]
