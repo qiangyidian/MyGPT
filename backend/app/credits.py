@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from math import ceil
 from typing import Any
@@ -108,11 +109,13 @@ def generate_code() -> str:
 def normalize_code(raw: str) -> str:
     """把用户输入的任意格式归一化到码表内的紧凑形式。
 
-    规则：去掉所有非字母数字字符、转大写、修正手抄歧义字符（I/L→1、O→0）。
-    生成时与哈希前都必须走这条路径，两边一致才能匹配上。
+    规则：NFKC 兼容归一化（全角字母/数字折叠回 ASCII）、去掉所有非字母数字
+    字符、转大写、修正手抄歧义字符（I/L→1、O→0）。生成时与哈希前都必须走
+    这条路径，两边一致才能匹配上。
     """
+    folded = unicodedata.normalize("NFKC", raw or "")
     out: list[str] = []
-    for ch in (raw or "").upper():
+    for ch in folded.upper():
         if not ch.isalnum():
             continue
         out.append(_CHAR_FIXES.get(ch, ch))

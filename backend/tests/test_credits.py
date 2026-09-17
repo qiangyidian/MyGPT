@@ -97,6 +97,31 @@ def test_normalize_is_idempotent():
     assert normalize_code(once) == once
 
 
+def test_normalize_folds_fullwidth_form_to_ascii():
+    """全角输入（ＡＢ１２…）与 ASCII 原码归一化到同一结果。
+
+    中文用户粘贴全角码是现实场景：NFKC 把全角拉丁字母/数字折叠回 ASCII，
+    之后走原有的过滤与手抄修正，不会再误报"兑换码不存在"。
+    """
+    code = generate_code()
+    fullwidth = code.translate(
+        {ord(c): ord(c) + 0xFEE0 for c in code if ord(c) >= 0x21 and ord(c) <= 0x7E}
+    )
+    assert fullwidth != code  # 确认翻译确实发生了
+    assert normalize_code(fullwidth) == normalize_code(code)
+    assert normalize_code(fullwidth) == normalize_code(code.upper())
+
+
+def test_normalize_folds_fullwidth_digit_to_ascii():
+    assert normalize_code("１２３４") == "1234"
+
+
+def test_normalize_folds_fullwidth_handcopy_fixes_apply_after_nkfc():
+    """NFKC 折叠之后，手抄修正（O→0、I/L→1）仍然按顺序生效。"""
+    assert normalize_code("ＯＯ１１") == "0011"
+    assert normalize_code("ＩＬＬ１") == "1111"
+
+
 def test_hash_is_64_hex_and_depends_on_normalized_form():
     normalized = normalize_code(generate_code())
     digest = hash_code(normalized)
