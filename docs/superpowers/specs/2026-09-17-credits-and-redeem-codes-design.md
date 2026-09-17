@@ -242,7 +242,8 @@ cost_usd 未知但有 token: 积分 = max(1, ceil(total_tokens / 1000 * CREDITS_
 | `CREDITS_SIGNUP_BONUS` | `0` | 注册赠送；0 = 不送 |
 | `CREDITS_MAX_ADJUST` | `10000000` | 单次管理员调分绝对值上限（防误操作） |
 | `REDEEM_MAX_CODES_PER_BATCH` | `5000` | 单批生成上限（防一次生成百万行） |
-| `REDEEM_RATE_LIMIT_PER_MIN` | `10` | 每用户每分钟兑换尝试次数 |
+
+兑换接口的限流用字面量 `rate_limit_user(10, 60, "credits-redeem")`，不做成配置项 —— 代码库中所有限流（`auth` / `chat` / `artifacts` / `agent_runs` / `retrieval`）都是字面量，且限流在 `ENV=test` 下整体禁用，加一个配置项只会多一处不一致。
 
 `CREDITS_ENFORCED` 在 `ENV == "test"` 时强制为 `false`，与 `quotas.py` / `rate_limit.py` 的既有约定一致 —— 测试套件默认不被拦截。需要测拦截的用例显式注入开启的配置。
 
@@ -380,8 +381,12 @@ HAVING a.balance <> COALESCE(SUM(l.delta), 0);
 - 超过 `CREDITS_MAX_ADJUST` → 400
 - 非管理员 → 403
 
-并发（Postgres-only，SQLite 下 skip）：
-- 两个会话并发兑换同一码 → 恰好一个成功，另一个 `redeem_code_used`，账本恰好多一条
+并发（测试套件跑在内存 SQLite 上，而 SQLite 是单写者模型，无法制造真并发）：
+
+- **套件内**：确定性地摆出"陈旧预读"时序，验证 CAS 语句本身 —— 先用一个会话把码按 `active` 读出，另一个会话兑掉并提交，再对那个陈旧对象执行 CAS，必须得 0 行。这正是"先 SELECT 判断再 UPDATE"会踩的坑，且不依赖并发。
+- **套件外**：真多写者行为在真实 Postgres 上手动演练（并发兑同码、并发发放、账本幂等），步骤写在 `docs/credits-operations.md` 的并发演练小节，**首次上线前做一次**。
+
+不写"永远 skip 的 Postgres 测试" —— `tests/conftest.py` 强制 `DATABASE_URL` 为内存 SQLite，那种测试在 CI 里永远不会真跑，是假的生产级。
 
 ### 10.2 前端
 
@@ -412,7 +417,8 @@ HAVING a.balance <> COALESCE(SUM(l.delta), 0);
 - `app/core/config.py` — 新增配置项
 - `app/main.py` — 挂载 router
 - `app/services/chat_service.py` — §5.1 统一结算入口 + §5.3 两个准入点
-- `app/services/auth_service.py` — 注册时创建账户行（+ 可选赠送）
+- `app/api/auth.py` — 注册时创建账户行（+ 可选赠送）。注意注册逻辑在路由里，
+  `app/services/auth_service.py` 的 `register()` 没有任何调用方，是死代码
 - `app/schemas/__init__.py` — 导出新 schema
 - `.env.example`
 - `docker-compose.prod.yml` — 修过期注释
