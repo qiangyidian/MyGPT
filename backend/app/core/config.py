@@ -426,6 +426,22 @@ class Settings(BaseSettings):
     # How long a reserved concurrent-run slot lives before other admissions
     # may reclaim it (protects against a release lost to a Redis outage).
     QUOTA_RUN_TTL_SECONDS: int = 3600
+
+    # ---- Credits / redeem codes ----
+    # 预付费积分。CREDITS_ENFORCED 默认关 = 观察模式：扣分照常记账、余额照常
+    # 显示，但余额不足不拦截。上线时先发码核对扣分数字，再打开拦截。
+    CREDITS_ENFORCED: bool = False
+    # 1 美元服务端实测成本 = 多少积分。
+    CREDITS_PER_USD: float = 1000.0
+    # 未配置定价的模型（usage_cost() 返回 None）按 token 兜底扣分，
+    # 每 1000 token 记多少积分。没有这条兜底，这些模型就是免费额度。
+    CREDITS_PER_1K_TOKENS_FALLBACK: float = 1.0
+    # 注册赠送积分；0 = 不送。
+    CREDITS_SIGNUP_BONUS: int = 0
+    # 单次管理员调分的绝对值上限（防误操作把余额打成天文数字）。
+    CREDITS_MAX_ADJUST: int = 10_000_000
+    # 单批兑换码生成上限。
+    REDEEM_MAX_CODES_PER_BATCH: int = 5000
     # ---- Data retention (app.services.retention) ----
     AUDIT_RETENTION_DAYS: int = 365
     RUN_EVENT_RETENTION_DAYS: int = 90

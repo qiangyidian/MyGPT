@@ -1,0 +1,135 @@
+"""积分核心逻辑测试：扣分公式与兑换码编解码。纯函数，不碰数据库。"""
+from __future__ import annotations
+
+import pytest
+
+from app.credits import (
+    CROCKFORD_ALPHABET,
+    CreditPolicy,
+    code_prefix,
+    compute_charge,
+    generate_code,
+    hash_code,
+    normalize_code,
+)
+
+POLICY = CreditPolicy(
+    enforced=False,
+    credits_per_usd=1000.0,
+    credits_per_1k_tokens=1.0,
+    signup_bonus=0,
+    max_adjust=10_000_000,
+    max_codes_per_batch=5000,
+)
+
+
+# ---- 扣分公式 --------------------------------------------------------- #
+
+def test_charge_uses_cost_when_known():
+    # 0.0123 USD * 1000 = 12.3 -> 向上取整 13
+    assert compute_charge(0.0123, 5000, POLICY) == 13
+
+
+def test_charge_rounds_up_so_a_real_turn_never_costs_zero():
+    # 0.0001 USD * 1000 = 0.1 -> 向上取整 1，不能是 0
+    assert compute_charge(0.0001, 10, POLICY) == 1
+
+
+def test_charge_falls_back_to_tokens_when_cost_is_none():
+    """未配置定价的模型 usage_cost() 返回 None；没有兜底就是免费额度。"""
+    # 3500 tokens / 1000 * 1.0 = 3.5 -> 4
+    assert compute_charge(None, 3500, POLICY) == 4
+
+
+def test_charge_falls_back_to_tokens_when_cost_is_zero():
+    assert compute_charge(0.0, 2000, POLICY) == 2
+
+
+def test_charge_is_zero_when_nothing_was_consumed():
+    assert compute_charge(None, None, POLICY) == 0
+    assert compute_charge(0.0, 0, POLICY) == 0
+    assert compute_charge(None, 0, POLICY) == 0
+
+
+def test_charge_prefers_cost_over_tokens():
+    # cost 已知时完全忽略 token 数量
+    assert compute_charge(0.002, 10_000_000, POLICY) == 2
+
+
+# ---- 码的生成与规范化 -------------------------------------------------- #
+
+def test_generated_code_has_four_groups_of_four():
+    code = generate_code()
+    parts = code.split("-")
+    assert len(parts) == 4
+    assert all(len(p) == 4 for p in parts)
+
+
+def test_generated_code_only_uses_crockford_alphabet():
+    for _ in range(200):
+        normalized = normalize_code(generate_code())
+        assert len(normalized) == 16
+        assert set(normalized) <= set(CROCKFORD_ALPHABET)
+
+
+def test_generated_codes_are_unique():
+    assert len({generate_code() for _ in range(500)}) == 500
+
+
+def test_normalize_accepts_lowercase_and_missing_dashes():
+    code = generate_code()
+    assert normalize_code(code.lower().replace("-", "")) == normalize_code(code)
+
+
+def test_normalize_maps_ambiguous_characters():
+    """手抄错误：O 打成 0、I/L 打成 1，应该仍然能兑换。"""
+    assert normalize_code("oooo-1111-llll-O0I1") == "0000111111110011"
+
+
+def test_normalize_strips_arbitrary_separators():
+    assert normalize_code(" ab12 cd34 ef56 gh78 ") == "AB12CD34EF56GH78"
+    assert normalize_code("AB12/ CD34_EF56.GH78") == "AB12CD34EF56GH78"
+
+
+def test_normalize_is_idempotent():
+    code = generate_code()
+    once = normalize_code(code)
+    assert normalize_code(once) == once
+
+
+def test_hash_is_64_hex_and_depends_on_normalized_form():
+    normalized = normalize_code(generate_code())
+    digest = hash_code(normalized)
+    assert len(digest) == 64
+    assert all(c in "0123456789abcdef" for c in digest)
+
+
+def test_hash_ignores_input_formatting():
+    code = generate_code()
+    assert hash_code(normalize_code(code)) == hash_code(normalize_code(code.lower()))
+
+
+def test_code_prefix_is_six_chars():
+    assert code_prefix("AB12CD34EF56GH78") == "AB12CD"
+
+
+# ---- 策略解析 ---------------------------------------------------------- #
+
+def test_enforcement_is_forced_off_in_test_env():
+    """与 quotas.py / rate_limit.py 的既有约定一致：测试套件默认不被拦截。"""
+    from app.core.config import get_settings
+
+    policy = CreditPolicy.from_settings(get_settings())
+    assert policy.enforced is False
+
+
+def test_policy_overrides_are_injectable():
+    from dataclasses import replace
+
+    from app.credits import get_credit_policy, set_credit_policy
+
+    set_credit_policy(replace(POLICY, enforced=True))
+    try:
+        assert get_credit_policy().enforced is True
+    finally:
+        set_credit_policy(None)
