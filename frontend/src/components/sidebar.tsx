@@ -6,6 +6,7 @@ import {
   Archive,
   ArchiveRestore,
   Boxes,
+  Coins,
   FolderInput,
   FolderPlus,
   LogOut,
@@ -40,6 +41,8 @@ import { api } from "@/lib/api";
 import { setAccessToken } from "@/lib/auth";
 import { DeleteAccountDialog } from "@/components/delete-account-dialog";
 import type { Conversation, Project, User } from "@/lib/types";
+import { useCredits } from "@/hooks/useCredits";
+import { formatCredits } from "@/lib/credits";
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -133,6 +136,7 @@ export function Sidebar({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState("");
   const [focusedIndex, setFocusedIndex] = useState(0);
+  const { credits } = useCredits();
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -409,6 +413,19 @@ export function Sidebar({
             <Link href={withReturnTo("/settings/knowledge-bases", returnTo)}>
               <Boxes className="h-4 w-4" />
               知识库
+            </Link>
+          </Button>
+          <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
+            <Link href={withReturnTo("/settings/credits", returnTo)} className="w-full">
+              <span className="flex w-full items-center justify-between">
+                <span className="flex items-center gap-2">
+                  <Coins className="h-4 w-4" />
+                  积分
+                </span>
+                <span className="font-mono tabular-nums">
+                  {credits ? formatCredits(credits.balance) : "—"}
+                </span>
+              </span>
             </Link>
           </Button>
           <Button asChild variant="ghost" size="sm" className="w-full justify-start gap-2 text-muted-foreground">
