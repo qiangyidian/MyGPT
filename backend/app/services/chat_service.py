@@ -81,6 +81,7 @@ from app.models import (
 )
 from app.providers.registry import get_provider_for_config
 from app.quotas import QuotaExceeded, get_quota_service
+from app.services import credit_service
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
 from app.schemas import ChatRequest, Citation
@@ -233,6 +234,30 @@ async def _charge_quota_if_enabled(tenant_id: str, message: Message) -> None:
         logger.warning(
             "quota overage for tenant %s after turn usage charge", tenant_id
         )
+
+
+async def settle_turn_usage(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    message: Message,
+    model_name: str | None,
+    usage: dict[str, Any] | None,
+) -> None:
+    """一轮对话的统一结算入口：记账 + 配额计费 + 积分扣减。
+
+    五个调用点全部走这里，不再各自成对调用 ``_apply_usage_accounting`` 与
+    ``_charge_quota_if_enabled``。原因是一个真实的漏洞：``_finalize_error``
+    与 ``_finalize_interrupted`` 过去只记账不计费，于是"故意让请求报错"就能
+    烧 token 而不付账。合并成单一入口后，结构上不可能只记账不计费。
+
+    原子性边界：记账与积分扣减在**同一 DB 事务**内（由调用方提交），幂等由
+    ``credit_ledger`` 上 ``ref_type='message'`` 的唯一部分索引保证。配额计费
+    走 Redis，是 best-effort（与 :mod:`app.quotas` 既有语义一致），失败不影响
+    积分账本 —— 积分是钱，配额是限流，可靠性要求不同，不该捆成一个事务。
+    """
+    _apply_usage_accounting(message, model_name, usage)
+    await _charge_quota_if_enabled(str(user_id), message)
+    await credit_service.charge_message_credits(db, user_id, message)
 
 
 def _log_turn_outcome(
@@ -1751,12 +1776,14 @@ class ChatService:
                     # (propagated through the runtime's done event). The provider
                     # parses usage; it used to be discarded — now it answers
                     # "who spent what" and enables per-user budgets.
-                    _apply_usage_accounting(
-                        assistant_msg, cfg.model_name, evt.data.get("usage")
+                    # 统一结算：记账 + 配额计费 + 积分扣减。
+                    await settle_turn_usage(
+                        db,
+                        user.id,
+                        assistant_msg,
+                        cfg.model_name,
+                        evt.data.get("usage"),
                     )
-                    # Quota charge (Task 11): forward the SERVER-computed usage
-                    # to the tenant's quota counters. No-op unless QUOTAS_ENABLED.
-                    await _charge_quota_if_enabled(str(user.id), assistant_msg)
                     assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                     _log_turn_outcome(
                         "complete",
@@ -1810,6 +1837,7 @@ class ChatService:
                             usage=evt.data.get("usage"),
                             model_name=cfg.model_name,
                             budget=evt.data.get("budget"),
+                            user_id=user.id,
                         )
                     # Structured record for a FAILED turn (same field set as a
                     # completed one) so failed runs are queryable too.
@@ -1863,6 +1891,7 @@ class ChatService:
                     finish_reason=reason,
                     usage=ctx.extra.get("usage"),
                     model_name=cfg.model_name,
+                    user_id=user.id,
                 )
             raise
 
@@ -1894,6 +1923,7 @@ class ChatService:
         usage: dict[str, Any] | None = None,
         model_name: str | None = None,
         budget: dict[str, Any] | None = None,
+        user_id: uuid.UUID | None = None,
     ) -> None:
         # Preserve partial content (assistant_msg.content is mutated by the
         # runtime as tokens stream) — only record why it stopped.
@@ -1908,7 +1938,15 @@ class ChatService:
         if budget is not None:
             md["budget"] = dict(budget)
         assistant_msg.metadata_ = md
-        _apply_usage_accounting(assistant_msg, model_name, usage)
+        if user_id is not None:
+            await settle_turn_usage(db, user_id, assistant_msg, model_name, usage)
+        else:
+            # 没有 user 上下文（例如运维脚本直接调用）时退化为只记账，
+            # 不静默漏计费 —— 记一条警告便于排查。
+            logger.warning(
+                "_finalize_error called without user_id; usage was recorded but not charged"
+            )
+            _apply_usage_accounting(assistant_msg, model_name, usage)
         await commit_with_rollback(db)
 
     async def _finalize_interrupted(
@@ -1919,13 +1957,20 @@ class ChatService:
         finish_reason: str,
         usage: dict[str, Any] | None,
         model_name: str | None,
+        user_id: uuid.UUID | None = None,
     ) -> None:
         assistant_msg.metadata_ = {
             **(assistant_msg.metadata_ or {}),
             "finish_reason": finish_reason,
             "status": _status_for_finish(finish_reason),
         }
-        _apply_usage_accounting(assistant_msg, model_name, usage)
+        if user_id is not None:
+            await settle_turn_usage(db, user_id, assistant_msg, model_name, usage)
+        else:
+            logger.warning(
+                "_finalize_interrupted called without user_id; usage was recorded but not charged"
+            )
+            _apply_usage_accounting(assistant_msg, model_name, usage)
         await _persist_partial(db, assistant_msg)
 
     async def _maybe_summarize(
@@ -2501,12 +2546,13 @@ async def run_durable_turn(
                 assistant_msg.metadata_["is_demo"] = bool(
                     ctx.extra.get("is_demo")
                 ) or bool(getattr(sel, "is_demo", False))
-                _apply_usage_accounting(
-                    assistant_msg, cfg.model_name, evt.data.get("usage")
+                await settle_turn_usage(
+                    db,
+                    user.id,
+                    assistant_msg,
+                    cfg.model_name,
+                    evt.data.get("usage"),
                 )
-                # Quota charge (Task 11): forward SERVER-computed usage to the
-                # tenant's counters. No-op unless QUOTAS_ENABLED.
-                await _charge_quota_if_enabled(str(user.id), assistant_msg)
                 assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                 conversation.last_message_preview = (assistant_msg.content or "")[:280]
                 await commit_with_rollback(db)
@@ -2525,6 +2571,7 @@ async def run_durable_turn(
                     code=err_code,
                     usage=evt.data.get("usage"),
                     model_name=cfg.model_name,
+                    user_id=user.id,
                 )
                 yield evt
                 return
@@ -2534,11 +2581,13 @@ async def run_durable_turn(
         assistant_msg.metadata_ = ChatService._meta(
             cfg, [], "stream_disconnected", assistant_msg.metadata_
         )
-        _apply_usage_accounting(
-            assistant_msg, cfg.model_name, ctx.extra.get("usage")
+        await settle_turn_usage(
+            db,
+            user.id,
+            assistant_msg,
+            cfg.model_name,
+            ctx.extra.get("usage"),
         )
-        # Quota charge (Task 11): even a partial turn consumed tokens.
-        await _charge_quota_if_enabled(str(user.id), assistant_msg)
         await _persist_partial(db, assistant_msg)
         raise
 
