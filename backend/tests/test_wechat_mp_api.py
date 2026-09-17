@@ -159,6 +159,41 @@ async def test_login_keyword_always_works(client, wechat_configured, fake_redis)
     assert _replied_code(r.text) == derive_login_code(openid, 1700000000, CALLBACK_TOKEN)
 
 
+async def test_reply_text_does_not_name_either_application(
+    client, wechat_configured, fake_redis
+):
+    """同一条码在**两个站点都能登录**，所以回复里点名其中任何一个都会误导
+    从另一个站点扫码的用户（他看到的会是另一家的名字）。
+
+    这条文案是"共用同一个公众号"的架构推出来的结论，不是措辞偏好：微信只显示
+    主回调（sql2er）那一条被动回复，且消息体里没有任何"用户想登哪个站"的信息，
+    所以文案不可能按应用区分，只能中性。
+    """
+    r = await client.post(
+        f"/api/wechat/callback?{_signed_params()}",
+        content=_message_body(
+            openid="oNEUTRALtext000000000000001",
+            msg_type="event",
+            event="subscribe",
+            content="",
+        ),
+    )
+    # 码照常发出去（改的是文案，不是协议）
+    assert _replied_code(r.text)
+    assert "SQL2ER" not in r.text
+    assert "MyChat" not in r.text
+
+
+async def test_keyword_reply_is_also_neutral(client, wechat_configured, fake_redis):
+    r = await client.post(
+        f"/api/wechat/callback?{_signed_params()}",
+        content=_message_body(openid="oNEUTRALkw00000000000000001", content="验证码"),
+    )
+    assert _replied_code(r.text)
+    assert "SQL2ER" not in r.text
+    assert "MyChat" not in r.text
+
+
 async def test_unrelated_text_gets_no_reply(client, wechat_configured, fake_redis):
     r = await client.post(
         f"/api/wechat/callback?{_signed_params()}",

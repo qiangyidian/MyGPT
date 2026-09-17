@@ -157,4 +157,10 @@ async def _code_reply(openid: str, message: dict[str, str]) -> str:
         # another follower's. Never hand out a code we did not register.
         return "验证码服务繁忙，请稍后重试。"
     ttl = settings.WECHAT_MP_CODE_TTL_SECONDS
-    return f"您的 MyChat 登录验证码是：{code}，{max(ttl // 60, 1)} 分钟内有效。"
+    # Deliberately NAMES NO APPLICATION. The same code signs the follower in to
+    # every service sharing this Official Account, so naming one of them would
+    # mislead anyone who scanned from the other. It is also not a wording
+    # preference: WeChat shows only the primary callback's single passive reply,
+    # and the message body carries nothing about which site the user wants — so
+    # the text cannot be made application-specific in the first place.
+    return f"您的验证码是：{code}，{max(ttl // 60, 1)} 分钟内有效。"

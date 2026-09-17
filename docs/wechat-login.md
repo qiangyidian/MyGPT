@@ -46,6 +46,21 @@ code = HMAC_SHA256(wechat_token, f"{openid}:{create_time}") 取模 10^6，补零
 
 **两边完全独立**：sql2er 停机不影响 MyChat 扫码登录，反之亦然（mirror 是异步的，不占微信那 5 秒超时）。
 
+### 公众号回复的文案为什么不写应用名
+
+微信里看到的是「欢迎关注！您的验证码是：XXXXXX」——**刻意不出现 MyChat 或 SQL2ER**。
+
+原因是架构决定的，不是措辞偏好：微信服务器配置一个号只有一个 URL、被动回复也只显示一条
+（展示给用户的是主回调 sql2er 那一条，MyChat 的回复被 mirror 丢弃），而消息体里只有
+`openid` / `CreateTime` / 正文，**没有任何"用户想登哪个站"的信息**。所以文案做不到按应用区分。
+
+而这条码在两边都能登录，点名其中任何一个反而会误导从另一个站点扫码的用户。
+真要做到按应用区分，得给每个站点配**带参数二维码**（`qrcode/create` API，靠 `Scene` 区分），
+那需要 AppID/AppSecret，也要放弃"一个二维码两边通用"——本流程刻意避开了这条依赖。
+
+两侧仓库都有测试钉住这一点（`test_reply_text_names_no_application` /
+`test_reply_text_does_not_name_either_application`），别把应用名加回去。
+
 ---
 
 ## 二、你需要准备的东西
