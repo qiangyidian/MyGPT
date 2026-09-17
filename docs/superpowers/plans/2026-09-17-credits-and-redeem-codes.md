@@ -5377,7 +5377,7 @@ cd frontend && NEXT_PUBLIC_API_BASE_URL=http://localhost:8001 npx next dev -p 30
 - [ ] **Step 6: 提交**
 
 ```bash
-git add docs/credits-operations.md README.md
+git add docs/credits-operations.md README.md scripts/verify_migrations.sh scripts/restore-drill.sh
 git commit -m "docs(credits): 运维手册
 
 上线顺序（强调必须先观察模式再开拦截）、对账 SQL、常见问题排查表、
