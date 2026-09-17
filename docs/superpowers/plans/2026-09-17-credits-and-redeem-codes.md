@@ -2658,8 +2658,12 @@ class LedgerPageOut(BaseModel):
 
 class RedeemBatchCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    credits_per_code: int = Field(gt=0)
-    count: int = Field(gt=0)
+    # 刻意不加 Field(gt=0)：加了之后 credits_per_code=0 会在 pydantic 层变成 422
+    # （code="validation"），永远到不了服务层的 redeem_batch_invalid_credits（400）。
+    # 同一个字段的 0 与 99999 会得到两种不同的错误形状 —— 0 → 422/validation，
+    # 99999 → 400/redeem_batch_too_large。全部交给服务层校验，错误信封才一致。
+    credits_per_code: int
+    count: int
     expires_at: datetime | None = None
     note: str | None = None
 
