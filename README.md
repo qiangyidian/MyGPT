@@ -102,6 +102,9 @@ alembic revision --autogenerate -m "init"
 alembic upgrade head
 ```
 
+积分与兑换码的运维操作（上线顺序、对账 SQL、常见问题）见
+[docs/credits-operations.md](docs/credits-operations.md)。
+
 ---
 
 ## 项目结构

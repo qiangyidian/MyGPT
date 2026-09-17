@@ -2,7 +2,7 @@
 # Task 13 — migration-head verification.
 #
 # Runs Alembic migrations against ISOLATED throwaway Postgres databases and
-# asserts both reach the repo head (0010_artifacts). Nothing touches the dev or
+# asserts both reach the repo head (0014_credits_redeem). Nothing touches the dev or
 # production database.
 #
 # Two paths are exercised:

@@ -4,7 +4,7 @@
 # Restores a backup produced by scripts/backup.sh into ISOLATED throwaway
 # Postgres + Qdrant containers (never the dev/prod data stores) and verifies:
 #   1. Postgres: the dump restores cleanly AND alembic current == repo head
-#      (0010_artifacts) — i.e. the migration revision survives backup/restore.
+#      (0014_credits_redeem) — i.e. the migration revision survives backup/restore.
 #   2. Qdrant:   every collection snapshot uploads and the collection is listed.
 #   3. Object    storage: uploads.tar extracts without error and the per-file
 #      sha256 of the extracted tree matches a re-extraction (tar round-trip
