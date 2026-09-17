@@ -424,7 +424,12 @@ function RedeemCodesPanel() {
   const voidMut = useMutation({
     mutationFn: (batchId: string) => api.adminVoidRedeemBatch(batchId),
     onSuccess: (result) => {
-      toast.success(`已作废 ${result.voided} 个未使用的兑换码`);
+      if (result.voided === 0) {
+        // 后端对未知/无剩余批次也返回 200: {voided: 0} —— 如实告知而非假成功。
+        toast.warning("该批次已无可作废的兑换码，可能已被其他人处理");
+      } else {
+        toast.success(`已作废 ${result.voided} 个未使用的兑换码`);
+      }
       qc.invalidateQueries({ queryKey: ["admin-redeem-batches"] });
     },
     onError: () => toast.error("作废失败"),
