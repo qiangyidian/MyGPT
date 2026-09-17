@@ -8,7 +8,6 @@ import { Coins, Info } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { formatCredits, normalizeRedeemCodeInput, redeemErrorMessage } from "@/lib/credits";
 import { useCredits } from "@/hooks/useCredits";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -31,7 +30,7 @@ const REASON_LABELS: Record<string, string> = {
  */
 export default function CreditsSettingsPage() {
   const qc = useQueryClient();
-  const { credits, isLoading } = useCredits();
+  const { credits, isLoading, isError } = useCredits();
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -80,20 +79,35 @@ export default function CreditsSettingsPage() {
           <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
             <div>
               <div className="text-xs text-muted-foreground">当前余额</div>
-              <div className="text-3xl font-semibold tabular-nums">
-                {isLoading ? "—" : formatCredits(credits?.balance)}
-              </div>
+              {isError ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-3xl font-semibold">—</span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => qc.invalidateQueries({ queryKey: ["credits"] })}
+                    aria-label="重新加载余额"
+                  >
+                    重试
+                  </Button>
+                  <span className="text-xs text-muted-foreground">余额加载失败</span>
+                </div>
+              ) : (
+                <div className="text-3xl font-semibold tabular-nums">
+                  {isLoading ? "—" : formatCredits(credits?.balance)}
+                </div>
+              )}
             </div>
             <div>
               <div className="text-xs text-muted-foreground">累计获得</div>
               <div className="text-lg tabular-nums">
-                {formatCredits(credits?.lifetime_granted)}
+                {isLoading || isError ? "—" : formatCredits(credits?.lifetime_granted)}
               </div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">累计消耗</div>
               <div className="text-lg tabular-nums">
-                {formatCredits(credits?.lifetime_consumed)}
+                {isLoading || isError ? "—" : formatCredits(credits?.lifetime_consumed)}
               </div>
             </div>
           </div>
@@ -151,6 +165,13 @@ export default function CreditsSettingsPage() {
         <CardContent className="space-y-3">
           {ledgerQ.isLoading ? (
             <p className="text-sm text-muted-foreground">加载中…</p>
+          ) : ledgerQ.isError ? (
+            <div className="flex items-center gap-3">
+              <p className="text-sm text-destructive">记录加载失败，请稍后重试。</p>
+              <Button variant="outline" size="sm" onClick={() => ledgerQ.refetch()}>
+                重试
+              </Button>
+            </div>
           ) : entries.length === 0 ? (
             <p className="text-sm text-muted-foreground">暂无记录。</p>
           ) : (
