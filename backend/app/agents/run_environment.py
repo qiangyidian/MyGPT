@@ -29,6 +29,10 @@ from app.db import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
+# 单条 stage 产出的透出上限。超过即截断并在事件上标记 truncated，
+# ``chars`` 保留截断前的真实长度供 UI 显示提示。
+_STEP_OUTPUT_MAX_CHARS = 20_000
+
 
 @dataclass
 class RunEnvironment:
@@ -175,6 +179,8 @@ class RunEnvironment:
                 usage, cost_usd=cost, usage_id=f"crewai:stage:{step_id}"
             )
             self.guard.check()
+        if self._rich_events_enabled():
+            self._emit_step_output(step_id, output)
         self.emitter.emit_agent_completed(
             step_id,
             output_summary=output_summary or None,
@@ -191,6 +197,32 @@ class RunEnvironment:
 
     def finish(self, status: str) -> None:
         self.emitter.emit_run_status(status)
+
+    # ------------------------------------------------------------------ #
+    # 过程可见性
+    # ------------------------------------------------------------------ #
+    def _rich_events_enabled(self) -> bool:
+        from app.core.config import get_settings
+
+        return bool(getattr(get_settings(), "AGENT_RICH_STEP_EVENTS", False))
+
+    def _emit_step_output(self, step_id: str, text: str | None) -> None:
+        from app.agents.schemas import ev_step_output
+
+        raw = text or ""
+        if not raw:
+            return
+        truncated = len(raw) > _STEP_OUTPUT_MAX_CHARS
+        body = raw[:_STEP_OUTPUT_MAX_CHARS] if truncated else raw
+        self.stage_ctx.emit(
+            ev_step_output(
+                run_id=self.run_id,
+                agent_id=step_id,
+                text=body,
+                truncated=truncated,
+                chars=len(raw),
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # 持久化与归集

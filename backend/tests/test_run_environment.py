@@ -251,3 +251,56 @@ async def test_node_carries_usage_and_cost(db_session):
     node = env.emitter.graph.node("researcher")
     assert node.usage == {"total_tokens": 42}
     assert node.cost_usd == 0.03
+
+
+async def test_step_completed_emits_full_output(db_session):
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    body = "检索到的证据：" + "x" * 500
+    env.step_started("researcher")
+    env.step_completed("researcher", output=body, output_summary="摘要")
+
+    events = await _drain_events(env)
+    outs = [e for e in events if e.kind == "step_output"]
+    assert len(outs) == 1
+    assert outs[0].data["text"] == body
+    assert outs[0].data["truncated"] is False
+    assert outs[0].data["chars"] == len(body)
+    assert outs[0].data["agent_id"] == "researcher"
+
+
+async def test_step_output_truncates_at_20000(db_session):
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    body = "y" * 25_000
+    env.step_started("researcher")
+    env.step_completed("researcher", output=body)
+
+    outs = [e for e in await _drain_events(env) if e.kind == "step_output"]
+    assert len(outs) == 1
+    assert len(outs[0].data["text"]) == 20_000
+    assert outs[0].data["truncated"] is True
+    assert outs[0].data["chars"] == 25_000
+
+
+async def test_step_output_skipped_for_empty_output(db_session):
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    env.step_completed("researcher", output="")
+    assert [e for e in await _drain_events(env) if e.kind == "step_output"] == []
+
+
+async def test_step_output_gated_by_flag(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "AGENT_RICH_STEP_EVENTS", False, raising=False)
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    env.step_completed("researcher", output="正文")
+    assert [e for e in await _drain_events(env) if e.kind == "step_output"] == []
