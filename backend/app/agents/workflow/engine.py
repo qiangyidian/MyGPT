@@ -34,6 +34,7 @@ unit-testable with stubs.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from typing import Any
@@ -66,12 +67,18 @@ class WorkflowEngine:
         run_id: uuid.UUID | str | None = None,
         session_factory: Any = None,
         max_concurrency: int = 8,
+        on_step_start: Any = None,
+        on_step_end: Any = None,
+        on_step_error: Any = None,
     ) -> None:
         self._executor = executor
         self._verifier = verifier
         self._run_id = _opt_uuid(run_id)
         self._session_factory = session_factory
         self._max_concurrency = max(1, int(max_concurrency))
+        self._on_step_start = on_step_start
+        self._on_step_end = on_step_end
+        self._on_step_error = on_step_error
 
     # ------------------------------------------------------------------ #
     async def run(
@@ -283,6 +290,7 @@ class WorkflowEngine:
                 with observe_span(
                     "workflow.step", step_id=step.id, attempt=attempt_number
                 ) as _sp:
+                    await self._call_hook(self._on_step_start, step.id)
                     await self._open_attempt(step.id, attempt_number)
                     async with semaphore:
                         state.in_flight += 1
@@ -297,6 +305,9 @@ class WorkflowEngine:
                         obs.usage = {**dict(obs.usage), "attempts": attempt}
                     obs.attempts = attempt
                     await self._close_attempt(step.id, attempt_number, obs)
+                    await self._call_hook(
+                        self._on_step_end, step.id, obs.output, obs.usage
+                    )
                 observe_counter("workflow.steps", 1, outcome="done")
                 return obs
             except BaseException as exc:
@@ -308,8 +319,29 @@ class WorkflowEngine:
                 logger.warning(
                     "workflow step %s failed permanently: %s", step.id, exc
                 )
+                await self._call_hook(self._on_step_error, step.id, str(exc))
                 observe_counter("workflow.steps", 1, outcome="failed")
                 return None
+
+    # ------------------------------------------------------------------ #
+    # 只读步骤回调
+    #
+    # 引擎的步骤生命周期以回调形式外泄，供 RunEnvironment 发 agent_status /
+    # step_output / step_progress。这是**观测**通道：回调不得改变调度、重试或
+    # 终止语义，其异常被吞掉并记日志 —— 与引擎 best-effort 的持久化策略一致
+    # （观测绝不 veto 执行）。
+    # ------------------------------------------------------------------ #
+    async def _call_hook(self, hook: Any, *args: Any) -> None:
+        if hook is None:
+            return
+        try:
+            result = hook(*args)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("workflow step hook failed", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Persistence helpers (best-effort, short-lived sessions)
