@@ -250,8 +250,13 @@ async def test_engine_run_persists_agent_attempts(db_session, monkeypatch):
 
     # The engine was wired with run_id + session_factory, so each step persisted
     # at least one AgentAttempt row that reached 'done'.
+    #
+    # 必须按 run_id 过滤：同一进程内的内存库是共享的，不过滤会把别的用例写入的
+    # attempt 行也算进来（跨用例串扰，断言就失去了意义）。
     rows = (
-        await db_session.execute(select(AgentAttempt))
+        await db_session.execute(
+            select(AgentAttempt).where(AgentAttempt.run_id == ctx.run_id)
+        )
     ).scalars().all()
     step_keys = {r.step_key for r in rows}
     assert {"researcher", "analyst", "writer"} <= step_keys, (
@@ -369,3 +374,35 @@ async def test_engine_and_walker_emit_the_same_lifecycle_event_kinds(
     assert engine_kinds == walker_kinds, (
         f"engine={sorted(engine_kinds)} walker={sorted(walker_kinds)}"
     )
+
+
+async def test_engine_path_persists_terminal_graph_state(db_session, monkeypatch):
+    """跑完后 graph_state 必须是终态，而不是每个节点都还 pending。
+
+    旧实现只在开头落一次 definition，刷新/重连后拿到的是「什么都没跑过」的
+    快照。修复后引擎路径与 walker 一样在结构事件后重写。
+    """
+    from app.models import AgentRun
+
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"}
+    )
+    _spy_crewai(monkeypatch)
+
+    events = await _drive(ChatOrchestrator(), ctx)
+    assert [k for k, _ in events][-1] == "done"
+
+    row = (
+        await db_session.execute(select(AgentRun).where(AgentRun.id == ctx.run_id))
+    ).scalar_one()
+    await db_session.refresh(row)
+
+    statuses = {n["id"]: n["status"] for n in row.graph_state["nodes"]}
+    assert statuses == {
+        "researcher": "completed",
+        "analyst": "completed",
+        "writer": "completed",
+    }, f"persisted graph_state must reflect the terminal state, got {statuses}"
+    assert row.graph_state["status"] == "completed"

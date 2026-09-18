@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 # ``chars`` 保留截断前的真实长度供 UI 显示提示。
 _STEP_OUTPUT_MAX_CHARS = 20_000
 
+# 图快照是 best-effort 观测写：共用一条连接时可能与在途写者冲突，重试几次。
+_GRAPH_PERSIST_ATTEMPTS = 5
+_GRAPH_PERSIST_RETRY_DELAY_S = 0.05
+
 
 @dataclass
 class RunEnvironment:
@@ -288,26 +292,44 @@ class RunEnvironment:
     # 持久化与归集
     # ------------------------------------------------------------------ #
     async def persist_graph(self, *, definition: bool) -> None:
-        """把图快照写到 AgentRun 行（best-effort）。"""
+        """把图快照写到 AgentRun 行（best-effort）。
+
+        这个写是纯观测性质的：落库失败绝不能影响运行，所以异常被吞掉并记日志。
+
+        为什么需要重试：``persist_graph_snapshot`` 自己开一个 session，而运行中
+        还有别的写者（引擎的 AgentAttempt 记录、检查点续写）用同一个 session
+        工厂。两者共用一条物理连接时（测试里的 StaticPool 内存库就是这种情形），
+        并发提交会让 SQLite 抛 "cannot commit transaction - SQL statements in
+        progress" 并丢掉这一次快照。生产用连接池，每个 session 各拿一条连接，
+        正常不会触发；重试让两个环境都拿到一致行为。
+        """
         from app.agents.db_mutation import db_mutation_scope
         from app.agents.persistence import persist_graph_snapshot
 
         session_factory = (
             self.ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
         )
-        try:
-            async with db_mutation_scope(self.ctx.extra.get("persistence_lock")):
-                await persist_graph_snapshot(
-                    session_factory,
-                    run_id=self.ctx.run_id,
-                    snapshot=self.emitter.snapshot(),
-                    definition=definition,
-                )
-        except BaseException as exc:
-            if isinstance(exc, Exception):
-                logger.warning("failed to persist agent graph snapshot", exc_info=True)
+        last_exc: Exception | None = None
+        for attempt in range(_GRAPH_PERSIST_ATTEMPTS):
+            try:
+                async with db_mutation_scope(self.ctx.extra.get("persistence_lock")):
+                    await persist_graph_snapshot(
+                        session_factory,
+                        run_id=self.ctx.run_id,
+                        snapshot=self.emitter.snapshot(),
+                        definition=definition,
+                    )
                 return
-            raise
+            except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    raise
+                last_exc = exc
+                if attempt + 1 < _GRAPH_PERSIST_ATTEMPTS:
+                    # 让在途写者先提交完再重试。
+                    await asyncio.sleep(_GRAPH_PERSIST_RETRY_DELAY_S)
+        logger.warning(
+            "failed to persist agent graph snapshot", exc_info=last_exc
+        )
 
     def aggregate_usage(self, results: Mapping[str, Any]) -> dict | None:
         from app.agents.continuation import aggregate_usage

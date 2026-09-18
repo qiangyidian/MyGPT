@@ -502,6 +502,10 @@ class ChatOrchestrator:
         await asyncio.sleep(0)  # 让 finish 的事件落地（同上）
         for evt in _drain_env_events(env):
             yield evt
+        # 终态快照。必须在这里：env.finish() 在 drain 循环之后才把图翻到
+        # completed，所以循环内的任何落库都不可能包含终态。引擎任务此时已
+        # join，写入都已提交，不再与它争连接。
+        await env.persist_graph(definition=False)
 
         # 终态步骤 = 拓扑序最后一个。模板里它是 writer，但这里**不按名字硬编码**
         # —— 拓扑已由 plan 决定，名字硬编码会在新 profile 上静默取错。
