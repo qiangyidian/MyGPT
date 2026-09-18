@@ -23,6 +23,10 @@ interface FeedItem {
   spin?: boolean;
   text: string;
   tone: "muted" | "primary" | "emerald" | "amber" | "destructive";
+  /** 该阶段完整产出（仅 completed 且有产出时）。渲染为可展开的详情。 */
+  detail?: string;
+  /** detail 是否被后端截断。 */
+  detailTruncated?: boolean;
 }
 
 export function AgentActivityFeed({
@@ -63,7 +67,27 @@ export function AgentActivityFeed({
                 it.spin && "animate-spin"
               )}
             />
-            <span className="text-foreground/90">{it.text}</span>
+            <span className="text-foreground/90">
+              {it.text}
+              {it.detail && (
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                    查看完整产出
+                  </summary>
+                  <div
+                    data-testid="feed-detail"
+                    className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2 text-[11px] text-muted-foreground"
+                  >
+                    {it.detail}
+                  </div>
+                  {it.detailTruncated && (
+                    <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                      产出过长，已截断显示。
+                    </span>
+                  )}
+                </details>
+              )}
+            </span>
           </div>
         );
       })}
@@ -102,6 +126,9 @@ function buildFeed(graph: AgentGraphState): FeedItem[] {
           : failed
             ? `${n.name} 执行失败`
             : `${n.name} 执行中${n.taskTitle ? `：${n.taskTitle}` : ""}`,
+        // 完整产出随完成事件到达；无 full 时回退到 160 字摘要，避免两处文案不一致。
+        detail: done ? (n.outputFull ?? n.outputSummary) : undefined,
+        detailTruncated: n.outputTruncated,
       });
     }
     if (n.currentTool) {

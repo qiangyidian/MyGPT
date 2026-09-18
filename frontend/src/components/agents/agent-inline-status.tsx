@@ -1,8 +1,43 @@
 "use client";
 
-import { selectIsMultiAgent, useAgentRunStore } from "@/stores/agent-run-store";
+import { useAgentRunStore } from "@/stores/agent-run-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
-import type { AgentGraphNode } from "@/lib/agent-graph-types";
+import type { AgentGraphNode, AgentGraphState } from "@/lib/agent-graph-types";
+
+/**
+ * Derive the one-line status label. Pure so it can be unit-tested directly
+ * (the component is store-driven and therefore not renderable in the node-only
+ * vitest environment, which has no server snapshot for the zustand store).
+ *
+ * 运行中显示真实进度（心跳带来的最近工具），完成后显示完成而非「并行中」——
+ * 数据全部来自 store，不编造前端模拟的计数或耗时。
+ */
+export function inlineStatusLabel(active: AgentGraphState): string {
+  const multi = active.nodes.length >= 2;
+
+  if (!active.runId || active.nodes.length === 0) return "思考中…";
+  if (!multi) return "智能助手正在作答";
+
+  const runningNodes = active.activeAgentIds
+    .map((id) => active.nodes.find((n) => n.id === id))
+    .filter((n): n is AgentGraphNode => !!n);
+  if (runningNodes.length > 0) {
+    const head = runningNodes[0];
+    const note = head.progressNote ? ` · ${head.progressNote}` : "";
+    return runningNodes.length > 1
+      ? `${runningNodes.map((n) => n.name).join("、")} 并行中${note}`
+      : `${head.name} 处理中${note}`;
+  }
+
+  const finished = active.nodes.filter((n) => n.status === "completed");
+  if (finished.length > 0) {
+    const last = finished[finished.length - 1];
+    const secs =
+      last.durationMs != null ? ` · ${(last.durationMs / 1000).toFixed(1)}s` : "";
+    return `✓ ${last.name} 完成${secs}`;
+  }
+  return "多 Agent 协作中";
+}
 
 /**
  * Live agent status shown inside the streaming assistant bubble before tokens
@@ -12,7 +47,6 @@ import type { AgentGraphNode } from "@/lib/agent-graph-types";
  */
 export function AgentInlineStatus() {
   const active = useAgentRunStore((s) => s.active);
-  const multi = useAgentRunStore(selectIsMultiAgent);
   const openWith = useContextPanelStore((s) => s.openWith);
 
   if (!active.runId || active.nodes.length === 0) {
@@ -27,15 +61,7 @@ export function AgentInlineStatus() {
     );
   }
 
-  const runningNodes = active.activeAgentIds
-    .map((id) => active.nodes.find((n) => n.id === id))
-    .filter((n): n is AgentGraphNode => !!n);
-
-  const label = multi
-    ? runningNodes.length > 0
-      ? `${runningNodes.map((n) => n.name).join("、")} 并行中`
-      : "多 Agent 协作中"
-    : "智能助手正在作答";
+  const label = inlineStatusLabel(active);
 
   return (
     <button

@@ -42,7 +42,12 @@ export function AgentNodeCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const running = node.status === "running";
-  const hasDetail = !!(node.taskSummary || node.outputSummary || node.error);
+  const hasDetail = !!(
+    node.taskSummary ||
+    node.outputSummary ||
+    node.outputFull ||
+    node.error
+  );
   // Live duration while running: startedAt -> now; else stored durationMs.
   let durationLabel = "";
   if (node.status === "running" && node.startedAt) {
@@ -116,13 +121,52 @@ export function AgentNodeCard({
         </button>
       )}
       {expanded && (
-        <div className="mt-1.5 space-y-1 text-[11px]">
+        <div className="mt-1.5 space-y-1.5 text-[11px]">
           {node.taskSummary && (
             <div className="text-muted-foreground">{node.taskSummary}</div>
           )}
           {node.error && <div className="break-words text-destructive">{node.error}</div>}
-          {node.outputSummary && (
-            <div className="break-words text-muted-foreground">{node.outputSummary}</div>
+          {/* 完整产出（展开态）优先；截断时给出提示，否则用户会以为证据就这么多。 */}
+          {node.outputFull ? (
+            <div className="space-y-1">
+              <div
+                data-testid="node-output-full"
+                className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2 leading-relaxed text-muted-foreground"
+              >
+                {node.outputFull}
+              </div>
+              {node.outputTruncated && (
+                <p className="text-amber-600 dark:text-amber-400">
+                  产出过长，已截断显示。
+                </p>
+              )}
+            </div>
+          ) : (
+            node.outputSummary && (
+              <div className="break-words text-muted-foreground">
+                {node.outputSummary}
+              </div>
+            )
+          )}
+          {/* 该 stage 的用量：只在后端真的报上来时才显示，不编造。 */}
+          {(node.durationMs != null ||
+            node.usage?.total_tokens != null ||
+            node.costUsd != null) && (
+            <div className="flex flex-wrap gap-x-3 gap-y-0.5 tabular-nums text-muted-foreground">
+              {node.durationMs != null && (
+                <span data-testid="node-duration">
+                  耗时 {formatDuration(node.durationMs)}
+                </span>
+              )}
+              {node.usage?.total_tokens != null && (
+                <span data-testid="node-tokens">
+                  tokens {node.usage.total_tokens}
+                </span>
+              )}
+              {node.costUsd != null && (
+                <span data-testid="node-cost">${node.costUsd.toFixed(4)}</span>
+              )}
+            </div>
           )}
         </div>
       )}
