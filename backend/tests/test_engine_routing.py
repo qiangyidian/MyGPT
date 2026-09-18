@@ -102,9 +102,11 @@ class _FakeWorkflowExecutor:
         *,
         fail_step: str | None = None,
         outputs: dict[str, str] | None = None,
+        usage: dict[str, int | float] | None = None,
     ) -> None:
         self.fail_step = fail_step
         self.outputs = outputs or {}
+        self.usage = usage
         self.calls: list[str] = []
 
     async def execute(
@@ -114,7 +116,7 @@ class _FakeWorkflowExecutor:
         if step.id == self.fail_step:
             raise RuntimeError(f"engine forced failure at {step.id}")
         out = self.outputs.get(step.id, f"[{step.id}] output")
-        return StepObservation(step_id=step.id, output=out)
+        return StepObservation(step_id=step.id, output=out, usage=self.usage)
 
 
 async def _drive(orchestrator: ChatOrchestrator, ctx) -> list[tuple[str, dict]]:
@@ -167,8 +169,12 @@ async def test_engine_runs_when_flag_on_and_profile_is_deep_research(
 
     # The engine ran the turn end-to-end.
     assert "agent_graph" in kinds, f"missing agent_graph in {kinds}"
-    assert "step_started" in kinds, f"missing step_started in {kinds}"
-    assert "step_completed" in kinds, f"missing step_completed in {kinds}"
+    # 引擎路径与 walker 的事件词汇必须一致：walker 不发 step_started /
+    # step_completed（那是 native 单 Agent 路径的轨迹事件），引擎路径也不发。
+    assert "agent_status" in kinds, f"missing agent_status in {kinds}"
+    assert "run_status" in kinds, f"missing run_status in {kinds}"
+    assert "step_started" not in kinds, "引擎路径不得自造 walker 不发的 step 事件"
+    assert "step_completed" not in kinds, "引擎路径不得自造 walker 不发的 step 事件"
     assert kinds[-1] == "done", f"expected done last, got {kinds[-1]}"
     # The writer's observation became the assistant answer.
     assert ctx.assistant_msg.content == "the final cited answer"
@@ -250,4 +256,116 @@ async def test_engine_run_persists_agent_attempts(db_session, monkeypatch):
     step_keys = {r.step_key for r in rows}
     assert {"researcher", "analyst", "writer"} <= step_keys, (
         f"expected attempts for all three steps, got {step_keys}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 5. 引擎路径的三处缺陷修复（usage / current_agent_ids / graph_state）
+# --------------------------------------------------------------------------- #
+async def test_engine_path_reports_usage(db_session, monkeypatch):
+    """ev_done 必须带 usage —— 否则 credits 对引擎轮次静默漏账。"""
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"},
+        usage={"total_tokens": 120, "prompt_tokens": 80, "completion_tokens": 40,
+               "cost_usd": 0.02},
+    )
+    _spy_crewai(monkeypatch)
+
+    events = await _drive(ChatOrchestrator(), ctx)
+    done = [d for k, d in events if k == "done"]
+
+    assert done, "engine path must emit done"
+    assert done[0].get("usage"), "engine path must report usage"
+    assert done[0]["usage"]["total_tokens"] == 360  # 三个 step 各 120
+    assert ctx.extra["usage"]["total_tokens"] == 360
+
+
+async def test_engine_path_reports_active_agents(db_session, monkeypatch):
+    """run_status 必须列出真实运行中的 agent，否则面板「并行中」不显示。"""
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"}
+    )
+    _spy_crewai(monkeypatch)
+
+    events = await _drive(ChatOrchestrator(), ctx)
+    statuses = [d for k, d in events if k == "run_status"]
+
+    assert statuses, "engine path must emit run_status"
+    # 旧实现恒发 current_agent_ids=[]，面板因此永远显示不出「N 并行中」。
+    assert any(d.get("current_agent_ids") for d in statuses), (
+        f"no run_status carried active agents: {statuses}"
+    )
+
+
+async def test_engine_path_persists_graph_state(db_session, monkeypatch):
+    """引擎路径必须写 graph_state，否则刷新后链路丢失。"""
+    from app.models import AgentRun
+
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"}
+    )
+    _spy_crewai(monkeypatch)
+
+    await _drive(ChatOrchestrator(), ctx)
+
+    row = (
+        await db_session.execute(select(AgentRun).where(AgentRun.id == ctx.run_id))
+    ).scalar_one()
+    await db_session.refresh(row)
+    assert row.graph_state, "engine path must persist graph_state"
+    assert row.graph_definition, "engine path must persist graph_definition once"
+
+
+async def test_engine_path_topology_comes_from_plan(db_session, monkeypatch):
+    """拓扑来自 plan（graph_from_plan），不是硬编码的 build_deep_research_graph。"""
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"}
+    )
+    _spy_crewai(monkeypatch)
+
+    events = await _drive(ChatOrchestrator(), ctx)
+    graph_evt = next(d for k, d in events if k == "agent_graph")
+    nodes = graph_evt["graph"]["nodes"]
+
+    assert [n["id"] for n in nodes] == ["researcher", "analyst", "writer"]
+    # 展示层复用静态 builder，所以中文产品文案得以保留（不是 plan 里的英文技术串）。
+    assert nodes[0]["role"] == "资料检索"
+    assert nodes[0]["task_title"] == "检索和整理证据"
+
+
+async def test_engine_and_walker_emit_the_same_lifecycle_event_kinds(
+    db_session, monkeypatch
+):
+    """引擎路径与 CrewAI walker 的事件种类集合必须一致（spec §10）。"""
+    from app.agents.runtime.stage_executor import FakeStageExecutor
+
+    # --- 引擎路径 ---
+    _patch_flag(monkeypatch, engine="1", crewai=True)
+    ctx_engine = await _seed_ctx(db_session)
+    ctx_engine.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={"researcher": "ev", "analyst": "f", "writer": "answer"}
+    )
+    _spy_crewai(monkeypatch)
+    engine_events = await _drive(ChatOrchestrator(), ctx_engine)
+
+    # --- walker 路径 ---
+    _patch_flag(monkeypatch, engine="", crewai=True)
+    ctx_walker = await _seed_ctx(db_session)
+    ctx_walker.extra["stage_executor"] = FakeStageExecutor()
+    walker_events = await _drive(ChatOrchestrator(), ctx_walker)
+
+    lifecycle = {"agent_graph", "agent_status", "agent_edge", "run_status", "token", "done"}
+    engine_kinds = {k for k, _ in engine_events} & lifecycle
+    walker_kinds = {k for k, _ in walker_events} & lifecycle
+
+    assert engine_kinds == walker_kinds, (
+        f"engine={sorted(engine_kinds)} walker={sorted(walker_kinds)}"
     )

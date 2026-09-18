@@ -53,6 +53,8 @@ from app.agents.events import append_event_safe
 from app.agents.persistence import persist_terminal_run
 from app.agents.run_controls import drop as drop_run_control
 from app.agents.run_controls import get_or_create as get_run_control
+from app.agents.graph import graph_from_plan
+from app.agents.run_environment import RunEnvironment
 from app.agents.runtime.native_runtime import NativeChatRuntime
 from app.agents.schemas import (
     AgentEvent,
@@ -381,11 +383,8 @@ class ChatOrchestrator:
         from app.agents.graph import build_deep_research_graph
         from app.agents.schemas import (
             ev_agent_graph,
-            ev_agent_status,
             ev_done,
             ev_run_status,
-            ev_step_completed,
-            ev_step_started,
             ev_token,
         )
         from app.agents.token_budget import PromptAdmissionError
@@ -408,72 +407,57 @@ class ChatOrchestrator:
         # Resolve the per-step executor. An injected executor (tests / future
         # wiring) wins; otherwise build the real StageAdapterExecutor from the
         # existing crew's stage specs so each step runs via CrewAIStageExecutor.
+        env = RunEnvironment.for_turn(ctx)
+        env.attach_graph(graph_from_plan(plan))
+        env.begin()
+        # 图定义只落一次，与 walker 路径一致（刷新后可恢复链路）。
+        await env.persist_graph(definition=True)
+
         injected = ctx.extra.get("workflow_executor")
         if injected is not None:
             inner = injected
         else:
-            inner = self._build_stage_adapter(ctx, run)
+            inner = self._build_stage_adapter(ctx, run, env)
 
-        # The engine calls executor.execute(step, upstream) for each ready step.
-        # Wrap it to (a) surface the lifecycle as SSE events the frontend
-        # already understands, and (b) map Budget/PromptAdmission errors to
-        # StepError(transient=False) so the engine fails the step immediately
-        # instead of retrying a hard budget exhaustion.
-        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+        class _EnvExecutor:
+            """把引擎的步骤执行接到 RunEnvironment 的共享上下文上。
 
-        class _EmittingExecutor:
+            只做一件事：把硬预算/准入失败映射成 StepError(transient=False)，
+            让引擎立即失败而不是重试一个已经耗尽的预算。事件发射全部交给
+            on_step_* 回调（见下），这里不再自造事件。
+            """
+
             async def execute(self, step: Any, upstream: dict) -> Any:
-                title = (step.task_description or step.name or step.id)[:80]
-                await queue.put(
-                    ev_step_started(
-                        step_id=step.id, title=title, step_type="llm",
-                        agent=step.role or step.id,
-                    )
-                )
-                await queue.put(
-                    ev_agent_status(
-                        run_id=run.id, agent_id=step.id, status="running",
-                        task_title=title,
-                    )
-                )
                 try:
-                    obs = await inner.execute(step, upstream)
+                    return await inner.execute(step, upstream)
                 except (BudgetExceeded, PromptAdmissionError) as exc:
-                    # Hard budget/admission exhaustion — never retry.
-                    await queue.put(
-                        ev_agent_status(
-                            run_id=run.id, agent_id=step.id, status="failed",
-                            error=str(exc),
-                        )
-                    )
                     raise StepError(str(exc), transient=False) from exc
-                except Exception as exc:
-                    await queue.put(
-                        ev_agent_status(
-                            run_id=run.id, agent_id=step.id, status="failed",
-                            error=str(exc),
-                        )
-                    )
-                    raise
-                await queue.put(ev_step_completed(step_id=step.id, status="done"))
-                await queue.put(
-                    ev_agent_status(
-                        run_id=run.id, agent_id=step.id, status="completed",
-                        output_summary=(obs.output or "")[:160] or None,
-                    )
-                )
-                return obs
 
         engine = WorkflowEngine(
-            executor=_EmittingExecutor(),
+            executor=_EnvExecutor(),
             verifier=RuleBasedVerifier(),
             run_id=run.id,
             session_factory=ctx.extra.get("persistence_session_factory"),
+            on_step_start=env.step_started,
+            on_step_end=lambda step_id, output, usage: env.step_completed(
+                step_id,
+                output=output,
+                output_summary=(output or "")[:160] or None,
+                usage=usage,
+            ),
+            on_step_error=lambda step_id, message: env.step_failed(
+                step_id, error=message
+            ),
         )
 
-        # Drive the engine in a task; concurrently drain its lifecycle events
-        # so the UI updates in real time (same pattern as CrewAIRuntime's
-        # run_flow + queue drain).
+        # 驱动引擎的同时并发排空 env 的事件队列，让面板实时更新 —— 与 walker
+        # 路径的 run_flow + drain 同构。若写成 `result = await engine.run(plan)`
+        # 再排空，所有过程事件会挤到最后一次性到达，面板在整个多 Agent 轮次
+        # 里全程静止。
+        #
+        # 哨兵（None）由引擎任务在 finally 里投放，保证它排在所有步骤事件之后：
+        # stage_ctx.emit 走 call_soon_threadsafe，回调要到下一个 loop tick 才
+        # 执行；先 await asyncio.sleep(0) 让已排队的回调落地，再放哨兵。
         result_holder: dict[str, Any] = {}
         engine_exc: list[BaseException] = []
 
@@ -483,12 +467,13 @@ class ChatOrchestrator:
             except BaseException as exc:
                 engine_exc.append(exc)
             finally:
-                await queue.put(None)
+                await asyncio.sleep(0)
+                env.stage_ctx.close()
 
         engine_task = asyncio.create_task(_run_engine())
         try:
             while True:
-                evt = await queue.get()
+                evt = await env.stage_ctx.queue.get()
                 if evt is None:
                     break
                 yield evt
@@ -513,19 +498,34 @@ class ChatOrchestrator:
                 f"error={getattr(result, 'error', None)})"
             )
 
-        yield ev_run_status(
-            run_id=run.id, status="completed", current_agent_ids=[]
-        )
+        env.finish("completed")
+        await asyncio.sleep(0)  # 让 finish 的事件落地（同上）
+        for evt in _drain_env_events(env):
+            yield evt
 
-        # The writer step holds the final cited answer.
-        writer_obs = result.observations.get("writer")
-        final_text = (writer_obs.output if writer_obs else "") or ""
+        # 终态步骤 = 拓扑序最后一个。模板里它是 writer，但这里**不按名字硬编码**
+        # —— 拓扑已由 plan 决定，名字硬编码会在新 profile 上静默取错。
+        terminal_step = plan.topological_order()[-1]
+        terminal_obs = result.observations.get(terminal_step)
+        final_text = (terminal_obs.output if terminal_obs else "") or ""
         ctx.assistant_msg.content = final_text
         if final_text:
             yield ev_token(delta=final_text)
-        yield ev_done(message_id=ctx.assistant_msg.id, finish_reason="stop")
 
-    def _build_stage_adapter(self, ctx: AgentTurnContext, run: AgentRun):
+        usage = env.aggregate_usage(result.observations)
+        if usage:
+            ctx.extra["usage"] = usage
+        ctx.extra["finish_reason"] = "stop"
+        yield ev_done(
+            message_id=ctx.assistant_msg.id,
+            finish_reason="stop",
+            usage=usage,
+            budget=ctx.extra.get("budget"),
+        )
+
+    def _build_stage_adapter(
+        self, ctx: AgentTurnContext, run: AgentRun, env: RunEnvironment
+    ):
         """Build the real StageAdapterExecutor from the existing crew stages.
 
         Imports crewai lazily (via the crew builder) and reuses the runtime's
@@ -534,13 +534,12 @@ class ChatOrchestrator:
         """
         from app.agents.adapters.llm_adapter import CrewAILLMFactory
         from app.agents.crews import build_research_stages
-        from app.agents.runtime.crewai_runtime import _guard_for_context
-        from app.agents.stage_context import make_stage_context
         from app.agents.workflow.executor import StageAdapterExecutor
 
-        guard = _guard_for_context(ctx)
+        # stage_ctx / 预算守卫来自共享的 RunEnvironment —— 与 walker 路径同一实例。
+        guard = env.guard
         llm = CrewAILLMFactory.from_model_config(ctx.model_config, budget_guard=guard)
-        stage_ctx = make_stage_context(str(run.id), budget_guard=guard)
+        stage_ctx = env.stage_ctx
         # tools are not strictly needed by the adapter contract (CrewAIStageExecutor
         # receives agent+task from the StageSpec, which already embed tools); pass
         # an empty list to satisfy the builder signature.
@@ -755,6 +754,16 @@ class ChatOrchestrator:
 
 # Module-level singleton — stateless aside from the lazy crewai cache.
 chat_orchestrator = ChatOrchestrator()
+
+
+def _drain_env_events(env: RunEnvironment) -> list[AgentEvent]:
+    """取出 RunEnvironment 队列中累积的事件（非阻塞）。"""
+    out: list[AgentEvent] = []
+    while not env.stage_ctx.queue.empty():
+        evt = env.stage_ctx.queue.get_nowait()
+        if evt is not None:
+            out.append(evt)
+    return out
 
 
 def _truthy(value: str | None) -> bool:
