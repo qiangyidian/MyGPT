@@ -22,13 +22,18 @@ cd "$REPO_DIR"
 
 # Incremental path exercises "prior revision -> head"; derive the prior
 # revision from the head migration's down_revision instead of hardcoding it.
+#
+# NOTE: this reads $REPO_HEAD, so it MUST be called after REPO_HEAD is resolved
+# (further down). Calling it earlier made the reference an `unbound variable`
+# under `set -u`; the function still exited 0 with empty output, so the
+# incremental path — the one a real deploy actually takes — was silently
+# SKIPPED and the script still printed PASS.
 resolve_prior_rev() {
   local head_file
   head_file="$(grep -rlE "^revision(:[^=]*)?= *['\"]${REPO_HEAD}['\"]" backend/migrations/versions 2>/dev/null | head -n1)"
   [ -n "$head_file" ] || return 0
   sed -nE "s/^down_revision(:[^=]*)?= *['\"]([^'\"]+)['\"].*/\2/p" "$head_file" | head -n1
 }
-PRIOR_REV="${PRIOR_REV:-$(resolve_prior_rev)}"
 PG_PORT="${PG_PORT:-55432}"
 PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
 CTR="mygpt-verify-pg-$$"
@@ -53,6 +58,9 @@ if [ -z "$REPO_HEAD" ]; then
   echo "[verify] FAIL: cannot resolve alembic head from backend/migrations" >&2
   exit 1
 fi
+
+# Resolved HERE (not at the top) because resolve_prior_rev reads REPO_HEAD.
+PRIOR_REV="${PRIOR_REV:-$(resolve_prior_rev)}"
 
 cleanup() {
   echo "[verify] tearing down $CTR"
