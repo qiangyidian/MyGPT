@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agents.adapters.tool_adapter import _execution_usage, build_crewai_tool
 from app.agents.continuation import aggregate_usage
 from app.agents.orchestrator import ChatOrchestrator
+from app.agents.run_environment import RunEnvironment
 from app.agents.runtime.crewai_runtime import (
     CrewAIRuntime,
     _aggregate_crewai_usage,
@@ -1340,17 +1341,19 @@ async def test_graph_failure_rolls_back_only_independent_session(db_session):
     )
     ctx.extra["persistence_session_factory"] = graph_sessions
     snapshot = {"nodes": [{"id": "writer", "status": "running"}], "edges": []}
-    emitter = SimpleNamespace(snapshot=lambda: snapshot)
+    # 图持久化已从 CrewAIRuntime 迁到 RunEnvironment（两条 walker 共用）。
+    env = RunEnvironment.for_turn(ctx)
+    env._emitter = SimpleNamespace(snapshot=lambda: snapshot)
 
     # Graph persistence is best-effort for ordinary SQLAlchemy failures.
-    await CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
+    await env.persist_graph(definition=True)
 
     assert FailFirstGraphCommitSession.rollback_calls == 1
     # A rollback on ctx.db would expire both and raise MissingGreenlet here.
     assert ctx.assistant_msg.content == ""
     assert run.output is None
 
-    await CrewAIRuntime()._persist_graph(ctx, emitter, definition=True)
+    await env.persist_graph(definition=True)
     async with graph_sessions() as verify:
         durable_run = await verify.get(AgentRun, ctx.run_id)
         assert durable_run.graph_definition == snapshot
@@ -1368,9 +1371,10 @@ async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
             ChatDelta(finish_reason="length"),
         ]]
     )
+    # provider 的构建已随装配逻辑迁到 RunEnvironment.for_turn。
     monkeypatch.setattr(
-        "app.agents.runtime.crewai_runtime.get_provider_for_config",
-        lambda _cfg: provider,
+        "app.providers.registry.get_provider_for_config",
+        lambda _cfg, **_kw: provider,
     )
     ctx.extra["stage_executor"] = StreamingWriterExecutor(
         FakeStageExecutor(

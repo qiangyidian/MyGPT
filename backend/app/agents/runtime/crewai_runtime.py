@@ -38,7 +38,6 @@ from sqlalchemy import select
 
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
-from app.agents.approval_bridge import ApprovalBridge
 from app.agents.continuation import aggregate_usage
 from app.agents.crews import (
     build_debate_stages,
@@ -48,11 +47,11 @@ from app.agents.crews import (
 from app.agents.crews.stage import StageSpec
 from app.agents.db_mutation import db_mutation_scope
 from app.agents.events import append_event_safe
-from app.agents.lifecycle import AgentLifecycleEmitter
-from app.agents.persistence import persist_graph_snapshot, persist_research_plan
+from app.agents.persistence import persist_research_plan
 from app.agents.planning import build_plan, classify_intent
 from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
 from app.agents.run_controls import get as get_run_control
+from app.agents.run_environment import RunEnvironment
 from app.agents.runtime.stage_executor import (
     CrewAIStageExecutor,
     StageExecutor,
@@ -71,15 +70,13 @@ from app.agents.schemas import (
     ev_run_resumed,
     ev_token,
 )
-from app.agents.stage_context import StageContext, make_stage_context
+from app.agents.stage_context import StageContext
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.agents.token_budget import PromptAdmissionError
 from app.core.config import get_settings
 from app.core.pricing import usage_cost
-from app.db import AsyncSessionLocal
 from app.models import AgentRun
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
-from app.providers.registry import get_provider_for_config
 
 logger = logging.getLogger(__name__)
 
@@ -523,57 +520,13 @@ class CrewAIRuntime:
     async def _run_multi_agent(
         self, ctx: AgentTurnContext, llm: Any, profile: str
     ) -> AsyncIterator[AgentEvent]:
-        guard = _guard_for_context(ctx)
-        stage_ctx = make_stage_context(ctx.run_id, budget_guard=guard)
-        # Populate the streaming-writer fields so the writer stage can call the
-        # provider directly and mutate the assistant message token-by-token.
-        # All Optional; harmless for the non-writer stages and for fakes/demos.
-        try:
-            # The conversation id doubles as the provider's session identity
-            # (OpenCode gateways require a stable one per conversation; Hermes
-            # scopes server-side memory with it). Same contract as the native
-            # runtime — see NativeChatRuntime._stream_turn_body.
-            stage_ctx.provider = get_provider_for_config(
-                ctx.model_config, session_id=str(ctx.conversation.id)
-            )
-        except TypeError:
-            # Injected test doubles may still take the single-arg signature.
-            stage_ctx.provider = get_provider_for_config(ctx.model_config)
-        except Exception as exc:
-            logger.warning("could not build provider for streaming writer: %s", exc)
-            stage_ctx.provider = None
-        stage_ctx.model_config = ctx.model_config
-        stage_ctx.assistant_msg = ctx.assistant_msg
-        stage_ctx.user_content = ctx.user_content
-        stage_ctx.cancel_event = asyncio.Event()
-        stage_ctx.db = ctx.db
-        stage_ctx.persistence_session_factory = ctx.extra.get(
-            "persistence_session_factory"
-        ) or AsyncSessionLocal
-        stage_ctx.persistence_lock = ctx.extra.get("persistence_lock")
-        persist_checkpoint = ctx.extra.get("persist_continuation_checkpoint")
-        if callable(persist_checkpoint):
-            stage_ctx.persist_continuation_checkpoint = persist_checkpoint
-        else:
-            async def persist_checkpoint_fallback(checkpoint: dict[str, Any]) -> None:
-                from app.services.chat_service import (
-                    _persist_continuation_checkpoint,
-                )
-
-                async with db_mutation_scope(stage_ctx.persistence_lock):
-                    await _persist_continuation_checkpoint(
-                        stage_ctx.persistence_session_factory,
-                        ctx.assistant_msg,
-                        ctx.run_id,
-                        checkpoint,
-                    )
-
-            stage_ctx.persist_continuation_checkpoint = persist_checkpoint_fallback
+        # 整个执行环境（stage_ctx 装配 / 审批桥 / emitter）由 RunEnvironment
+        # 统一提供 —— 引擎路径用的是同一个构造器，两条 walker 因此拿到完全
+        # 相同的运行时能力。
+        env = RunEnvironment.for_turn(ctx)
+        stage_ctx = env.stage_ctx
+        guard = env.guard
         tools = await self._build_tools(ctx, stage_ctx=stage_ctx)
-
-        # The approval bridge is built after the emitter (it needs the emitter
-        # to emit waiting/run_status). We attach it to the stage ctx below.
-        approval_bridge_holder: dict[str, Any] = {}
 
         # Build graph + stages for the profile.
         try:
@@ -601,17 +554,14 @@ class CrewAIRuntime:
             # every other stage keeps using aexecute_task unchanged.
             # (Tests inject their own executor via ctx.extra["stage_executor"].)
             executor = StreamingWriterExecutor(CrewAIStageExecutor())
-        emitter = AgentLifecycleEmitter(run_id=ctx.run_id, graph=graph, stage_ctx=stage_ctx)
-
-        # Wire the cross-thread approval bridge so dangerous tools pause the
-        # agent node + run and resume on user approval.
-        approval_bridge = ApprovalBridge(
-            loop=stage_ctx.loop, stage_ctx=stage_ctx, emitter=emitter, run_id=ctx.run_id,
-        )
-        stage_ctx.approval_bridge = approval_bridge
+        env.attach_graph(graph)
+        emitter = env.emitter
+        # 跨线程审批桥（危险工具暂停 agent 节点 + 运行，等用户批准后恢复）
+        # 由 attach_graph 建好并挂在 stage_ctx 上。
+        approval_bridge = stage_ctx.approval_bridge
 
         # Persist the static graph_definition once.
-        await self._persist_graph(ctx, emitter, definition=True)
+        await env.persist_graph(definition=True)
 
         # ---- Phase 2: publish a draft research plan (deep_research) ----
         # Built deterministically from the question; the UI shows it in the
@@ -669,17 +619,16 @@ class CrewAIRuntime:
         async def run_flow() -> None:
             nonlocal run_exc
             try:
-                emitter.emit_graph_initialized()
-                emitter.emit_run_status("running")
-                await self._walk_stages(ctx, stages, emitter, executor, stage_ctx, outputs)
-                emitter.emit_run_status("completed")
+                env.begin()
+                await self._walk_stages(ctx, stages, executor, env, outputs)
+                env.finish("completed")
             except asyncio.CancelledError:
-                emitter.emit_run_status("cancelled")
+                env.finish("cancelled")
                 raise
             except Exception as exc:
                 run_exc = exc
                 logger.exception("multi-agent flow failed: %s", exc)
-                emitter.emit_run_status("failed")
+                env.finish("failed")
             finally:
                 stage_ctx.close()
 
@@ -691,7 +640,7 @@ class CrewAIRuntime:
                     break
                 # Persist live graph_state on structural events (cheap; few).
                 if evt.kind in ("agent_graph", "agent_status", "agent_edge", "run_status"):
-                    await self._persist_graph(ctx, emitter, definition=False)
+                    await env.persist_graph(definition=False)
                 # Durable control-state events (user pause/resume/instruction):
                 # persist to run_events so the cursor-replay SSE
                 # (/api/agent-runs/{id}/events) — which RunControls subscribes
@@ -720,7 +669,7 @@ class CrewAIRuntime:
                 if run_exc is None:
                     run_exc = exc
             # Final snapshot persist.
-            await self._persist_graph(ctx, emitter, definition=False)
+            await env.persist_graph(definition=False)
             partial_usage = _aggregate_crewai_usage(stages, outputs, stage_ctx)
             if partial_usage is not None:
                 ctx.extra["usage"] = partial_usage
@@ -826,7 +775,7 @@ class CrewAIRuntime:
             await asyncio.sleep(1.0)
         return False
 
-    async def _respect_controls(self, ctx, stage_ctx, emitter) -> None:
+    async def _respect_controls(self, ctx, env) -> None:
         """Honor user pause/resume + drain appended instructions between stages.
 
         Also consumes DURABLE commands (``run_commands`` rows) here (B8): the
@@ -835,10 +784,12 @@ class CrewAIRuntime:
         (exactly-once) and covers the case where the live signal missed (e.g.
         a different worker process held the run).
         """
+        stage_ctx = env.stage_ctx
+        emitter = env.emitter
         ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
         if ctl is None:
             return
-        guard = stage_ctx.budget_guard
+        guard = env.guard
         if guard is not None:
             guard.check()
         # Honor a user-initiated cancel between stages.
@@ -919,9 +870,8 @@ class CrewAIRuntime:
         self,
         ctx: AgentTurnContext,
         stages: list[StageSpec],
-        emitter: AgentLifecycleEmitter,
         executor: StageExecutor,
-        stage_ctx: StageContext,
+        env: RunEnvironment,
         outputs: dict[str, StageResult],
     ) -> None:
         """Execute stages grouped by ``stage`` number; same-stage specs run in
@@ -933,9 +883,9 @@ class CrewAIRuntime:
 
         for stage_num in sorted(stage_groups):
             group = stage_groups[stage_num]
-            await self._respect_controls(ctx, stage_ctx, emitter)
+            await self._respect_controls(ctx, env)
             if len(group) == 1:
-                await self._run_one_stage(group[0], emitter, executor, stage_ctx, outputs)
+                await self._run_one_stage(group[0], executor, env, outputs)
             else:
                 # Parallel: run all specs in this stage concurrently. Each emits
                 # its own agent_started/completed; multiple are running at once.
@@ -943,7 +893,7 @@ class CrewAIRuntime:
                 # downstream. Siblings still in flight are awaited (returned_ex).
                 tasks = [
                     asyncio.create_task(
-                        self._run_one_stage(s, emitter, executor, stage_ctx, outputs)
+                        self._run_one_stage(s, executor, env, outputs)
                     )
                     for s in group
                 ]
@@ -960,13 +910,13 @@ class CrewAIRuntime:
     async def _run_one_stage(
         self,
         spec: StageSpec,
-        emitter: AgentLifecycleEmitter,
         executor: StageExecutor,
-        stage_ctx: StageContext,
+        env: RunEnvironment,
         outputs: dict[str, StageResult],
     ) -> None:
         """Run a single agent stage with real lifecycle events around it."""
-        guard = stage_ctx.budget_guard
+        stage_ctx = env.stage_ctx
+        guard = env.guard
         # Build the context string from dependency outputs (the handoff).
         context_parts = []
         for dep_id in spec.depends_on:
@@ -981,7 +931,14 @@ class CrewAIRuntime:
             stage_ctx.pending_instructions = []
         context_str = "\n\n".join(context_parts) if context_parts else None
 
-        started = emitter.emit_agent_started(spec.agent_id, task_title=spec.task.description[:80] if hasattr(spec.task, "description") else None)
+        started = env.step_started(
+            spec.agent_id,
+            title=(
+                spec.task.description[:80]
+                if hasattr(spec.task, "description")
+                else None
+            ),
+        )
         if not started:
             # Waiting on a join — the emitter already moved it to waiting. Skip
             # execution until predecessors complete (handled by stage ordering,
@@ -1013,30 +970,21 @@ class CrewAIRuntime:
                         f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
                     ) from exc
             outputs[spec.agent_id] = result
-            if guard is not None and result.usage and not result.usage_charged:
-                cost = result.usage.get("cost_usd")
-                if cost is None:
-                    cost = usage_cost(
-                        getattr(stage_ctx.model_config, "model_name", None),
-                        result.usage,
-                    )
-                guard.add_usage(
-                    result.usage,
-                    cost_usd=cost,
-                    usage_id=f"crewai:stage:{spec.agent_id}",
-                )
-                guard.check()
-            emitter.emit_agent_completed(
-                spec.agent_id, output_summary=result.output_summary or None
+            # 计费 + 完成事件（含 usage 归属）统一由 RunEnvironment 负责。
+            env.step_completed(
+                spec.agent_id,
+                output=result.raw,
+                output_summary=result.output_summary or None,
+                usage=result.usage,
+                usage_charged=result.usage_charged,
             )
         except asyncio.CancelledError:
-            emitter.emit_agent_cancelled(spec.agent_id)
+            env.step_cancelled(spec.agent_id)
             raise
         except Exception as exc:
             logger.exception("stage %s failed: %s", spec.agent_id, exc)
-            emitter.emit_agent_failed(spec.agent_id, error=str(exc))
-            # Fail-fast: cancel everything downstream of this node.
-            emitter.cancel_downstream(spec.agent_id)
+            # Fail-fast: 失败事件 + 取消下游，由 RunEnvironment 一并处理。
+            env.step_failed(spec.agent_id, error=str(exc))
             raise
 
     # ====================================================================== #
@@ -1133,25 +1081,3 @@ class CrewAIRuntime:
             **(getattr(assistant, "metadata_", None) or {}), "budget": snapshot
         }
 
-    async def _persist_graph(
-        self,
-        ctx: AgentTurnContext,
-        emitter: AgentLifecycleEmitter,
-        *,
-        definition: bool,
-    ) -> None:
-        """Write the graph snapshot to the AgentRun row (best-effort)."""
-        session_factory = ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
-        try:
-            async with db_mutation_scope(ctx.extra.get("persistence_lock")):
-                await persist_graph_snapshot(
-                    session_factory,
-                    run_id=ctx.run_id,
-                    snapshot=emitter.snapshot(),
-                    definition=definition,
-                )
-        except BaseException as exc:
-            if isinstance(exc, Exception):
-                logger.warning("failed to persist agent graph snapshot", exc_info=True)
-                return
-            raise
