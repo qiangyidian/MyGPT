@@ -15,7 +15,8 @@ Sensitive-data redaction: :func:`sanitize_attributes` is the single chokepoint
 that scrubs api keys / secrets / bearer tokens / Fernet ciphertext from any
 attributes BEFORE they are handed to a span or a log. Every span/counter/histogram
 adapter routes its attributes through it so a leak can't slip through an
-unredacted call site.
+unredacted call site. :func:`scrub_text` is the string-level companion, for
+free-form text that was never a structured field (upstream error bodies).
 """
 from __future__ import annotations
 
@@ -200,6 +201,49 @@ def _sanitize(value: Any) -> Any:
     if _is_sensitive_value(value):
         return REDACTED
     return value
+
+
+# --------------------------------------------------------------------------- #
+# String-level redaction. The value patterns above are ^...$ ANCHORED: they
+# answer "is this value, in its entirety, a credential?" — which is the right
+# question for a config attribute or a log field. Free-form text (an upstream
+# HTTP error body, a stack tail) is a different shape: the credential sits in
+# the MIDDLE of a longer sentence and the anchored patterns never fire.
+#
+# These are the same four credential shapes, re-expressed as unanchored
+# substrings so they can be replaced anywhere in a string.
+# --------------------------------------------------------------------------- #
+_SCRUB_PATTERNS = (
+    # OpenAI-compatible API keys (sk-, sk-proj-, sk-live-, …).
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    # Fernet ciphertext (url-safe base64 whose version byte 0x80 encodes "gAAAAA").
+    re.compile(r"gAAAAA[A-Za-z0-9_\-]{20,}={0,2}"),
+    # Inline "Bearer <token>" / "Basic <token>".
+    re.compile(r"(?:bearer|basic)\s+[A-Za-z0-9._\-]{8,}", re.IGNORECASE),
+    # JWTs: three base64url segments, first starting "eyJ" (a JSON header).
+    re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+)
+
+
+def scrub_text(text: Any, *, max_chars: int = 300) -> str:
+    """Redact credential shapes embedded in free-form text, then bound length.
+
+    The string-level counterpart of :func:`sanitize_attributes`, for text that is
+    displayed or logged but was never a structured field — an upstream error body
+    being the motivating case. Callers should still redact any *known* secret by
+    value as well; pattern matching is defense in depth, not a guarantee.
+
+    Non-string input yields ``""`` (a missing/undecodable body is not an error).
+    """
+    if not isinstance(text, str):
+        return ""
+    out = text
+    for pattern in _SCRUB_PATTERNS:
+        out = pattern.sub(REDACTED, out)
+    out = out.strip()
+    if len(out) > max_chars:
+        out = out[:max_chars] + "…"
+    return out
 
 
 # --------------------------------------------------------------------------- #
