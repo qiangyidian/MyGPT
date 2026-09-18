@@ -309,3 +309,101 @@ def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
             sides.side_a if sides else "A", sides.side_b if sides else "B"
         )
     return build_deep_research_graph(question)
+
+
+# --------------------------------------------------------------------------- #
+# Plan → Graph：引擎路径的拓扑来源
+# --------------------------------------------------------------------------- #
+_TASK_SUMMARY_MAX = 200
+
+
+def graph_from_plan(plan: Any) -> AgentGraph:
+    """从 plan 构建拓扑，供引擎路径的 :class:`AgentLifecycleEmitter` 使用。
+
+    拓扑（节点 id、依赖边、stage、lane）**完全取自 plan** —— 这是引擎路径
+    存在的意义：plan 是唯一真相。
+
+    展示文案（name / role / task_title / task_summary）复用同 profile 的静态
+    builder，因为那些 builder 携带的是产品级中文文案，而 plan 模板是英文技术
+    描述。只有当 builder 的节点 id 集合与 plan 的 step id 集合**完全相等**时
+    才复用；否则整体回退到 plan 推导 —— 这保证新 profile 不会被误配上
+    deep_research 的文案。
+    """
+    step_ids = [s.id for s in plan.steps]
+
+    presentation: dict[str, AgentGraphNode] = {}
+    mode = GraphMode.sequential
+    try:
+        template = build_graph_for_profile(plan.profile, plan.goal)
+        if template.nodes and {n.id for n in template.nodes} == set(step_ids):
+            presentation = {n.id: n for n in template.nodes}
+            mode = template.mode
+    except Exception:  # pragma: no cover - 展示层复用失败不得阻断拓扑构建
+        presentation = {}
+
+    stages = _stage_depths(plan)
+    lanes = _lane_indexes(stages, plan)
+
+    nodes: list[AgentGraphNode] = []
+    for step in plan.steps:
+        base = presentation.get(step.id)
+        if base is not None:
+            nodes.append(base.model_copy(update={"status": AgentNodeStatus.pending}))
+            continue
+        summary = (step.task_description or "")[:_TASK_SUMMARY_MAX]
+        nodes.append(
+            AgentGraphNode(
+                id=step.id,
+                name=step.name or step.id,
+                role=step.role or "",
+                task_title=step.name or step.id,
+                task_summary=summary,
+                stage=stages.get(step.id, 0),
+                lane=lanes.get(step.id, 0),
+            )
+        )
+
+    edges: list[AgentGraphEdge] = []
+    for step in plan.steps:
+        for dep in step.dependencies:
+            edges.append(
+                AgentGraphEdge(
+                    id=f"{dep}-{step.id}",
+                    source=dep,
+                    target=step.id,
+                    type=EdgeType.handoff,
+                )
+            )
+
+    return AgentGraph(
+        run_id="",
+        runtime="crewai",
+        flow_name=plan.profile or "workflow",
+        mode=mode,
+        status="pending",
+        nodes=nodes,
+        edges=edges,
+    )
+
+
+def _stage_depths(plan: Any) -> dict[str, int]:
+    """stage = 最长依赖链长度（拓扑深度）。plan 已保证无环。"""
+    depth: dict[str, int] = {}
+    deps = {s.id: list(s.dependencies) for s in plan.steps}
+    for step_id in plan.topological_order():
+        if deps.get(step_id):
+            depth[step_id] = 1 + max(depth.get(d, 0) for d in deps[step_id])
+        else:
+            depth[step_id] = 0
+    return depth
+
+
+def _lane_indexes(stages: dict[str, int], plan: Any) -> dict[str, int]:
+    """同 stage 内按声明顺序编号 —— 面板靠它并排渲染并行节点。"""
+    lanes: dict[str, int] = {}
+    counters: dict[int, int] = {}
+    for step in plan.steps:
+        stage = stages.get(step.id, 0)
+        lanes[step.id] = counters.get(stage, 0)
+        counters[stage] = lanes[step.id] + 1
+    return lanes
