@@ -81,6 +81,9 @@ class AgentGraphNode(BaseModel):
     # 该 stage 的 token 用量与成本（rich step events 开启时由 emitter 写入）。
     usage: dict[str, int] | None = None
     cost_usd: float | None = None
+    # 正在重试（引擎的 transient 重试）：{"attempt": N, "error": "..."}。
+    # 仅 informational —— 面板据此显示「第 N 次尝试」。
+    retrying: dict[str, Any] | None = None
     error: str | None = None
 
 

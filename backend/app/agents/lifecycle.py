@@ -163,6 +163,13 @@ class AgentLifecycleEmitter:
             return
         if node.status == AgentNodeStatus.completed:
             return  # idempotent
+        # cancelled 是用户主动取消的真正终态，不得被翻回 completed。
+        # failed 允许覆盖 —— 重试成功本就该覆盖失败（见 emit_agent_retrying）。
+        if node.status == AgentNodeStatus.cancelled:
+            logger.info(
+                "agent_completed: drop (cancelled) node=%s", agent_id
+            )
+            return
         node.status = AgentNodeStatus.completed
         node.finished_at = _now_iso()
         start = self._node_starts.pop(agent_id, None)
@@ -170,6 +177,9 @@ class AgentLifecycleEmitter:
             node.duration_ms = int((self._time.monotonic() - start) * 1000)
         if output_summary:
             node.output_summary = output_summary
+        # 重试成功后，上一轮的失败信息与重试标记都必须消失。
+        node.error = None
+        node.retrying = None
         if usage is not None:
             node.usage = {k: v for k, v in usage.items() if isinstance(v, int)}
         if cost_usd is not None:
@@ -199,7 +209,11 @@ class AgentLifecycleEmitter:
         node.status = AgentNodeStatus.failed
         node.finished_at = _now_iso()
         node.error = error
-        start = self._node_starts.pop(agent_id, None)
+        # 注意：这里**不** pop _node_starts —— 引擎可能对 transient 失败重试，
+        # 保留起始时间戳使重试成功后的 duration_ms 是「从首次开始」的累计耗时
+        # （更接近用户感知）。真正的终态结算由 emit_agent_completed /
+        # emit_agent_cancelled 负责。
+        start = self._node_starts.get(agent_id)
         if start is not None:
             node.duration_ms = int((self._time.monotonic() - start) * 1000)
         self._emit(ev_agent_status(
@@ -219,6 +233,32 @@ class AgentLifecycleEmitter:
         # running siblings (parallel) are left alone so their own completion is
         # still reported honestly.
         self.cancel_downstream(agent_id)
+
+    def emit_agent_retrying(
+        self, agent_id: str, *, attempt: int, error: str
+    ) -> None:
+        """标记一个节点正在重试（引擎的 transient 重试）。
+
+        把节点从 failed 翻回 running，让面板显示「第 N 次尝试」而不是节点
+        忽然诈尸。cancelled 节点不接受重试（用户已取消）。
+        """
+        node = self.graph.node(agent_id)
+        if node is None:
+            return
+        if node.status == AgentNodeStatus.cancelled:
+            return
+        node.status = AgentNodeStatus.running
+        node.retrying = {"attempt": attempt, "error": error}
+        node.error = None
+        self._emit(ev_agent_status(
+            run_id=self.run_id, agent_id=agent_id,
+            status=AgentNodeStatus.running.value,
+            retrying={"attempt": attempt, "error": error},
+        ))
+        self._emit(ev_run_status(
+            run_id=self.run_id, status=self.graph.status or "running",
+            current_agent_ids=self.graph.recompute_active(),
+        ))
 
     def emit_agent_cancelled(self, agent_id: str) -> None:
         node = self.graph.node(agent_id)

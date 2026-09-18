@@ -352,6 +352,7 @@ def ev_agent_status(
     error: str | None = None,
     usage: dict[str, Any] | None = None,
     cost_usd: float | None = None,
+    retrying: dict[str, Any] | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {
         "run_id": str(run_id),
@@ -374,6 +375,8 @@ def ev_agent_status(
         data["usage"] = usage
     if cost_usd is not None:
         data["cost_usd"] = cost_usd
+    if retrying is not None:
+        data["retrying"] = retrying
     return AgentEvent(kind="agent_status", data=data)
 
 
