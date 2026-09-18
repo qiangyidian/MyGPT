@@ -529,6 +529,15 @@ class CrewAIRuntime:
         # provider directly and mutate the assistant message token-by-token.
         # All Optional; harmless for the non-writer stages and for fakes/demos.
         try:
+            # The conversation id doubles as the provider's session identity
+            # (OpenCode gateways require a stable one per conversation; Hermes
+            # scopes server-side memory with it). Same contract as the native
+            # runtime — see NativeChatRuntime._stream_turn_body.
+            stage_ctx.provider = get_provider_for_config(
+                ctx.model_config, session_id=str(ctx.conversation.id)
+            )
+        except TypeError:
+            # Injected test doubles may still take the single-arg signature.
             stage_ctx.provider = get_provider_for_config(ctx.model_config)
         except Exception as exc:
             logger.warning("could not build provider for streaming writer: %s", exc)

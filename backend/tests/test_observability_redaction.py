@@ -17,6 +17,7 @@ from app.observability import (
     histogram,
     new_correlation_id,
     sanitize_attributes,
+    scrub_text,
     span,
 )
 
@@ -147,3 +148,55 @@ def test_correlation_id_propagates_into_logs(capsys):
     captured = capsys.readouterr().out + capsys.readouterr().err
     # The bound correlation id must appear in the rendered log line.
     assert cid in captured
+
+
+# --------------------------------------------------------------------------- #
+# scrub_text — the STRING-level counterpart of sanitize_attributes.
+#
+# sanitize_attributes answers "is this whole value a credential?" (its value
+# regexes are ^...$ anchored). An upstream HTTP error body is free-form text,
+# so a credential can sit in the MIDDLE of it and survive the anchored check.
+# scrub_text exists for exactly that: provider error details.
+# --------------------------------------------------------------------------- #
+def test_scrub_text_redacts_embedded_openai_key():
+    out = scrub_text("Invalid API key: sk-abcdefghijklmnopqrstuvwxyz1234")
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in out
+    assert "[redacted]" in out
+    # The useful part of the message survives — that is the whole point.
+    assert "Invalid API key" in out
+
+
+def test_scrub_text_redacts_embedded_fernet_ciphertext():
+    blob = "gAAAAABm" + "A" * 40
+    out = scrub_text(f"decrypt failed for {blob} in request")
+    assert blob not in out
+    assert "[redacted]" in out
+
+
+def test_scrub_text_redacts_bearer_header_inside_text():
+    out = scrub_text("upstream rejected Authorization: Bearer abc123def456ghi789")
+    assert "abc123def456ghi789" not in out
+    assert "[redacted]" in out
+
+
+def test_scrub_text_redacts_embedded_jwt():
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g"
+    out = scrub_text(f"token {jwt} rejected")
+    assert jwt not in out
+    assert "[redacted]" in out
+
+
+def test_scrub_text_truncates_and_bounds_length():
+    out = scrub_text("x" * 5000, max_chars=300)
+    assert len(out) <= 301  # 300 chars + the ellipsis marker
+    assert out.startswith("xxx")
+
+
+def test_scrub_text_is_safe_on_non_string_input():
+    assert scrub_text(None) == ""
+    assert scrub_text(12345) == ""
+
+
+def test_scrub_text_leaves_ordinary_text_alone():
+    msg = "Model deepseek-v4.1-flash is not supported"
+    assert scrub_text(msg) == msg

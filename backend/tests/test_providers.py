@@ -357,29 +357,87 @@ async def test_openai_provider_rejects_extra_override_before_stream_client(
     assert constructed == 0
 
 
-async def test_openai_provider_http_error_does_not_expose_upstream_body():
-    secret = "upstream-secret-must-not-escape"
+async def test_openai_provider_http_error_surfaces_reason_but_redacts_secrets():
+    # An upstream 4xx body is surfaced so the user can see WHY the request was
+    # rejected (this is what makes a missing header debuggable) — but any
+    # credential echoed back in that body must be scrubbed first.
+    our_key = "sk-" + "o" * 30
 
     class ErrorProvider(_RecordingOpenAIProvider):
         async def _request(self, client, url, payload):
             return httpx.Response(
                 400,
-                text=f"bad request echoed {secret}",
+                text=(
+                    "invalid request: model not found"
+                    f" (key was {our_key}; header Bearer {'z' * 24})"
+                ),
                 request=httpx.Request("POST", url),
             )
 
-    provider = ErrorProvider(base_url="http://x/v1", model="m")
+    provider = ErrorProvider(base_url="http://x/v1", model="m", api_key=our_key)
 
     with pytest.raises(ProviderError) as exc_info:
         await provider.chat([{"role": "user", "content": "small"}])
 
-    assert secret not in str(exc_info.value)
+    msg = str(exc_info.value)
+    # The actionable reason IS visible...
+    assert "model not found" in msg
+    assert "HTTP 400" in msg
+    # ...and nothing credential-shaped escaped.
+    assert our_key not in msg
+    assert "z" * 24 not in msg
+    assert "[redacted]" in msg
 
 
-async def test_openai_provider_stream_error_does_not_expose_upstream_body(
+async def test_openai_provider_http_error_redacts_own_api_key_in_unknown_shape():
+    # Defense in depth: our own key is scrubbed literally, so it can't leak even
+    # when the upstream echoes a value that matches no known credential regex.
+    our_key = "not-a-recognised-key-shape-9f2c1d84"
+
+    class ErrorProvider(_RecordingOpenAIProvider):
+        async def _request(self, client, url, payload):
+            return httpx.Response(
+                400,
+                text=f"bad request, rejected credential {our_key}",
+                request=httpx.Request("POST", url),
+            )
+
+    provider = ErrorProvider(base_url="http://x/v1", model="m", api_key=our_key)
+
+    with pytest.raises(ProviderError) as exc_info:
+        await provider.chat([{"role": "user", "content": "small"}])
+
+    msg = str(exc_info.value)
+    assert our_key not in msg
+    assert "[redacted]" in msg
+
+
+async def test_openai_provider_401_stays_opaque():
+    # Auth failures never echo the upstream body — there is no useful detail to
+    # show and the body is the most likely place for a key to be repeated.
+    class ErrorProvider(_RecordingOpenAIProvider):
+        async def _request(self, client, url, payload):
+            return httpx.Response(
+                401,
+                text="Invalid API key: sk-abcdefghijklmnopqrstuvwxyz",
+                request=httpx.Request("POST", url),
+            )
+
+    provider = ErrorProvider(base_url="http://x/v1", model="m", api_key="sk-x")
+
+    with pytest.raises(ProviderError) as exc_info:
+        await provider.chat([{"role": "user", "content": "small"}])
+
+    msg = str(exc_info.value)
+    assert msg == "model endpoint authentication failed"
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in msg
+
+
+async def test_openai_provider_stream_error_surfaces_reason_but_redacts_secrets(
     monkeypatch,
 ):
-    secret = "stream-secret-must-not-escape"
+    our_key = "sk-" + "s" * 30
+    body = f"invalid request: session missing (key was {our_key})"
 
     class ErrorResponse:
         status_code = 400
@@ -391,7 +449,11 @@ async def test_openai_provider_stream_error_does_not_expose_upstream_body(
             return False
 
         async def aread(self):
-            return f"bad request echoed {secret}".encode()
+            return body.encode()
+
+        @property
+        def text(self):
+            return body
 
     class ErrorClient:
         def __init__(self, *args, **kwargs):
@@ -409,7 +471,9 @@ async def test_openai_provider_stream_error_does_not_expose_upstream_body(
     monkeypatch.setattr(
         "app.providers.openai_compatible.httpx.AsyncClient", ErrorClient
     )
-    provider = OpenAICompatibleProvider(base_url="http://x/v1", model="m")
+    provider = OpenAICompatibleProvider(
+        base_url="http://x/v1", model="m", api_key=our_key
+    )
 
     with pytest.raises(ProviderError) as exc_info:
         async for _delta in provider.stream_chat(
@@ -417,7 +481,10 @@ async def test_openai_provider_stream_error_does_not_expose_upstream_body(
         ):
             pass
 
-    assert secret not in str(exc_info.value)
+    msg = str(exc_info.value)
+    assert "session missing" in msg
+    assert our_key not in msg
+    assert "[redacted]" in msg
 
 
 async def test_openai_stream_retry_gate_stops_before_second_http_attempt(monkeypatch):
@@ -493,3 +560,57 @@ async def test_openai_provider_uses_fixed_vision_reserve_not_data_url_length():
     await provider.chat(messages, ChatOptions(max_tokens=200))
 
     assert len(provider.requests) == 1
+
+
+# --------------------------------------------------------------------------- #
+# x-opencode-session — OpenCode Go rejects every request without it (HTTP 400
+# MissingSessionID). The header is gated on the host so unrelated
+# OpenAI-compatible endpoints never receive an OpenCode-specific header.
+# --------------------------------------------------------------------------- #
+def test_opencode_go_endpoint_sends_session_header():
+    p = OpenAICompatibleProvider(
+        base_url="https://opencode.ai/zen/go/v1", model="m", api_key="k"
+    )
+    h = p._headers()
+    assert h["x-opencode-session"], "must be a non-empty session id"
+
+
+def test_opencode_session_header_generated_when_not_supplied_is_stable():
+    p = OpenAICompatibleProvider(
+        base_url="https://opencode.ai/zen/go/v1", model="m"
+    )
+    # Same provider instance → same session id, so a connection probe and the
+    # requests that follow it share one routing/cache identity.
+    assert p._headers()["x-opencode-session"] == p._headers()["x-opencode-session"]
+
+
+def test_opencode_session_header_uses_the_callers_session_id():
+    # The chat path threads the conversation id here so OpenCode's routing and
+    # prompt cache see one stable session per conversation.
+    p = OpenAICompatibleProvider(
+        base_url="https://opencode.ai/zen/go/v1", model="m", session_id="conv-42"
+    )
+    assert p._headers()["x-opencode-session"] == "conv-42"
+
+
+def test_opencode_session_header_applies_to_subdomains():
+    p = OpenAICompatibleProvider(
+        base_url="https://zen.opencode.ai/v1", model="m", session_id="conv-42"
+    )
+    assert p._headers()["x-opencode-session"] == "conv-42"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.siliconflow.cn/v1",
+        "https://api.openai.com/v1",
+        "http://localhost:11434/v1",
+        "http://10.1.119.2:8642/v1",
+        # A host that merely CONTAINS the name must not match.
+        "https://opencode.ai.evil.example/v1",
+    ],
+)
+def test_non_opencode_endpoints_never_receive_the_session_header(base_url):
+    p = OpenAICompatibleProvider(base_url=base_url, model="m")
+    assert "x-opencode-session" not in p._headers()

@@ -28,10 +28,11 @@ def get_provider_for_config(
     base_url + model. Raises ProviderError for unknown provider types so
     callers fail loudly instead of silently falling back.
 
-    ``session_id`` / ``session_key`` are only consumed by providers with
-    server-side session memory (Hermes): the chat service passes the platform
-    conversation id / user id so each conversation gets isolated Hermes memory
-    and one user shares long-term memory across their conversations.
+    ``session_id`` / ``session_key`` scope server-side session state. Hermes
+    keeps per-conversation memory from them. ``session_id`` is also the
+    per-conversation identity the OpenAI-compatible provider sends to OpenCode
+    gateways (which reject requests without one); providers that need neither
+    ignore both.
     """
     api_key = decrypt_secret(cfg.api_key_encrypted or "")
     provider_type = (cfg.provider or "").strip().lower()
@@ -44,6 +45,7 @@ def get_provider_for_config(
             model=cfg.model_name,
             output_token_parameter=getattr(cfg, "output_token_parameter", "max_tokens"),
             capabilities=capabilities,
+            session_id=session_id,
         )
     if provider_type == "mock":
         return MockProvider(

@@ -10,8 +10,10 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from tenacity import (
@@ -22,7 +24,13 @@ from tenacity import (
 )
 
 from app.core.config import get_settings
-from app.observability import observe_counter, observe_histogram, observe_span
+from app.observability import (
+    REDACTED,
+    observe_counter,
+    observe_histogram,
+    observe_span,
+    scrub_text,
+)
 from app.providers.base import (
     PROVIDER_ERR_NETWORK,
     PROVIDER_ERR_TIMEOUT,
@@ -45,6 +53,18 @@ _RETRYABLE_EXC = (
 )
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# OpenCode's Go gateway rejects every request that does not carry a session id
+# with HTTP 400 ``MissingSessionID``. The header is only sent to OpenCode hosts
+# so unrelated OpenAI-compatible endpoints never see a vendor-specific header.
+_OPENCODE_HOST = "opencode.ai"
+_OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+
+def _is_opencode_host(base_url: str) -> bool:
+    """True when ``base_url``'s host is opencode.ai or a subdomain of it."""
+    host = (urlsplit(base_url).hostname or "").lower()
+    return host == _OPENCODE_HOST or host.endswith("." + _OPENCODE_HOST)
 
 
 def _is_retryable_response(resp: httpx.Response) -> bool:
@@ -79,6 +99,7 @@ class OpenAICompatibleProvider(ModelProvider):
         api_key: str = "",
         model: str = "",
         output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
+        session_id: str = "",
         **extra: Any,
     ) -> None:
         super().__init__(
@@ -88,6 +109,12 @@ class OpenAICompatibleProvider(ModelProvider):
             output_token_parameter=output_token_parameter,
             **extra,
         )
+        # Stable identity for one conversation, used by OpenCode's Go gateway for
+        # request routing + prompt caching. Callers with a conversation to scope
+        # to pass its id; one-off calls (a connection probe) get a generated id
+        # so they are still routable. Generated once per instance, so the probe
+        # and the calls that follow it share an identity.
+        self.session_id = session_id or uuid.uuid4().hex
         # Generous read timeout so slow / long (code) generations aren't killed
         # mid-stream; connect stays short. Driven by Settings, not hardcoded.
         s = get_settings()
@@ -103,6 +130,8 @@ class OpenAICompatibleProvider(ModelProvider):
         h: dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
+        if _is_opencode_host(self.base_url):
+            h[_OPENCODE_SESSION_HEADER] = self.session_id
         return h
 
     def _chat_url(self) -> str:
@@ -181,15 +210,41 @@ class OpenAICompatibleProvider(ModelProvider):
                 return resp
         raise ProviderError("model endpoint retry failed")
 
-    @staticmethod
-    def _raise_for_status(resp: httpx.Response, _url: str) -> None:
+    def _upstream_detail(self, resp: httpx.Response) -> str:
+        """A scrubbed, length-bounded snippet of an upstream error body.
+
+        The upstream message is usually the fastest route to a fix ("missing
+        x-opencode-session" beats "HTTP 400"), but the same body can echo the
+        request back — credentials included. Two layers of defense: generic
+        credential shapes are scrubbed, then our own key is stripped by value so
+        it cannot leak even in a shape no pattern would recognise. Never call
+        this for 401/403 — auth failures stay opaque on purpose.
+        """
+        try:
+            raw = resp.text
+        except Exception:  # unread or undecodable body — no detail is fine
+            return ""
+        detail = scrub_text(raw)
+        if self.api_key:
+            detail = detail.replace(self.api_key, REDACTED)
+        return detail
+
+    def _raise_for_status(self, resp: httpx.Response, _url: str) -> None:
         if resp.status_code >= 400:
-            logger.warning("model endpoint returned HTTP %s", resp.status_code)
+            detail = self._upstream_detail(resp) if resp.status_code not in (401, 403) else ""
+            logger.warning(
+                "model endpoint returned HTTP %s%s",
+                resp.status_code,
+                f": {detail}" if detail else "",
+            )
             if resp.status_code in (401, 403):
                 raise ProviderError(
                     "model endpoint authentication failed"
                 )
-            raise ProviderError(f"model endpoint returned HTTP {resp.status_code}")
+            raise ProviderError(
+                f"model endpoint returned HTTP {resp.status_code}"
+                + (f": {detail}" if detail else "")
+            )
 
     # -- request body builders ---------------------------------------------
     @staticmethod
@@ -336,22 +391,17 @@ class OpenAICompatibleProvider(ModelProvider):
                                             min(2 ** attempt, 10),
                                         )
                                         continue
+                                    detail = self._upstream_detail(resp)
                                     raise ProviderError(
                                         f"model endpoint returned HTTP {resp.status_code} after retries"
+                                        + (f": {detail}" if detail else "")
                                     )
                                 if resp.status_code >= 400:
                                     await resp.aread()
-                                    logger.warning(
-                                        "model endpoint returned HTTP %s",
-                                        resp.status_code,
-                                    )
-                                    if resp.status_code in (401, 403):
-                                        raise ProviderError(
-                                            "model endpoint authentication failed"
-                                        )
-                                    raise ProviderError(
-                                        f"model endpoint returned HTTP {resp.status_code}"
-                                    )
+                                    # Same policy as the non-streaming path: auth
+                                    # failures stay opaque, everything else carries
+                                    # the (scrubbed) upstream reason.
+                                    self._raise_for_status(resp, self._chat_url())
                                 started_iter = True
                                 async for chunk in self._iter_sse(resp):
                                     yield chunk
