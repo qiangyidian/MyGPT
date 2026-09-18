@@ -43,6 +43,9 @@ class RunEnvironment:
     stage_ctx: StageContext
     guard: Any = None
     _emitter: AgentLifecycleEmitter | None = field(default=None, repr=False)
+    # 运行中的心跳任务与各自的单调起点。finish() 会清空它们 —— 不允许泄漏。
+    _progress_tasks: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
+    _step_started_at: dict[str, float] = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -154,7 +157,10 @@ class RunEnvironment:
         self.emitter.emit_run_status("running")
 
     def step_started(self, step_id: str, *, title: str | None = None) -> bool:
-        return self.emitter.emit_agent_started(step_id, task_title=title)
+        started = self.emitter.emit_agent_started(step_id, task_title=title)
+        if started:
+            self._start_progress(step_id)
+        return started
 
     def step_completed(
         self,
@@ -167,6 +173,7 @@ class RunEnvironment:
     ) -> None:
         """记完成。usage 的计费只在此处发生一次（usage_charged 表示调用方
         已实时计费，不得重复累加）。"""
+        self._stop_progress(step_id)
         cost: float | None = usage.get("cost_usd") if usage else None
         if usage and self.guard is not None and not usage_charged:
             if cost is None and self.stage_ctx.model_config is not None:
@@ -189,13 +196,16 @@ class RunEnvironment:
         )
 
     def step_failed(self, step_id: str, *, error: str) -> None:
+        self._stop_progress(step_id)
         self.emitter.emit_agent_failed(step_id, error=error)
         self.emitter.cancel_downstream(step_id)
 
     def step_cancelled(self, step_id: str) -> None:
+        self._stop_progress(step_id)
         self.emitter.emit_agent_cancelled(step_id)
 
     def finish(self, status: str) -> None:
+        self._stop_all_progress()
         self.emitter.emit_run_status(status)
 
     # ------------------------------------------------------------------ #
@@ -223,6 +233,56 @@ class RunEnvironment:
                 chars=len(raw),
             )
         )
+
+    # ------------------------------------------------------------------ #
+    # 心跳
+    # ------------------------------------------------------------------ #
+    def _start_progress(self, step_id: str) -> None:
+        if not self._rich_events_enabled():
+            return
+        self._stop_progress(step_id)
+        self._step_started_at[step_id] = self.stage_ctx.loop.time()
+        self._progress_tasks[step_id] = self.stage_ctx.loop.create_task(
+            self._progress_loop(step_id)
+        )
+
+    def _stop_progress(self, step_id: str) -> None:
+        task = self._progress_tasks.pop(step_id, None)
+        self._step_started_at.pop(step_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _stop_all_progress(self) -> None:
+        for step_id in list(self._progress_tasks):
+            self._stop_progress(step_id)
+
+    async def _progress_loop(self, step_id: str) -> None:
+        from app.agents.schemas import ev_step_progress
+        from app.core.config import get_settings
+
+        loop = self.stage_ctx.loop
+        interval = float(
+            getattr(get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 5.0) or 5.0
+        )
+        while True:
+            await asyncio.sleep(interval)
+            started = self._step_started_at.get(step_id)
+            self.stage_ctx.emit(
+                ev_step_progress(
+                    run_id=self.run_id,
+                    agent_id=step_id,
+                    elapsed_s=round(loop.time() - started, 1) if started else 0.0,
+                    note=self._progress_note(step_id),
+                )
+            )
+
+    def _progress_note(self, step_id: str) -> str | None:
+        """note 取自已有状态（emitter 已把当前工具写在节点上），不新增簿记。"""
+        node = self.emitter.graph.node(step_id)
+        tool = getattr(node, "current_tool", None) if node is not None else None
+        if isinstance(tool, dict) and tool.get("name"):
+            return f"最近工具：{tool['name']}"
+        return None
 
     # ------------------------------------------------------------------ #
     # 持久化与归集

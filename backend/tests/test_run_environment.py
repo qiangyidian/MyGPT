@@ -304,3 +304,92 @@ async def test_step_output_gated_by_flag(db_session, monkeypatch):
     env.step_started("researcher")
     env.step_completed("researcher", output="正文")
     assert [e for e in await _drain_events(env) if e.kind == "step_output"] == []
+
+
+async def test_progress_heartbeat_fires_while_running(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 0.02, raising=False
+    )
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    await asyncio.sleep(0.09)
+
+    progresses = [e for e in await _drain_events(env) if e.kind == "step_progress"]
+    assert len(progresses) >= 2
+    assert progresses[0].data["agent_id"] == "researcher"
+    assert progresses[0].data["elapsed_s"] >= 0
+
+
+async def test_progress_heartbeat_reports_current_tool(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 0.02, raising=False
+    )
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    env.emitter.set_current_tool(
+        "researcher", call_id="c1", name="web_search", status="running"
+    )
+    await asyncio.sleep(0.05)
+
+    progresses = [e for e in await _drain_events(env) if e.kind == "step_progress"]
+    assert progresses
+    assert progresses[0].data["note"] == "最近工具：web_search"
+
+
+async def test_progress_stops_after_completion(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 0.02, raising=False
+    )
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    await asyncio.sleep(0.03)
+    env.step_completed("researcher", output="done")
+    await asyncio.sleep(0.05)
+
+    await _drain_events(env)
+    await asyncio.sleep(0.06)
+    assert [e for e in await _drain_events(env) if e.kind == "step_progress"] == []
+    assert env._progress_tasks == {}
+
+
+async def test_finish_cancels_all_heartbeats(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 0.02, raising=False
+    )
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    await asyncio.sleep(0.03)
+    env.finish("completed")
+    await asyncio.sleep(0.05)
+    assert env._progress_tasks == {}
+
+
+async def test_heartbeat_gated_by_flag(db_session, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 0.02, raising=False
+    )
+    monkeypatch.setattr(get_settings(), "AGENT_RICH_STEP_EVENTS", False, raising=False)
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    await asyncio.sleep(0.09)
+    assert [e for e in await _drain_events(env) if e.kind == "step_progress"] == []
