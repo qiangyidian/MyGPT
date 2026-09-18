@@ -372,7 +372,9 @@ export type ChatStreamEvent =
   | { event: "step_started"; data: { step_id: string; title: string; type: string; agent?: string } }
   | { event: "step_completed"; data: { step_id: string; status: string } }
   | { event: "agent_graph"; data: { run_id: string; graph: unknown } }
-  | { event: "agent_status"; data: { run_id: string; agent_id: string; status: string; task_title?: string; started_at?: string; finished_at?: string; duration_ms?: number; output_summary?: string; error?: string } }
+  | { event: "agent_status"; data: { run_id: string; agent_id: string; status: string; task_title?: string; started_at?: string; finished_at?: string; duration_ms?: number; output_summary?: string; error?: string; usage?: Record<string, number>; cost_usd?: number } }
+  | { event: "step_output"; data: { run_id: string; agent_id: string; text: string; truncated: boolean; chars: number } }
+  | { event: "step_progress"; data: { run_id: string; agent_id: string; elapsed_s: number; note?: string } }
   | { event: "agent_edge"; data: { run_id: string; edge_id: string; status: string; label?: string } }
   | { event: "run_status"; data: { run_id: string; status: string; current_agent_ids?: string[] } }
   | { event: "tool_call"; data: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string; agent_id?: string; task_id?: string } }

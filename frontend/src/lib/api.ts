@@ -640,6 +640,13 @@ export interface ChatStreamHandlers {
     runId: string; agentId: string; status: string; taskTitle?: string;
     startedAt?: string; finishedAt?: string; durationMs?: number;
     outputSummary?: string; error?: string;
+    usage?: Record<string, number>; costUsd?: number;
+  }) => void;
+  onStepOutput?: (e: {
+    runId: string; agentId: string; text: string; truncated: boolean; chars: number;
+  }) => void;
+  onStepProgress?: (e: {
+    runId: string; agentId: string; elapsedS: number; note?: string;
   }) => void;
   onAgentEdge?: (e: { runId: string; edgeId: string; status: string; label?: string }) => void;
   onRunStatus?: (e: { runId: string; status: string; currentAgentIds?: string[] }) => void;
@@ -738,6 +745,25 @@ export function dispatchChatStreamEvent(
             durationMs: data.duration_ms,
             outputSummary: data.output_summary,
             error: data.error,
+            usage: data.usage,
+            costUsd: data.cost_usd,
+          });
+          break;
+        case "step_output":
+          handlers.onStepOutput?.({
+            runId: data.run_id,
+            agentId: data.agent_id,
+            text: data.text,
+            truncated: data.truncated,
+            chars: data.chars,
+          });
+          break;
+        case "step_progress":
+          handlers.onStepProgress?.({
+            runId: data.run_id,
+            agentId: data.agent_id,
+            elapsedS: data.elapsed_s,
+            note: data.note,
           });
           break;
         case "agent_edge":

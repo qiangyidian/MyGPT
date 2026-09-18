@@ -398,7 +398,32 @@ export function useChatStream(): ChatStreamState {
             durationMs: e.durationMs,
             outputSummary: e.outputSummary,
             error: e.error,
+            usage: e.usage,
+            costUsd: e.costUsd,
           },
+        });
+      },
+      // Rich step events: full stage output (expandable) + run heartbeat.
+      // api.ts has already mapped snake_case → camelCase, and parse*() read the
+      // backend field names off the original payload, so we dispatch the mapped
+      // fields directly here.
+      onStepOutput: (e) => {
+        useAgentRunStore.getState().dispatch({
+          type: "STEP_OUTPUT",
+          runId: e.runId,
+          agentId: e.agentId,
+          text: e.text,
+          truncated: e.truncated,
+          chars: e.chars,
+        });
+      },
+      onStepProgress: (e) => {
+        useAgentRunStore.getState().dispatch({
+          type: "STEP_PROGRESS",
+          runId: e.runId,
+          agentId: e.agentId,
+          elapsedS: e.elapsedS,
+          note: e.note,
         });
       },
       onAgentEdge: (e) => {
