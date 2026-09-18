@@ -350,6 +350,8 @@ def ev_agent_status(
     duration_ms: int | None = None,
     output_summary: str | None = None,
     error: str | None = None,
+    usage: dict[str, Any] | None = None,
+    cost_usd: float | None = None,
 ) -> AgentEvent:
     data: dict[str, Any] = {
         "run_id": str(run_id),
@@ -368,6 +370,10 @@ def ev_agent_status(
         data["output_summary"] = output_summary
     if error is not None:
         data["error"] = error
+    if usage is not None:
+        data["usage"] = usage
+    if cost_usd is not None:
+        data["cost_usd"] = cost_usd
     return AgentEvent(kind="agent_status", data=data)
 
 
@@ -685,3 +691,46 @@ class ConversationFlowState(BaseModel):
     token_budget_used: int = 0
     pending_approval: dict[str, Any] | None = None
     final_answer: str = ""
+
+
+def ev_step_output(
+    *,
+    run_id: uuid.UUID | str,
+    agent_id: str,
+    text: str,
+    truncated: bool,
+    chars: int,
+) -> AgentEvent:
+    """一个 stage 的完整产出（展开态）。
+
+    与 ``agent_status.output_summary``（160 字折叠态摘要）分层共存，不是替换。
+    ``chars`` 是**截断前**的真实长度，供 UI 显示「已截断」提示。
+    """
+    return AgentEvent(
+        kind="step_output",
+        data={
+            "run_id": str(run_id),
+            "agent_id": agent_id,
+            "text": text,
+            "truncated": truncated,
+            "chars": chars,
+        },
+    )
+
+
+def ev_step_progress(
+    *,
+    run_id: uuid.UUID | str,
+    agent_id: str,
+    elapsed_s: float,
+    note: str | None = None,
+) -> AgentEvent:
+    """运行中心跳：让长跑 stage 在面板上有真实进度，而不是静止的「运行中」。"""
+    data: dict[str, Any] = {
+        "run_id": str(run_id),
+        "agent_id": agent_id,
+        "elapsed_s": elapsed_s,
+    }
+    if note is not None:
+        data["note"] = note
+    return AgentEvent(kind="step_progress", data=data)

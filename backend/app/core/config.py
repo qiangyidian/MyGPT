@@ -205,6 +205,12 @@ class Settings(BaseSettings):
     # the only deep_research executor. On ANY engine exception the turn falls back
     # to the existing CrewAI path, so enabling this can never make a turn worse.
     AGENT_WORKFLOW_ENGINE: str = ""
+    # 丰富 step 事件：stage 完成时透出完整产出（step_output）、运行中发心跳
+    # （step_progress）、节点携带 tokens 与成本。纯增量事件与字段，老客户端
+    # 忽略即可，故默认开；置假即回到旧行为。
+    AGENT_RICH_STEP_EVENTS: bool = True
+    # step_progress 心跳间隔（秒）。
+    AGENT_STEP_PROGRESS_INTERVAL_S: float = 5.0
 
     # ---- Office→PDF preview conversion (类飞书在线预览) ----
     # Gotenberg server (docker: gotenberg/gotenberg:8) deployed on a SEPARATE

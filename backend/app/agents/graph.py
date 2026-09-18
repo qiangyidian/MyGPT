@@ -78,6 +78,9 @@ class AgentGraphNode(BaseModel):
     duration_ms: int | None = None
     current_tool: dict[str, Any] | None = None
     output_summary: str | None = None
+    # 该 stage 的 token 用量与成本（rich step events 开启时由 emitter 写入）。
+    usage: dict[str, int] | None = None
+    cost_usd: float | None = None
     error: str | None = None
 
 

@@ -151,7 +151,12 @@ class AgentLifecycleEmitter:
         ))
 
     def emit_agent_completed(
-        self, agent_id: str, *, output_summary: str | None = None
+        self,
+        agent_id: str,
+        *,
+        output_summary: str | None = None,
+        usage: dict[str, int] | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         node = self.graph.node(agent_id)
         if node is None:
@@ -165,10 +170,14 @@ class AgentLifecycleEmitter:
             node.duration_ms = int((self._time.monotonic() - start) * 1000)
         if output_summary:
             node.output_summary = output_summary
+        if usage is not None:
+            node.usage = {k: v for k, v in usage.items() if isinstance(v, int)}
+        if cost_usd is not None:
+            node.cost_usd = cost_usd
         self._emit(ev_agent_status(
             run_id=self.run_id, agent_id=agent_id, status=AgentNodeStatus.completed.value,
             finished_at=node.finished_at, duration_ms=node.duration_ms,
-            output_summary=output_summary,
+            output_summary=output_summary, usage=usage, cost_usd=cost_usd,
         ))
         # Activate outbound handoff edges (evidence/result handed off).
         for e in self.graph.edges:

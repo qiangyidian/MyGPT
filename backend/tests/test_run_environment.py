@@ -237,3 +237,17 @@ async def test_aggregate_usage_includes_charged_stages(db_session):
     agg = env.aggregate_usage(results)
     assert agg is not None
     assert agg["total_tokens"] == 8
+
+
+async def test_node_carries_usage_and_cost(db_session):
+    env = await _env_with_graph(db_session)
+    env.begin()
+    await _drain(env)
+    env.step_started("researcher")
+    env.step_completed(
+        "researcher", output="证据",
+        usage={"total_tokens": 42, "cost_usd": 0.03},
+    )
+    node = env.emitter.graph.node("researcher")
+    assert node.usage == {"total_tokens": 42}
+    assert node.cost_usd == 0.03

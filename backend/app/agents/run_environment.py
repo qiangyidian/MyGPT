@@ -176,7 +176,10 @@ class RunEnvironment:
             )
             self.guard.check()
         self.emitter.emit_agent_completed(
-            step_id, output_summary=output_summary or None
+            step_id,
+            output_summary=output_summary or None,
+            usage=usage,
+            cost_usd=cost,
         )
 
     def step_failed(self, step_id: str, *, error: str) -> None:
