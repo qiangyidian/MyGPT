@@ -162,3 +162,91 @@ describe("agent-graph-reducer", () => {
     });
   });
 });
+
+// --------------------------------------------------------------------------- //
+// 富步骤事件：完整产出 / 进度 / usage
+// --------------------------------------------------------------------------- //
+describe("富步骤事件", () => {
+  const base = (): AgentGraphState => ({
+    runId: "r1",
+    runtime: "crewai",
+    flowName: "deep_research",
+    mode: "sequential",
+    status: "running",
+    nodes: [
+      {
+        id: "researcher",
+        name: "Researcher",
+        role: "资料检索",
+        stage: 0,
+        status: "running",
+      },
+    ],
+    edges: [],
+    activeAgentIds: ["researcher"],
+  });
+
+  it("STEP_OUTPUT 写入完整产出与截断标记", () => {
+    const next = reducer(base(), {
+      type: "STEP_OUTPUT",
+      runId: "r1",
+      agentId: "researcher",
+      text: "证据正文",
+      truncated: true,
+      chars: 25000,
+    });
+    const node = next.nodes[0];
+    expect(node.outputFull).toBe("证据正文");
+    expect(node.outputTruncated).toBe(true);
+  });
+
+  it("STEP_OUTPUT 对已完成节点仍然生效（不回归守卫只挡状态）", () => {
+    const state = base();
+    state.nodes[0].status = "completed";
+    const next = reducer(state, {
+      type: "STEP_OUTPUT",
+      runId: "r1",
+      agentId: "researcher",
+      text: "迟到的产出",
+      truncated: false,
+      chars: 5,
+    });
+    expect(next.nodes[0].status).toBe("completed");
+    expect(next.nodes[0].outputFull).toBe("迟到的产出");
+  });
+
+  it("STEP_PROGRESS 写入进度提示行", () => {
+    const next = reducer(base(), {
+      type: "STEP_PROGRESS",
+      runId: "r1",
+      agentId: "researcher",
+      elapsedS: 23,
+      note: "最近工具：web_search",
+    });
+    expect(next.nodes[0].progressNote).toBe("最近工具：web_search");
+  });
+
+  it("未知 agent 的富事件被忽略而不是崩溃", () => {
+    const next = reducer(base(), {
+      type: "STEP_OUTPUT",
+      runId: "r1",
+      agentId: "nobody",
+      text: "x",
+      truncated: false,
+      chars: 1,
+    });
+    expect(next.nodes).toHaveLength(1);
+    expect(next.nodes[0].outputFull).toBeUndefined();
+  });
+
+  it("AGENT_STATUS 携带 usage / costUsd", () => {
+    const next = reducer(base(), {
+      type: "AGENT_STATUS",
+      runId: "r1",
+      agentId: "researcher",
+      patch: { status: "completed", usage: { total_tokens: 42 }, costUsd: 0.03 },
+    });
+    expect(next.nodes[0].usage).toEqual({ total_tokens: 42 });
+    expect(next.nodes[0].costUsd).toBe(0.03);
+  });
+});

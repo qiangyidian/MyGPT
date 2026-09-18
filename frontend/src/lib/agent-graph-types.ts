@@ -52,6 +52,16 @@ export interface AgentGraphNode {
   currentTool?: AgentToolActivity;
 
   outputSummary?: string;
+  /** 该 stage 的完整产出（展开态）。与 outputSummary（160 字折叠态）分层共存。 */
+  outputFull?: string;
+  /** outputFull 是否被后端按 20k 上限截断。 */
+  outputTruncated?: boolean;
+  /** 该 stage 的 token 用量。 */
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  /** 该 stage 的成本（USD）。 */
+  costUsd?: number;
+  /** 运行中心跳的最近状态行（如「最近工具：web_search」）。 */
+  progressNote?: string;
   error?: string;
 }
 

@@ -31,6 +31,8 @@ export type AgentGraphAction =
   | { type: "TOOL_STARTED"; runId: string; agentId: string; callId: string; name: string; title?: string }
   | { type: "TOOL_COMPLETED"; runId: string; agentId: string; callId: string; ok: boolean }
   | { type: "APPROVAL_REQUIRED"; runId: string; agentId?: string }
+  | { type: "STEP_OUTPUT"; runId: string; agentId: string; text: string; truncated: boolean; chars: number }
+  | { type: "STEP_PROGRESS"; runId: string; agentId: string; elapsedS: number; note?: string }
   | { type: "RESET_RUN"; runId: string }
   | { type: "RUN_RESTORED"; runId: string; graph: AgentGraphState };
 
@@ -74,6 +76,24 @@ export function reducer(state: AgentGraphState, action: AgentGraphAction): Agent
       // any graph event; for a fallback there is no graph (multi_agent_executed
       // is false) and the UI shows a warning instead of a fake agent panel.
       return finalize({ ...state, selection: action.selection });
+    }
+
+    case "STEP_OUTPUT": {
+      // 完整产出是「非状态字段」——即使节点已 terminal 也要写入，
+      // 否则 stage 完成后到达的产出会被丢弃。
+      const nodes = state.nodes.map((n) =>
+        n.id === action.agentId
+          ? { ...n, outputFull: action.text, outputTruncated: action.truncated }
+          : n
+      );
+      return finalize({ ...state, nodes });
+    }
+
+    case "STEP_PROGRESS": {
+      const nodes = state.nodes.map((n) =>
+        n.id === action.agentId ? { ...n, progressNote: action.note ?? undefined } : n
+      );
+      return finalize({ ...state, nodes });
     }
 
     case "AGENT_STATUS": {
