@@ -153,16 +153,18 @@ debate 辩论 —— 双 Agent 并行论证 + 中立裁判
 
 后端 `VALID_MODES` 与 `decide_route` 的 `debate` 分支**已存在且完整**，本项是纯前端补入口。`SPECIAL_MODES` 加入 `debate`（composer 显示模式徽章）。`chat-ui-store.ts` 的 `mapLegacyMode` 已把 v3 的 `debate` 映射为 `expert`——改为映射回 `debate`。
 
-### 6.2 计划审批门
+### 6.2 计划审批门：计划先行，默认不阻塞
 
-`PLAN_REQUIRE_CONFIRMATION` 默认由 `False` 改为 **`True`**。连带调整：
+`PLAN_REQUIRE_CONFIRMATION` 默认由 `False` 改为 **`True`**，但**语义升级**为「计划先行」：
 
-- `PLAN_CONFIRM_TIMEOUT_S` 由 `300` 降为 **`90`**：多数用户不会盯着等，卡 5 分钟不合理。
-- **超时行为**：现有逻辑是超时后「警告并继续执行」（`crewai_runtime.py` 的 `_await_plan_confirmation` 返回 False 后 proceed）。保持不变——用户没响应不应导致任务失败。
-- **超时文案**：引擎/walker 在超时续跑时发一个明确的 `run_status` 说明（面板可见），不让用户以为门禁被无声忽略。
-- **引擎路径补齐**：`_run_engine_path` 需接入同一门（子项目 1 未做，spec §6.1 已声明延后到此）。
+- 计划**总是**发布（`research_plan` 事件 + 落库），UI 立即可见、可修改、可阻止。
+- **默认不阻塞**：计划发布后运行立即继续。生产系统的默认行为不能让用户干等——多数用户要的是答案，不是审批流程。
+- **用户可主动上闸**：PlanReview 提供「暂停执行」；点击后在下一次 step 边界进入门禁（复用 §4 的 `before_step` 控制点），等用户确认/修改后再继续。
+- **`PLAN_CONFIRM_TIMEOUT_S`** 默认 **`90`**（由 300 降）。仅在用户**已经**上闸时才可能等待；超时后按计划继续，并发出说明事件（面板可见），不让门禁被无声忽略。
 
-前端 `PlanReview` 的 `requires_confirmation` 语义保持：门开时显示确认/修改按钮，超时续跑后显示「已按默认计划继续」状态。
+这样「门」是真实存在的（可阻断、可修改、有超时兜底、有说明），但默认路径零等待。相比「默认阻塞 90 秒」，这是生产环境下唯一可接受的默认值。
+
+引擎路径需接入同一门（子项目 1 未做，其 spec §6.1 已声明延后到此）。`RunEnvironment.respect_controls()`（§4.2）在消费控制时一并检查「用户是否上闸」，因此两个 walker 共享同一套门禁逻辑。
 
 ## 7. 子项目 3：规划与验收智能化
 
@@ -235,11 +237,36 @@ drafter (stage 0) → reviewer (stage 1) → finalizer (stage 2)
 
 **误判的代价**：一次误升级 = 用户多等几十秒。所以新 profile 的自动升级**只认模型给出的显式 route**，不做关键词猜测——`decide_route`（纯关键词路径）**不**新增 `task_decomposition` / `write_review` 的匹配规则；只有 `decide_route_with_intent`（模型判断路径）在模型明确点名时才升级。这样「纳入自动路由」的能力来自模型的意图识别，而不会因为用户随手写了「任务」「审阅」这类词就误触发。
 
-## 8. 预算与计费
+## 8. 预算、计费与可观测性
+
+### 8.1 预算与计费
 
 - LLM 规划器与 verifier 的 token 走 **`RunEnvironment.guard`**（`ctx.extra["budget_guard"]`），与 stage 同源，usage_id 分别为 `crewai:planner:{run_id}` 与 `crewai:verifier:{run_id}`。
 - 二者计入 `AGENT_MAX_TOTAL_TOKENS` / `AGENT_MAX_COST_USD`，且 `guard.check()` 在调用前执行——预算耗尽时规划器直接回退模板，不阻断运行。
-- `aggregate_usage` 需把它们并入，避免计费漏账（这是子项目 1 修过的同类缺陷，不能再犯）。
+- `aggregate_usage` 必须把它们并入，**避免计费漏账**（子项目 1 修过同类缺陷，不能再犯）。
+- **并发安全约束（实施时不可违反）**：`BudgetGuard` 内部用 `threading.RLock`（`budget_policy.py:124`）保护临界区，因为工具在 worker 线程里调用它。规划器/verifier 在主事件循环上调用同一 guard——这在 RLock 下是正确的，**前提是临界区内不得出现 `await`**。实施时任何新增的「先 check 再 add_usage」都必须保持同步，中间不能 yield。
+
+### 8.2 可观测性（生产必备）
+
+LLM 规划器与 verifier 是**额外的模型调用**，它们失败时必须能从指标看出来——只写 `logger.warning` 在生产上等于不可观测。复用仓库既有的 `observe_counter` / `observe_span`（引擎已在用，`engine.py`）：
+
+| 指标 | 类型 | 标签 | 用途 |
+|---|---|---|---|
+| `agent.llm_planner` | counter | `outcome` ∈ `ok` / `invalid_plan` / `error` / `timeout` / `budget_exhausted` | 规划器成功率与失败归因 |
+| `agent.llm_verifier` | counter | `outcome` ∈ `ok` / `invalid_verdict` / `error` / `timeout` | verifier 成功率与失败归因 |
+| `workflow.step.retry` | counter | `step_id` | 重试频次（配合 §3 的修复观测重试是否健康） |
+| `agent.engine.profile` | counter | `profile` | 哪些 profile 真的跑在引擎上（灰度可见性） |
+
+span：`agent.llm_plan` 与 `agent.llm_verify`，属性只带 `profile` / `step_id` / `duration_ms`——**绝不带 prompt 或产出的正文**（沿用仓库的脱敏约定，见 `observe_span` 的 redacted attributes 说明与 `test_observability_redaction.py`）。
+
+### 8.3 延迟预算
+
+规划器调用发生在**用户等待期**（首 token 之前），所以它直接增加首 token 延迟。生产约束：
+
+- `AGENT_LLM_PLANNER_TIMEOUT_S` 默认 **`8`**（含重试的总预算，不是单次）。超时即回退模板 plan，运行继续。
+- verifier 调用发生在步骤之间，同样受限：`AGENT_LLM_VERIFIER_TIMEOUT_S` 默认 **`10`**。
+- 两者都**不重试模型调用**（重试会让延迟翻倍，而回退路径本身就是可用的）。失败即回退。
+- 规划器的 `max_tokens` 限制（默认 1024）：plan 是结构化短输出，不需要长生成。
 
 ## 9. flag 与默认值汇总
 
@@ -247,11 +274,13 @@ drafter (stage 0) → reviewer (stage 1) → finalizer (stage 2)
 |---|---|---|
 | `AGENT_WORKFLOW_ENGINE` | `""`（关） | 总开关，保持关 |
 | `AGENT_WORKFLOW_ENGINE_PROFILES` | `""`（空名单） | 显式列出要迁移的 profile |
-| `PLAN_REQUIRE_CONFIRMATION` | **`True`**（由 False 改） | 审批门默认开 |
-| `PLAN_CONFIRM_TIMEOUT_S` | **`90`**（由 300 改） | 缩短用户等待 |
+| `PLAN_REQUIRE_CONFIRMATION` | **`True`**（由 False 改） | 门开着，但默认不阻塞（见 §6.2） |
+| `PLAN_CONFIRM_TIMEOUT_S` | **`90`**（由 300 改） | 仅用户已上闸时可能等待 |
 | `AGENT_LLM_PLANNER` | `False` | LLM 规划器，先关后开 |
 | `AGENT_LLM_VERIFIER` | `False` | LLM verifier，先关后开 |
 | `AGENT_LLM_PLANNER_MAX_STEPS` | `8` | 防超大 plan |
+| `AGENT_LLM_PLANNER_TIMEOUT_S` | `8` | 首 token 延迟预算 |
+| `AGENT_LLM_VERIFIER_TIMEOUT_S` | `10` | 步骤间延迟预算 |
 | `AGENT_RICH_STEP_EVENTS` | `True` | 子项目 1 已上，不变 |
 
 ## 10. 测试策略
@@ -267,25 +296,45 @@ drafter (stage 0) → reviewer (stage 1) → finalizer (stage 2)
 
 ## 11. 验收标准
 
-1. 重试成功后节点无残留 `error`、`duration_ms` 非零、状态为 `completed`。
+1. 重试成功后节点无残留 `error`、`duration_ms` 非零、状态为 `completed`；`cancelled` 不被 `completed` 覆盖。
 2. 名单内的 profile 在引擎上跑通，且用户可暂停/恢复/取消/追加指令。
-3. `expert` 轮次发布计划并等待确认；确认后执行；90 秒无响应则按默认计划继续且面板有说明。
+3. 计划总是发布且可修改；默认路径**不阻塞**；用户上闸后进入门禁，确认或超时（90s）后继续且面板有说明。
 4. 辩论模式出现在模式选择器并真的跑出双 advocate + judge。
-5. 开启 LLM 规划器后，非法/失败的模型输出一律回退模板，运行不中断。
+5. 开启 LLM 规划器后，非法/失败的模型输出一律回退模板，运行不中断；**首 token 延迟增量 ≤ `AGENT_LLM_PLANNER_TIMEOUT_S`**。
 6. 开启 LLM verifier 后，`revise` 触发定向重跑而非全量。
-7. 新拓扑在显式点名时正确执行；自动路由不升级短提问与低置信度请求。
-8. `ruff check app tests` 全绿；后端全量测试（含既有 1226 项）无回归；前端 typecheck/lint/test 全绿。
-9. 零迁移。
+7. 新拓扑在模型明确点名时正确执行；自动路由不升级短提问与低置信度请求，显式 speed 永不升级。
+8. **回滚可验证**：把某 profile 从 `AGENT_WORKFLOW_ENGINE_PROFILES` 移除后，该 profile 确实回到 walker 路径（断言事件来源与执行栈），且行为与迁移前一致。
+9. **灰度可见**：`agent.engine.profile` 指标能区分「跑在引擎上」与「跑在 walker 上」的轮次，运维无需读日志即可确认灰度状态。
+10. **可观测性**：规划器/verifier 的每类失败（`invalid_plan` / `error` / `timeout` / `budget_exhausted`）都有对应 counter 增量；span 属性不含 prompt 或产出正文（由脱敏测试把守）。
+11. **计费不漏账**：规划器与 verifier 的 token 计入 `ev_done.usage`，且计入预算上限。
+12. `ruff check app tests` 全绿；后端全量测试（含既有 1226 项）无回归；前端 typecheck/lint/test 全绿。
+13. 零迁移。
 
 ## 12. 风险
 
 | 风险 | 缓解 |
 |---|---|
-| 审批门默认开导致用户困惑「为什么不动了」 | 90s 超时 + 明确文案 + PlanReview 明确展示等待态 |
-| 新拓扑被误路由，用户多等 | 三道闸（显式模式短路 / 置信度 / 长度）；仅模型明确点名才升级 |
+| 审批门让用户困惑「为什么不动了」 | 默认不阻塞（§6.2）；门只在用户主动上闸后生效；90s 超时兜底 + 明确文案 |
+| 新拓扑被误路由，用户多等 | 三道闸（显式模式短路 / 置信度 / 长度）；只认模型显式点名，不加关键词规则 |
 | LLM 规划器产出坏 plan | `validate_plan()` 强校验 + 全回退路径 |
 | LLM verifier 误判导致无谓重跑 | `revise` 受 `max_replans` 约束；非法输出回退规则版 |
 | 迁移后行为回归 | 名单式灰度，每个 profile 可独立摘除；引擎路由始终在总开关之后 |
+| LLM 规划器拖慢首 token | 8s 超时预算 + 不重试 + 回退即用（§8.3）；有独立开关可整体关掉 |
+| 额外模型调用推高成本 | 走同一 guard，计入预算上限；有独立开关；指标可见调用量与失败率 |
+| 一次全开导致大面积行为变化 | 见 §12.1 的分阶段发布 |
+
+### 12.1 分阶段发布（生产约束）
+
+本设计的 flag 默认值全部是**安全**的（引擎关、LLM 规划器/verifier 关、名单空），所以**合入 main 不改变任何生产行为**。行为变化全部来自运维显式改 `.env`。发布分四步，每步可独立观测、独立回滚：
+
+| 阶段 | 动作 | 观测 | 回滚 |
+|---|---|---|---|
+| 1（合入） | 代码上生产，flag 全默认为安全值 | 无行为变化 | — |
+| 2 | `AGENT_WORKFLOW_ENGINE=1` + `AGENT_WORKFLOW_ENGINE_PROFILES=deep_research` | `agent.engine.profile` 出现 deep_research；重试指标正常 | 清空名单 |
+| 3 | 名单加入 `parallel_research`、`debate` | 同上，加两个 profile | 从名单移除对应项 |
+| 4 | `AGENT_LLM_PLANNER=1` / `AGENT_LLM_VERIFIER=1` | 规划器/verifier 的 outcome counter；首 token 延迟 | 关掉对应 flag |
+
+每步之间至少观察一个真实使用周期。唯一**默认改变行为**的一项是 `PLAN_REQUIRE_CONFIRMATION=True`（§6.2）——但它默认不阻塞，所以用户感知是「多了一个可查看可修改的计划」，而不是「卡住了」。
 
 ## 13. 关键文件清单
 
