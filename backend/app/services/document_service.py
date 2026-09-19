@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Sequence
 
@@ -17,7 +18,14 @@ from sqlalchemy import delete as _sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.storage import get_storage
+from app.core.config import get_settings
+from app.core.exceptions import AppException
+from app.core.file_signatures import (
+    FileSignatureError,
+    check_file_signature,
+    verified_size,
+)
+from app.core.storage import UploadTooLargeError, get_storage
 from app.models import Document, DocumentChunk, KnowledgeBase, ModelConfig
 from app.providers.registry import get_provider_for_config
 from app.rag.embedder import ProviderEmbedder
@@ -58,19 +66,59 @@ async def _resolve_embedding_config(db: AsyncSession, kb: KnowledgeBase) -> Mode
 async def upload(
     db: AsyncSession, kb: KnowledgeBase, user, upload_file
 ) -> Document:
-    """Persist the uploaded file and create a pending Document row."""
+    """Persist the uploaded file and create a pending Document row.
+
+    Every check that guards *what may enter a knowledge base* lives here, because
+    every path into a KB funnels through this function — the HTTP upload route and
+    the attachment -> KB promotion both — so neither can skip one:
+
+      * extension allow-list (``storage.save``, KB allow-list);
+      * the real byte cap, enforced while the body streams to disk;
+      * content-vs-extension sniffing with the SAME magic-byte table chat
+        attachments use (an extension whitelist alone accepts any bytes named
+        ``.pdf``);
+      * the true stored size on ``Document.file_size``.
+
+    A rejected file is removed from storage before raising, so nothing orphaned
+    stays readable on disk.
+    """
+    settings = get_settings()
     storage = get_storage()
-    path = await storage.save(upload_file, user.id)
     filename = upload_file.filename or "upload"
     # Extension drives the parser; strip any path component.
-    import os
     ext = os.path.splitext(filename)[1].lower()
+    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+
+    try:
+        path = await storage.save(upload_file, user.id, max_bytes=max_bytes)
+    except UploadTooLargeError as exc:
+        # storage.save deleted the partial object when it crossed the cap.
+        raise AppException(
+            413, "document_too_large", f"文件过大，最大 {settings.MAX_UPLOAD_MB}MB"
+        ) from exc
+    except ValueError as exc:
+        # The allow-list reject in storage.save — reachable from save-to-KB, which
+        # can carry an attachment extension the KB list does not allow (.png, …).
+        raise AppException(400, "document_type_not_allowed", f"不支持的文件类型: {ext or '(无)'}") from exc
+
+    try:
+        check_file_signature(path, ext)
+    except FileSignatureError as exc:
+        try:
+            await storage.delete(path)
+        except Exception:  # pragma: no cover - cleanup is best effort
+            logger.warning("could not remove rejected upload %s", path)
+        code = "document_unreadable" if exc.reason == "unreadable" else "document_signature_mismatch"
+        raise AppException(400, code, exc.message) from exc
+
     doc = Document(
         knowledge_base_id=kb.id,
         filename=filename,
         file_path=path,
         file_type=ext or ".txt",
-        file_size=0,
+        # Bytes actually written. This column used to be hard-coded 0, so every
+        # size shown in the UI (and any limit reading it) saw an empty file.
+        file_size=verified_size(path),
         status="pending",
     )
     db.add(doc)

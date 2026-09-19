@@ -4,7 +4,11 @@ Both runtimes (native + CrewAI adapter) and the ``/api/tools/test`` path go
 through :class:`ToolGateway`. It enforces, in order:
 
   1. **Resolution** — the tool must be registered.
-  2. **Permission** — ``python_exec`` is disabled outside dev/sandbox.
+  2. **Permission** — ``python_exec`` is disabled outside dev/sandbox; a tool
+     with ``requires_user = True`` is refused when no user is bound.
+  2b. **Tenant scope** — the run's ``user`` is bound as the tool execution
+     context (see :mod:`app.tools.context`) so owner-scoped tools can check the
+     caller instead of trusting an id argument.
   3. **SQL hardening** — ``db_query`` SQL must pass ``validate_readonly_sql``.
   4. **Approval** — dangerous tools need a valid (approved, non-expired)
      :class:`~app.models.ToolApproval` matching the exact arguments; otherwise a
@@ -51,6 +55,7 @@ from app.models.user import User
 from app.observability import observe_counter, observe_histogram, observe_span
 from app.quotas import QuotaExceeded, get_quota_service
 from app.tools.base import BaseTool, ToolError, ToolRegistry
+from app.tools.context import bind_tool_context, make_tool_context, reset_tool_context
 from app.tools.registry_init import get_default_registry
 
 logger = logging.getLogger(__name__)
@@ -239,6 +244,20 @@ class ToolGateway:
                 error=f"tool {tool_name!r} is not permitted in this environment",
             )
 
+        # 2b. Tenant scope (fail closed): a tool that resolves user-owned
+        # resources by id is meaningless — and unsafe — without a principal. The
+        # gateway is the one place that holds the run's ``user``, so it binds the
+        # tool context here and :mod:`app.tools.context` hands it to ``run()``.
+        # Binding is a contextvar set/reset: no lock is held across the await, so
+        # this can never deadlock against ``BudgetGuard``'s ``threading.RLock``
+        # (whose critical sections must stay await-free).
+        if getattr(tool, "requires_user", False) and self.user is None:
+            return await self._finalize(
+                tool_call_id, tool_name, args, started,
+                ok=False, status="blocked",
+                error=f"tool {tool_name!r} requires an authenticated user scope",
+            )
+
         # 3. SQL hardening for db_query (defense in depth; the tool also checks).
         if tool_name == "db_query":
             try:
@@ -303,7 +322,15 @@ class ToolGateway:
                     step_type="approval", step_status="waiting",
                 )
 
-        # 5. Execute under a timeout backstop.
+        # 5. Execute under a timeout backstop, with this run's tenant scope bound
+        # so a tool's owner checks read the caller identity instead of trusting an
+        # id argument. ``asyncio.wait_for`` copies the context into the task it
+        # creates, so the binding is visible inside ``tool.run`` (and to anything
+        # it offloads with ``asyncio.to_thread``).
+        ctx = make_tool_context(
+            self.user, conversation_id=self.conversation_id, run_id=self.run_id
+        )
+        ctx_token = bind_tool_context(ctx)
         try:
             result = await asyncio.wait_for(tool.run(**args), timeout=TOOL_TIMEOUT_SECONDS)
         except TimeoutError:
@@ -323,6 +350,8 @@ class ToolGateway:
                 tool_call_id, tool_name, args, started,
                 ok=False, status="error", error=f"{type(exc).__name__}: {exc}",
             )
+        finally:
+            reset_tool_context(ctx_token)
 
         # 6 + 7. Truncate + finalize (persists rows).
         usage = normalize_usage(result.get("usage")) if isinstance(result, dict) else None

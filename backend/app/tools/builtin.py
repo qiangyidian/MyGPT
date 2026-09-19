@@ -8,6 +8,13 @@ open short-lived clients (httpx / sync sqlalchemy) inside run(), and never mutat
 global state. DANGEROUS tools (code exec, raw SQL) set dangerous=True so the
 agent loop / UI can gate them behind confirmation.
 
+Any tool that fetches a resource *by id supplied in its arguments* must declare
+``requires_user = True`` and scope the lookup to the caller from
+:func:`app.tools.context.current_tool_context` — ids come from the model / the
+ad-hoc test endpoint, so they are attacker-controllable and can name somebody
+else's row. See :class:`FileAnalyzeTool` for the canonical shape (refusal
+payload, never an uncaught exception, and no existence leak for foreign rows).
+
 All run() methods are async and return JSON-serialisable values.
 """
 from __future__ import annotations
@@ -17,6 +24,7 @@ import ipaddress
 import json
 import socket
 import tempfile
+import uuid
 from datetime import datetime, UTC
 from typing import Any
 
@@ -27,7 +35,9 @@ from app.core.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
+from app.models.knowledge_base import KnowledgeBase
 from app.tools.base import BaseTool, ToolError, ToolParameter
+from app.tools.context import current_tool_context, forbidden_result
 
 # How much of an HTTP body we keep — payloads can be huge and bust the LLM context.
 _HTTP_MAX_CHARS = 4000
@@ -38,6 +48,18 @@ _HTTP_MAX_CHARS = 4000
 _HTTP_MAX_BYTES = 4 * 1024 * 1024
 # Sync DB query safety cap — read-only-ish, bounded row count.
 _DB_ROW_LIMIT = 50
+
+
+def _not_readable(document_id: str) -> dict[str, Any]:
+    """One denial shape for ``file_analyze``.
+
+    Used for a missing row, a malformed id, and a row owned by somebody else, so
+    the tool cannot be turned into a document-existence oracle by diffing errors.
+    """
+    return forbidden_result(
+        "文档不存在或无权访问 (not found or not authorized)",
+        document_id=document_id,
+    )
 
 
 def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
@@ -122,6 +144,7 @@ class DateTimeNowTool(BaseTool):
     description = "Get the current UTC date and time in ISO-8601 format. Takes no parameters."
     category = "utility"
     dangerous = False
+    user_testable = True
     parameters: list[ToolParameter] = []
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
@@ -143,6 +166,9 @@ class HttpGetTool(BaseTool):
     )
     category = "network"
     dangerous = False
+    # Reachable by every user's agent already (and SSRF-guarded below), so the
+    # ad-hoc test endpoint grants no extra capability.
+    user_testable = True
     parameters = [
         ToolParameter(
             name="url",
@@ -252,6 +278,7 @@ class WebSearchTool(BaseTool):
     )
     category = "network"
     dangerous = False
+    user_testable = True
     parameters = [
         ToolParameter(
             name="query",
@@ -643,6 +670,20 @@ class DbQueryTool(BaseTool):
         sql = str(kwargs.get("sql") or "").strip()
         if not sql:
             raise ToolError("'sql' is required")
+        # Tenant scope: this tool sees EVERY row in the application database, so
+        # it is an admin-only primitive. :func:`is_tool_allowed` already refuses
+        # it for non-admins in prod; enforce it here too because the dev/test env
+        # keeps that gate open and ``run()`` is reachable without the gateway.
+        # Only judged when a caller identity is actually bound — a bound
+        # ``user=None`` is the fail-closed case, an unbound context means a
+        # non-request caller (unit test / ops script).
+        ctx = current_tool_context()
+        if ctx is not None and not ctx.is_admin:
+            # Same key shape as the tool's own error envelope (``rows`` present) so
+            # a consumer reading the result never KeyErrors on a denial.
+            return forbidden_result(
+                "db_query 可读全库，仅限管理员调用 (admin only)", sql=sql, rows=[]
+            )
         # Defense in depth: the ToolGateway also validates, but this path is
         # reached directly by /api/tools/test, so enforce the same hardening
         # here. Rejects multi-statement, DML/DDL, and session-control keywords.
@@ -696,6 +737,12 @@ class FileAnalyzeTool(BaseTool):
     the Document and its chunk texts from the DB and returns filename, status,
     total length, and the first chunk's content. It deliberately avoids touching the
     filesystem or storage backend so it works regardless of storage config.
+
+    Tenant scope (``requires_user``): the extracted text is the user's private
+    content, so the id is resolved through the owning knowledge base and compared
+    against the caller bound by the gateway (:mod:`app.tools.context`). Without a
+    bound user the tool refuses outright — otherwise ``document_id`` alone would be
+    a cross-tenant full-text read primitive for anyone who can name a UUID.
     """
 
     name = "file_analyze"
@@ -705,6 +752,8 @@ class FileAnalyzeTool(BaseTool):
     )
     category = "rag"
     dangerous = False
+    requires_user = True
+    user_testable = True
     parameters = [
         ToolParameter(
             name="document_id",
@@ -732,16 +781,48 @@ class FileAnalyzeTool(BaseTool):
         if max_chars <= 0:
             max_chars = _HTTP_MAX_CHARS
 
+        # Fail closed: no bound principal -> no document read.
+        ctx = current_tool_context()
+        user_id = ctx.user_id if ctx is not None else None
+        if user_id is None:
+            return forbidden_result(
+                "缺少登录用户上下文，无法按 id 读取文档", document_id=raw_id
+            )
+        # Reject a malformed id before it reaches the DB driver (an unparseable
+        # UUID would surface as a raw dialect error, not a clean result).
+        try:
+            doc_uuid = uuid.UUID(raw_id)
+        except ValueError:
+            return _not_readable(raw_id)
+
         from sqlalchemy import select
 
         async with AsyncSessionLocal() as session:
             doc = (
                 await session.execute(
-                    select(Document).where(Document.id == raw_id)
+                    select(Document).where(Document.id == doc_uuid)
                 )
             ).scalar_one_or_none()
-            if doc is None:
-                return {"ok": False, "error": "document not found", "document_id": raw_id}
+
+            # Ownership lives on the knowledge base (documents have no user_id),
+            # mirroring app/api/documents.py::_load_owned_doc. Admin passes.
+            kb_owner: Any = None
+            if doc is not None:
+                kb_owner = (
+                    await session.execute(
+                        select(KnowledgeBase.user_id).where(
+                            KnowledgeBase.id == doc.knowledge_base_id
+                        )
+                    )
+                ).scalar_one_or_none()
+
+            if doc is None or (
+                str(kb_owner or "") != str(user_id) and not ctx.is_admin
+            ):
+                # One message for "missing" and "not yours", on purpose: a foreign
+                # id must stay indistinguishable from a non-existent one, so the
+                # tool can never be used to enumerate other tenants' documents.
+                return _not_readable(raw_id)
 
             chunk_rows = (
                 await session.execute(

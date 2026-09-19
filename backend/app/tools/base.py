@@ -28,6 +28,15 @@ class BaseTool(ABC):
     description: str = ""
     category: str = "general"
     dangerous: bool = False          # requires elevated confirmation (e.g. code exec)
+    # Tenant scope is mandatory for this tool: it reads resources owned by one
+    # user, so :class:`~app.agents.gateway.tool_gateway.ToolGateway` refuses to
+    # execute it when no authenticated principal is bound (fail closed).
+    requires_user: bool = False
+    # Explicitly safe for a logged-in (non-admin) user to invoke ad hoc through
+    # ``POST /api/tools/test``. Default False: an unknown tool is NOT testable,
+    # so newly added tools never widen the ad-hoc surface by accident. Admins may
+    # test any tool that the environment permission gate also allows.
+    user_testable: bool = False
     parameters: list[ToolParameter] = []
 
     @abstractmethod

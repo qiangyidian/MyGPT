@@ -82,11 +82,12 @@ async def upload_document(
     ext = os.path.splitext(filename)[1].lower()
     if ext not in settings.allowed_extensions:
         raise HTTPException(BAD, f"不支持的文件类型: {ext or '(无)'}")
-    # Soft size guard — Starlette populates .size after the upload is received.
-    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
-    if file.size is not None and file.size > max_bytes:
-        raise HTTPException(BAD, f"文件过大，最大 {settings.MAX_UPLOAD_MB}MB")
-
+    # Deliberately no size check on ``file.size`` here: Starlette only populates it
+    # once the body has already been received (and it can stay None, which skipped
+    # the guard entirely). The real cap lives downstream —
+    # ``app/services/document_service.py`` passes ``max_bytes`` into the storage
+    # layer, which aborts + deletes the partial object the moment the stream
+    # crosses it — together with the magic-byte content check.
     kb = await _load_owned_kb(db, kb_id, user)
     doc = await document_service.upload(db, kb, user, file)
     background_tasks.add_task(_index_background, doc.id)

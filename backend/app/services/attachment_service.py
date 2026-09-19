@@ -29,7 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.exceptions import AppException
-from app.core.storage import get_storage
+from app.core.file_signatures import (
+    EXT_RULES,
+    FileSignatureError,
+    check_file_signature,
+    verified_size,
+)
+from app.core.storage import UploadTooLargeError, get_storage
 from app.db import AsyncSessionLocal
 from app.models import ChatAttachment, KnowledgeBase, User
 from app.rag import attachment_rag
@@ -59,36 +65,10 @@ def _spawn(coro):
     return task
 
 
-# Extension -> (accepted MIME prefixes, magic-byte signatures). Signatures are
-# matched against the first bytes of the saved file. Text types have no robust
-# signature and are accepted on extension + MIME alone.
-_EXT_RULES: dict[str, tuple[tuple[str, ...], tuple[bytes, ...]]] = {
-    ".pdf":  (("application/pdf",), (b"%PDF",)),
-    ".png":  (("image/png",), (b"\x89PNG\r\n\x1a\n",)),
-    ".jpg":  (("image/jpeg",), (b"\xff\xd8\xff",)),
-    ".jpeg": (("image/jpeg",), (b"\xff\xd8\xff",)),
-    ".webp": (("image/webp", "image/riff"), (b"RIFF",)),
-    ".gif":  (("image/gif",), (b"GIF87a", b"GIF89a")),
-    ".bmp":  (("image/bmp", "image/x-ms-bmp"), (b"BM",)),
-    ".tif":  (("image/tiff",), (b"II*\x00", b"MM\x00*")),
-    ".tiff": (("image/tiff",), (b"II*\x00", b"MM\x00*")),
-    ".docx": (("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".xlsx": (("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".odt":  (("application/vnd.oasis.opendocument.text",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".ods":  (("application/vnd.oasis.opendocument.spreadsheet",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".odp":  (("application/vnd.oasis.opendocument.presentation",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".pptx": (("application/vnd.openxmlformats-officedocument.presentationml.presentation",
-               "application/zip", "application/octet-stream"), (b"PK\x03\x04",)),
-    ".txt":  (("text/plain", "text/markdown", "application/octet-stream"), ()),
-    ".md":   (("text/markdown", "text/plain", "application/octet-stream"), ()),
-    ".csv":  (("text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"), ()),
-    ".json": (("application/json", "text/plain", "application/octet-stream"), ()),
-}
+# Extension -> (accepted MIME prefixes, magic-byte signatures). The table lives in
+# :mod:`app.core.file_signatures` so KB uploads and artifacts validate against the
+# exact same rules — keeping it here had it drifting into "attachments only".
+_EXT_RULES = EXT_RULES
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 _TABLE_EXTS = {".csv", ".xlsx"}
@@ -128,21 +108,18 @@ def _validate_extension(filename: str, content_type: str | None) -> str:
 
 
 def _verify_signature(path: str, ext: str) -> None:
-    """Compare the file's leading bytes against the known signature for ext."""
-    rules = _EXT_RULES.get(ext)
-    if rules is None:
-        return
-    _accepted, sigs = rules
-    if not sigs:
-        return
+    """Compare the file's leading bytes against the known signature for ext.
+
+    Thin wrapper over :func:`app.core.file_signatures.check_file_signature`: the KB
+    document path calls the same checker, so the two upload surfaces can never
+    disagree about what counts as a valid file. The ``attachment_*`` codes and the
+    Chinese messages are unchanged — the frontend keys off them.
+    """
     try:
-        with open(path, "rb") as fh:
-            head = fh.read(16)
-    except OSError as exc:  # pragma: no cover
-        raise AppException(400, "attachment_unreadable", "无法读取上传文件") from exc
-    if not any(head.startswith(s) for s in sigs):
-        raise AppException(400, "attachment_signature_mismatch",
-                           "文件内容与其扩展名声明不一致")
+        check_file_signature(path, ext)
+    except FileSignatureError as exc:
+        code = "attachment_unreadable" if exc.reason == "unreadable" else "attachment_signature_mismatch"
+        raise AppException(400, code, exc.message) from exc
 
 
 async def _count_unbound(db: AsyncSession, conversation_id: uuid.UUID) -> int:
@@ -179,35 +156,25 @@ async def upload(
     original = _sanitize_filename(upload_file.filename or "attachment")
     ext = _validate_extension(original, getattr(upload_file, "content_type", None))
 
-    # Size guard: read in a bounded loop without trusting content-length.
+    # Size guard: enforced while the body streams to disk, without trusting the
+    # client-declared content-length or ``UploadFile.size`` (both can be absent).
     max_bytes = settings.ATTACHMENT_MAX_MB * 1024 * 1024
-    size = 0
     await upload_file.seek(0)
-    # We must persist the file to inspect it; stream-copy with a running tally
-    # and abort if it exceeds the cap.
     storage = get_storage()
     # Attachments accept a broader allow-list than KB uploads (e.g. images).
     attachment_allow = {
         e.strip().lower() for e in settings.ATTACHMENT_ALLOWED_EXT.split(",") if e.strip()
     }
-    # storage.save streams to disk in 1MB chunks but does not enforce our cap;
-    # so we verify size after save and reject+delete if too large.
-    storage_key = await storage.save(upload_file, user.id, allowed_extensions=attachment_allow)
     try:
-        size = os.path.getsize(storage_key)
-    except OSError:
-        size = 0
-
-    def _cleanup() -> None:
-        try:
-            asyncio.get_event_loop().create_task(storage.delete(storage_key))
-        except Exception:
-            pass
-
-    if size > max_bytes:
-        await storage.delete(storage_key)
+        storage_key = await storage.save(
+            upload_file, user.id, allowed_extensions=attachment_allow, max_bytes=max_bytes
+        )
+    except UploadTooLargeError:
+        # storage.save already removed the partial object when it crossed the cap.
         raise AppException(413, "attachment_too_large",
-                           f"单个附件不能超过 {settings.ATTACHMENT_MAX_MB}MB")
+                           f"单个附件不能超过 {settings.ATTACHMENT_MAX_MB}MB") from None
+    # Bytes actually on disk — what the row reports and what the quota checks use.
+    size = verified_size(storage_key)
 
     try:
         _verify_signature(storage_key, ext)

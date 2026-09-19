@@ -4,6 +4,13 @@ Only the local filesystem backend exists. Business code obtains a backend via
 ``get_storage()`` — never constructs paths or talks to the FS directly, so a
 future S3/MinIO backend can slot in behind the same ``StorageBackend`` protocol
 without touching call sites.
+
+Size limits are enforced *while writing*: ``UploadFile.size`` is None until the
+framework has already buffered the body, and the file is on disk by the time a
+caller gets to inspect it, so a post-hoc check means an upload can be capped only
+after it was fully written (and can be skipped entirely when ``size`` is None).
+``save(..., max_bytes=...)`` counts bytes as they stream and removes the partial
+object when the cap is crossed.
 """
 from __future__ import annotations
 
@@ -17,18 +24,40 @@ from fastapi import UploadFile
 
 from app.core.config import get_settings
 
+# Read granularity while streaming an upload to disk.
+_CHUNK_BYTES = 1024 * 1024
+
+
+class UploadTooLargeError(Exception):
+    """An upload crossed its byte cap; the partial object has been removed.
+
+    ``limit_bytes`` lets the caller render its own message (MB figure, domain
+    error code) instead of the storage layer guessing user-facing copy.
+    """
+
+    def __init__(self, limit_bytes: int) -> None:
+        super().__init__(f"upload exceeds the {limit_bytes} byte limit")
+        self.limit_bytes = limit_bytes
+
 
 class StorageBackend(ABC):
     """Interface every storage backend implements."""
 
     @abstractmethod
     async def save(
-        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
+        self,
+        upload_file: UploadFile,
+        user_id,
+        *,
+        allowed_extensions: set[str] | None = None,
+        max_bytes: int | None = None,
     ) -> str:
         """Persist ``upload_file`` for ``user_id``; return the stored path/key.
 
         ``allowed_extensions`` overrides the configured allow-list (used by chat
         attachments, which accept a broader set than KB uploads, e.g. images).
+        ``max_bytes`` aborts the write (and deletes what was already written) with
+        :class:`UploadTooLargeError` once the stream exceeds the cap.
         """
 
     @abstractmethod
@@ -65,7 +94,12 @@ class LocalStorage(StorageBackend):
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     async def save(
-        self, upload_file: UploadFile, user_id, *, allowed_extensions: set[str] | None = None
+        self,
+        upload_file: UploadFile,
+        user_id,
+        *,
+        allowed_extensions: set[str] | None = None,
+        max_bytes: int | None = None,
     ) -> str:
         settings = get_settings()
         ext = self._safe_suffix(upload_file.filename or "")
@@ -89,13 +123,31 @@ class LocalStorage(StorageBackend):
         except ValueError:
             raise ValueError("Invalid storage path")
 
-        # Stream the upload to disk so large files don't get fully buffered.
+        # Stream the upload to disk so large files don't get fully buffered, and
+        # count the bytes on the way past: a declared limit is enforced the
+        # moment it is crossed instead of after the whole body landed.
         await upload_file.seek(0)
-        with open(dest, "wb") as out:
-            chunk = await upload_file.read(1024 * 1024)
-            while chunk:
-                out.write(chunk)
-                chunk = await upload_file.read(1024 * 1024)
+        written = 0
+        try:
+            with open(dest, "wb") as out:
+                chunk = await upload_file.read(_CHUNK_BYTES)
+                while chunk:
+                    written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        raise UploadTooLargeError(max_bytes)
+                    out.write(chunk)
+                    chunk = await upload_file.read(_CHUNK_BYTES)
+        except BaseException:
+            # Any abort — over-cap, disk error, or a cancelled request (client
+            # hung up mid-upload) — must not leave an object behind: it would
+            # still be readable through the storage dir and count against disk.
+            # ``BaseException`` on purpose: asyncio cancellation is not an
+            # ``Exception``.
+            try:
+                Path(dest).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return str(dest)
 
     def open(self, path: str) -> IO[bytes]:
