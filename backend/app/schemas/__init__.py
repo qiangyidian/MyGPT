@@ -8,6 +8,7 @@ from app.schemas.agent import (
     PlanStepIn,
     PlanUpdateRequest,
     RejectRequest,
+    PlanGateRequest,
     RunInstructionRequest,
     ToolApprovalOut,
     ToolCallAuditOut,
@@ -93,7 +94,7 @@ __all__ = [
     # agent runs (Phase 3)
     "AgentRunOut", "AgentStepOut", "ToolApprovalOut", "ToolCallAuditOut",
     "ApproveRequest", "RejectRequest", "ActionResult",
-    "PlanStepIn", "PlanUpdateRequest", "RunInstructionRequest",
+    "PlanGateRequest", "PlanStepIn", "PlanUpdateRequest", "RunInstructionRequest",
     # auth
     "RegisterRequest", "LoginRequest", "TokenResponse", "RefreshResponse", "UserOut",
     "WechatCodeLoginRequest", "WechatBindingOut",

@@ -50,7 +50,7 @@ from app.agents.db_mutation import (
     rollback_safely,
 )
 from app.agents.events import append_event_safe
-from app.agents.persistence import persist_terminal_run
+from app.agents.persistence import persist_research_plan, persist_terminal_run
 from app.agents.run_controls import drop as drop_run_control
 from app.agents.run_controls import get_or_create as get_run_control
 from app.agents.graph import graph_from_plan
@@ -64,6 +64,7 @@ from app.agents.schemas import (
     ev_done,
     ev_error,
     ev_intent_recognized,
+    ev_research_plan,
     ev_run_started,
     ev_runtime_selected,
 )
@@ -389,7 +390,10 @@ class ChatOrchestrator:
         )
         from app.agents.token_budget import PromptAdmissionError
         from app.agents.workflow.engine import WorkflowEngine
-        from app.agents.workflow.planner import build_plan_for_profile
+        from app.agents.workflow.planner import (
+            build_plan_for_profile,
+            plan_to_ui_payload,
+        )
         from app.agents.workflow.schemas import StepError
 
         question = ctx.user_content or ""
@@ -403,7 +407,8 @@ class ChatOrchestrator:
         env = RunEnvironment.for_turn(ctx)
 
         # LLM 规划器（flag 开时）：永远返回可用 plan（失败即回退模板）。
-        if bool(getattr(get_settings(), "AGENT_LLM_PLANNER", False)):
+        _used_llm_planner = bool(getattr(get_settings(), "AGENT_LLM_PLANNER", False))
+        if _used_llm_planner:
             from app.agents.workflow.llm_planner import build_plan_with_llm
 
             plan = await build_plan_with_llm(
@@ -412,6 +417,7 @@ class ChatOrchestrator:
                 profile=profile,
                 question=question,
                 guard=env.guard,
+                stage_ctx=env.stage_ctx,
             )
         else:
             plan = build_plan_for_profile(profile, question)
@@ -421,17 +427,38 @@ class ChatOrchestrator:
         graph = graph_from_plan(plan)
 
         env.attach_graph(graph)
+        # 计划先行：与 walker 同形状地发布计划卡并落库，用户才能在面板上看到
+        # 「打算做什么」并修改它。默认不阻塞；只有用户主动上闸才进门禁。
+        _plan_gate = bool(getattr(get_settings(), "PLAN_REQUIRE_CONFIRMATION", False))
+        ui_plan = plan_to_ui_payload(plan, requires_confirmation=_plan_gate)
+        factory = (
+            ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
+        )
+        try:
+            async with db_mutation_scope(ctx.extra.get("persistence_lock")):
+                await persist_research_plan(
+                    factory, run_id=run.id, plan=ui_plan
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("engine plan persist failed", exc_info=True)
+        env.stage_ctx.emit(
+            ev_research_plan(
+                run_id=run.id,
+                status="draft",
+                summary=ui_plan["summary"],
+                steps=ui_plan["steps"],
+                requires_confirmation=_plan_gate,
+            )
+        )
         # 计划门（与 walker 同语义）：计划先行、默认不阻塞；只有用户主动
         # 上闸（RunControl.request_gate）才在这里等确认。
-        if bool(getattr(get_settings(), "PLAN_REQUIRE_CONFIRMATION", False)):
+        if _plan_gate:
 
             async def _plan_status() -> str | None:
                 from sqlalchemy import select
 
-                factory = (
-                    ctx.extra.get("persistence_session_factory")
-                    or AsyncSessionLocal
-                )
                 async with db_mutation_scope(ctx.extra.get("persistence_lock")):
                     async with factory() as session:
                         row = await session.execute(
@@ -452,7 +479,9 @@ class ChatOrchestrator:
         if injected is not None:
             inner = injected
         else:
-            inner = await self._build_stage_adapter(ctx, run, env)
+            inner = await self._build_stage_adapter(
+                ctx, run, env, allow_dynamic_stages=_used_llm_planner
+            )
 
         class _EnvExecutor:
             """把引擎的步骤执行接到 RunEnvironment 的共享上下文上。
@@ -479,6 +508,7 @@ class ChatOrchestrator:
                 provider=env.stage_ctx.provider,
                 model_config=ctx.model_config,
                 guard=env.guard,
+                stage_ctx=env.stage_ctx,
             ),
             run_id=run.id,
             session_factory=ctx.extra.get("persistence_session_factory"),
@@ -599,7 +629,9 @@ class ChatOrchestrator:
             budget=ctx.extra.get("budget"),
         )
 
-    def _engine_verifier(self, *, provider: Any, model_config: Any, guard: Any) -> Any:
+    def _engine_verifier(
+        self, *, provider: Any, model_config: Any, guard: Any, stage_ctx: Any = None
+    ) -> Any:
         """按 flag 选 verifier。默认规则版；flag 开但没 provider 时也回退规则版。"""
         from app.agents.workflow.verifier import RuleBasedVerifier
 
@@ -610,11 +642,17 @@ class ChatOrchestrator:
         from app.agents.workflow.llm_verifier import LLMVerifier
 
         return LLMVerifier(
-            provider=provider, model_config=model_config, guard=guard
+            provider=provider, model_config=model_config, guard=guard,
+            stage_ctx=stage_ctx,
         )
 
     async def _build_stage_adapter(
-        self, ctx: AgentTurnContext, run: AgentRun, env: RunEnvironment
+        self,
+        ctx: AgentTurnContext,
+        run: AgentRun,
+        env: RunEnvironment,
+        *,
+        allow_dynamic_stages: bool = False,
     ):
         """Build the real StageAdapterExecutor from the existing crew stages.
 
@@ -656,7 +694,22 @@ class ChatOrchestrator:
         builder = builders.get(profile, build_research_stages)
         _, stages = builder(llm=llm, tools=tools, question=ctx.user_content or "")
         stages_by_id = {spec.agent_id: spec for spec in stages}
-        return StageAdapterExecutor(stages_by_id, stage_ctx)
+
+        stage_factory = None
+        if allow_dynamic_stages:
+            # 规划器的职责就是提出模板里没有的步骤；那些 step id 在这里查不到
+            # stage，旧行为是 execute 时 KeyError 当成永久失败 —— 开规划器等于
+            # 让多 Agent 轮次随机全挂。按 Step 自带文案现场建 agent+task 才让
+            # 「模型提议的计划」真的可执行。模板 plan 不用这条路（id 必然命中），
+            # 所以只在 flag 开时挂上，保留 builder 与模板漂移时的 fail-loud。
+            from app.agents.crews.dynamic_stage import build_dynamic_stage
+
+            def stage_factory(step: Any) -> Any:
+                return build_dynamic_stage(
+                    step=step, llm=llm, tools=tools, question=ctx.user_content or ""
+                )
+
+        return StageAdapterExecutor(stages_by_id, stage_ctx, stage_factory)
 
     def _crewai_status(self) -> tuple[bool, str | None]:
         """Return (available, fallback_reason). Cached after the first check."""

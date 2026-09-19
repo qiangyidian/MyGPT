@@ -41,6 +41,63 @@ _KNOWLEDGE_HINTS = (
 Intent = str  # "chat" | "knowledge" | "deep_research" | "action"
 
 
+# --------------------------------------------------------------------------- #
+# Research-signal confidence
+# --------------------------------------------------------------------------- #
+# ``classify_intent`` fires on a single keyword, so "总结一下这段" and "对比这两
+# 个数字" both read as deep_research. Escalating those to a real multi-agent
+# crew costs 3+ model calls and several times the latency of a direct answer,
+# so auto-escalation needs a *graded* signal instead of a boolean one.
+#
+# Strong hints are the ones nobody uses for a one-liner; medium hints only mean
+# "research" once the question has real substance; 总结/summarize is so common
+# it never escalates on its own (it only corroborates another signal).
+_STRONG_RESEARCH_HINTS = (
+    "研究", "调研", "综述", "深挖", "深入分析", "全面分析", "系统性",
+    "deep dive", "in depth", "investigate", "comprehensive",
+)
+_MEDIUM_RESEARCH_HINTS = (
+    "对比", "比较", "分析", "权衡", "评估",
+    "compare", "analyze", "evaluate", "versus",
+)
+_CORROBORATING_HINTS = ("总结", "summarize", "summary")
+
+# Below this many characters the request is a fragment, whatever words it uses.
+# Above it, a lone medium hint still only scores above the floor once the
+# question is long enough to carry actual multi-part work -- Chinese carries far
+# more meaning per character than English, so length may demote but never
+# promote.
+_RESEARCH_MIN_CHARS = 8
+_RESEARCH_SUBSTANTIAL_CHARS = 16
+
+
+def research_signal_score(text: str) -> float:
+    """Confidence in [0, 1] that ``text`` genuinely asks for multi-step research.
+
+    Deterministic and threshold-friendly:
+      * 0.0            — no research signal, or a sub-fragment request
+      * 0.4            — a passing medium hint in a short one-liner
+      * 0.55 / 0.6     — medium hint(s) on a substantial question
+      * 0.85 / 0.95    — a strong hint (+ a second signal)
+    """
+    stripped = (text or "").strip()
+    if len(stripped) < _RESEARCH_MIN_CHARS:
+        return 0.0
+    t = stripped.lower()
+    medium_hits = sum(1 for h in _MEDIUM_RESEARCH_HINTS if h in t)
+    corroborated = any(h in t for h in _CORROBORATING_HINTS)
+    substantial = len(stripped) >= _RESEARCH_SUBSTANTIAL_CHARS
+    if any(h in t for h in _STRONG_RESEARCH_HINTS):
+        return 0.95 if (medium_hits or corroborated) else 0.85
+    if not medium_hits and corroborated:
+        return 0.0
+    if not medium_hits:
+        return 0.0
+    if not substantial:
+        return 0.4
+    return 0.6 if medium_hits >= 2 else 0.55
+
+
 def classify_intent(text: str) -> Intent:
     """Rule-based intent classification. Deterministic + testable."""
     if not text:

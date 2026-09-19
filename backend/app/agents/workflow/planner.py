@@ -33,7 +33,11 @@ def validate_plan(plan: Plan) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Default retry policy shared by the templates' tool-calling steps
+# Default retry policy shared by every template step
+#
+# 每个步骤都是一次真实的模型调用，所以限流/502/超时对 analyst、writer、judge
+# 一视同仁 —— 只给带工具的步骤配回退，等于让一处瞬时的模型端点故障把整轮
+# 直接判死。
 # --------------------------------------------------------------------------- #
 _TRANSIENT = RetryPolicy(
     max_retries=1,
@@ -75,6 +79,7 @@ def build_deep_research_plan(question: str) -> Plan:
                 task_description="Cross-check the researcher's evidence for sufficiency.",
                 dependencies=["researcher"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="writer",
@@ -83,6 +88,7 @@ def build_deep_research_plan(question: str) -> Plan:
                 task_description=f"Write the cited final answer to: {q}",
                 dependencies=["analyst"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
         ],
     )
@@ -110,6 +116,7 @@ def build_parallel_research_plan(question: str) -> Plan:
                 task_description=f"Split the question into web + KB lines: {q}",
                 dependencies=[],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="web-researcher",
@@ -138,6 +145,7 @@ def build_parallel_research_plan(question: str) -> Plan:
                 task_description="Merge and cross-check both research lines.",
                 dependencies=["web-researcher", "kb-researcher"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="writer",
@@ -146,6 +154,7 @@ def build_parallel_research_plan(question: str) -> Plan:
                 task_description=f"Write the cited final answer to: {q}",
                 dependencies=["analyst"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
         ],
     )
@@ -177,6 +186,7 @@ def build_debate_plan(question: str) -> Plan:
                 task_description=f"Build the strongest structured case for {sa}.",
                 dependencies=[],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="advocate-b",
@@ -185,6 +195,7 @@ def build_debate_plan(question: str) -> Plan:
                 task_description=f"Build the strongest structured case for {sb}.",
                 dependencies=[],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="judge",
@@ -192,6 +203,7 @@ def build_debate_plan(question: str) -> Plan:
                 name="Judge",
                 task_description=f"Weigh {sa} vs {sb} on the same dimensions; conditional verdict.",
                 dependencies=["advocate-a", "advocate-b"],
+                retry_policy=_TRANSIENT,
                 acceptance_criteria={"min_chars": 1},
             ),
         ],
@@ -218,6 +230,7 @@ def build_task_decomposition_plan(question: str, worker_count: int = 3) -> Plan:
                 f"items: {q}"
             ),
             dependencies=[],
+            retry_policy=_TRANSIENT,
             acceptance_criteria={"min_chars": 1},
         )
     ]
@@ -246,6 +259,7 @@ def build_task_decomposition_plan(question: str, worker_count: int = 3) -> Plan:
                 "resolve conflicts and remove duplication."
             ),
             dependencies=[f"worker-{i}" for i in range(1, n + 1)],
+            retry_policy=_TRANSIENT,
             acceptance_criteria={"min_chars": 1},
         )
     )
@@ -267,6 +281,7 @@ def build_write_review_plan(question: str) -> Plan:
                 task_description=f"Write a complete first draft for: {q}",
                 dependencies=[],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="reviewer", role="reviewer", name="Reviewer",
@@ -277,6 +292,7 @@ def build_write_review_plan(question: str) -> Plan:
                 ),
                 dependencies=["drafter"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
             Step(
                 id="finalizer", role="finalizer", name="Finalizer",
@@ -286,6 +302,7 @@ def build_write_review_plan(question: str) -> Plan:
                 ),
                 dependencies=["reviewer"],
                 acceptance_criteria={"min_chars": 1},
+                retry_policy=_TRANSIENT,
             ),
         ],
     )
@@ -309,6 +326,117 @@ def build_plan_for_profile(profile: str, question: str) -> Plan:
 # --------------------------------------------------------------------------- #
 # Revision — retain completed valid work, rework only flagged steps
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Plan -> 前端 PlanReview 卡片
+# --------------------------------------------------------------------------- #
+# 引擎路径以前不发计划事件：面板上的计划卡、确认/修改入口在引擎轮次里整个消失
+# （验收 §11.3 要求「计划总是发布且可修改」）。
+_ROLE_TITLES = {
+    "researcher": "检索相关资料",
+    "coordinator": "拆分任务与调度",
+    "web-researcher": "检索网络资料",
+    "kb-researcher": "检索知识库",
+    "analyst": "核对来源与差异",
+    "writer": "生成带引用的汇总",
+    "advocate-a": "正方论证",
+    "advocate-b": "反方论证",
+    "judge": "裁判权衡与结论",
+    "decomposer": "拆分独立工作项",
+    "worker": "完成分派的工作项",
+    "integrator": "汇总为一份交付物",
+    "drafter": "起草初稿",
+    "reviewer": "审阅并列出问题",
+    "finalizer": "按审阅意见定稿",
+}
+
+_PROFILE_SUMMARIES = {
+    "deep_research": "先检索资料，再交叉核对来源，最后生成带引用的汇总",
+    "parallel_research": "网络与知识库两路并行检索，再汇总核对并成文",
+    "debate": "正反双方各自论证，由裁判在同一维度上权衡并给出结论",
+    "task_decomposition": "把请求拆成独立工作项并行完成，再整合为一份交付物",
+    "write_review": "先起草，再由审阅者只诊断不改写，最后按意见定稿",
+}
+
+
+def _step_title(step: Step) -> str:
+    return _ROLE_TITLES.get(step.role) or _ROLE_TITLES.get(step.id) or step.name or step.id
+
+
+def plan_summary_for_profile(profile: str, question: str) -> str:
+    """One-line, user-facing description of what will run."""
+    known = _PROFILE_SUMMARIES.get(profile)
+    if known:
+        return known
+    goal = (question or "").strip()
+    return f"按下列步骤完成：{goal[:120]}" if goal else "按下列步骤完成请求"
+
+
+def plan_acceptance_criteria(question: str, step_count: int) -> list[str]:
+    """Deterministic acceptance criteria, derived from the plan that will run."""
+    criteria = [
+        "回答直接针对用户问题，不偏题",
+        "关键结论附带可核实的来源引用",
+    ]
+    if step_count:
+        criteria.append(f"完成全部 {step_count} 个计划步骤")
+    if question and len(question) > 30:
+        criteria.append("对问题中的多个子点分别作答，不遗漏")
+    criteria.append("明确区分事实与推断；无法核实的结论标注不确定性")
+    return criteria
+
+
+_WEB_TOOLS = {"web_search", "http_get", "web_fetch"}
+_KB_TOOLS = {"kb_search", "knowledge_base_search", "rag_search"}
+
+
+def _step_sources(step: Step) -> list[str]:
+    """Which evidence lines a step draws on, inferred from its tool allowlist.
+
+    An empty allowlist means "whatever the run's tool set provides" -> report
+    both lines rather than none, so the card never under-claims coverage.
+    """
+    allowed = set(step.tool_allowlist or [])
+    if not allowed:
+        return ["knowledge_base", "web"]
+    sources: list[str] = []
+    if allowed & _WEB_TOOLS:
+        sources.append("web")
+    if allowed & _KB_TOOLS or not (allowed - _WEB_TOOLS):
+        sources.append("knowledge_base")
+    return sources
+
+
+def plan_to_ui_payload(plan: Plan, *, requires_confirmation: bool = False) -> dict:
+    """把引擎 :class:`Plan` 转成 walker 同形状的 UI 计划字典。"""
+    question = (plan.goal or "").strip()
+    steps = [
+        {"id": s.id, "title": _step_title(s), "sources": _step_sources(s)}
+        for s in plan.steps
+    ]
+    return {
+        "summary": plan_summary_for_profile(plan.profile, question),
+        "steps": steps,
+        "acceptanceCriteria": plan_acceptance_criteria(question, len(steps)),
+        "requires_confirmation": requires_confirmation,
+    }
+
+
+def _downstream_closure(steps: list[Step], roots: set[str]) -> set[str]:
+    """Every step id that transitively depends on one of ``roots`` (excluding them)."""
+    dependents: dict[str, list[str]] = {}
+    for s in steps:
+        for dep in s.dependencies:
+            dependents.setdefault(dep, []).append(s.id)
+    seen: set[str] = set()
+    stack = list(roots)
+    while stack:
+        for child in dependents.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    return seen - roots
+
+
 def revise_plan(
     plan: Plan,
     revise_step_ids: list[str],
@@ -316,8 +444,11 @@ def revise_plan(
 ) -> Plan:
     """Return a NEW versioned plan that reworks only ``revise_step_ids``.
 
-    Every step NOT flagged keeps its observation and is marked ``skip`` so the
-    engine does not re-execute it; the flagged steps are re-run. The plan's
+    Every step NOT flagged (and not downstream of a flagged one) keeps its
+    observation and is marked ``skip`` so the engine does not re-execute it.
+    Flagged steps **and their transitive dependents** re-run — a dependent kept
+    on the old upstream output would be stale forever, and the verifier would
+    judge a plan whose final answer never reflects the revision. The plan's
     ``version`` increments and ``replan_count`` advances by one. The revised
     plan is validated before being returned.
     """
@@ -331,9 +462,13 @@ def revise_plan(
             f"revise_step_ids reference unknown step(s): {sorted(unknown)}"
         )
     carried: dict[str, StepObservation] = {}
+    # 被改动步骤的**全部传递下游**也必须重跑：它们手上的观测是按旧上游算出
+    # 的，留着不重算就等于让 verifier 复核一份永远不会更新的过期答案。
+    stale = _downstream_closure(plan.steps, revise_set)
+    must_rerun = revise_set | stale
     new_steps: list[Step] = []
     for s in plan.steps:
-        if s.id in revise_set:
+        if s.id in must_rerun:
             # Rework: a fresh, runnable copy (skip stays False).
             new_steps.append(s.model_copy(update={"skip": False}))
         else:

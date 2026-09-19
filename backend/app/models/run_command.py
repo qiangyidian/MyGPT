@@ -33,7 +33,7 @@ class RunCommand(Base, TimestampMixin):
         nullable=False,
         index=True,
     )
-    # pause | resume | cancel | instruction | approve | reject
+    # pause | resume | cancel | instruction | approve | reject | gate
     command_type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     # pending | claimed | applied | failed

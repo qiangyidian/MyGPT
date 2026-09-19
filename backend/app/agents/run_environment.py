@@ -305,6 +305,11 @@ class RunEnvironment:
                                 ctl.resume()
                             elif ctype == "cancel":
                                 ctl.cancel.set()
+                            elif ctype == "gate":
+                                if payload.get("enabled"):
+                                    ctl.request_gate()
+                                else:
+                                    ctl.clear_gate()
                             elif ctype == "instruction":
                                 text = str(payload.get("text") or "").strip()
                                 if text:

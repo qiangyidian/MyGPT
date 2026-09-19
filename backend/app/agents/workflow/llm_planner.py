@@ -17,6 +17,7 @@ import logging
 import re
 from typing import Any
 
+from app.agents.crews.dynamic_stage import DEFAULT_DYNAMIC_TIMEOUT_S
 from app.agents.workflow.planner import build_plan_for_profile, validate_plan
 from app.agents.workflow.schemas import Plan, Step
 
@@ -30,10 +31,13 @@ _SYSTEM_PROMPT = (
     "execution plan as STRICT JSON. Output JSON only — no prose, no markdown "
     "fences. Schema:\n"
     '{"steps": [{"id": "<slug>", "role": "<agent role>", "name": "<display name>", '
-    '"task_description": "<one sentence>", "dependencies": ["<other step id>"]}]}\n'
+    '"task_description": "<one sentence>", "dependencies": ["<other step id>"], '
+    '"tool_allowlist": ["<tool name, or omit>"]}]}\n'
     "Rules: ids are unique snake_case slugs; dependencies reference existing ids; "
     "the graph must be acyclic; keep it small and only include work that is "
-    "genuinely needed. Answer in the user's language for name/task_description."
+    "genuinely needed. A step may use ONLY the tools named in its "
+    "tool_allowlist — omit the field for a step that just reasons over the "
+    "context it is given. Answer in the user's language for name/task_description."
 )
 
 
@@ -69,6 +73,9 @@ def _parse_plan_json(raw: str, profile: str, question: str) -> Plan | None:
         deps = item.get("dependencies") or []
         if not isinstance(deps, list):
             return None
+        allow = item.get("tool_allowlist") or []
+        if not isinstance(allow, list):
+            return None
         steps.append(
             Step(
                 id=sid,
@@ -76,6 +83,10 @@ def _parse_plan_json(raw: str, profile: str, question: str) -> Plan | None:
                 name=str(item.get("name") or sid),
                 task_description=str(item.get("task_description") or ""),
                 dependencies=[str(d) for d in deps],
+                tool_allowlist=[str(t) for t in allow],
+                # 动态步骤没有模板可抄，超时必须显式钉一个 —— 否则它只受整轮
+                # 预算约束，一个卡住的模型调用能拖住全图。
+                timeout_seconds=DEFAULT_DYNAMIC_TIMEOUT_S,
                 acceptance_criteria={"min_chars": 1},
             )
         )
@@ -94,19 +105,37 @@ def _parse_plan_json(raw: str, profile: str, question: str) -> Plan | None:
     return plan
 
 
-def _charge(guard: Any, usage: Any, model_config: Any, kind: str) -> None:
-    """把规划器/verifier 的 token 计入 run 预算（与 stage 同源）。
+def _charge(
+    guard: Any,
+    usage: Any,
+    model_config: Any,
+    kind: str,
+    stage_ctx: Any = None,
+    attempt: int = 1,
+) -> None:
+    """把规划器/verifier 的 token 同时计入 run 预算**和终账** ``ev_done.usage``。
+
+    有 stage_ctx 时走 :meth:`~app.agents.stage_context.StageContext.record_usage`
+    —— 它一次搞定「记进 usage_records（aggregate_usage 会并进取终账）+ 扣预算」，
+    且按 key 幂等。只扣预算不记账会让用户看到的用量少掉这几千 token（验收 11）。
 
     **同步调用**：BudgetGuard 的临界区用 RLock，中间不得 await。
     """
-    if guard is None or not isinstance(usage, dict) or not usage:
+    if not isinstance(usage, dict) or not usage:
+        return
+    if stage_ctx is not None:
+        stage_ctx.record_usage(
+            f"aux:{kind}:{attempt}", dict(usage), model_usage=True
+        )
+        return
+    if guard is None:
         return
     from app.core.pricing import usage_cost
 
     cost = usage.get("cost_usd")
     if cost is None:
         cost = usage_cost(getattr(model_config, "model_name", None), usage)
-    guard.add_usage(usage, cost_usd=cost, usage_id=f"crewai:{kind}")
+    guard.add_usage(usage, cost_usd=cost, usage_id=f"crewai:{kind}:{attempt}")
 
 
 async def build_plan_with_llm(
@@ -116,6 +145,7 @@ async def build_plan_with_llm(
     profile: str,
     question: str,
     guard: Any = None,
+    stage_ctx: Any = None,
     max_steps: int = 8,
 ) -> Plan:
     """用模型提议一个 plan；不可用时回退模板。**永远返回可用的 Plan**。"""
@@ -166,7 +196,13 @@ async def build_plan_with_llm(
         logger.warning("LLM planner call failed; using template plan", exc_info=True)
         return fallback
 
-    _charge(guard, getattr(result, "usage", None), model_config, "planner")
+    _charge(
+        guard,
+        getattr(result, "usage", None),
+        model_config,
+        "planner",
+        stage_ctx=stage_ctx,
+    )
 
     plan = _parse_plan_json(getattr(result, "content", "") or "", profile, question)
     if plan is None:

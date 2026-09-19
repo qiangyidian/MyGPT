@@ -104,12 +104,16 @@ class StageAdapterExecutor:
     back to a :class:`~app.agents.workflow.schemas.StepObservation`.
     """
 
-    def __init__(self, stages: dict, stage_ctx: Any) -> None:
+    def __init__(self, stages: dict, stage_ctx: Any, stage_factory: Any = None) -> None:
         # ``stages`` is typed loosely (dict[str, StageSpec]) to avoid importing
         # crewai at module load time; the runtime builds it from the crew
-        # builders. Missing ids raise KeyError at execute-time (fail loud).
+        # builders. ``stage_factory(step) -> StageSpec`` covers ids the template
+        # builders don't know about (an LLM planner's own steps); without one,
+        # an unknown id still fails loudly rather than running a stranger.
         self._stages = stages
         self._stage_ctx = stage_ctx
+        self._stage_factory = stage_factory
+        self._built: dict[str, Any] = {}
         # Lazy import so the workflow package imports cleanly without crewai.
         from app.agents.runtime.stage_executor import (
             CrewAIStageExecutor,
@@ -117,10 +121,25 @@ class StageAdapterExecutor:
 
         self._inner = CrewAIStageExecutor()
 
+    def _spec_for(self, step: Step) -> Any:
+        spec = self._stages.get(step.id)
+        if spec is not None:
+            return spec
+        if step.id in self._built:
+            return self._built[step.id]
+        if self._stage_factory is None:
+            raise KeyError(
+                f"no stage built for step {step.id!r} (profile stages: "
+                f"{sorted(self._stages)})"
+            )
+        spec = self._stage_factory(step)
+        self._built[step.id] = spec
+        return spec
+
     async def execute(
         self, step: Step, upstream: dict[str, StepObservation]
     ) -> StepObservation:
-        spec = self._stages[step.id]
+        spec = self._spec_for(step)
         context = _serialize_upstream(upstream) if upstream else None
         # 运行中用户追加的指导：与 walker 同语义，注入下一次 dispatch 的
         # context 并立即清空（每条只投一次）。引擎路径的 respect_controls 会把

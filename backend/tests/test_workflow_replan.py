@@ -137,19 +137,39 @@ def test_revise_plan_retains_done_steps_and_reworks_flagged():
     # version bumped; replan_count incremented; flagged step re-runs, others kept.
     assert revised.version == plan.version + 1
     assert revised.replan_count == plan.replan_count + 1
-    assert revised.get("a").skip is True          # observation retained
-    assert revised.get("c").skip is True          # observation retained
-    assert revised.get("b").skip is False         # flagged -> re-run
+    assert revised.get("a").skip is True          # 上游未变，观测保留
+    # c 的旧观测是**基于坏掉的 b** 产出的；b 重跑后它就是陈旧结果，必须一起重跑。
+    assert revised.get("c").skip is False
+    assert revised.get("b").skip is False         # flagged -> 重跑
     # carried-over observations are exposed so the engine does not recompute them.
     assert revised.carry_observations["a"].output == "good"
-    assert revised.carry_observations["c"].output == "good"
     assert "b" not in revised.carry_observations
+    assert "c" not in revised.carry_observations
+
+
+def test_revise_plan_reworks_only_the_downstream_closure():
+    """并行兄弟不在失效闭包里：撤掉一支 advocate 不该让另一支白重跑。"""
+    plan = Plan(
+        goal="fan",
+        steps=[
+            Step(id="root", dependencies=[]),
+            Step(id="left", dependencies=["root"]),
+            Step(id="right", dependencies=["root"]),
+            Step(id="sink", dependencies=["left", "right"]),
+        ],
+    )
+    obs = {sid: StepObservation(step_id=sid, output=sid) for sid in plan.step_ids}
+    revised = revise_plan(plan, revise_step_ids=["left"], observations=obs)
+    assert {s.id: s.skip for s in revised.steps} == {
+        "root": True, "left": False, "right": True, "sink": False
+    }
+    assert set(revised.carry_observations) == {"root", "right"}
 
 
 async def test_engine_replan_only_re_runs_flagged_step():
-    """When verify flags only 'b', the revision re-runs 'b' but NOT the
-    already-passing 'a'/'c'. A real executor with observable side-effects
-    proves no work was redone."""
+    """When verify flags only 'b', the revision re-runs 'b' and everything
+    downstream of it, but NOT the untouched upstream 'a'. A real executor with
+    observable side-effects proves no unrelated work was redone."""
     plan = _seq_plan("a", "b", "c", max_replans=2)
     runs: list[str] = []
 
@@ -169,9 +189,9 @@ async def test_engine_replan_only_re_runs_flagged_step():
     result = await engine.run(plan)
     assert result.status == "completed"
     assert result.replans == 1
-    # First pass ran a, b, c. Revision re-ran ONLY b. a and c were retained.
+    # 首轮跑 a/b/c；重规划只重跑 b 与它的下游 c，未受影响的 a 保留。
     assert runs.count("a") == 1
-    assert runs.count("c") == 1
+    assert runs.count("c") == 2
     assert runs.count("b") == 2  # original + one re-run after revise
 
 

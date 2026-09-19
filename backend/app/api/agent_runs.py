@@ -45,6 +45,7 @@ from app.schemas import (
     AgentRunOut,
     AgentStepOut,
     ApproveRequest,
+    PlanGateRequest,
     PlanUpdateRequest,
     RejectRequest,
     RunInstructionRequest,
@@ -364,6 +365,47 @@ async def append_instruction(
     if ctl is not None:
         ctl.add_instruction(body.instruction)
     return ActionResult(ok=True, status="received")
+
+
+@router.post("/{run_id}/gate", response_model_exclude_none=True,
+             dependencies=[Depends(rate_limit_user(60, 60, "approval"))])
+async def set_plan_gate(
+    run_id: uuid.UUID,
+    body: PlanGateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """上闸/撤闸：让计划在下一个计划边界等人工确认，或放回「不阻塞」默认。
+
+    这是计划门唯一的用户入口。``PLAN_REQUIRE_CONFIRMATION`` 只决定代码路径
+    存在与否；真正让某一轮停下来等确认的是这里的 ``gate_requested`` 旗标。没
+    有它，用户既不能让未开闸的运行上闸，也没有任何地方能取消已经上的闸。
+
+    生效点是**下一个计划边界**（本轮尚未开跑时即本轮开头；已开跑则在下一次
+    重规划）。运行已经终态时拒绝。
+    """
+    run = await _load_run(db, run_id)
+    await _assert_owned(run, user)
+    if run.status in _TERMINAL_STATUSES:
+        return ActionResult(
+            ok=False, status=run.status, message="run already finished"
+        )
+    # PERSIST FIRST: durable gate command, then commit, THEN signal the run.
+    await durable_controls.record_gate(db, run.id, enabled=body.enabled)
+    await db.commit()
+    ctl = get_run_control(run.id)
+    if ctl is not None:
+        if body.enabled:
+            ctl.request_gate()
+        else:
+            ctl.clear_gate()
+    return ActionResult(
+        ok=True,
+        status="armed" if body.enabled else "released",
+        message="计划在下一个计划边界等待确认"
+        if body.enabled
+        else "计划门已解除，恢复默认不阻塞",
+    )
 
 
 @router.post("/{run_id}/pause", response_model_exclude_none=True)

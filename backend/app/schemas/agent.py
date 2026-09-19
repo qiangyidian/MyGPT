@@ -114,3 +114,9 @@ class PlanUpdateRequest(BaseModel):
 class RunInstructionRequest(BaseModel):
     instruction: str
 
+
+class PlanGateRequest(BaseModel):
+    """上闸（``enabled=True``）让计划在下一个边界先等人工确认；撤闸放回默认的「计划先行但不阻塞」。"""
+
+    enabled: bool = True
+

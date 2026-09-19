@@ -98,12 +98,15 @@ class LLMVerifier:
         provider: Any,
         model_config: Any = None,
         guard: Any = None,
+        stage_ctx: Any = None,
         fallback: Any = None,
     ) -> None:
         self._provider = provider
         self._model_config = model_config
         self._guard = guard
+        self._stage_ctx = stage_ctx
         self._fallback = fallback or RuleBasedVerifier()
+        self._calls = 0
 
     async def verify(
         self, plan: Plan, observations: dict[str, StepObservation]
@@ -155,8 +158,14 @@ class LLMVerifier:
 
         from app.agents.workflow.llm_planner import _charge
 
+        self._calls += 1
         _charge(
-            self._guard, getattr(result, "usage", None), self._model_config, "verifier"
+            self._guard,
+            getattr(result, "usage", None),
+            self._model_config,
+            "verifier",
+            stage_ctx=self._stage_ctx,
+            attempt=self._calls,
         )
 
         parsed = _parse_verdict_json(getattr(result, "content", "") or "", plan)

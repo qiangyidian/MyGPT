@@ -32,12 +32,8 @@ VALID_MODES = {
 # Tools considered "web" — disabled in create mode to keep it focused.
 _WEB_TOOLS = {"web_search", "http_get"}
 
-# Minimum length for auto-mode intent-driven multi-agent escalation, so trivial
-# one-liners ("分析下", "总结下") stay native. Lower = more aggressive.
-_AUTO_MULTI_MIN_LEN = 6
-
-# Below this confidence the model's intent judgment is NOT trusted — fall back to
-# the keyword router rather than act on an unsure classification.
+# Below this confidence the router does NOT auto-escalate a plain request to a
+# multi-agent crew. See app.agents.planning.research_signal_score for the scale.
 _INTENT_MIN_CONFIDENCE = 0.5
 
 
@@ -215,6 +211,7 @@ def decide_route(
         classify_intent,
         looks_like_debate_request,
         looks_like_multi_agent_request,
+        research_signal_score,
     )
 
     if looks_like_debate_request(user_content):
@@ -240,13 +237,14 @@ def decide_route(
             requested_mode="auto",
         )
 
-    # auto: intent-driven escalation. A research / compare / analyze / summary
-    # flavored question (non-trivial length) escalates to the REAL research crew
-    # — not only explicit "多Agent" keywords. This is the "less conservative"
-    # lever; tune _AUTO_MULTI_MIN_LEN to make it more or less aggressive.
+    # auto: intent-driven escalation, gated on *confidence*. A lone research-
+    # flavoured keyword ("总结一下这段") must not buy the user a 3-agent crew,
+    # because auto mode is the default and the cost is paid on every turn. The
+    # explicit signals above (multi-agent / debate keywords, deep_research mode)
+    # still escalate unconditionally — this only throttles the guess.
     if (
-        len(user_content.strip()) >= _AUTO_MULTI_MIN_LEN
-        and classify_intent(user_content) == "deep_research"
+        classify_intent(user_content) == "deep_research"
+        and research_signal_score(user_content) >= _INTENT_MIN_CONFIDENCE
     ):
         profile = "parallel_research" if has_knowledge_base else "deep_research"
         return RouteDecision(

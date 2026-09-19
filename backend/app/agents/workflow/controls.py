@@ -30,6 +30,11 @@ async def record_cancel(db: AsyncSession, run_id: uuid.UUID | str) -> None:
     await CommandStore(db).append(run_id, "cancel", {})
 
 
+async def record_gate(db: AsyncSession, run_id: uuid.UUID | str, *, enabled: bool) -> None:
+    """上闸 / 撤闸：让运行在下一个计划边界进入（或退出）人工确认门禁。"""
+    await CommandStore(db).append(run_id, "gate", {"enabled": bool(enabled)})
+
+
 async def record_instruction(
     db: AsyncSession, run_id: uuid.UUID | str, text: str
 ) -> None:
