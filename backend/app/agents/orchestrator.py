@@ -391,7 +391,6 @@ class ChatOrchestrator:
         from app.agents.workflow.engine import WorkflowEngine
         from app.agents.workflow.planner import build_plan_for_profile
         from app.agents.workflow.schemas import StepError
-        from app.agents.workflow.verifier import RuleBasedVerifier
 
         question = ctx.user_content or ""
         # profile 的唯一权威来源是 RuntimeSelection（orchestrator 在 stream()
@@ -400,13 +399,27 @@ class ChatOrchestrator:
         # 静默退化成 deep_research。
         selection = ctx.extra.get("runtime_selection")
         profile = getattr(selection, "agent_profile", None) or "deep_research"
-        plan = build_plan_for_profile(profile, question)
+
+        env = RunEnvironment.for_turn(ctx)
+
+        # LLM 规划器（flag 开时）：永远返回可用 plan（失败即回退模板）。
+        if bool(getattr(get_settings(), "AGENT_LLM_PLANNER", False)):
+            from app.agents.workflow.llm_planner import build_plan_with_llm
+
+            plan = await build_plan_with_llm(
+                provider=env.stage_ctx.provider,
+                model_config=ctx.model_config,
+                profile=profile,
+                question=question,
+                guard=env.guard,
+            )
+        else:
+            plan = build_plan_for_profile(profile, question)
         # 拓扑由 plan 推导 —— 与 walker 的静态 builder 等价（test_graph_from_plan
         # 对三个 profile 都有断言）。不再 import 具体的 builder，否则每加一个
         # profile 都要改这里。
         graph = graph_from_plan(plan)
 
-        env = RunEnvironment.for_turn(ctx)
         env.attach_graph(graph)
         # 计划门（与 walker 同语义）：计划先行、默认不阻塞；只有用户主动
         # 上闸（RunControl.request_gate）才在这里等确认。
@@ -457,7 +470,11 @@ class ChatOrchestrator:
 
         engine = WorkflowEngine(
             executor=_EnvExecutor(),
-            verifier=RuleBasedVerifier(),
+            verifier=self._engine_verifier(
+                provider=env.stage_ctx.provider,
+                model_config=ctx.model_config,
+                guard=env.guard,
+            ),
             run_id=run.id,
             session_factory=ctx.extra.get("persistence_session_factory"),
             before_step=lambda step_id: env.respect_controls(),
@@ -548,6 +565,20 @@ class ChatOrchestrator:
             finish_reason="stop",
             usage=usage,
             budget=ctx.extra.get("budget"),
+        )
+
+    def _engine_verifier(self, *, provider: Any, model_config: Any, guard: Any) -> Any:
+        """按 flag 选 verifier。默认规则版；flag 开但没 provider 时也回退规则版。"""
+        from app.agents.workflow.verifier import RuleBasedVerifier
+
+        if not bool(getattr(get_settings(), "AGENT_LLM_VERIFIER", False)):
+            return RuleBasedVerifier()
+        if provider is None:
+            return RuleBasedVerifier()
+        from app.agents.workflow.llm_verifier import LLMVerifier
+
+        return LLMVerifier(
+            provider=provider, model_config=model_config, guard=guard
         )
 
     def _build_stage_adapter(
