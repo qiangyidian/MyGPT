@@ -122,6 +122,15 @@ class StageAdapterExecutor:
     ) -> StepObservation:
         spec = self._stages[step.id]
         context = _serialize_upstream(upstream) if upstream else None
+        # 运行中用户追加的指导：与 walker 同语义，注入下一次 dispatch 的
+        # context 并立即清空（每条只投一次）。引擎路径的 respect_controls 会把
+        # 它们收进 stage_ctx.pending_instructions，以前没人取用 → 追加指令在
+        # 引擎上静默丢失（验收 §11.2 要求两条路径都能追加指令）。
+        pending = list(getattr(self._stage_ctx, "pending_instructions", None) or [])
+        if pending:
+            self._stage_ctx.pending_instructions = []
+            block = "[用户追加指导]\n" + "\n".join(f"- {i}" for i in pending)
+            context = f"{context}\n\n{block}" if context else block
         result = await self._inner.execute(
             agent_id=step.id,
             agent=spec.agent,
@@ -140,12 +149,14 @@ class StageAdapterExecutor:
 def _serialize_upstream(upstream: dict[str, StepObservation]) -> str:
     """Flatten upstream observations into a context string for the next stage.
 
-    Mirrors what the live runtime feeds into ``aexecute_task`` as ``context``:
-    each prior step's output, in dependency order.
+    Mirrors what the live runtime feeds into ``aexecute_task`` as ``context``.
+    The engine hands over **only this step's declared dependencies** (see
+    ``engine._dependency_view``), so this stays a faithful flat map of the
+    handoff: a parallel sibling's output never leaks in here.
     """
     parts: list[str] = []
     for sid, obs in upstream.items():
         body = (obs.output or "").strip()
         if body:
-            parts.append(f"[{sid}]\n{body}")
+            parts.append(f"[{sid} output]\n{body}")
     return "\n\n".join(parts)

@@ -10,9 +10,19 @@ Each step is scheduled as an asyncio task that:
   1. waits for its dependencies' observations (an ``asyncio.Event`` per step),
   2. acquires a bounded-concurrency semaphore and increments the in-flight
      counter (the engine records the peak -> ``result.max_concurrency``),
-  3. runs the injected :class:`~app.agents.workflow.executor.StepExecutor`,
-  4. retries only on transient errors up to the step's :class:`RetryPolicy`,
+  3. runs the injected :class:`~app.agents.workflow.executor.StepExecutor` with
+     ONLY its declared dependencies' observations as upstream (parallel siblings
+     must never see each other's output — that would fake parallel independence),
+     under a per-step wall-clock timeout =
+     ``min(step.timeout_seconds, budget remaining)`` when either is known,
+  4. retries only on transient errors up to the step's :class:`RetryPolicy`
+     (a step timeout is transient, so it re-runs or fails within the budget),
   5. checkpoints its observation so downstream steps (and the verifier) see it.
+
+Cancellation is NOT a step failure: a :class:`asyncio.CancelledError` reaching a
+step (user cancel at the ``before_step`` boundary, the outer task being
+cancelled, ...) is surfaced through ``on_step_cancel`` and re-raised, so the
+caller settles the run as cancelled instead of retrying / failing it.
 
 After every step completes, the :class:`~app.agents.workflow.verifier.Verifier`
 inspects the accumulated observations. ``pass`` completes the run; ``fail``
@@ -45,6 +55,7 @@ from app.agents.workflow.planner import revise_plan, validate_plan
 from app.agents.workflow.schemas import (
     Plan,
     Step,
+    StepError,
     StepObservation,
     VerificationVerdict,
     VerifierResult,
@@ -71,7 +82,9 @@ class WorkflowEngine:
         on_step_end: Any = None,
         on_step_error: Any = None,
         on_step_retry: Any = None,
+        on_step_cancel: Any = None,
         before_step: Any = None,
+        budget_remaining_seconds: Any = None,
     ) -> None:
         self._executor = executor
         self._verifier = verifier
@@ -82,7 +95,13 @@ class WorkflowEngine:
         self._on_step_end = on_step_end
         self._on_step_error = on_step_error
         self._on_step_retry = on_step_retry
+        self._on_step_cancel = on_step_cancel
         self._before_step = before_step
+        # 预算剩余秒数的取值器（``Callable[[], float | None]``）。引擎不认识
+        # BudgetGuard，只用它把每步的挂钟超时压进整轮预算内 —— 否则一个卡死的
+        # 步骤可以越过 AGENT_MAX_RUNTIME_SECONDS 一直挂着，而暂停/取消要等它让出
+        # 控制权才进得来（before_step 在其之后）。
+        self._budget_remaining = budget_remaining_seconds
 
     # ------------------------------------------------------------------ #
     async def run(
@@ -264,6 +283,15 @@ class WorkflowEngine:
             for sid, obs in results:
                 if obs is None and sid is not None:
                     failed_step = sid
+        except asyncio.CancelledError:
+            # 取消不是失败：撤掉所有在途步骤再原样上抛，让调用方按 cancelled 收尾
+            # （与 walker 的 gather + cancel  siblings + raise 同构）。gather 不会
+            # 自行取消其余子任务，不显式收就会泄漏一批悬挂的 step。
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         except Exception:  # pragma: no cover - run_step traps its own errors
             # Defensive: cancel anything still in flight.
             for t in tasks:
@@ -291,6 +319,11 @@ class WorkflowEngine:
         policy = step.retry_policy
         attempt_number_base = await self._next_attempt_number(step.id)
         attempt = 0
+        # 上游 = **仅本步声明的依赖**，不是全部累计观测。并行兄弟（debate 的两个
+        # advocate、task_decomposition 的并行 worker）一旦互相看到对方产出，并行
+        # 独立性就是假的，且会把 prompt 撑爆。对照 walker 的
+        # ``CrewAIRuntime._run_one_stage``（它按 spec.depends_on 拼 context）。
+        upstream = _dependency_view(step, observations)
         while True:
             attempt += 1
             attempt_number = attempt_number_base + attempt - 1
@@ -304,7 +337,7 @@ class WorkflowEngine:
                         state.in_flight += 1
                         state.peak = max(state.peak, state.in_flight)
                         try:
-                            obs = await self._executor.execute(step, dict(observations))
+                            obs = await self._execute_within_deadline(step, upstream)
                         finally:
                             state.in_flight -= 1
                     if obs.usage is None:
@@ -318,6 +351,15 @@ class WorkflowEngine:
                     )
                 observe_counter("workflow.steps", 1, outcome="done")
                 return obs
+            except asyncio.CancelledError:
+                # 取消（用户取消 / 外层任务被撤 / 步骤被 cancel）既不是失败也不
+                # 是 transient 错误：不发 failed 事件、不写 error attempt、不进
+                # 重试循环 —— 打一个 cancelled 观测后原样上抛，由调用方把整轮
+                # 收成 cancelled。旧实现把它当成「永久失败」，于是引擎返回
+                # failed，orchestrator 又把取消当成异常去回退 CrewAI，用户点了
+                # 停止反而把整轮重跑一遍。
+                await self._call_hook(self._on_step_cancel, step.id)
+                raise
             except BaseException as exc:
                 transient = policy.is_transient(exc) and attempt <= policy.max_retries
                 await self._error_attempt(step.id, attempt_number, exc, transient)
@@ -336,6 +378,48 @@ class WorkflowEngine:
                 await self._call_hook(self._on_step_error, step.id, str(exc))
                 observe_counter("workflow.steps", 1, outcome="failed")
                 return None
+
+    # ------------------------------------------------------------------ #
+    async def _execute_within_deadline(
+        self, step: Step, upstream: dict[str, StepObservation]
+    ) -> StepObservation:
+        """Run one attempt under ``min(step.timeout_seconds, 预算剩余)`` 挂钟超时。
+
+        超时按 :class:`StepError` 的 transient 语义抛出（可重试），而不是让整轮
+        挂在一个不返回的步骤上。``asyncio.timeout`` 通过 cancel 内部 await 点来
+        打断，所以取消能一直穿透到 inner executor（真步骤 = CrewAI 的
+        ``aexecute_task``）。
+        """
+        limit = self._step_timeout_seconds(step)
+        if limit is None:
+            return await self._executor.execute(step, upstream)
+        try:
+            async with asyncio.timeout(limit):
+                return await self._executor.execute(step, upstream)
+        except TimeoutError as exc:
+            # 消息里带 "timeout"：即使某步的重试策略没声明 StepError，字符串
+            # 匹配也能把它认成 transient（模板里的 _TRANSIENT 就含该关键字）。
+            raise StepError(
+                f"step {step.id!r} timeout after {limit:.1f}s", transient=True
+            ) from exc
+
+    # ------------------------------------------------------------------ #
+    def _step_timeout_seconds(self, step: Step) -> float | None:
+        """本步的挂钟上限；None = 不限时（无预算取值器且步骤没声明超时）。"""
+        limits: list[float] = []
+        if step.timeout_seconds is not None and step.timeout_seconds > 0:
+            limits.append(float(step.timeout_seconds))
+        if self._budget_remaining is not None:
+            try:
+                remaining = float(self._budget_remaining())
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # 预算读数失败不该打断执行（也不该吞取消）
+                logger.debug("budget remaining_seconds failed", exc_info=True)
+                remaining = None
+            if remaining is not None:
+                limits.append(max(remaining, 0.0))
+        return min(limits) if limits else None
 
     # ------------------------------------------------------------------ #
     # 只读步骤回调
@@ -476,6 +560,22 @@ class WorkflowEngine:
 
     def _persistence_enabled(self) -> bool:
         return self._run_id is not None and self._session_factory is not None
+
+
+# --------------------------------------------------------------------------- #
+def _dependency_view(
+    step: Step, observations: dict[str, StepObservation]
+) -> dict[str, StepObservation]:
+    """本步的依赖产出（按 ``step.dependencies`` 声明序），不含其它步骤的观测。
+
+    依赖尚未记录观测（例如被撤掉的 skip 步）就跳过；无依赖 → 空 dict，
+    与 walker 给首个 stage 传 ``context=None`` 等价。
+    """
+    return {
+        dep: observations[dep]
+        for dep in step.dependencies
+        if dep in observations
+    }
 
 
 # --------------------------------------------------------------------------- #

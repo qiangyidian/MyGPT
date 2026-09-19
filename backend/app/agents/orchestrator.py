@@ -452,7 +452,7 @@ class ChatOrchestrator:
         if injected is not None:
             inner = injected
         else:
-            inner = self._build_stage_adapter(ctx, run, env)
+            inner = await self._build_stage_adapter(ctx, run, env)
 
         class _EnvExecutor:
             """把引擎的步骤执行接到 RunEnvironment 的共享上下文上。
@@ -468,6 +468,11 @@ class ChatOrchestrator:
                 except (BudgetExceeded, PromptAdmissionError) as exc:
                     raise StepError(str(exc), transient=False) from exc
 
+        def _budget_remaining() -> float | None:
+            # 引擎给每步施加 min(步骤 timeout_seconds, 预算剩余) 的挂钟超时。
+            # guard 为 None（无预算的注入执行器/测试）时返回 None = 不限时。
+            return None if env.guard is None else env.guard.remaining_seconds
+
         engine = WorkflowEngine(
             executor=_EnvExecutor(),
             verifier=self._engine_verifier(
@@ -478,6 +483,7 @@ class ChatOrchestrator:
             run_id=run.id,
             session_factory=ctx.extra.get("persistence_session_factory"),
             before_step=lambda step_id: env.respect_controls(),
+            budget_remaining_seconds=_budget_remaining,
             on_step_start=env.step_started,
             on_step_end=lambda step_id, output, usage: env.step_completed(
                 step_id,
@@ -488,6 +494,13 @@ class ChatOrchestrator:
             on_step_error=lambda step_id, message: env.step_failed(
                 step_id, error=message
             ),
+            # transient 重试的观测通道：节点从 failed 翻回 running + 「第 N 次
+            # 尝试」标记。以前没接这个钩子，重试期间前端节点一直显示 failed。
+            on_step_retry=lambda step_id, attempt, error: env.step_retrying(
+                step_id, attempt=attempt, error=error
+            ),
+            # 取消不是失败：节点按 cancelled 收尾（与 walker 的 step_cancelled 同）。
+            on_step_cancel=env.step_cancelled,
         )
 
         # 驱动引擎的同时并发排空 env 的事件队列，让面板实时更新 —— 与 walker
@@ -500,10 +513,19 @@ class ChatOrchestrator:
         # 执行；先 await asyncio.sleep(0) 让已排队的回调落地，再放哨兵。
         result_holder: dict[str, Any] = {}
         engine_exc: list[BaseException] = []
+        cancelled = False
 
         async def _run_engine() -> None:
+            nonlocal cancelled
             try:
                 result_holder["result"] = await engine.run(plan)
+            except asyncio.CancelledError:
+                cancelled = True
+                # 与 walker 的 run_flow 同构：把整轮收成 cancelled（节点已由
+                # on_step_cancel 逐个标记，这里补在途/未启动的 + run_status）。
+                env.cancel_all_steps()
+                env.finish("cancelled")
+                raise
             except BaseException as exc:
                 engine_exc.append(exc)
             finally:
@@ -519,11 +541,21 @@ class ChatOrchestrator:
                 yield evt
         finally:
             if not engine_task.done():
+                # 排空循环被打断（客户端断连）：撤掉引擎，让它自己走 cancelled
+                # 收尾，而不是留一堆 running 节点。
                 engine_task.cancel()
+                cancelled = True
             try:
                 await engine_task
             except (asyncio.CancelledError, Exception):
                 pass
+            if cancelled:
+                env.cancel_all_steps()
+                # 终态快照：取消后刷新页面必须看到 cancelled，而不是卡在 running。
+                await env.persist_graph(definition=False)
+
+        if cancelled:
+            raise asyncio.CancelledError()
 
         if engine_exc:
             raise engine_exc[0]
@@ -581,7 +613,7 @@ class ChatOrchestrator:
             provider=provider, model_config=model_config, guard=guard
         )
 
-    def _build_stage_adapter(
+    async def _build_stage_adapter(
         self, ctx: AgentTurnContext, run: AgentRun, env: RunEnvironment
     ):
         """Build the real StageAdapterExecutor from the existing crew stages.
@@ -598,15 +630,19 @@ class ChatOrchestrator:
             build_task_decomposition_stages,
             build_write_review_stages,
         )
+        from app.agents.runtime.crewai_runtime import build_runtime_tools
         from app.agents.workflow.executor import StageAdapterExecutor
 
         # stage_ctx / 预算守卫来自共享的 RunEnvironment —— 与 walker 路径同一实例。
         guard = env.guard
         llm = CrewAILLMFactory.from_model_config(ctx.model_config, budget_guard=guard)
         stage_ctx = env.stage_ctx
-        # tools are not strictly needed by the adapter contract (CrewAIStageExecutor
-        # receives agent+task from the StageSpec, which already embed tools); pass
-        # an empty list to satisfy the builder signature.
+        # 工具与 walker **同一构造函数、同一份代码**（app.agents.runtime.
+        # crewai_runtime.build_runtime_tools）：route 白名单、MCP/connector 合并、
+        # per-run 归属与调用者身份收口都在一起。这里以前传 tools=[]，而 builder
+        # 内部是 tools=tools or None —— 名单内 profile 一上引擎就静默地不检索、
+        # 不调工具。
+        tools = await build_runtime_tools(ctx, stage_ctx=stage_ctx)
         builders = {
             "parallel_research": build_parallel_research_stages,
             "debate": build_debate_stages,
@@ -618,7 +654,7 @@ class ChatOrchestrator:
         selection = ctx.extra.get("runtime_selection")
         profile = getattr(selection, "agent_profile", None) or "deep_research"
         builder = builders.get(profile, build_research_stages)
-        _, stages = builder(llm=llm, tools=[], question=ctx.user_content or "")
+        _, stages = builder(llm=llm, tools=tools, question=ctx.user_content or "")
         stages_by_id = {spec.agent_id: spec for spec in stages}
         return StageAdapterExecutor(stages_by_id, stage_ctx)
 

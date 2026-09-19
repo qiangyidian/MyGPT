@@ -111,10 +111,39 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
+        """Bind this stage's attribution for the whole call, then release it.
+
+        The binding is per-task (see :meth:`StageContext.set_stage`), so tools
+        invoked by a *concurrently running* sibling stage cannot be attributed
+        to this agent — with the old single-slot holder they could, which made
+        parallel stages' tool rows land on the wrong agent card.
+        """
+        token = stage_ctx.set_stage(
+            agent_id=agent_id, task_id=getattr(task, "id", "") or ""
+        )
+        try:
+            return await self._run_stage(
+                agent_id=agent_id,
+                agent=agent,
+                task=task,
+                context=context,
+                stage_ctx=stage_ctx,
+            )
+        finally:
+            stage_ctx.reset_stage(token)
+
+    async def _run_stage(
+        self,
+        *,
+        agent_id: str,
+        agent: Any,
+        task: Any,
+        context: str | None,
+        stage_ctx: StageContext,
+    ) -> StageResult:
         admitted_context = admit_stage_dispatch(
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )
-        stage_ctx.set_stage(agent_id=agent_id, task_id=getattr(task, "id", "") or "")
         llm = getattr(agent, "llm", None)
         realtime_generation_before = int(
             getattr(llm, "_usage_charge_generation", 0) or 0

@@ -218,6 +218,18 @@ class RunEnvironment:
         self._stop_progress(step_id)
         self.emitter.emit_agent_cancelled(step_id)
 
+    def cancel_all_steps(self) -> None:
+        """整轮取消后的收尾：心跳全停 + 所有未终态节点收成 cancelled。
+
+        引擎路径的取消不像 walker 那样「每个 stage 各自 except CancelledError」
+        —— 取消可能落在等待依赖、before_step、或某个在途步骤之后的任意 await 点，
+        那些没机会发事件的节点必须在这一刀里补上，否则节点卡在 running/pending。
+        """
+        self._stop_all_progress()
+        if self._emitter is None:  # pragma: no cover - 图都没装上，无事可收
+            return
+        self._emitter.cancel_unfinished()
+
     def finish(self, status: str) -> None:
         self._stop_all_progress()
         self.emitter.emit_run_status(status)

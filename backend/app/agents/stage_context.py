@@ -6,10 +6,13 @@ Two problems this solves:
    ``agent.aexecute_task``; the agent's adapted tools may execute in worker
    threads (see ``adapters.tool_adapter._bridge_async``). The current agent id
    varies per stage, but adapters are built once per run. A mutable
-   :class:`StageContext` holder is shared between the executor (which sets
-   ``agent_id`` before each stage) and every adapter (which reads it at call
-   time). String assignment is atomic in CPython, and we never switch the
-   agent mid-stage, so a tool always reads the correct id.
+   :class:`StageContext` holder is shared between the executor (which binds
+   ``agent_id`` for the duration of each stage) and every adapter (which reads
+   it at call time). The binding is a **contextvar**, so several stages running
+   concurrently (parallel specs in one walker stage, up to 8 engine steps) each
+   see their own agent id instead of whatever sibling wrote last; a tool call
+   that lands in a thread which never inherited the context falls back to the
+   last-written single slot.
 
 2. **Real-time tool events across threads.** The runtime drains an
    ``asyncio.Queue`` on the main loop while ``aexecute_task`` runs. Tool
@@ -26,6 +29,7 @@ import asyncio
 import logging
 import weakref
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +42,22 @@ logger = logging.getLogger(__name__)
 # Soft cap on the per-run event queue. Tools are not high-frequency; if this
 # ever fills we drop (logged) rather than block a worker thread.
 _QUEUE_MAX = 512
+
+
+@dataclass(frozen=True)
+class _StageSlot:
+    """一次 stage 的归属（agent / task）。不可变，写入即换一个新值。"""
+
+    agent_id: str = ""
+    task_id: str = ""
+
+
+# 「当前正在跑哪个 stage」的每任务绑定。contextvar 是这里唯一能同时满足
+# 「并发步骤各归各的」和「工作线程里读得到」的机制：asyncio 任务各拿一份副本，
+# 而线程不继承 —— 不继承时读侧回落到 :attr:`StageContext._legacy_slot`。
+_CURRENT_STAGE: ContextVar[_StageSlot | None] = ContextVar(
+    "crewai_current_stage", default=None
+)
 
 
 @dataclass
@@ -128,9 +148,9 @@ class LLMUsageCoordinator:
 class StageContext:
     """Shared, mutable per-run context for CrewAI tool attribution + events.
 
-    The executor sets :attr:`agent_id` (and :attr:`task_id`) before each stage;
-    adapters read them inside ``_run``. :meth:`emit` forwards an event to the
-    main-loop queue thread-safely.
+    The executor scopes :meth:`set_stage` around each stage (and resets it in
+    ``finally``); adapters read :attr:`agent_id` / :attr:`task_id` inside
+    ``_run``. :meth:`emit` forwards an event to the main-loop queue thread-safely.
     """
 
     run_id: str
@@ -144,8 +164,9 @@ class StageContext:
         default_factory=lambda: asyncio.Queue(maxsize=_QUEUE_MAX)
     )
     # Set by the executor before each stage; read by adapters at tool-call time.
-    agent_id: str = ""
-    task_id: str = ""
+    # 见 :meth:`set_stage` —— 真实值来自每任务绑定的 contextvar，下面这个单槽
+    # 只是没有上下文的工作线程（CrewAI 自己起线程跑工具）里的回落值。
+    _legacy_slot: _StageSlot = field(default_factory=_StageSlot)
     # Optional cross-thread approval bridge — when set, dangerous tools that
     # need approval pause the worker thread until the user decides.
     approval_bridge: Any = None
@@ -184,9 +205,43 @@ class StageContext:
     _dropped: int = 0
     _drop_warned: bool = False
 
-    def set_stage(self, *, agent_id: str, task_id: str = "") -> None:
-        self.agent_id = agent_id
-        self.task_id = task_id
+    def set_stage(self, *, agent_id: str, task_id: str = "") -> Token[_StageSlot]:
+        """绑定「现在跑的是哪个 stage」，返回交给 :meth:`reset_stage` 的 token。
+
+        两条腿一起写，因为读侧（工具适配器）可能出现在两种地方：
+
+          * **同一个 asyncio 任务**（引擎并发 8 步、walker 同一 stage 并行多个
+            spec 都走这里）：contextvar 每任务一份，所以工具事件归属到发起它的
+            那一步，而不是「最后写单槽的那一步」—— 旧单槽在并发下会把 A 步的
+            工具算到 B 步头上。
+          * **CrewAI 自己的工作线程**（不继承上下文，读不到 contextvar）：
+            回落到单槽，行为与修前一致，不会更差。
+        """
+        slot = _StageSlot(agent_id=agent_id, task_id=task_id)
+        self._legacy_slot = slot
+        return _CURRENT_STAGE.set(slot)
+
+    @staticmethod
+    def reset_stage(token: Token[_StageSlot] | None) -> None:
+        """解绑本次 stage 的归属（stage 结束 / 失败 / 取消都要走到）。"""
+        if token is None:  # pragma: no cover - 只有旧调用方传 None
+            return
+        try:
+            _CURRENT_STAGE.reset(token)
+        except ValueError:
+            # 跨任务 reset（token 属于另一个 Context）。单槽仍是对的，忽略即可。
+            logger.debug("stage attribution token reset across contexts", exc_info=True)
+
+    def _current_slot(self) -> _StageSlot:
+        return _CURRENT_STAGE.get() or self._legacy_slot
+
+    @property
+    def agent_id(self) -> str:
+        return self._current_slot().agent_id
+
+    @property
+    def task_id(self) -> str:
+        return self._current_slot().task_id
 
     def emit(self, event: AgentEvent) -> None:
         """Thread-safe forward to the main-loop queue. Never blocks."""

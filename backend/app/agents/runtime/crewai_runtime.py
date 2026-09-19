@@ -877,77 +877,13 @@ class CrewAIRuntime:
     async def _build_tools(
         self, ctx: AgentTurnContext, *, stage_ctx: StageContext | None
     ) -> list[Any]:
-        if not ctx.enable_tools:
-            return []
-        from app.agents.intent_router import filter_tool_names
+        """Compatibility shim —— 真正的构建逻辑在 :func:`build_runtime_tools`。
 
-        registry = __import__("app.tools.registry_init", fromlist=["get_default_registry"]).get_default_registry()
-        # Merge statically-configured MCP server tools so the CrewAI runtime also
-        # offers them; each wrapper routes through ToolGateway (via the shared
-        # budget/audit path) like a builtin. No-op when MCP is unconfigured.
-        from app.agents.mcp_client import merge_mcp_tools
-
-        merge_mcp_tools(registry)
-        user_id = ctx.user.id if ctx.user else None
-        # Per-tenant connector→session lifecycle (Task 9 follow-up): merge THIS
-        # user's enabled-connector tools through the same gateway path. The
-        # manager is cached on ctx.extra so multi-stage runs open sessions once
-        # and reuse them across stages (idempotent open_for_user); stream_turn's
-        # finally closes them at run end.
-        if user_id is not None:
-            _stashed_mgr = ctx.extra.get("_connector_session_manager")
-            _local_mgr = None
-            try:
-                if _stashed_mgr is None:
-                    from app.connectors.sessions import ConnectorSessionManager
-
-                    _local_mgr = ConnectorSessionManager(ctx.db)
-                    _conn_registry = await _local_mgr.open_for_user(user_id)
-                    merge_mcp_tools(registry, mcp_registry=_conn_registry)
-                    ctx.extra["_connector_session_manager"] = _local_mgr
-                else:
-                    _conn_registry = await _stashed_mgr.open_for_user(user_id)
-                    merge_mcp_tools(registry, mcp_registry=_conn_registry)
-            except Exception:
-                logger.warning(
-                    "crewai connector→session merge failed for run %s; skipping",
-                    ctx.run_id, exc_info=True,
-                )
-                # Defensive: a freshly-created (uncached) manager that failed
-                # before being stashed must be closed so sessions don't leak.
-                if _local_mgr is not None and _stashed_mgr is None:
-                    try:
-                        await _local_mgr.close_all()
-                    except Exception:
-                        pass
-        # Apply the intent route's allowlist / disable_web (search / create modes).
-        route = ctx.extra.get("route")
-        sources = list(registry.list())
-        if route is not None:
-            allowed = set(filter_tool_names([s.name for s in sources], route))
-            sources = [s for s in sources if s.name in allowed]
-        tools: list[Any] = []
-        for src in sources:
-            try:
-                tools.append(
-                    build_crewai_tool(
-                        src,
-                        conversation_id=ctx.conversation.id,
-                        message_id=ctx.assistant_msg.id,
-                        run_id=ctx.run_id,
-                        user_id=user_id,
-                        stage_ctx=stage_ctx,
-                        budget_guard=ctx.budget_guard,
-                        max_result_chars=(
-                            ctx.budget_guard.limits.max_tool_output_chars
-                            if ctx.budget_guard is not None
-                            else 8_000
-                        ),
-                    )
-                )
-            except Exception as exc:
-                logger.warning("failed to adapt tool %s: %s", src.name, exc)
-        return tools
+        提到模块级是为了让**引擎路径复用同一套构建**（``orchestrator.
+        _build_stage_adapter``）：以前引擎侧的 crew 拿到的是 ``tools=[]``，
+        名单内的 profile 上了引擎就静默地不检索、不调工具。
+        """
+        return await build_runtime_tools(ctx, stage_ctx=stage_ctx)
 
     @staticmethod
     def _record_budget(
@@ -964,4 +900,91 @@ class CrewAIRuntime:
         assistant.metadata_ = {
             **(getattr(assistant, "metadata_", None) or {}), "budget": snapshot
         }
+
+
+# --------------------------------------------------------------------------- #
+# Shared tool construction (walker + workflow engine)
+#
+# 这是**唯一**的「一次 run 该带哪些工具」的入口。引擎路径
+# （``orchestrator._build_stage_adapter``）必须调它而不是自己攒一份：曾经它传
+# ``tools=[]`` 给 crew builder，而 builder 里是 ``tools=tools or None`` —— 于是
+# 名单内的 profile 一上引擎就静默地不检索、不调工具，产出无据答案。提到模块级而
+# 不是留在类里，就是为了让两条 walker 拿到**字面上同一段代码**（含 per-user
+# connector 合并、route 白名单，以及工具执行时的调用者身份 —— 身份由
+# ``ToolGateway`` 用 ``bind_tool_context`` 绑定，见 app/tools/context.py）。
+# --------------------------------------------------------------------------- #
+async def build_runtime_tools(
+    ctx: AgentTurnContext, *, stage_ctx: StageContext | None
+) -> list[Any]:
+    if not ctx.enable_tools:
+        return []
+    from app.agents.intent_router import filter_tool_names
+
+    registry = __import__("app.tools.registry_init", fromlist=["get_default_registry"]).get_default_registry()
+    # Merge statically-configured MCP server tools so the CrewAI runtime also
+    # offers them; each wrapper routes through ToolGateway (via the shared
+    # budget/audit path) like a builtin. No-op when MCP is unconfigured.
+    from app.agents.mcp_client import merge_mcp_tools
+
+    merge_mcp_tools(registry)
+    user_id = ctx.user.id if ctx.user else None
+    # Per-tenant connector→session lifecycle (Task 9 follow-up): merge THIS
+    # user's enabled-connector tools through the same gateway path. The
+    # manager is cached on ctx.extra so multi-stage runs open sessions once
+    # and reuse them across stages (idempotent open_for_user); stream_turn's
+    # finally closes them at run end.
+    if user_id is not None:
+        _stashed_mgr = ctx.extra.get("_connector_session_manager")
+        _local_mgr = None
+        try:
+            if _stashed_mgr is None:
+                from app.connectors.sessions import ConnectorSessionManager
+
+                _local_mgr = ConnectorSessionManager(ctx.db)
+                _conn_registry = await _local_mgr.open_for_user(user_id)
+                merge_mcp_tools(registry, mcp_registry=_conn_registry)
+                ctx.extra["_connector_session_manager"] = _local_mgr
+            else:
+                _conn_registry = await _stashed_mgr.open_for_user(user_id)
+                merge_mcp_tools(registry, mcp_registry=_conn_registry)
+        except Exception:
+            logger.warning(
+                "crewai connector→session merge failed for run %s; skipping",
+                ctx.run_id, exc_info=True,
+            )
+            # Defensive: a freshly-created (uncached) manager that failed
+            # before being stashed must be closed so sessions don't leak.
+            if _local_mgr is not None and _stashed_mgr is None:
+                try:
+                    await _local_mgr.close_all()
+                except Exception:
+                    pass
+    # Apply the intent route's allowlist / disable_web (search / create modes).
+    route = ctx.extra.get("route")
+    sources = list(registry.list())
+    if route is not None:
+        allowed = set(filter_tool_names([s.name for s in sources], route))
+        sources = [s for s in sources if s.name in allowed]
+    tools: list[Any] = []
+    for src in sources:
+        try:
+            tools.append(
+                build_crewai_tool(
+                    src,
+                    conversation_id=ctx.conversation.id,
+                    message_id=ctx.assistant_msg.id,
+                    run_id=ctx.run_id,
+                    user_id=user_id,
+                    stage_ctx=stage_ctx,
+                    budget_guard=ctx.budget_guard,
+                    max_result_chars=(
+                        ctx.budget_guard.limits.max_tool_output_chars
+                        if ctx.budget_guard is not None
+                        else 8_000
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning("failed to adapt tool %s: %s", src.name, exc)
+    return tools
 

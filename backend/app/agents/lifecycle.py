@@ -287,6 +287,23 @@ class AgentLifecycleEmitter:
             if node and node.status not in _TERMINAL and node.status != AgentNodeStatus.running:
                 self.emit_agent_cancelled(nid)
 
+    def cancel_unfinished(self) -> list[str]:
+        """整轮被取消时的收尾：把仍然 open（pending/waiting/running）的节点全部
+        收成 cancelled，一个都不留。
+
+        引擎路径的取消可能发生在任意时刻 —— 在途步骤由 ``on_step_cancel`` 逐个
+        标记，但还没轮到启动的节点没有任何回调会来标记它们，不补这一刀的话刷新
+        页面会看到一堆永远 running/pending 的节点。已终态（completed/failed/
+        cancelled）不动 —— 那是真实发生过的事。
+        """
+        cancelled: list[str] = []
+        for node in list(self.graph.nodes):
+            if node.status in _TERMINAL:
+                continue
+            self.emit_agent_cancelled(node.id)
+            cancelled.append(node.id)
+        return cancelled
+
     # ------------------------------------------------------------------ #
     # Tool attribution (current tool on a node card)
     # ------------------------------------------------------------------ #
