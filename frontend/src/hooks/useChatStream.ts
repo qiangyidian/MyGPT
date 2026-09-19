@@ -400,6 +400,7 @@ export function useChatStream(): ChatStreamState {
             error: e.error,
             usage: e.usage,
             costUsd: e.costUsd,
+            retrying: e.retrying,
           },
         });
       },

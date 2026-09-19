@@ -23,6 +23,8 @@ interface PlanReviewProps {
   acceptanceCriteria?: string[];
   /** Current plan status (e.g. "proposed" | "confirmed" | "updated"). */
   status?: string;
+  /** 计划门已上闸（用户主动暂停等确认）。draft 态据此显示两态文案。 */
+  gating?: boolean;
   onApprove?: (runId: string) => Promise<unknown>;
   onRevise?: (runId: string, revision: { summary?: string }) => Promise<unknown>;
   className?: string;
@@ -39,6 +41,7 @@ export function PlanReview({
   steps,
   acceptanceCriteria,
   status,
+  gating,
   onApprove,
   onRevise,
   className,
@@ -83,6 +86,11 @@ export function PlanReview({
         {status && (
           <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
             {status}
+          </span>
+        )}
+        {status === "draft" && (
+          <span className={cn("text-[11px]", gating ? "text-blue-600 dark:text-blue-400" : "text-muted-foreground")}>
+            {gating ? "等待你的确认" : "计划已发布 · 执行中（可随时暂停修改）"}
           </span>
         )}
       </div>

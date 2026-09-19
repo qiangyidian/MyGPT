@@ -109,6 +109,7 @@ function DurableRunSurface({ runId }: { runId: string }) {
           steps={plan.steps ?? []}
           acceptanceCriteria={plan.acceptanceCriteria}
           status={planStatus}
+          gating={reconciled.paused || reconciled.blocked}
           onApprove={(id) => api.confirmPlan(id)}
           onRevise={(id, rev) => api.updatePlan(id, rev)}
         />

@@ -109,6 +109,12 @@ export function AgentNodeCard({
         )}
       </div>
 
+      {node.retrying && (
+        <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+          正在重试（第 {node.retrying.attempt} 次尝试）{node.retrying.error ? `· ${node.retrying.error}` : ""}
+        </div>
+      )}
+
       {hasDetail && (
         <button
           type="button"

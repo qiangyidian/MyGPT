@@ -60,6 +60,8 @@ export interface AgentGraphNode {
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   /** 该 stage 的成本（USD）。 */
   costUsd?: number;
+  /** 正在重试（引擎 transient 重试）：{attempt, error}。 */
+  retrying?: { attempt: number; error: string };
   /** 运行中心跳的最近状态行（如「最近工具：web_search」）。 */
   progressNote?: string;
   error?: string;
@@ -131,6 +133,11 @@ export const TERMINAL_NODE_STATUSES: ReadonlySet<AgentNodeStatus> = new Set([
 
 /** True if transitioning from -> to is a forward (or equal) move. */
 export function canTransitionTo(from: AgentNodeStatus, to: AgentNodeStatus): boolean {
+  // failed 是可恢复的：引擎的 transient 重试复用同一节点（failed → running），
+  // 且重试事件丢失时完成事件仍要能落账（failed → completed）。
+  if (from === "failed") {
+    return to !== "pending" && to !== "queued";
+  }
   // Terminal states never regress (a late "running" can't revive a completed node).
   if (TERMINAL_NODE_STATUSES.has(from)) return false;
   // "waiting" is a side state: reachable from any active state, and a waiting

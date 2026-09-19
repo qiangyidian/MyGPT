@@ -83,7 +83,7 @@ export function RunControls({
     }
     if (state.runStatus === "pending") {
       return {
-        text: "计划已发布，等待确认后开始执行。",
+        text: "计划已发布，即将开始执行。",
         cls: "border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-400",
         Icon: ShieldQuestion,
       };

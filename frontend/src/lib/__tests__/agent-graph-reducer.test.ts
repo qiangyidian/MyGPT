@@ -250,3 +250,46 @@ describe("富步骤事件", () => {
     expect(next.nodes[0].costUsd).toBe(0.03);
   });
 });
+
+describe("重试状态", () => {
+  const base = (): AgentGraphState => ({
+    runId: "r1", runtime: "crewai", flowName: "deep_research",
+    mode: "sequential", status: "running",
+    nodes: [{ id: "researcher", name: "Researcher", role: "资料检索",
+              stage: 0, status: "running" }],
+    edges: [], activeAgentIds: ["researcher"],
+  });
+
+  it("failed 节点可被 AGENT_STATUS 翻回 running（重试）", () => {
+    const state = base();
+    state.nodes[0].status = "failed";
+    const next = reducer(state, {
+      type: "AGENT_STATUS", runId: "r1", agentId: "researcher",
+      patch: { status: "running", retrying: { attempt: 2, error: "timeout" } },
+    });
+    expect(next.nodes[0].status).toBe("running");
+    expect(next.nodes[0].retrying).toEqual({ attempt: 2, error: "timeout" });
+  });
+
+  it("completed 时清除 retrying 与 error", () => {
+    const state = base();
+    state.nodes[0].status = "failed";
+    state.nodes[0].retrying = { attempt: 2, error: "timeout" };
+    state.nodes[0].error = "timeout";
+    const next = reducer(state, {
+      type: "AGENT_STATUS", runId: "r1", agentId: "researcher",
+      patch: { status: "completed" },
+    });
+    expect(next.nodes[0].status).toBe("completed");
+  });
+
+  it("cancelled 节点不被 running 覆盖", () => {
+    const state = base();
+    state.nodes[0].status = "cancelled";
+    const next = reducer(state, {
+      type: "AGENT_STATUS", runId: "r1", agentId: "researcher",
+      patch: { status: "running" },
+    });
+    expect(next.nodes[0].status).toBe("cancelled");
+  });
+});

@@ -641,6 +641,7 @@ export interface ChatStreamHandlers {
     startedAt?: string; finishedAt?: string; durationMs?: number;
     outputSummary?: string; error?: string;
     usage?: Record<string, number>; costUsd?: number;
+    retrying?: { attempt: number; error: string };
   }) => void;
   onStepOutput?: (e: {
     runId: string; agentId: string; text: string; truncated: boolean; chars: number;
@@ -747,6 +748,7 @@ export function dispatchChatStreamEvent(
             error: data.error,
             usage: data.usage,
             costUsd: data.cost_usd,
+            retrying: data.retrying,
           });
           break;
         case "step_output":
