@@ -544,6 +544,10 @@ class Settings(BaseSettings):
     AUDIT_RETENTION_DAYS: int = 365
     RUN_EVENT_RETENTION_DAYS: int = 90
     ORPHAN_SWEEP_ENABLED: bool = True
+    # 删知识库时向量那一步是 best-effort（Qdrant 抖动不该把用户的删除变成 502），
+    # 失败会留下名字派生自已删除 KB id、正常路径再也指不回来的孤儿 collection。
+    # 这个开关控制周期性回收它们（只认 kb_<32hex> 形状，见 retention.py）。
+    ORPHAN_COLLECTION_SWEEP_ENABLED: bool = True
 
     # ---- Derived ----
     @property

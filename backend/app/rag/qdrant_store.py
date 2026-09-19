@@ -115,6 +115,35 @@ class QdrantVectorStore(VectorStore):
         await self._client.delete_collection(collection_name=collection)
         self._known.discard(collection)
 
+    async def collection_exists(self, collection: str) -> bool:
+        try:
+            return bool(
+                await self._client.collection_exists(collection_name=collection)
+            )
+        except Exception as exc:  # 老客户端没有 collection_exists
+            logger.debug("collection_exists failed for %s: %s", collection, exc)
+        try:
+            await self._client.get_collection(collection_name=collection)
+            return True
+        except Exception:
+            return False
+
+    async def list_collections(self) -> list[str]:
+        """All collection names — the orphan sweep's candidate set."""
+        try:
+            response = await self._client.get_collections()
+        except Exception as exc:
+            logger.warning("qdrant list collections failed: %s", exc)
+            return []
+        names: list[str] = []
+        for item in getattr(response, "collections", None) or []:
+            name = getattr(item, "name", None) or (
+                item.get("name") if isinstance(item, dict) else None
+            )
+            if name:
+                names.append(str(name))
+        return names
+
     async def upsert(self, collection: str, points: list[VectorPoint]) -> None:
         _, models = _import_qdrant()
         await self._client.upsert(

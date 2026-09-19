@@ -79,11 +79,23 @@ def _kb_shape_statements(statements: list[str]) -> list[str]:
 @pytest.fixture
 def no_vectors(monkeypatch):
     """Stub the vector store: no Qdrant in tests, and no connection timeouts."""
-    calls: list[tuple[str, dict]] = []
+
+    class _Calls(list):
+        """delete_by_filter calls, with the drop_collection names hung off it."""
+
+    calls: _Calls = _Calls()
+    dropped: list[str] = []
+    calls.dropped = dropped
 
     class _Stub:
         async def delete_by_filter(self, collection, filters=None):
             calls.append((collection, dict(filters or {})))
+
+        async def drop_collection(self, collection):
+            dropped.append(collection)
+
+        async def list_collections(self):
+            return list(dropped)
 
     def _get():
         return _Stub()
@@ -303,7 +315,11 @@ async def test_delete_kb_removes_documents_and_chunks(client, db_session, no_vec
 
     res = await client.delete(f"/api/knowledge-bases/{victim.id}", headers=hdrs)
     assert res.status_code == 204, res.text
-    assert no_vectors, "deleting a KB should still ask Qdrant for its points"
+    # 整份 collection 必须被 drop。以前这里传的是 delete_by_filter(coll, {})，
+    # 空名单在 store 里直接 return —— 一次删除都没发生，向量永久泄漏。
+    assert no_vectors.dropped == [f"kb_{str(victim.id).replace('-', '')}"], (
+        "deleting a KB must drop its whole Qdrant collection"
+    )
 
     async with TestSessionLocal() as check:
         assert await check.get(KnowledgeBase, victim.id) is None

@@ -167,6 +167,100 @@ async def sweep_orphan_uploads(session_factory: Any, *, max_files: int = 500) ->
 from app.models.artifact import Artifact as _Artifact
 from app.models.chat_attachment import ChatAttachment as _Attachment
 from app.models.document import Document as _Document
+from app.models.knowledge_base import KnowledgeBase as _KnowledgeBase
+
+# KB 向量 collection 的名字由 KB id 派生（``kb_`` + 32 位十六进制，见
+# app.rag.rag_service.collection_name）。孤儿回收**只**认这个精确形状 ——
+# 共享的 chat_attachments、记忆 collection 等一律不碰。
+_KB_COLLECTION_RE = None
+
+
+def _kb_collection_pattern():
+    global _KB_COLLECTION_RE
+    if _KB_COLLECTION_RE is None:
+        import re
+
+        _KB_COLLECTION_RE = re.compile(r"^kb_[0-9a-f]{32}$")
+    return _KB_COLLECTION_RE
+
+
+def _kb_hex(collection: str) -> str | None:
+    """kb_<32hex> -> 那 32 位十六进制；形状不符返回 None（绝不拿去比对）。"""
+    if not _kb_collection_pattern().match(collection):
+        return None
+    return collection[3:]
+
+
+async def sweep_orphan_collections(
+    session_factory: Any, *, vector_store: Any = None, max_drops: int = 50
+) -> int:
+    """删掉没有对应知识库行的 ``kb_*`` collection（Qdrant 侧的存储泄漏）。
+
+    删除知识库时先落库、后删向量；向量那一步是 best-effort（Qdrant 抖动不能
+    把用户的删除变成 502），所以每次失败都会留下一个**再也指不回来**的孤儿
+    collection —— 名字派生自已删除的 KB id，正常代码路径永远不会再触碰它。
+    这里就是那条兜底路径。
+
+    安全边界：只处理精确匹配 ``kb_<32hex>`` 的名字；KB 行存在 = 在用；读不到 KB
+    集合（查询失败/空表）时整轮跳过，因为「无法区分在用与孤儿」时误删是不可逆的。
+    """
+    if not getattr(get_settings(), "ORPHAN_COLLECTION_SWEEP_ENABLED", True):
+        return 0
+    if vector_store is None:
+        try:
+            from app.rag.qdrant_store import get_vector_store
+
+            store = get_vector_store()
+        except Exception:
+            return 0
+    else:
+        store = vector_store
+
+    try:
+        collections = await store.list_collections()
+    except Exception as exc:
+        logger.debug("retention: qdrant collection listing failed: %s", exc)
+        return 0
+    candidates = [c for c in collections if _kb_hex(c) is not None]
+    if not candidates:
+        return 0
+
+    try:
+        async with session_factory() as db:
+            live = {
+                # SQLite 的 UUID 类型适配不如 PG 稳定，两边都可能出现 str 或
+                # uuid.UUID —— 一律按字符串比对，避免「明明在用却被当成孤儿」。
+                str(row).replace("-", "")
+                for row in (
+                    await db.execute(select(_KnowledgeBase.id))
+                ).scalars().all()
+            }
+    except Exception:
+        # 无法判定谁还在用 —— 跳过，绝不猜。
+        logger.warning("retention: KB lookup failed, skipping collection sweep")
+        return 0
+    if not live:
+        # 一条知识库都读不到，就无法区分「平台是空的」与「查询出错了」；后者的
+        # 代价是清空所有人的向量，前者只是少回收一次。所以一律跳过。
+        logger.warning(
+            "retention: knowledge-base lookup returned nothing, skipping collection sweep"
+        )
+        return 0
+
+    dropped = 0
+    for collection in candidates:
+        if dropped >= max_drops:
+            break
+        if _kb_hex(collection) in live:
+            continue
+        try:
+            await store.drop_collection(collection)
+            dropped += 1
+        except Exception:
+            logger.debug("retention: drop collection %s failed", collection, exc_info=True)
+    if dropped:
+        logger.warning("retention: dropped %d orphaned Qdrant collection(s)", dropped)
+    return dropped
 
 
 class RetentionSweeper:
@@ -216,3 +310,4 @@ class RetentionSweeper:
         await prune_audit_events(self._session_factory)
         await prune_terminal_run_events(self._session_factory)
         await sweep_orphan_uploads(self._session_factory)
+        await sweep_orphan_collections(self._session_factory)

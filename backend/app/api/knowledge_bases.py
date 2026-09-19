@@ -6,6 +6,7 @@ KBs, so the UI can show them without extra calls and without loading rows.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -18,6 +19,8 @@ from app.db import get_db
 from app.models import Document, DocumentChunk, KnowledgeBase, User
 from app.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
 from app.services import document_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/knowledge-bases", tags=["knowledge-bases"])
 
@@ -139,13 +142,21 @@ async def delete_knowledge_base(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     kb = await _load_owned(db, kb_id, user)
-    # Best-effort: drop the Qdrant collection's points for this KB.
+    # 整个 collection 必须删掉。原来这里调的是 delete_by_filter(collection, {})
+    # —— 空名单在 _to_filter 里变成 None 并直接 return，也就是说**一次删除都没
+    # 发生过**：行、文档、KB 全没了，向量还整份躺在 Qdrant 里，而且 collection
+    # 名字由 kb id 派生，删掉 KB 后再也没有代码路径能指回它（孤儿泄漏）。
+    #
+    # 这里仍然不阻塞删除：Qdrant 不可达时把用户的「删掉我的知识库」变成 502 是
+    # 更糟的失败。漏掉的 collection 由
+    # :func:`app.services.retention.sweep_orphan_collections` 兜底回收。
     try:
         from app.rag.qdrant_store import get_vector_store
         from app.rag.rag_service import collection_name
-        await get_vector_store().delete_by_filter(collection_name(kb.id), {})
-    except Exception:
-        pass
+
+        await get_vector_store().drop_collection(collection_name(kb.id))
+    except Exception as exc:
+        logger.warning("drop Qdrant collection for KB %s failed: %s", kb.id, exc)
     # Child rows go first, with explicit SQL: ``KnowledgeBase.documents`` is
     # lazy="raise", so ``db.delete(kb)`` can no longer load the collection to
     # cascade — and on SQLite the FK's ON DELETE CASCADE is not enforced either.
