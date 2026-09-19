@@ -23,7 +23,13 @@ from typing import Any
 
 from app.agents.graph import AgentGraph
 from app.agents.lifecycle import AgentLifecycleEmitter
-from app.agents.schemas import AgentTurnContext
+from app.agents.policies import BudgetExceeded
+from app.agents.schemas import (
+    AgentTurnContext,
+    ev_run_instruction_received,
+    ev_run_paused,
+    ev_run_resumed,
+)
 from app.agents.stage_context import StageContext, make_stage_context
 from app.db import AsyncSessionLocal
 
@@ -215,6 +221,98 @@ class RunEnvironment:
     def finish(self, status: str) -> None:
         self._stop_all_progress()
         self.emitter.emit_run_status(status)
+
+    # ------------------------------------------------------------------ #
+    # 运行控制（两条 walker 共享）
+    # ------------------------------------------------------------------ #
+    async def respect_controls(self) -> None:
+        """消费用户控制：取消 / 暂停 / 追加指令 + 持久命令 drain。
+
+        语义与 walker 的 _respect_controls 完全一致 —— 两条路径必须在
+        「按暂停真的会停」这件事上表现相同，否则用户会认为按钮坏了。
+        """
+        from app.agents.run_controls import get_or_create as _get_or_create
+
+        ctl = self.ctx.extra.get("run_control") or _get_or_create(self.run_id)
+        if ctl is None:
+            return
+        guard = self.guard
+        if guard is not None:
+            guard.check()
+        # 用户主动取消：抛 CancelledError 让调用方终止。
+        if ctl.cancel.is_set():
+            raise asyncio.CancelledError()
+        # 持久命令 drain（exactly-once claim → apply → mark）。
+        await self.drain_durable_commands(ctl)
+        pending = ctl.drain_instructions()
+        for instr in pending:
+            self.stage_ctx.emit(
+                ev_run_instruction_received(run_id=self.run_id, instruction=instr)
+            )
+            self.stage_ctx.pending_instructions.append(instr)
+        if ctl.is_paused():
+            self.stage_ctx.emit(ev_run_paused(run_id=self.run_id, reason="user"))
+            while ctl.is_paused():
+                if ctl.cancel.is_set():
+                    break
+                if guard is None:
+                    await asyncio.sleep(0.1)
+                else:
+                    try:
+                        async with asyncio.timeout(guard.remaining_seconds):
+                            await asyncio.sleep(0.1)
+                    except TimeoutError as exc:
+                        raise BudgetExceeded(
+                            f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
+                        ) from exc
+                    guard.check()
+            self.stage_ctx.emit(ev_run_resumed(run_id=self.run_id))
+
+    async def drain_durable_commands(self, ctl: Any) -> None:
+        """Claim + apply 本 run 的持久 RunCommand（B8）。
+
+        把命令类型映射到进程内的 RunControl。每条命令恰好被应用/失败一次。
+        best-effort：存储失败绝不打断执行。
+        """
+        from app.agents.db_mutation import db_mutation_scope
+        from app.agents.workflow.repository import CommandStore
+
+        try:
+            factory = self.stage_ctx.persistence_session_factory
+            async with db_mutation_scope(self.stage_ctx.persistence_lock):
+                async with factory() as session:
+                    store = CommandStore(session)
+                    commands = await store.claim_pending(self.run_id)
+                    for cmd in commands or []:
+                        ctype = cmd.command_type
+                        payload = dict(cmd.payload or {})
+                        try:
+                            if ctype == "pause":
+                                ctl.pause()
+                            elif ctype == "resume":
+                                ctl.resume()
+                            elif ctype == "cancel":
+                                ctl.cancel.set()
+                            elif ctype == "instruction":
+                                text = str(payload.get("text") or "").strip()
+                                if text:
+                                    ctl.add_instruction(text)
+                            elif ctype in ("approve", "reject"):
+                                # 由审批总线消费，不在这里处理。撤回 claim 让
+                                # 它自己的消费者仍能找到这条 pending 行。
+                                cmd.status = "pending"
+                                cmd.claimed_at = None
+                                cmd.claimed_by = None
+                                await session.flush()
+                                continue
+                            await store.mark_applied(cmd.id)
+                        except Exception as exc:
+                            await store.mark_failed(cmd.id, str(exc)[:500])
+                    await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("durable command drain failed", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 过程可见性

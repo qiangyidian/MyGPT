@@ -65,9 +65,6 @@ from app.agents.schemas import (
     ev_error,
     ev_plan_created,
     ev_research_plan,
-    ev_run_instruction_received,
-    ev_run_paused,
-    ev_run_resumed,
     ev_token,
 )
 from app.agents.stage_context import StageContext
@@ -775,97 +772,6 @@ class CrewAIRuntime:
             await asyncio.sleep(1.0)
         return False
 
-    async def _respect_controls(self, ctx, env) -> None:
-        """Honor user pause/resume + drain appended instructions between stages.
-
-        Also consumes DURABLE commands (``run_commands`` rows) here (B8): the
-        API persists pause/resume/cancel/instruction as RunCommands before the
-        in-process signal; claiming+applying them here makes those rows real
-        (exactly-once) and covers the case where the live signal missed (e.g.
-        a different worker process held the run).
-        """
-        stage_ctx = env.stage_ctx
-        emitter = env.emitter
-        ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
-        if ctl is None:
-            return
-        guard = env.guard
-        if guard is not None:
-            guard.check()
-        # Honor a user-initiated cancel between stages.
-        if ctl.cancel.is_set():
-            raise asyncio.CancelledError()
-        # Durable command drain (exactly-once claim → apply → mark).
-        await self._drain_durable_commands(ctx, stage_ctx, ctl)
-        pending = ctl.drain_instructions()
-        for instr in pending:
-            stage_ctx.emit(ev_run_instruction_received(run_id=ctx.run_id, instruction=instr))
-            stage_ctx.pending_instructions.append(instr)
-        if ctl.is_paused():
-            stage_ctx.emit(ev_run_paused(run_id=ctx.run_id, reason="user"))
-            while ctl.is_paused():
-                if ctl.cancel.is_set():
-                    break
-                if guard is None:
-                    await asyncio.sleep(0.1)
-                else:
-                    try:
-                        async with asyncio.timeout(guard.remaining_seconds):
-                            await asyncio.sleep(0.1)
-                    except TimeoutError as exc:
-                        raise BudgetExceeded(
-                            f"time budget ({guard.limits.max_runtime_seconds}s) exceeded"
-                        ) from exc
-                    guard.check()
-            stage_ctx.emit(ev_run_resumed(run_id=ctx.run_id))
-
-    async def _drain_durable_commands(self, ctx, stage_ctx, ctl) -> None:
-        """Claim + apply pending durable RunCommands for this run (B8).
-
-        Maps command types onto the in-process RunControl (pause/resume/cancel/
-        instruction). Each command is marked applied/failed exactly once. Best-
-        effort: a store failure never breaks the stage walk.
-        """
-        try:
-            from app.agents.workflow.repository import CommandStore
-
-            async with db_mutation_scope(stage_ctx.persistence_lock):
-                factory = stage_ctx.persistence_session_factory
-                async with factory() as session:
-                    store = CommandStore(session)
-                    commands = await store.claim_pending(ctx.run_id)
-                    for cmd in commands or []:
-                        ctype = cmd.command_type
-                        payload = dict(cmd.payload or {})
-                        try:
-                            if ctype == "pause":
-                                ctl.pause()
-                            elif ctype == "resume":
-                                ctl.resume()
-                            elif ctype == "cancel":
-                                ctl.cancel.set()
-                            elif ctype == "instruction":
-                                text = str(payload.get("text") or "").strip()
-                                if text:
-                                    ctl.add_instruction(text)
-                            elif ctype in ("approve", "reject"):
-                                # Consumed by the approval bus coordinator, not
-                                # here. Revert the claim so its dedicated
-                                # consumer still finds the row pending.
-                                cmd.status = "pending"
-                                cmd.claimed_at = None
-                                cmd.claimed_by = None
-                                await session.flush()
-                                continue
-                            await store.mark_applied(cmd.id)
-                        except Exception as exc:
-                            await store.mark_failed(cmd.id, str(exc)[:500])
-                    await session.commit()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.debug("durable command drain failed", exc_info=True)
-
     async def _walk_stages(
         self,
         ctx: AgentTurnContext,
@@ -883,7 +789,7 @@ class CrewAIRuntime:
 
         for stage_num in sorted(stage_groups):
             group = stage_groups[stage_num]
-            await self._respect_controls(ctx, env)
+            await env.respect_controls()
             if len(group) == 1:
                 await self._run_one_stage(group[0], executor, env, outputs)
             else:
