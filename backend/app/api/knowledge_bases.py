@@ -1,13 +1,15 @@
 """Knowledge-base router: list / create / get / delete.
 
 A user only sees their own knowledge bases. Admins may access any. Counts
-(documents / chunks) are aggregated so the UI can show them without extra calls.
+(documents / chunks) are aggregated with GROUP BY queries scoped to the listed
+KBs, so the UI can show them without extra calls and without loading rows.
 """
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,10 +17,17 @@ from app.core.deps import get_current_user
 from app.db import get_db
 from app.models import Document, DocumentChunk, KnowledgeBase, User
 from app.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
+from app.services import document_service
 
 router = APIRouter(prefix="/api/knowledge-bases", tags=["knowledge-bases"])
 
 NOT_FOUND = status.HTTP_404_NOT_FOUND
+
+# Listing is paginated: the admin branch used to ``select(KnowledgeBase)`` over
+# the whole platform with no cap. ``limit`` stays generous so existing clients
+# that send no parameters keep seeing everything they plausibly have.
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 500
 
 
 async def _load_owned(
@@ -71,13 +80,24 @@ def _to_out(kb: KnowledgeBase, doc_counts: dict, chunk_counts: dict) -> Knowledg
 
 @router.get("", response_model=list[KnowledgeBaseOut])
 async def list_knowledge_bases(
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[KnowledgeBaseOut]:
-    stmt = select(KnowledgeBase).where(KnowledgeBase.user_id == user.id).order_by(KnowledgeBase.created_at.desc())
-    if user.role == "admin":
-        stmt = select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
-    res = await db.execute(stmt)
+    """One page of knowledge bases, newest first.
+
+    Users see their own; admins see every KB on the platform — which is exactly
+    why the page cap is real: the unbounded version listed (and eager-loaded)
+    the whole table on every request.
+    """
+    stmt = (
+        select(KnowledgeBase)
+        .order_by(KnowledgeBase.created_at.desc(), KnowledgeBase.id.desc())
+    )
+    if user.role != "admin":
+        stmt = stmt.where(KnowledgeBase.user_id == user.id)
+    res = await db.execute(stmt.limit(limit).offset(offset))
     kbs = list(res.scalars().all())
     doc_counts, chunk_counts = await _counts(db, [kb.id for kb in kbs])
     return [_to_out(kb, doc_counts, chunk_counts) for kb in kbs]
@@ -126,5 +146,9 @@ async def delete_knowledge_base(
         await get_vector_store().delete_by_filter(collection_name(kb.id), {})
     except Exception:
         pass
-    await db.delete(kb)  # cascades documents + chunks
+    # Child rows go first, with explicit SQL: ``KnowledgeBase.documents`` is
+    # lazy="raise", so ``db.delete(kb)`` can no longer load the collection to
+    # cascade — and on SQLite the FK's ON DELETE CASCADE is not enforced either.
+    await document_service.purge_kb_rows(db, [kb.id])
+    await db.execute(sa_delete(KnowledgeBase).where(KnowledgeBase.id == kb.id))
     await db.commit()

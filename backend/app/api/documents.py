@@ -17,12 +17,14 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     HTTPException,
+    Query,
     UploadFile,
     status,
 )
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.knowledge_bases import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
@@ -94,11 +96,14 @@ async def upload_document(
 @router.get("/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
 async def list_documents(
     kb_id: uuid.UUID,
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[DocumentOut]:
+    """One page of the KB's documents, newest first (see the KB list's cap)."""
     await _load_owned_kb(db, kb_id, user)
-    docs = await document_service.list_for_kb(db, kb_id)
+    docs = await document_service.list_for_kb(db, kb_id, limit=limit, offset=offset)
     return [DocumentOut.model_validate(d) for d in docs]
 
 

@@ -28,5 +28,16 @@ class Document(Base, TimestampMixin):
 
     knowledge_base = relationship("KnowledgeBase", back_populates="documents")
     chunks = relationship(
-        "DocumentChunk", back_populates="document", cascade="all, delete-orphan", lazy="selectin"
+        "DocumentChunk",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        # ``lazy="raise"``: an implicit load here selected EVERY chunk body of a
+        # document (hundreds to tens of thousands of Text rows) on any
+        # ``select(Document)`` / ``db.get(Document)`` — the document list, the
+        # keyword retriever's join, file_analyze, each ingestion run. No caller
+        # reads this collection (chunk text is queried explicitly where needed,
+        # e.g. app/tools/builtin.py), so accessing it is now a hard error rather
+        # than a silent full-table read. Deleting a document therefore has to
+        # delete its chunks explicitly (app/services/document_service.py).
+        lazy="raise",
     )

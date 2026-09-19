@@ -181,6 +181,25 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
+/** A paginated list request: server-side page size + zero-based skip. */
+export interface PageParams {
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Append ``limit`` / ``offset`` to a list URL, omitting what isn't set so a
+ * bare call keeps hitting the backend's default first page.
+ */
+function withPageParams(path: string, page?: PageParams): string {
+  if (!page) return path;
+  const qs = new URLSearchParams();
+  if (page.limit != null) qs.set("limit", String(page.limit));
+  if (page.offset != null) qs.set("offset", String(page.offset));
+  const q = qs.toString();
+  return q ? `${path}?${q}` : path;
+}
+
 // ===========================================================================
 // Auth
 // ===========================================================================
@@ -366,12 +385,17 @@ export const api = {
   testModel: (id: string) => request<ModelTestResult>("POST", `/api/models/${id}/test`),
 
   // ---- Knowledge bases ----
-  listKnowledgeBases: () => request<KnowledgeBase[]>("GET", "/api/knowledge-bases"),
+  // Both list endpoints are paginated server-side (``limit`` defaults to the
+  // backend's page size, so calling them with no args returns the first page).
+  // Pass ``{ limit, offset }`` to walk the rest — see ``withPageParams``.
+  listKnowledgeBases: (page?: PageParams) =>
+    request<KnowledgeBase[]>("GET", withPageParams("/api/knowledge-bases", page)),
   createKnowledgeBase: (body: { name: string; description?: string; embedding_model_id?: string | null }) =>
     request<KnowledgeBase>("POST", "/api/knowledge-bases", body),
   getKnowledgeBase: (id: string) => request<KnowledgeBase>("GET", `/api/knowledge-bases/${id}`),
   deleteKnowledgeBase: (id: string) => request("DELETE", `/api/knowledge-bases/${id}`),
-  listDocuments: (kbId: string) => request<DocFile[]>("GET", `/api/knowledge-bases/${kbId}/documents`),
+  listDocuments: (kbId: string, page?: PageParams) =>
+    request<DocFile[]>("GET", withPageParams(`/api/knowledge-bases/${kbId}/documents`, page)),
   uploadDocument: (kbId: string, file: File) => {
     const fd = new FormData();
     fd.append("file", file);

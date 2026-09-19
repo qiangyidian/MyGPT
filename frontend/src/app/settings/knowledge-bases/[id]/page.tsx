@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -18,6 +18,9 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 
 const IN_PROGRESS = new Set(["pending", "parsing", "chunking", "embedding"]);
+
+// Server-side page size for the document list (the endpoint paginates).
+const DOC_PAGE_SIZE = 100;
 
 function statusVariant(s: DocFile["status"]) {
   if (s === "indexed") return "default";
@@ -48,15 +51,52 @@ function KbDetailContent() {
     queryFn: () => api.getKnowledgeBase(kbId),
   });
 
+  // Latest visible list (page 0 + appended pages), mirrored into a ref so the
+  // polling predicate below can read it without a declaration-order cycle.
+  const docsRef = useRef<DocFile[]>([]);
   const docsQ = useQuery({
     queryKey: ["kb-docs", kbId],
-    queryFn: () => api.listDocuments(kbId),
+    queryFn: () => api.listDocuments(kbId, { limit: DOC_PAGE_SIZE }),
     refetchInterval: (q) => {
-      const docs = (q.state.data as DocFile[] | undefined) ?? [];
-      return docs.some((d) => IN_PROGRESS.has(d.status)) ? 3000 : false;
+      // Poll while anything visible (page 0 + locally appended pages) is still
+      // being indexed.
+      const first = (q.state.data as DocFile[] | undefined) ?? [];
+      return [...first, ...docsRef.current].some((d) => IN_PROGRESS.has(d.status)) ? 3000 : false;
     },
   });
-  const docs = docsQ.data ?? [];
+  // The documents endpoint paginates; page 0 comes from the query cache (so
+  // upload/reindex/delete invalidations keep working) and later pages are
+  // appended locally by "加载更多".
+  const [morePages, setMorePages] = useState<DocFile[][]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const docs = useMemo(() => {
+    const seen = new Set<string>();
+    const out: DocFile[] = [];
+    for (const d of [...(docsQ.data ?? []), ...morePages.flat()]) {
+      if (!seen.has(d.id)) {
+        seen.add(d.id);
+        out.push(d);
+      }
+    }
+    return out;
+  }, [docsQ.data, morePages]);
+  docsRef.current = docs;
+
+  const fetchedRows = (docsQ.data?.length ?? 0) + morePages.reduce((n, p) => n + p.length, 0);
+  const lastPage = morePages.length > 0 ? morePages[morePages.length - 1] : (docsQ.data ?? []);
+  const hasMore = lastPage.length >= DOC_PAGE_SIZE;
+
+  async function handleLoadMore() {
+    setLoadingMore(true);
+    try {
+      const next = await api.listDocuments(kbId, { limit: DOC_PAGE_SIZE, offset: fetchedRows });
+      setMorePages((pages) => [...pages, next]);
+    } catch (e: unknown) {
+      toast.error(e instanceof ApiError ? e.message : "加载失败");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   const uploadMut = useMutation({
     mutationFn: (file: File) => api.uploadDocument(kbId, file),
@@ -78,8 +118,10 @@ function KbDetailContent() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => api.deleteDocument(id),
-    onSuccess: () => {
+    onSuccess: (_deleted: unknown, id: string) => {
       toast.success("已删除");
+      // Locally appended pages aren't in the query cache — drop the row there.
+      setMorePages((pages) => pages.map((p) => p.filter((d) => d.id !== id)));
       qc.invalidateQueries({ queryKey: ["kb-docs", kbId] });
     },
     onError: (e: ApiError) => toast.error(e.message),
@@ -217,6 +259,13 @@ function KbDetailContent() {
             )}
           </tbody>
         </table>
+        {hasMore ? (
+          <div className="flex justify-center border-t border-border p-3">
+            <Button variant="outline" size="sm" onClick={handleLoadMore} disabled={loadingMore}>
+              {loadingMore ? "加载中…" : `加载更多文档（已显示 ${docs.length}）`}
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {/* Retrieval test */}

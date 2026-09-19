@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Sequence
 
+from sqlalchemy import delete as _sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Embedding batch size — most OpenAI-compatible endpoints cap a single request.
 _EMBED_BATCH = 32
+
+# Default page size for document listings; the API layer passes its own
+# validated ``limit`` and this is the backstop for any other caller.
+_DEFAULT_LIST_LIMIT = 200
 
 
 async def _resolve_embedding_config(db: AsyncSession, kb: KnowledgeBase) -> ModelConfig:
@@ -80,9 +86,8 @@ async def _clear_existing(db: AsyncSession, doc: Document, collection: str) -> N
         await store.delete_by_filter(collection, {"document_id": str(doc.id)})
     except Exception as exc:
         logger.debug("delete_by_filter failed (ok on first index): %s", exc)
-    # NB: must use the SQLAlchemy construct, not this module's own `delete()`
-    # service function below — the module-level def shadows the import.
-    from sqlalchemy import delete as _sa_delete
+    # NB: ``_sa_delete`` — this module's own ``delete()`` service function below
+    # shadows the SQLAlchemy construct in the module namespace.
     await db.execute(_sa_delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
 
 
@@ -197,15 +202,57 @@ async def reindex(db: AsyncSession, document_id: uuid.UUID) -> ReindexResult:
     )
 
 
-async def list_for_kb(db: AsyncSession, kb_id: uuid.UUID) -> list[Document]:
-    result = await db.execute(
-        select(Document).where(Document.knowledge_base_id == kb_id).order_by(Document.created_at.desc())
+async def list_for_kb(
+    db: AsyncSession,
+    kb_id: uuid.UUID,
+    *,
+    limit: int = _DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+) -> list[Document]:
+    """Documents of one KB, newest first, capped at ``limit``.
+
+    Paginated on purpose: a KB can hold thousands of rows and the listing used
+    to be unbounded (and to eager-load every chunk body of every one of them).
+    """
+    stmt = (
+        select(Document)
+        .where(Document.knowledge_base_id == kb_id)
+        .order_by(Document.created_at.desc())
+        .offset(max(0, offset))
+        .limit(limit)
     )
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
 async def get(db: AsyncSession, document_id: uuid.UUID) -> Document | None:
     return await db.get(Document, document_id)
+
+
+async def delete_chunks_of(db: AsyncSession, document_ids: Sequence[uuid.UUID]) -> None:
+    """Delete the chunk rows of the given documents (see ``purge_kb_rows``)."""
+    ids = list(document_ids)
+    if not ids:
+        return
+    await db.execute(_sa_delete(DocumentChunk).where(DocumentChunk.document_id.in_(ids)))
+
+
+async def purge_kb_rows(db: AsyncSession, kb_ids: Sequence[uuid.UUID]) -> None:
+    """Delete the chunk + document rows of the given KBs (plain SQL).
+
+    Needed because ``KnowledgeBase.documents`` / ``Document.chunks`` are
+    ``lazy="raise"`` now: the ORM can no longer load those collections to drive
+    its delete-orphan cascade, and SQLite (CI + dev) does not enforce the FKs'
+    ON DELETE CASCADE, so leaning on the database would silently leave rows (and
+    a non-zero count in the UI) behind there.
+    """
+    ids = list(kb_ids)
+    if not ids:
+        return
+    await db.execute(
+        _sa_delete(DocumentChunk).where(DocumentChunk.knowledge_base_id.in_(ids))
+    )
+    await db.execute(_sa_delete(Document).where(Document.knowledge_base_id.in_(ids)))
 
 
 async def delete(db: AsyncSession, document_id: uuid.UUID) -> bool:
@@ -214,7 +261,7 @@ async def delete(db: AsyncSession, document_id: uuid.UUID) -> bool:
         return False
     collection = collection_name(doc.knowledge_base_id)
     try:
-        get_vector_store().delete_by_filter(collection, {"document_id": str(doc.id)})
+        await get_vector_store().delete_by_filter(collection, {"document_id": str(doc.id)})
     except Exception:
         pass
     # Also remove the stored file from disk.
@@ -222,6 +269,10 @@ async def delete(db: AsyncSession, document_id: uuid.UUID) -> bool:
         await get_storage().delete(doc.file_path)
     except Exception:
         pass
-    await db.delete(doc)
+    # Chunks first, then the document row: the ORM cascade can no longer load
+    # ``doc.chunks`` (lazy="raise"), and the DB cascade isn't guaranteed on
+    # SQLite. See ``purge_kb_rows`` for the same reasoning on the KB side.
+    await delete_chunks_of(db, [doc.id])
+    await db.execute(_sa_delete(Document).where(Document.id == document_id))
     await db.commit()
     return True

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -37,6 +37,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+// Server-side page size for the KB list (the endpoint paginates; see
+// ``limit`` in app/api/knowledge_bases.py).
+const KB_PAGE_SIZE = 100;
+
 export default function KnowledgeBasesPage() {
   return (
     <NavSuspense>
@@ -59,10 +63,47 @@ function KnowledgeBasesContent() {
   const [description, setDescription] = useState("");
   const [embeddingModelId, setEmbeddingModelId] = useState<string>("");
 
+  // The endpoint is paginated (the old one returned every KB on the platform).
+  // Page 0 comes from the shared "knowledge-bases" query so the pickers and the
+  // optimistic create/delete updates keep working; later pages are appended
+  // locally by "加载更多".
   const { data: kbs, isLoading } = useQuery({
     queryKey: ["knowledge-bases"],
-    queryFn: () => api.listKnowledgeBases(),
+    queryFn: () => api.listKnowledgeBases({ limit: KB_PAGE_SIZE }),
   });
+  const [morePages, setMorePages] = useState<KnowledgeBase[][]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  // Deduped union of every fetched page: refetches can overlap after another
+  // tab creates/deletes a KB, which would otherwise render the same card twice.
+  const all = useMemo(() => {
+    const seen = new Set<string>();
+    const out: KnowledgeBase[] = [];
+    for (const kb of [...(kbs ?? []), ...morePages.flat()]) {
+      if (!seen.has(kb.id)) {
+        seen.add(kb.id);
+        out.push(kb);
+      }
+    }
+    return out;
+  }, [kbs, morePages]);
+
+  // The offset for the next page = how many rows the server has handed us.
+  const fetchedRows = (kbs?.length ?? 0) + morePages.reduce((n, p) => n + p.length, 0);
+  const lastPage = morePages.length > 0 ? morePages[morePages.length - 1] : (kbs ?? []);
+  const hasMore = lastPage.length >= KB_PAGE_SIZE;
+
+  async function handleLoadMore() {
+    setLoadingMore(true);
+    try {
+      const next = await api.listKnowledgeBases({ limit: KB_PAGE_SIZE, offset: fetchedRows });
+      setMorePages((pages) => [...pages, next]);
+    } catch (err: unknown) {
+      toast.error(err instanceof ApiError ? err.message : "加载失败");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   // Embedding-capable models populate the embedding-model select.
   const { data: models } = useQuery({
@@ -99,6 +140,8 @@ function KnowledgeBasesContent() {
       qc.setQueryData<KnowledgeBase[]>(["knowledge-bases"], (old) =>
         (old ?? []).filter((k) => k.id !== id)
       );
+      // Locally appended pages live outside the query cache — drop it there too.
+      setMorePages((pages) => pages.map((p) => p.filter((k) => k.id !== id)));
       return { prev };
     },
     onError: (err: unknown, _id, ctx) => {
@@ -127,7 +170,7 @@ function KnowledgeBasesContent() {
     deleteMutation.mutate(kb.id);
   }
 
-  const filtered = (kbs ?? []).filter((k) =>
+  const filtered = all.filter((k) =>
     k.name.toLowerCase().includes(filter.trim().toLowerCase())
   );
 
@@ -241,12 +284,21 @@ function KnowledgeBasesContent() {
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <EmptyState hasAny={(kbs ?? []).length > 0} />
+          <EmptyState hasAny={all.length > 0} />
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {filtered.map((kb) => (
-              <KbCard key={kb.id} kb={kb} returnTo={returnTo} onDelete={() => handleDelete(kb)} />
-            ))}
+          <div className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {filtered.map((kb) => (
+                <KbCard key={kb.id} kb={kb} returnTo={returnTo} onDelete={() => handleDelete(kb)} />
+              ))}
+            </div>
+            {hasMore ? (
+              <div className="flex justify-center">
+                <Button variant="outline" onClick={handleLoadMore} disabled={loadingMore}>
+                  {loadingMore ? "加载中…" : "加载更多知识库"}
+                </Button>
+              </div>
+            ) : null}
           </div>
         )}
       </div>
