@@ -80,12 +80,35 @@ async def prune_terminal_run_events(session_factory: Any, days: int | None = Non
     return deleted
 
 
+def _resolve_key(base: Path, value: str) -> str:
+    """Normalize a stored reference to a comparable absolute path.
+
+    ``LocalStorage.save()`` returns an absolute path, so every one of
+    ``ChatAttachment.storage_key`` / ``Artifact.storage_key`` /
+    ``Document.file_path`` holds absolute strings; a path relative to the base
+    dir is only ever compared against those if it is expanded first. Slashes are
+    unified because SQLite/Python mix ``\\`` and ``/`` across platforms.
+    """
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    return str(path).replace("\\", "/")
+
+
 async def sweep_orphan_uploads(session_factory: Any, *, max_files: int = 500) -> int:
     """Delete files in the local upload dir that no DB row references.
 
     Orphans come from failed commits between file-save and row-insert. Only
     meaningful for LocalStorage (object stores manage their own lifecycle);
     files younger than 24h are skipped so an in-flight upload is never deleted.
+
+    The reference set must cover **every** table that owns a file under
+    ``STORAGE_DIR`` — attachments, artifacts, and knowledge-base documents.
+    A missing source turns this sweep into silent bulk deletion of live files.
     """
     settings = get_settings()
     if not getattr(settings, "ORPHAN_SWEEP_ENABLED", True):
@@ -101,8 +124,19 @@ async def sweep_orphan_uploads(session_factory: Any, *, max_files: int = 500) ->
         artifact_keys = set(
             (await db.execute(select(_Artifact.storage_key))).scalars().all()
         )
+        document_keys = set((await db.execute(select(_Document.file_path))).scalars().all())
 
-    referenced = attachment_keys | artifact_keys
+    referenced = {
+        _resolve_key(storage_dir, key)
+        for key in (attachment_keys | artifact_keys | document_keys)
+        if key
+    }
+    if not referenced:
+        # Nothing claims a file, which also means we cannot tell live uploads
+        # from orphans (fresh install, or the lookup returned nothing useful).
+        # Mass-deletion is the unrecoverable failure mode here, so skip.
+        logger.warning("retention: empty reference set, skipping orphan sweep")
+        return 0
     import time as _time
 
     now = _time.time()
@@ -112,10 +146,7 @@ async def sweep_orphan_uploads(session_factory: Any, *, max_files: int = 500) ->
             break
         if not path.is_file():
             continue
-        # Local storage keys are stored relative to base dir; match on the
-        # tail so either absolute or relative references compare cleanly.
-        rel = str(path.relative_to(storage_dir))
-        if rel in referenced:
+        if _resolve_key(storage_dir, str(path)) in referenced:
             continue
         # Skip brand-new files (an upload may be mid-commit).
         try:
@@ -135,6 +166,7 @@ async def sweep_orphan_uploads(session_factory: Any, *, max_files: int = 500) ->
 
 from app.models.artifact import Artifact as _Artifact
 from app.models.chat_attachment import ChatAttachment as _Attachment
+from app.models.document import Document as _Document
 
 
 class RetentionSweeper:
