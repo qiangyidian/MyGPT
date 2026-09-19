@@ -343,6 +343,17 @@ def decide_route_with_intent(
             requested_mode=mode,
         )
 
+    # 新协作拓扑：只认模型显式点名（关键词路径不产出这两个值，见 decide_route）。
+    if route_name in ("task_decomposition", "write_review"):
+        return RouteDecision(
+            execution_mode=ExecutionMode.agent,
+            agent_profile=route_name,
+            enable_tools=True,
+            use_multi_agent=True,
+            mode=mode,
+            requested_mode=mode,
+        )
+
     # native / factual: enable only the tools the model hinted at (if any).
     hints = list(getattr(intent, "tool_hints", []) or [])
     return RouteDecision(

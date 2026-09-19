@@ -115,7 +115,14 @@ class IntentClassifierConfig:
 # --------------------------------------------------------------------------- #
 # Valid enums + alias coercion
 # --------------------------------------------------------------------------- #
-_VALID_ROUTES = {"native", "deep_research", "parallel_research", "debate"}
+_VALID_ROUTES = {
+    "native",
+    "deep_research",
+    "parallel_research",
+    "debate",
+    "task_decomposition",
+    "write_review",
+}
 _VALID_KINDS = {"code", "document", "factual"}
 
 # Common model phrasings → canonical enum values (defensive; the prompt asks for
@@ -155,7 +162,9 @@ _SYSTEM = (
     '- route: 执行路径。可选值："native"（单 Agent 直接回答/写代码）、'
     '"deep_research"（研究型多 Agent：检索+交叉核对+带引用的深入调研）、'
     '"parallel_research"（知识库与网络并行研究，当绑定了知识库时）、'
-    '"debate"（两个明确主体的对比/辩论+裁判）。\n'
+    '"debate"（两个明确主体的对比/辩论+裁判）、'
+    '"task_decomposition"（任务分解：用户明确要求把工作拆成多个可并行的子项）、'
+    '"write_review"（写-审-改：用户明确要求产出草稿后经审阅定稿的高质量文档）。\n'
     '- deliverable_kind: 交付物。可选值："code"（写代码/程序/脚本/小游戏）、'
     '"document"（方案/文档/报告/总结）、"factual"（事实/解释/闲聊/简单问答）。\n'
     "- tool_hints: 建议启用的工具名数组（如 [\"web_search\",\"python_exec\"]）；不确定就给 []。\n"
@@ -167,7 +176,10 @@ _SYSTEM = (
     "2) 需要检索多个来源、交叉核对、带引用的深入调研 → route=\"deep_research\""
     "（若绑定了知识库则用 parallel_research）。\n"
     "3) 两个明确主体的对比/辩论（如 React vs Vue）→ route=\"debate\"。\n"
-    "4) 闲聊、简单问答、单轮解释 → route=\"native\", deliverable_kind=\"factual\"。\n\n"
+    "4) 闲聊、简单问答、单轮解释 → route=\"native\", deliverable_kind=\"factual\"。\n"
+    "5) 用户明确要求把工作拆成多个并行子项 → route=\"task_decomposition\"；"
+    "明确要求草稿经审阅后定稿 → route=\"write_review\"。"
+    "用户没有明确点名这两种流程时不要使用它们。\n\n"
     "示例：\n"
     "用户：用 Python 写一个贪吃蛇游戏 → "
     '{"route":"native","deliverable_kind":"code","tool_hints":[],"confidence":0.95,"rationale":"明确的写代码请求"}\n'
