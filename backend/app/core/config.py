@@ -209,6 +209,17 @@ class Settings(BaseSettings):
     # 空字符串 = 空名单 → 没有任何 profile 走引擎（安全默认：开总开关不会
     # 意外把所有 profile 都切过去）。每个 profile 可单独摘除 = 独立回滚。
     AGENT_WORKFLOW_ENGINE_PROFILES: str = ""
+    # LLM 规划器：开启后计划先由模型提议，产出必须通过 validate_plan()，
+    # 否则回退模板。模型失败/超时/预算耗尽一律回退 —— LLM 永远不能让引擎
+    # 挂掉。默认关：这是额外的模型调用，消耗用户 token 且发生在首 token 之前。
+    AGENT_LLM_PLANNER: bool = False
+    AGENT_LLM_PLANNER_MAX_STEPS: int = 8
+    # 首 token 延迟预算（总预算，不是单次）。超时即回退模板。
+    AGENT_LLM_PLANNER_TIMEOUT_S: float = 8.0
+    # LLM verifier：用模型验收步骤产出（而非只查 min_chars）。
+    # 非法 verdict 回退 RuleBasedVerifier。默认关。
+    AGENT_LLM_VERIFIER: bool = False
+    AGENT_LLM_VERIFIER_TIMEOUT_S: float = 10.0
     # 丰富 step 事件：stage 完成时透出完整产出（step_output）、运行中发心跳
     # （step_progress）、节点携带 tokens 与成本。纯增量事件与字段，老客户端
     # 忽略即可，故默认开；置假即回到旧行为。
