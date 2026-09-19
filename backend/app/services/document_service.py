@@ -9,6 +9,7 @@ an error message rather than raising.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import uuid
@@ -28,6 +29,7 @@ from app.core.file_signatures import (
 from app.core.storage import UploadTooLargeError, get_storage
 from app.models import Document, DocumentChunk, KnowledgeBase, ModelConfig
 from app.providers.registry import get_provider_for_config
+from app.rag.chunk_meta import annotate, chunk_metadata
 from app.rag.embedder import ProviderEmbedder
 from app.rag.parsers import default_parser
 from app.rag.qdrant_store import get_vector_store
@@ -161,14 +163,20 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         if not text or not text.strip():
             raise ValueError("文档内容为空或无法解析")
 
-        # 2. Split.
+        # 2. Split. The KB may override the chunk shape; ``None`` keeps the
+        # platform default (RecursiveTextSplitter falls back to settings).
         doc.status = "chunking"
         await db.commit()
-        splitter = RecursiveTextSplitter()
+        splitter = RecursiveTextSplitter(
+            chunk_size=kb.chunk_size, chunk_overlap=kb.chunk_overlap
+        )
         chunk_texts = splitter.split(text)
         if not chunk_texts:
             raise ValueError("切分后没有可用的文本块")
         token_counts = [splitter.count_tokens(c) for c in chunk_texts]
+        # Recover each chunk's span/page/heading before the vectors exist: this is
+        # the only moment the full parsed text is in hand.
+        spans = annotate(chunk_texts, parsed)
 
         # 3. Embed (batched) + store.
         doc.status = "embedding"
@@ -182,6 +190,9 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         await _clear_existing(db, doc, collection)
 
         # Create chunk rows first so we have stable ids for the vector points.
+        # ``embedding_model`` / ``embedding_dim`` are what make a later model
+        # swap visible instead of a silent quality drop.
+        digests = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in chunk_texts]
         chunk_rows = [
             DocumentChunk(
                 document_id=doc.id,
@@ -189,9 +200,16 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
                 chunk_index=i,
                 content=txt,
                 token_count=tok,
-                metadata_={},
+                metadata_=chunk_metadata(
+                    span, parsed, token_count=tok, sha256=digest
+                ),
+                embedding_model=cfg.embedding_model_name or None,
+                embedding_dim=embedder.dim,
+                content_sha256=digest,
             )
-            for i, (txt, tok) in enumerate(zip(chunk_texts, token_counts, strict=False))
+            for i, (txt, tok, span, digest) in enumerate(
+                zip(chunk_texts, token_counts, spans, digests, strict=False)
+            )
         ]
         db.add_all(chunk_rows)
         await db.flush()  # populate ids
@@ -221,6 +239,11 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
                         "chunk_id": str(c.id),
                         "chunk_index": c.chunk_index,
                         "text": c.content,
+                        # Provenance the citation needs at query time, copied in
+                        # now so retrieval never has to read the DB back.
+                        "collection": collection,
+                        "page": (c.metadata_ or {}).get("page"),
+                        "heading": (c.metadata_ or {}).get("heading"),
                     },
                 )
                 for c, vec in zip(batch, vectors, strict=False)

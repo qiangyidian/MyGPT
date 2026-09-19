@@ -2,12 +2,13 @@
 # Task 13 — migration-head verification.
 #
 # Runs Alembic migrations against ISOLATED throwaway Postgres databases and
-# asserts both reach the repo head (0014_credits_redeem). Nothing touches the dev or
-# production database.
+# asserts both reach the repo head (resolved dynamically from `alembic heads`,
+# never hardcoded — a pinned head here stops testing the real head). Nothing
+# touches the dev or production database.
 #
 # Two paths are exercised:
 #   1. EMPTY      — a fresh DB upgraded from zero -> head.
-#   2. INCREMENTAL— a fresh DB upgraded to the PRIOR revision (0009_connectors)
+#   2. INCREMENTAL— a fresh DB upgraded to the head's own down_revision
 #                    then to head, proving an existing deployment at the
 #                    previous head upgrades cleanly (the real deploy path).
 #

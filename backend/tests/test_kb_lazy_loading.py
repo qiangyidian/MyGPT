@@ -431,8 +431,12 @@ async def test_admin_kb_list_is_scoped_and_paginated(client, db_session):
     ).json()
     assert {k["name"] for k in mine} == {"mine-fk"}
 
+    # By email, not by role: the session DB is shared across test files, so
+    # "exactly one admin" is not a fact any test may assume.
     admin_id = (
-        await db_session.execute(select(User.id).where(User.role == "admin"))
+        await db_session.execute(
+            select(User.id).where(User.email == "admin-test@example.com")
+        )
     ).scalar_one()
     hdrs = auth_headers(get_access_token(admin_id))
     whole = (await client.get("/api/knowledge-bases?limit=500", headers=hdrs)).json()

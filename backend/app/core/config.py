@@ -131,11 +131,18 @@ class Settings(BaseSettings):
     RAG_CHUNK_SIZE: int = 500
     RAG_CHUNK_OVERLAP: int = 80
     RAG_TOP_K: int = 5
+    # Hard ceiling on the retrieved-context block, in tokens. top_k alone never
+    # bounded prompt size: 12 chunks of a long-document KB is an ~18k-token
+    # context paid for on every turn. 0 disables the budget (historic shape).
+    RAG_CONTEXT_TOKENS: int = 6000
     # Hybrid retrieval (vector + keyword fusion via RRF). Off preserves the
     # pure-vector behaviour of earlier phases.
     RAG_HYBRID: bool = True
     # RRF fusion constant (standard k=60).
     RAG_RRF_K: int = 60
+    # Keyword-path candidate ceiling. Scoring the candidates is Python-side, so
+    # this is what bounds per-turn CPU on a big KB; 400 was a hard-coded literal.
+    RAG_KEYWORD_CANDIDATES: int = 400
     # Context compression: drop near-duplicate chunks by token overlap.
     RAG_COMPRESS_DEDUP: bool = True
     # Minimum retrieval score for a chunk to be admitted into the answer

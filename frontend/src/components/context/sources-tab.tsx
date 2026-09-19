@@ -67,6 +67,12 @@ function SourceRow({ c, index, focused }: { c: Citation; index: number; focused:
       )}
       <div className="mt-1.5 flex items-center gap-2 text-[11px] text-muted-foreground">
         {c.page_number != null && <span>第 {c.page_number} 页</span>}
+        {typeof c.metadata?.heading === "string" && (
+          <span className="max-w-[16rem] truncate">章节：{c.metadata.heading as string}</span>
+        )}
+        {!c.url && c.source_type !== "web" && (
+          <span>片段 #{c.chunk_index + 1}</span>
+        )}
         {c.url && (
           <a
             href={c.url}

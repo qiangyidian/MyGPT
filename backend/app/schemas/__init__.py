@@ -69,6 +69,7 @@ from app.schemas.document import (
 from app.schemas.feedback import MessageFeedbackOut, MessageFeedbackRequest
 from app.schemas.knowledge_base import (
     KnowledgeBaseCreate,
+    KnowledgeBaseUpdate,
     KnowledgeBaseOut,
 )
 from app.schemas.memory import MemoryOut, MemoryUpdate
@@ -127,7 +128,7 @@ __all__ = [
     "ConnectorCreate", "ConnectorUpdate", "ConnectorRotate", "ConnectorOut",
     "ProviderManifestOut",
     # knowledge base / documents
-    "KnowledgeBaseCreate", "KnowledgeBaseOut",
+    "KnowledgeBaseCreate", "KnowledgeBaseOut", "KnowledgeBaseUpdate",
     "DocumentOut", "DocumentPreview", "ReindexResult", "UploadCapabilities",
     # tools
     "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult",

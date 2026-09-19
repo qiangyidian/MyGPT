@@ -6,6 +6,14 @@ platform's reliability guarantees.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
+from app.core.config import get_settings
+
+# A remainder smaller than this is noise: dropping the chunk outright is more
+# honest than appending a sentence fragment to the prompt.
+_MIN_KEEP_TOKENS = 64
+
 RAG_SYSTEM_PREAMBLE = (
     "你是一个严谨、可靠的 AI 助手。请优先根据提供的知识库内容回答用户问题。\n\n"
     "要求：\n"
@@ -37,5 +45,77 @@ def format_context_block(hits: list) -> str:
         payload = getattr(hit, "payload", None) or {}
         name = payload.get("document_name") or payload.get("source") or "未知来源"
         text = payload.get("text") or payload.get("content") or ""
-        lines.append(f"[source {i}] {name}\n{text}")
+        heading = payload.get("heading")
+        location = f" · 章节：{heading}" if heading else ""
+        page = payload.get("page")
+        if page:
+            location += f" · 第 {page} 页"
+        lines.append(f"[source {i}] {name}{location}\n{text}")
     return "\n\n".join(lines)
+
+
+def _token_counter():
+    """tiktoken-backed counter, or a char heuristic when the encoding is missing.
+
+    Imported lazily on purpose: this module is on the chat hot path and must not
+    make prompt assembly depend on tiktoken being loadable.
+    """
+    try:
+        from app.rag.splitter import _count_tokens
+    except Exception:  # pragma: no cover
+        return lambda text: max(1, len(text) // 4)
+    return lambda text: _count_tokens(text, "gpt-3.5-turbo")
+
+
+def _head_to_tokens(text: str, budget: int, counter) -> str:
+    """Longest prefix of ``text`` within ``budget`` tokens (binary search on chars)."""
+    if budget <= 0 or not text or counter(text) <= budget:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if counter(text[:mid]) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low]
+
+
+def fit_context(hits: list, max_tokens: int | None = None) -> list:
+    """Pack hits into the context window, most relevant first.
+
+    Retrieval was bounded by chunk *count* only, so the prompt size grew with
+    whoever configured the biggest ``top_k`` (or the longest chunks): 12 chunks
+    of 1.5k tokens is an 18k-token context paid for on every turn, and the
+    "lost in the middle" degradation that comes with it.
+
+    Hits are dropped whole from the tail; only the one hit that straddles the
+    remaining budget is truncated, and it is replaced (not mutated) so the
+    citation rendered from the returned list shows exactly what the model saw.
+    ``max_tokens`` <= 0 disables the budget.
+    """
+    budget = int(max_tokens if max_tokens is not None else get_settings().RAG_CONTEXT_TOKENS)
+    if not hits or budget <= 0:
+        return list(hits)
+    counter = _token_counter()
+    out: list = []
+    used = 0
+    for hit in hits:
+        payload = getattr(hit, "payload", None) or {}
+        text = payload.get("text") or payload.get("content") or ""
+        cost = counter(text)
+        if used + cost <= budget:
+            out.append(hit)
+            used += cost
+            continue
+        remaining = budget - used
+        # Keep a prefix of this hit only when it still leaves something usable in
+        # the window; a two-token remainder is noise worth dropping.
+        if remaining >= _MIN_KEEP_TOKENS and text:
+            trimmed = _head_to_tokens(text, remaining, counter)
+            try:
+                out.append(replace(hit, payload={**payload, "text": trimmed}))
+            except TypeError:  # not a dataclass — keep it whole rather than lose it
+                out.append(hit)
+        break
+    return out

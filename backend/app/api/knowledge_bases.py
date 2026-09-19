@@ -16,8 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.db import get_db
-from app.models import Document, DocumentChunk, KnowledgeBase, User
-from app.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
+from app.models import Document, DocumentChunk, KnowledgeBase, ModelConfig, User
+from app.schemas import KnowledgeBaseCreate, KnowledgeBaseOut, KnowledgeBaseUpdate
 from app.services import document_service
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,11 @@ def _to_out(kb: KnowledgeBase, doc_counts: dict, chunk_counts: dict) -> Knowledg
         name=kb.name,
         description=kb.description,
         embedding_model_id=kb.embedding_model_id,
+        top_k=kb.top_k,
+        score_threshold=kb.score_threshold,
+        rerank_enabled=kb.rerank_enabled,
+        chunk_size=kb.chunk_size,
+        chunk_overlap=kb.chunk_overlap,
         document_count=doc_counts.get(str(kb.id), 0),
         chunk_count=chunk_counts.get(str(kb.id), 0),
         created_at=kb.created_at,
@@ -112,16 +117,103 @@ async def create_knowledge_base(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseOut:
+    if payload.embedding_model_id is not None:
+        await _validate_embedding_model(db, payload.embedding_model_id)
     kb = KnowledgeBase(
         user_id=user.id,
         name=payload.name,
         description=payload.description,
         embedding_model_id=payload.embedding_model_id,
+        top_k=payload.top_k,
+        score_threshold=payload.score_threshold,
+        rerank_enabled=payload.rerank_enabled,
+        chunk_size=payload.chunk_size,
+        chunk_overlap=payload.chunk_overlap,
     )
     db.add(kb)
     await db.commit()
     await db.refresh(kb)
     return _to_out(kb, {}, {})
+
+
+# Fields the PATCH may write. ``None`` on any of them means "inherit the
+# platform default", so clearing an override is a real action, not a no-op.
+_PATCHABLE = (
+    "name",
+    "description",
+    "embedding_model_id",
+    "top_k",
+    "score_threshold",
+    "rerank_enabled",
+    "chunk_size",
+    "chunk_overlap",
+)
+
+
+@router.patch("/{kb_id}", response_model=KnowledgeBaseOut)
+async def update_knowledge_base(
+    kb_id: uuid.UUID,
+    payload: KnowledgeBaseUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeBaseOut:
+    """Rename / re-describe / re-tune one knowledge base.
+
+    ``model_fields_set`` is what makes this a correct PATCH: a key the client
+    omitted stays as-is, while a key it sent as ``null`` is reset to "inherit
+    the platform default". Reading ``payload.model_dump()`` without
+    ``exclude_unset`` would erase every field the caller never mentioned.
+    """
+    kb = await _load_owned(db, kb_id, user)
+    provided = payload.model_fields_set & set(_PATCHABLE)
+    if not provided:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "没有需要更新的字段")
+
+    swaps_model = (
+        "embedding_model_id" in provided
+        and payload.embedding_model_id != kb.embedding_model_id
+    )
+    if swaps_model:
+        await _validate_embedding_model(db, payload.embedding_model_id)
+    # Anything that changes how text becomes vectors: a new embedding space or a
+    # new chunk shape.
+    retunes_indexing = swaps_model or (
+        "chunk_size" in provided and payload.chunk_size != kb.chunk_size
+    ) or (
+        "chunk_overlap" in provided and payload.chunk_overlap != kb.chunk_overlap
+    )
+
+    for field in provided:
+        setattr(kb, field, getattr(payload, field))
+    await db.commit()
+    await db.refresh(kb)
+    doc_counts, chunk_counts = await _counts(db, [kb.id])
+    stale_chunks = chunk_counts.get(str(kb.id), 0)
+    if retunes_indexing and stale_chunks:
+        # 已入库的向量不会自动失效：它们仍是按旧模型/旧切分算出来的，状态却照旧
+        # 显示 indexed。没有这条线索，之后的检索质量下降在日志里无从解释。
+        logger.warning(
+            "kb %s: embedding/chunking settings changed while %d chunk(s) were "
+            "already indexed — those vectors are stale until re-indexed",
+            kb.id,
+            stale_chunks,
+        )
+    return _to_out(kb, doc_counts, chunk_counts)
+
+
+async def _validate_embedding_model(db: AsyncSession, model_id: uuid.UUID | None) -> None:
+    """A KB's collection holds one embedding space; refuse a model that can't fill it.
+
+    Pointing a KB at a chat model (or a deleted id) used to be accepted and then
+    turned *every* later retrieval into a silent zero-hit search.
+    """
+    if model_id is None:
+        return
+    cfg = await db.get(ModelConfig, model_id)
+    if cfg is None or not cfg.is_embedding:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "embedding_model_id 必须指向一个存在的向量模型"
+        )
 
 
 @router.get("/{kb_id}", response_model=KnowledgeBaseOut)
