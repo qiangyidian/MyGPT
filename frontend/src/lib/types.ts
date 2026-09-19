@@ -10,14 +10,14 @@ export type Role = "system" | "user" | "assistant" | "tool";
 export type UserChatMode =
   | "speed"
   | "expert"
+  | "debate"
   | "hermes"
   // Legacy values kept for displaying older conversations / backward compat:
   | "auto"
   | "search"
   | "deep_research"
   | "create"
-  | "data_analysis"
-  | "debate";
+  | "data_analysis";
 
 export interface User {
   id: string;

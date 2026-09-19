@@ -114,6 +114,8 @@ function flowNameLabel(flow: string): string {
     deep_research: "深度研究",
     parallel_research: "并行研究",
     debate: "辩论",
+    task_decomposition: "任务分解",
+    write_review: "写-审-改",
     single_agent: "单 Agent 对话",
   };
   return map[flow] ?? flow ?? "";

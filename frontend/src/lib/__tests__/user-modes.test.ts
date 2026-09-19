@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { USER_MODES, getModeMeta, isUserChatMode, isSpecialMode } from "@/lib/user-modes";
 
 describe("user-modes", () => {
-  it("exposes exactly the three user-facing modes (speed | expert | hermes)", () => {
+  it("exposes exactly the four user-facing modes (speed | expert | debate | hermes)", () => {
     const values = USER_MODES.map((m) => m.value);
-    expect(values).toEqual(["speed", "expert", "hermes"]);
+    expect(values).toEqual(["speed", "expert", "debate", "hermes"]);
   });
 
   it("expert mode is the multi-agent one; speed/hermes are not", () => {
@@ -25,9 +25,10 @@ describe("user-modes", () => {
     }
   });
 
-  it("isUserChatMode accepts the two modes", () => {
+  it("isUserChatMode accepts the selectable modes", () => {
     expect(isUserChatMode("speed")).toBe(true);
     expect(isUserChatMode("expert")).toBe(true);
+    expect(isUserChatMode("debate")).toBe(true);
     expect(isUserChatMode("nope")).toBe(false);
     expect(isUserChatMode(undefined)).toBe(false);
   });
@@ -36,5 +37,26 @@ describe("user-modes", () => {
     expect(getModeMeta("nonsense").value).toBe("speed");
     expect(getModeMeta(undefined).value).toBe("speed");
     expect(getModeMeta("expert").value).toBe("expert");
+  });
+});
+
+describe("辩论模式", () => {
+  it("出现在模式选择器里", () => {
+    const debate = USER_MODES.find((m) => m.value === "debate");
+    expect(debate).toBeDefined();
+    expect(debate?.label).toContain("辩论");
+  });
+
+  it("被标记为特殊模式（composer 显示徽章）", () => {
+    expect(isSpecialMode("debate")).toBe(true);
+  });
+
+  it("与 expert 一样是多 Agent 模式", () => {
+    expect(isSpecialMode("expert")).toBe(true);
+    expect(isSpecialMode("speed")).toBe(false);
+  });
+
+  it("极速模式不是特殊模式", () => {
+    expect(isSpecialMode("hermes")).toBe(false);
   });
 });

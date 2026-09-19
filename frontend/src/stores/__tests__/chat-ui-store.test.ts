@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The chat-mode store persists the user's picker choice. The picker now exposes
- * exactly two modes — speed | expert — and migrates the legacy 6-mode v3 value
- * onto them: legacy multi-agent modes (deep_research, debate) → expert;
- * everything else → speed.
+ * four modes — speed | expert | debate | hermes — and migrates the legacy
+ * 6-mode v3 value onto them: deep_research → expert; debate → debate (selectable
+ * again); everything else → speed.
  */
 
 type Store = Record<string, string>;
@@ -58,9 +58,9 @@ describe("chat-ui-store mode default + v3→v4 migration", () => {
     expect(storage.getItem("mygpt.chat.mode.v3")).toBeNull();
   });
 
-  it("migrates a legacy v3 debate to expert too", async () => {
+  it("migrates a legacy v3 debate to debate (selectable again)", async () => {
     const { mod } = await loadStore({ "mygpt.chat.mode.v3": "debate" });
-    expect(mod.useChatUiStore.getState().mode).toBe("expert");
+    expect(mod.useChatUiStore.getState().mode).toBe("debate");
   });
 
   it("migrates a legacy v3 non-multi-agent mode (auto/search/create/data_analysis) to speed", async () => {

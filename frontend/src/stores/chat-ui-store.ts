@@ -10,7 +10,8 @@ import { isUserChatMode } from "@/lib/user-modes";
 // v2 ("mygpt.chat.mode.v2") — DEFAULT "deep_research" (caused demo leak; reverted).
 // v3 ("mygpt.chat.mode.v3") — DEFAULT "auto"; picker had 6 modes
 //                             (auto/search/deep_research/create/data_analysis/debate).
-// v4 ("mygpt.chat.mode.v4") — picker reduced to TWO modes: speed | expert.
+// v4 ("mygpt.chat.mode.v4") — picker now has FOUR modes:
+//                             speed | expert | debate | hermes.
 //                             Legacy v3 values are mapped onto these (see mapLegacyMode).
 const MODE_KEY = "mygpt.chat.mode.v4";
 const LEGACY_MODE_KEY_V3 = "mygpt.chat.mode.v3";
@@ -23,18 +24,20 @@ const EFFORT_KEY = "mygpt.chat.reasoningEffort";
 const DEFAULT_MODE: UserChatMode = "speed";
 
 /**
- * Map a legacy (pre-v4) mode onto the new two-mode picker. The old multi-agent
- * modes become 专家 (expert); everything else becomes 极速 (speed).
+ * Map a legacy (pre-v4) mode onto the current picker. deep_research becomes
+ * 专家 (expert); debate is selectable again so it maps to itself; everything
+ * else becomes 极速 (speed).
  */
 function mapLegacyMode(v: string | null): UserChatMode {
-  if (v === "deep_research" || v === "debate") return "expert"; // was multi-agent
+  if (v === "debate") return "debate"; // 辩论现在是独立可选的模式
+  if (v === "deep_research") return "expert"; // was multi-agent
   return "speed"; // auto/search/create/data_analysis/unknown → fast native
 }
 
 /**
  * Resolve the persisted mode, migrating a legacy v3 value exactly once. The v3
- * value is mapped onto speed/expert (we cannot carry it verbatim — those modes
- * are no longer selectable), written to v4, and the v3 key cleared.
+ * value is mapped onto the current picker values, written to v4, and the v3 key
+ * cleared.
  */
 function migrateMode(): UserChatMode {
   if (typeof window === "undefined") return DEFAULT_MODE;
