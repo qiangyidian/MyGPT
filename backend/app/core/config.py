@@ -205,6 +205,10 @@ class Settings(BaseSettings):
     # the only deep_research executor. On ANY engine exception the turn falls back
     # to the existing CrewAI path, so enabling this can never make a turn worse.
     AGENT_WORKFLOW_ENGINE: str = ""
+    # 逗号分隔的 profile 名单。总开关为真时，只有名单内的 profile 走引擎。
+    # 空字符串 = 空名单 → 没有任何 profile 走引擎（安全默认：开总开关不会
+    # 意外把所有 profile 都切过去）。每个 profile 可单独摘除 = 独立回滚。
+    AGENT_WORKFLOW_ENGINE_PROFILES: str = ""
     # 丰富 step 事件：stage 完成时透出完整产出（step_output）、运行中发心跳
     # （step_progress）、节点携带 tokens 与成本。纯增量事件与字段，老客户端
     # 忽略即可，故默认开；置假即回到旧行为。

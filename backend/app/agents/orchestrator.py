@@ -340,23 +340,20 @@ class ChatOrchestrator:
         return self._native, selection
 
     # ------------------------------------------------------------------ #
-    # Task 6b: workflow-engine routing for deep_research
+    # Task 6b: workflow-engine routing (profile roster)
     # ------------------------------------------------------------------ #
     def _should_route_to_engine(self, selection: RuntimeSelection) -> bool:
-        """True only when the engine flag is truthy AND this is a genuine
-        deep_research multi-agent turn.
+        """True 当且仅当：总开关为真、本回合真的要多 Agent、且 profile 在名单内。
 
-        Scoped to ``deep_research`` (the simplest sequential profile) so the
-        engine proves itself on one profile before generalizing.
-        ``parallel_research`` / ``debate`` can be added later behind the same
-        flag. When this returns False the existing path runs unchanged.
+        名单为空 → 一律不走引擎（安全默认）。每个 profile 可单独摘除，
+        摘除后立刻回到已验证的 CrewAI 路径。
         """
-        if not _truthy(getattr(get_settings(), "AGENT_WORKFLOW_ENGINE", "")):
+        settings = get_settings()
+        if not _truthy(getattr(settings, "AGENT_WORKFLOW_ENGINE", "")):
             return False
-        return (
-            selection.multi_agent_requested
-            and selection.agent_profile == "deep_research"
-        )
+        if not selection.multi_agent_requested:
+            return False
+        return selection.agent_profile in _engine_profiles(settings)
 
     async def _run_engine_path(
         self, ctx: AgentTurnContext, run: AgentRun
@@ -380,35 +377,31 @@ class ChatOrchestrator:
         (mirrors the CrewAI runtime's ``ctx.extra["stage_executor"]`` seam).
         """
         # Late imports: keep crewai/workflow out of the module-load path.
-        from app.agents.graph import build_deep_research_graph
         from app.agents.schemas import (
-            ev_agent_graph,
             ev_done,
-            ev_run_status,
             ev_token,
         )
         from app.agents.token_budget import PromptAdmissionError
         from app.agents.workflow.engine import WorkflowEngine
-        from app.agents.workflow.planner import build_deep_research_plan
+        from app.agents.workflow.planner import build_plan_for_profile
         from app.agents.workflow.schemas import StepError
         from app.agents.workflow.verifier import RuleBasedVerifier
 
         question = ctx.user_content or ""
-        plan = build_deep_research_plan(question)
-        # Reuse the static deep_research topology for the agent_graph event
-        # (the SAME graph build_research_stages would produce). This does not
-        # import crewai, so the engine path is unit-testable without it.
-        graph = build_deep_research_graph(question)
-        graph.run_id = str(run.id)
+        # profile 的唯一权威来源是 RuntimeSelection（orchestrator 在 stream()
+        # 里写进 ctx.extra）。**不要**用 run.flow_name —— 那一列在 _create_run
+        # 里写死成 "native_chat"，引擎路径从不更新它，用它会让所有 profile
+        # 静默退化成 deep_research。
+        selection = ctx.extra.get("runtime_selection")
+        profile = getattr(selection, "agent_profile", None) or "deep_research"
+        plan = build_plan_for_profile(profile, question)
+        # 拓扑由 plan 推导 —— 与 walker 的静态 builder 等价（test_graph_from_plan
+        # 对三个 profile 都有断言）。不再 import 具体的 builder，否则每加一个
+        # profile 都要改这里。
+        graph = graph_from_plan(plan)
 
-        yield ev_agent_graph(run_id=run.id, graph=graph.to_public_dict())
-        yield ev_run_status(run_id=run.id, status="running", current_agent_ids=[])
-
-        # Resolve the per-step executor. An injected executor (tests / future
-        # wiring) wins; otherwise build the real StageAdapterExecutor from the
-        # existing crew's stage specs so each step runs via CrewAIStageExecutor.
         env = RunEnvironment.for_turn(ctx)
-        env.attach_graph(graph_from_plan(plan))
+        env.attach_graph(graph)
         env.begin()
         # 图定义只落一次，与 walker 路径一致（刷新后可恢复链路）。
         await env.persist_graph(definition=True)
@@ -538,7 +531,11 @@ class ChatOrchestrator:
         the SAME CrewAIStageExecutor the live CrewAI path uses.
         """
         from app.agents.adapters.llm_adapter import CrewAILLMFactory
-        from app.agents.crews import build_research_stages
+        from app.agents.crews import (
+            build_debate_stages,
+            build_parallel_research_stages,
+            build_research_stages,
+        )
         from app.agents.workflow.executor import StageAdapterExecutor
 
         # stage_ctx / 预算守卫来自共享的 RunEnvironment —— 与 walker 路径同一实例。
@@ -548,9 +545,16 @@ class ChatOrchestrator:
         # tools are not strictly needed by the adapter contract (CrewAIStageExecutor
         # receives agent+task from the StageSpec, which already embed tools); pass
         # an empty list to satisfy the builder signature.
-        _, stages = build_research_stages(
-            llm=llm, tools=[], question=ctx.user_content or ""
-        )
+        builders = {
+            "parallel_research": build_parallel_research_stages,
+            "debate": build_debate_stages,
+        }
+        # 与 plan 用同一个 profile 来源（见上）—— 两处必须一致，否则 plan 里
+        # 的 step id 与这里取出的 stage 对不上，直接 KeyError。
+        selection = ctx.extra.get("runtime_selection")
+        profile = getattr(selection, "agent_profile", None) or "deep_research"
+        builder = builders.get(profile, build_research_stages)
+        _, stages = builder(llm=llm, tools=[], question=ctx.user_content or "")
         stages_by_id = {spec.agent_id: spec for spec in stages}
         return StageAdapterExecutor(stages_by_id, stage_ctx)
 
@@ -769,6 +773,12 @@ def _drain_env_events(env: RunEnvironment) -> list[AgentEvent]:
         if evt is not None:
             out.append(evt)
     return out
+
+
+def _engine_profiles(settings: Any) -> frozenset[str]:
+    """解析 profile 名单（逗号分隔，容忍空白与空项）。"""
+    raw = getattr(settings, "AGENT_WORKFLOW_ENGINE_PROFILES", "") or ""
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
 
 
 def _truthy(value: str | None) -> bool:

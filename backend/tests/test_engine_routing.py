@@ -126,10 +126,13 @@ async def _drive(orchestrator: ChatOrchestrator, ctx) -> list[tuple[str, dict]]:
     return out
 
 
-def _patch_flag(monkeypatch, *, engine: str = "", crewai: bool = True) -> None:
+def _patch_flag(
+    monkeypatch, *, engine: str = "", crewai: bool = True, profiles: str = "deep_research"
+) -> None:
     """Patch the cached Settings instance (the orchestrator reads get_settings())."""
     s = get_settings()
     monkeypatch.setattr(s, "AGENT_WORKFLOW_ENGINE", engine, raising=False)
+    monkeypatch.setattr(s, "AGENT_WORKFLOW_ENGINE_PROFILES", profiles, raising=False)
     monkeypatch.setattr(s, "CREWAI_ENABLED", crewai, raising=False)
 
 
@@ -406,3 +409,38 @@ async def test_engine_path_persists_terminal_graph_state(db_session, monkeypatch
         "writer": "completed",
     }, f"persisted graph_state must reflect the terminal state, got {statuses}"
     assert row.graph_state["status"] == "completed"
+
+
+# --------------------------------------------------------------------------- #
+# 6. 拓扑来自 route 的 profile，而不是写死的 deep_research（Task 5 Step 8）
+# --------------------------------------------------------------------------- #
+async def test_engine_path_uses_the_route_profile_not_deep_research(
+    db_session, monkeypatch
+):
+    _patch_flag(monkeypatch, engine="1", crewai=True, profiles="parallel_research")
+    ctx = await _seed_ctx(db_session)
+    ctx.extra["route"].agent_profile = "parallel_research"
+    ctx.extra["workflow_executor"] = _FakeWorkflowExecutor(
+        outputs={
+            "coordinator": "split",
+            "web-researcher": "web evidence",
+            "kb-researcher": "kb evidence",
+            "analyst": "merged",
+            "writer": "parallel final answer",
+        }
+    )
+    _spy_crewai(monkeypatch)
+
+    events = await _drive(ChatOrchestrator(), ctx)
+    graph_evt = next(d for k, d in events if k == "agent_graph")
+    node_ids = [n["id"] for n in graph_evt["graph"]["nodes"]]
+
+    assert node_ids == [
+        "coordinator",
+        "web-researcher",
+        "kb-researcher",
+        "analyst",
+        "writer",
+    ], f"topology must follow the route profile (parallel_research), got {node_ids}"
+    assert "researcher" not in node_ids, "deep_research 硬编码拓扑不得泄漏"
+    assert ctx.assistant_msg.content == "parallel final answer"
