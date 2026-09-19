@@ -51,6 +51,10 @@ from typing import Any
 
 from app.agents.events import append_event_safe
 from app.agents.workflow.attempts import AttemptRepository
+from app.agents.workflow.checkpoints import (
+    StepCheckpointStore,
+    apply_checkpoints,
+)
 from app.agents.workflow.planner import revise_plan, validate_plan
 from app.agents.workflow.schemas import (
     Plan,
@@ -102,6 +106,8 @@ class WorkflowEngine:
         # 步骤可以越过 AGENT_MAX_RUNTIME_SECONDS 一直挂着，而暂停/取消要等它让出
         # 控制权才进得来（before_step 在其之后）。
         self._budget_remaining = budget_remaining_seconds
+        # 本轮从检查点复用的步骤 id（跨进程 resume 的成果，供结果与埋点读出）。
+        self._reused_steps: list[str] = []
 
     # ------------------------------------------------------------------ #
     async def run(
@@ -127,6 +133,14 @@ class WorkflowEngine:
             verifier_results=verifier_results,
             revise_step_ids=revise_step_ids,
         )
+
+        # 跨进程 resume：崩溃/丢租约后同一个 run_id 会被重新入队，这里把上一轮
+        # 已经成功落库的步骤产出读回来、标成 skip 并携带进本轮。首轮没有检查点，
+        # 读回来是空 dict —— 零副作用。
+        self._reused_steps = apply_checkpoints(plan, await self._load_checkpoints())
+        if self._reused_steps:
+            observe_counter("workflow.steps", len(self._reused_steps), outcome="resumed")
+            await self._emit("plan.resumed", {"step_ids": list(self._reused_steps)})
 
         observations: dict[str, StepObservation] = dict(plan.carry_observations)
         replans = 0
@@ -156,6 +170,9 @@ class WorkflowEngine:
             verifier_history.append(verdict)
 
             if verdict.verdict == VerificationVerdict.pass_:
+                # 整轮成功 → 检查点没有复用价值了，清掉，免得终态 run 的行了无
+                # 人烟地占着审计表（失败/取消路径**不清**，那正是下一轮要用的）。
+                await self._clear_checkpoints()
                 return WorkflowResult(
                     status="completed",
                     replans=replans,
@@ -163,6 +180,7 @@ class WorkflowEngine:
                     observations=observations,
                     findings=verdict.findings,
                     verifier_results=verifier_history,
+                    reused_steps=self._reused_steps,
                 )
             if verdict.verdict == VerificationVerdict.fail:
                 return WorkflowResult(
@@ -265,7 +283,17 @@ class WorkflowEngine:
             if step.skip:
                 # Already-done retained work: nothing to execute.
                 events[step.id].set()
-                return step.id, observations.get(step.id)
+                carried = observations.get(step.id)
+                if step.id in self._reused_steps and carried is not None:
+                    # 跨进程 resume 复用的步骤：面板上的节点还停在 pending，必须
+                    # 补一对 started/completed，否则用户看到的是「这一步没跑」，
+                    # 而它的产出其实正在被下游使用。用量照原样入账一次 —— 上一轮
+                    # 进程死在结算之前，这些 token 从没进过用户账单。
+                    await self._call_hook(self._on_step_start, step.id)
+                    await self._call_hook(
+                        self._on_step_end, step.id, carried.output, carried.usage
+                    )
+                return step.id, carried
             obs = await self._run_with_retries(step, observations, semaphore, state)
             if obs is None:
                 # Step failed permanently; unblock waiters and surface failure.
@@ -346,6 +374,7 @@ class WorkflowEngine:
                         obs.usage = {**dict(obs.usage), "attempts": attempt}
                     obs.attempts = attempt
                     await self._close_attempt(step.id, attempt_number, obs)
+                    await self._save_checkpoint(obs)
                     await self._call_hook(
                         self._on_step_end, step.id, obs.output, obs.usage
                     )
@@ -547,6 +576,43 @@ class WorkflowEngine:
                 await sess.commit()
         except Exception:  # pragma: no cover - best effort
             logger.debug("error_attempt failed for %s", step_id, exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 步骤检查点（跨进程 resume）
+    #
+    # 与 attempt 行同一套「短会话 + best-effort」纪律：检查点只是省钱的优化，
+    # 任何一次读写失败都不能 veto 执行 —— 读失败等于没有可复用的活，写失败等于
+    # 这步下次重跑。
+    # ------------------------------------------------------------------ #
+    async def _load_checkpoints(self) -> dict[str, StepObservation]:
+        if not self._persistence_enabled():
+            return {}
+        try:
+            async with self._session_factory() as sess:
+                return await StepCheckpointStore(sess).load(self._run_id)
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("load step checkpoints failed", exc_info=True)
+            return {}
+
+    async def _save_checkpoint(self, obs: StepObservation) -> None:
+        if not self._persistence_enabled():
+            return
+        try:
+            async with self._session_factory() as sess:
+                await StepCheckpointStore(sess).save(self._run_id, obs)
+                await sess.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("save step checkpoint failed for %s", obs.step_id, exc_info=True)
+
+    async def _clear_checkpoints(self) -> None:
+        if not self._persistence_enabled():
+            return
+        try:
+            async with self._session_factory() as sess:
+                await StepCheckpointStore(sess).clear(self._run_id)
+                await sess.commit()
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("clear step checkpoints failed", exc_info=True)
 
     async def _emit(self, event_type: str, data: dict) -> None:
         if not self._persistence_enabled():

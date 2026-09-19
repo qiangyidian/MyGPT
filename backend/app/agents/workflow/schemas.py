@@ -198,6 +198,8 @@ class WorkflowResult(BaseModel):
     observations: dict[str, StepObservation] = Field(default_factory=dict)
     findings: list[str] = Field(default_factory=list)
     verifier_results: list[VerifierResult] = Field(default_factory=list)
+    # 跨进程 resume 时从检查点复用（未重跑）的步骤 id。空 = 本轮全部真跑。
+    reused_steps: list[str] = Field(default_factory=list)
     error: str | None = None
 
 

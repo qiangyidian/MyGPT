@@ -180,12 +180,14 @@ def test_parse_html(tmp_path: Path):
 
 
 def test_parse_rtf(tmp_path: Path):
+    pytest.importorskip("striprtf", reason="rtf 解析依赖 striprtf（CI 安装，本地可缺）")
     p = _write(tmp_path / "p.rtf", b"{\\rtf1\\ansi\\deff0 Hello RTF world}")
     r = default_parser.parse(p, ".rtf")
     assert "Hello RTF world" in r.text
 
 
 def test_parse_epub(tmp_path: Path):
+    pytest.importorskip("ebooklib", reason="epub 解析依赖 EbookLib（CI 安装，本地可缺）")
     p = _write(tmp_path / "b.epub", _make_epub("Book", "<html><body><p>Hello EPUB chapter</p></body></html>"))
     r = default_parser.parse(p, ".epub")
     assert "Hello EPUB chapter" in r.text
