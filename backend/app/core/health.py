@@ -338,23 +338,32 @@ async def _check_storage() -> dict[str, Any]:
 
 
 async def _check_runner() -> dict[str, Any]:
-    """A code-execution runner is available (local subprocess or docker)."""
+    """The code-execution sandbox is actually usable, not merely "configured".
+
+    This check used to read the ``SANDBOX_MODE`` string and call it good — which
+    hid the real failure mode (nothing in production ever constructed a
+    ``DockerRunner``, so workspace/``python_exec`` calls died in a dev-only
+    ``LocalRunner``). The verdict now comes from the single runner construction
+    point, :func:`app.agents.sandbox.factory.runner_descriptor`, which validates
+    the mode, the permission profile, the image, and the docker CLI presence; in
+    docker mode we additionally probe that the CLI really runs.
+    """
     try:
-        settings = get_settings()
-        mode = str(getattr(settings, "SANDBOX_MODE", "local")).lower()
-        if mode == "docker":
-            # Confirm the docker binary is on PATH.
+        from app.agents.sandbox.factory import runner_descriptor
+
+        info = runner_descriptor()
+        if not info.get("ok"):
+            return _fail(str(info.get("reason") or "沙箱配置不可用"))
+        if info.get("mode") == "docker":
             proc = await asyncio.create_subprocess_exec(
                 "docker", "--version",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=_PROBE_TIMEOUT)
-            if proc.returncode == 0:
-                return _ok("docker runner available")
-            return _fail("docker --version exited non-zero")
-        # local mode: the subprocess runner is always available.
-        return _ok("local runner available")
+            if proc.returncode != 0:
+                return _fail("docker --version exited non-zero（沙箱守护进程不可用）")
+        return _ok(str(info.get("reason")))
     except Exception as exc:
         return _fail(f"runner check error: {exc}")
 

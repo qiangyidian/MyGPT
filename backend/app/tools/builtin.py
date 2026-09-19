@@ -22,10 +22,14 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
+import os
+import shutil
 import socket
 import tempfile
 import uuid
 from datetime import datetime, UTC
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -39,6 +43,8 @@ from app.models.knowledge_base import KnowledgeBase
 from app.tools.base import BaseTool, ToolError, ToolParameter
 from app.tools.context import current_tool_context, forbidden_result
 
+logger = logging.getLogger(__name__)
+
 # How much of an HTTP body we keep — payloads can be huge and bust the LLM context.
 _HTTP_MAX_CHARS = 4000
 # Hard cap on how many bytes we will ever buffer from a single HTTP response
@@ -48,6 +54,64 @@ _HTTP_MAX_CHARS = 4000
 _HTTP_MAX_BYTES = 4 * 1024 * 1024
 # Sync DB query safety cap — read-only-ish, bounded row count.
 _DB_ROW_LIMIT = 50
+
+
+# --------------------------------------------------------------------------- #
+# Sandbox scratch directory (the only host path a code-execution container sees)
+# --------------------------------------------------------------------------- #
+def _sandbox_scratch_base(settings: Any) -> Path:
+    """Where per-call scratch dirs live: ``SANDBOX_SCRATCH_ROOT`` →
+    ``WORKSPACE_ROOT`` → the system temp dir.
+
+    A sandboxed snippet gets ONE empty directory as its whole filesystem view
+    (docker bind-mounts exactly this path), so the configured root must never be
+    a shared/interesting directory — the app source tree included. The system
+    temp dir is the last resort and always acceptable: it is per-call-empty, and
+    the caller removes it again.
+    """
+    for attr in ("SANDBOX_SCRATCH_ROOT", "WORKSPACE_ROOT"):
+        raw = str(getattr(settings, attr, "") or "").strip()
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate.parent == candidate:
+            # 配成了文件系统根（"/"、"D:\\"）—— 那等于把整块盘挂进容器。
+            raise ToolError(f"{attr} 不能是文件系统根目录: {raw!r}")
+        return candidate
+    return Path(tempfile.gettempdir())
+
+
+def _make_sandbox_scratch_dir(settings: Any) -> str:
+    """Create a fresh, empty, world-writable scratch dir and return its path.
+
+    ``0o777`` because the docker runner executes as ``--user nobody``: a dir only
+    the backend user can write would make every snippet fail on the first
+    ``open(..., "w")``. It holds one throwaway file and is removed by
+    :func:`_cleanup_sandbox_scratch_dir` right after the call.
+    """
+    base = _sandbox_scratch_base(settings)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        path = Path(
+            tempfile.mkdtemp(prefix=f"pyexec-{uuid.uuid4().hex[:12]}-", dir=str(base))
+        )
+    except OSError as exc:
+        raise ToolError(f"无法创建沙箱临时目录: {exc}") from exc
+    try:
+        os.chmod(path, 0o777)
+    except OSError:  # pragma: no cover - Windows has limited chmod semantics
+        pass
+    return str(path)
+
+
+def _cleanup_sandbox_scratch_dir(path: str) -> None:
+    """Best-effort removal of a scratch dir the container may have written into.
+
+    Never raises: a leftover temp dir is a disk-hygiene problem, not a reason to
+    fail a tool call that already completed. Files created by the container's
+    ``nobody`` user can still be unlinked here because the *directory* is ours.
+    """
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _not_readable(document_id: str) -> dict[str, Any]:
@@ -512,18 +576,40 @@ class WebSearchTool(BaseTool):
 
 
 class PythonExecTool(BaseTool):
-    """Execute a Python snippet in a subprocess sandbox (DANGEROUS).
+    """Execute a Python snippet **through the sandbox runner** (DANGEROUS).
 
-    The code is written to a temp file and run with `python <file>` in a fresh temp
-    directory, with a hard timeout. stdout/stderr are captured and returned. We never
-    eval the code inline (no exec()/eval() in this process).
+    The snippet is written into a fresh, empty scratch directory and run as
+    ``python snippet.py`` via the one runner the sandbox factory hands out for
+    ``SANDBOX_MODE``:
+
+      * ``docker`` (production) —— an isolated container: read-only rootfs,
+        ``--network=none``, bounded memory/CPU/PIDs, ``--user nobody``, and the
+        **only** host directory it can see is that scratch dir.
+      * ``local`` (dev/test only) —— a subprocess that :class:`LocalRunner`
+        refuses outside dev/test, and that refuses wherever hard resource caps
+        cannot be applied (Windows) instead of pretending to enforce them.
+
+    Two invariants that used to be broken and must stay broken-free:
+
+      * **no implicit environment**: the child never inherits this process's env
+        (the backend holds the DB DSN, the JWT/Fernet keys and every model API
+        key). The runner builds the child env from an allow-list
+        (:func:`app.agents.sandbox.base.build_child_env`).
+      * **never a bare ``subprocess``**: this tool used to call
+        ``asyncio.create_subprocess_exec("python", ...)`` directly, i.e. outside
+        every sandbox, memory/CPU/network policy and env restriction. Any new
+        execution path goes through the runner.
+
+    We never ``eval``/``exec`` the code in this process either.
     """
 
     name = "python_exec"
     description = (
-        "Execute a Python 3 code snippet in a sandboxed subprocess and return "
-        "stdout/stderr. DANGEROUS: the code runs with the process's permissions; "
-        "use only for trusted computations. A 10-second timeout is enforced."
+        "Execute a Python 3 code snippet inside the configured sandbox runner and "
+        "return stdout/stderr. In production that is an isolated container (no "
+        "network, bounded CPU/memory, sees only its own scratch directory); the "
+        "snippet never inherits the server environment. DANGEROUS: requires human "
+        "approval and an enabled sandbox."
     )
     category = "code"
     dangerous = True
@@ -537,94 +623,124 @@ class PythonExecTool(BaseTool):
         ToolParameter(
             name="timeout",
             type="integer",
-            description="Execution timeout in seconds (capped at 10).",
+            description="Execution timeout in seconds (capped by the sandbox config).",
             required=False,
             default=10,
         ),
     ]
 
+    # Name of the snippet inside the scratch dir. Passed to the runner as a
+    # RELATIVE path so the same argv works locally (cwd = scratch dir) and in
+    # docker (the scratch dir is bind-mounted as the container cwd).
+    _SCRIPT_NAME = "snippet.py"
+    # Backstop below the ToolGateway's own 30s tool timeout: a tool call the
+    # gateway cancels mid-flight would leave the sandbox child running, so the
+    # runner must always finish (and reap the child) first.
+    _MAX_TIMEOUT_SECONDS = 25
+
+    def __init__(self, *, runner: object | None = None, settings: object | None = None) -> None:
+        # ``runner`` is for tests / embedded agents; by default the sandbox
+        # factory decides per call (one construction point for runners).
+        self._runner = runner
+        self._settings = settings
+
     async def run(self, **kwargs: Any) -> dict[str, Any]:
         code = kwargs.get("code")
         if not code or not isinstance(code, str):
             raise ToolError("'code' is required and must be a string")
-        try:
-            timeout = int(kwargs.get("timeout", 10))
-        except (TypeError, ValueError):
-            timeout = 10
-        timeout = max(1, min(timeout, 10))
 
         # Defense in depth: the ToolGateway also gates this, but this run() is
         # reached directly by /api/tools/test (and any other caller that bypasses
         # the gateway), so enforce the same environment gate HERE. python_exec is
-        # fail-closed outside dev unless explicitly opted in (ALLOW_PYTHON_EXEC)
-        # or a real sandbox backend is configured (PYTHON_SANDBOX). Without this
+        # fail-closed outside dev: it needs ALLOW_PYTHON_EXEC *and* a real
+        # isolation backend (see app.agents.policies.tool_policy). Without this
         # guard, POST /api/tools/test {name:python_exec} is arbitrary code
         # execution with the backend process's privileges.
         from app.agents.policies.tool_policy import is_tool_allowed
 
+        settings = self._settings if self._settings is not None else get_settings()
         if not is_tool_allowed("python_exec", None):
-            return {
-                "ok": False,
-                "error": (
-                    "python_exec is disabled in this environment (allow only in dev, "
-                    "or set ALLOW_PYTHON_EXEC=true / PYTHON_SANDBOX)"
-                ),
-                "stdout": "",
-                "stderr": "",
-                "returncode": None,
-                "blocked": True,
-            }
+            return self._refused(
+                "python_exec 在当前环境被禁用：非 dev 环境必须同时配置 "
+                "ALLOW_PYTHON_EXEC=true 与真隔离后端 "
+                "(PYTHON_SANDBOX=docker 且 SANDBOX_MODE=docker)"
+            )
 
-        with tempfile.TemporaryDirectory(prefix="pyexec_") as workdir:
-            script_path = f"{workdir}/snippet.py"
-            with open(script_path, "w", encoding="utf-8") as fh:
+        try:
+            requested = int(kwargs.get("timeout", 10))
+        except (TypeError, ValueError):
+            requested = 10
+        configured = int(getattr(settings, "SANDBOX_TIMEOUT_SECONDS", 30) or 30)
+        timeout = max(1, min(requested, self._MAX_TIMEOUT_SECONDS, configured))
+
+        try:
+            from app.agents.sandbox.base import RunnerError
+            from app.agents.sandbox.factory import (
+                get_sandbox_runner,
+                python_interpreter_argv,
+            )
+        except ImportError as exc:  # pragma: no cover - packaging failure, not runtime
+            return self._refused(f"沙箱模块不可用，已按 fail closed 拒绝执行: {exc}")
+
+        runner = self._runner
+        try:
+            argv_prefix = python_interpreter_argv(settings)
+            if runner is None:
+                runner = get_sandbox_runner(settings)
+        except RunnerError as exc:
+            # 非法模式 / 未配镜像 —— 配置问题，不是「换个方式再试」。
+            return self._refused(str(exc))
+
+        workdir: str | None = None
+        try:
+            workdir = _make_sandbox_scratch_dir(settings)
+            with open(os.path.join(workdir, self._SCRIPT_NAME), "w", encoding="utf-8") as fh:
                 fh.write(code)
+            result = await runner.run(  # type: ignore[union-attr]
+                [*argv_prefix, self._SCRIPT_NAME],
+                cwd=workdir,
+                timeout=float(timeout),
+                output_limit=int(getattr(settings, "SANDBOX_OUTPUT_LIMIT", 8192)),
+            )
+        except RunnerError as exc:
+            return self._refused(str(exc))
+        except ToolError as exc:
+            return self._refused(f"沙箱临时目录不可用，已按 fail closed 拒绝执行: {exc}")
+        except Exception as exc:
+            logger.exception("python_exec failed to prepare/run")
+            return self._refused(f"执行准备失败，已按 fail closed 拒绝: {type(exc).__name__}: {exc}")
+        finally:
+            if workdir is not None:
+                _cleanup_sandbox_scratch_dir(workdir)
 
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "python",
-                    script_path,
-                    cwd=workdir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            except FileNotFoundError:
-                return {
-                    "ok": False,
-                    "error": "python interpreter not found",
-                    "stdout": "",
-                    "stderr": "",
-                    "returncode": None,
-                }
+        return {
+            "ok": result.exit_code == 0 and not result.timed_out,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.exit_code,
+            "timed_out": result.timed_out,
+            # 如实上报：False = 这次执行没有被硬限额约束（平台/配置没那个手段）。
+            "limits_enforced": result.limits_enforced,
+        }
 
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-            except TimeoutError:
-                # Kill the timed-out child so it doesn't leak.
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-                return {
-                    "ok": False,
-                    "error": f"timed out after {timeout}s",
-                    "stdout": "",
-                    "stderr": "",
-                    "returncode": None,
-                    "timed_out": True,
-                }
+    @staticmethod
+    def _refused(reason: str) -> dict[str, Any]:
+        """One refusal shape for every python_exec deny path (never an exception).
 
-            stdout = (stdout_b or b"").decode("utf-8", errors="replace")
-            stderr = (stderr_b or b"").decode("utf-8", errors="replace")
-            return {
-                "ok": proc.returncode == 0,
-                "stdout": stdout[:_HTTP_MAX_CHARS],
-                "stderr": stderr[:_HTTP_MAX_CHARS],
-                "returncode": proc.returncode,
-            }
+        ``blocked=True`` keeps the historical envelope the tests pin; the message
+        is Chinese because it is surfaced to the end user as the reason their
+        专家模式 turn could not run code.
+        """
+        return {
+            "ok": False,
+            "error": reason,
+            "stdout": "",
+            "stderr": "",
+            "returncode": None,
+            "timed_out": False,
+            "limits_enforced": False,
+            "blocked": True,
+        }
 
 
 class DbQueryTool(BaseTool):

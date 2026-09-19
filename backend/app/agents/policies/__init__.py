@@ -16,7 +16,9 @@ from app.agents.policies.budget_policy import (
 )
 from app.agents.policies.tool_policy import (
     UnsafeSQLError,
+    isolated_sandbox_configured,
     is_tool_allowed,
+    python_exec_enabled,
     risk_level_for,
     should_require_approval,
     validate_readonly_sql,
@@ -32,8 +34,10 @@ __all__ = [
     "arguments_hash",
     "expiry_from_now",
     "is_expired",
+    "isolated_sandbox_configured",
     "is_tool_allowed",
     "preview",
+    "python_exec_enabled",
     "risk_from_level",
     "risk_level_for",
     "risk_summary",

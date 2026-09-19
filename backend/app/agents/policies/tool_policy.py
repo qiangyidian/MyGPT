@@ -11,10 +11,11 @@ import re
 from typing import TYPE_CHECKING
 
 from app.agents.schemas import RiskLevel
-from app.core.config import get_settings
+from app.core.config import SANDBOX_MODE_DOCKER, env_flag, get_settings
 from app.tools.base import BaseTool, ToolError
 
 if TYPE_CHECKING:  # pragma: no cover
+    from app.core.config import Settings
     from app.models import User
 
 # Tools that always require human approval before running.
@@ -48,12 +49,55 @@ def _has_admin_role(user: User | None) -> bool:
     return bool(user is not None and getattr(user, "role", "") == "admin")
 
 
+def isolated_sandbox_configured(settings: Settings) -> bool:
+    """是否真的配好了一个「隔离执行后端」（而不是有人随手写了个 ``PYTHON_SANDBOX=0``）。
+
+    两个条件同时成立才算数，缺一不算：
+
+      1. ``PYTHON_SANDBOX`` 解析后 == ``docker`` —— 本仓库唯一真实存在的后端。
+         ``e2b`` / ``gvisor`` 只是配置注释里的占位名，写了也不放行；
+         ``"0"`` / ``"false"`` / ``"no"`` 这类「非空但明显是关」的取值更不是。
+      2. ``SANDBOX_MODE`` == ``docker`` —— 即 runner 工厂真的会给出
+         :class:`~app.agents.sandbox.docker.DockerRunner`。后端名字写对了但
+         runner 还停在 local（子进程带本进程权限），所谓隔离就是句空话。
+
+    ``SANDBOX_MODE`` 取值非法时（工厂会抛）按「未配置」处理：安全判断里任何
+    不确定都等于拒绝，绝不让一次配置笔误变成放行。
+    """
+    backend = str(getattr(settings, "PYTHON_SANDBOX", "") or "").strip().lower()
+    if backend != SANDBOX_MODE_DOCKER:
+        return False
+    from app.agents.sandbox.factory import SandboxConfigError, sandbox_mode
+
+    try:
+        return sandbox_mode(settings) == SANDBOX_MODE_DOCKER
+    except SandboxConfigError:
+        return False
+
+
+def python_exec_enabled(settings: Settings) -> bool:
+    """``python_exec`` 在当前配置下是否可用（唯一判定口径）。
+
+    生产里的语义是 **AND**：``ALLOW_PYTHON_EXEC``（按 :func:`env_flag` 解析，
+    ``"0"``/``"false"``/``""`` 都是关）**且** 真隔离后端已配好
+    （:func:`isolated_sandbox_configured`）。这里曾经写成 ``or``，于是
+    ``PYTHON_SANDBOX`` 被填成任意非空字符串就能在生产放行任意代码执行。
+    dev 仍然直接可用（本地开发路径，执行仍受 runner 的限额/环境拒绝约束）。
+    """
+    if settings.is_dev:
+        return True
+    return env_flag(getattr(settings, "ALLOW_PYTHON_EXEC", False)) and isolated_sandbox_configured(
+        settings
+    )
+
+
 def is_tool_allowed(tool_name: str, user: User | None, *, strict: bool | None = None) -> bool:
     """Whether ``tool_name`` may run for ``user`` in the current environment.
 
-    ``python_exec`` is disabled outside dev unless an explicit sandbox is
-    configured (``ALLOW_PYTHON_EXEC=true``) — the subprocess "sandbox" is not a
-    real isolation boundary, so we fail closed in production.
+    ``python_exec`` is disabled outside dev unless an explicit opt-in combines
+    with a real isolation backend (see :func:`python_exec_enabled`) — the
+    subprocess "sandbox" is not a real isolation boundary, so we fail closed in
+    production.
 
     ``db_query`` reads the WHOLE application database — every tenant's rows
     (users, conversations, messages). For a regular C-end user it is a
@@ -66,10 +110,7 @@ def is_tool_allowed(tool_name: str, user: User | None, *, strict: bool | None = 
         strict = not settings.is_dev
 
     if tool_name == "python_exec":
-        # In prod, require an explicit opt-in AND a configured sandbox backend.
-        sandbox_ok = bool(getattr(settings, "PYTHON_SANDBOX", "") or "")
-        allowed = settings.is_dev or bool(getattr(settings, "ALLOW_PYTHON_EXEC", False)) or sandbox_ok
-        if strict and not allowed:
+        if strict and not python_exec_enabled(settings):
             return False
     if tool_name == "db_query":
         if strict and not _has_admin_role(user):

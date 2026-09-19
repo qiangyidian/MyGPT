@@ -145,10 +145,53 @@ WORKSPACE_WRITE_OPERATIONS: frozenset[str] = frozenset(
         "git_rebase",
     }
 )
+# Operations that actually spawn a process (via the sandbox Runner). They need
+# the ``shell`` capability even when they are read-only, because "run git status"
+# is code execution that happens to be side-effect free.
+WORKSPACE_EXEC_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "workspace_shell",
+        "workspace_git_status",
+        "workspace_git_diff",
+    }
+)
+
+# 工具名 → 需要的 CapabilityPolicy 字段。写在这里而不是散落在注册代码里，
+# 是为了「哪个档案放开哪把能力」只有一处定义。
+_TOOL_CAPABILITY: dict[str, str] = {
+    "workspace_read": "fs_read",
+    "workspace_list": "fs_read",
+    "workspace_search": "fs_read",
+    "workspace_git_status": "shell",
+    "workspace_git_diff": "shell",
+    "workspace_shell": "shell",
+    "workspace_write": "fs_write",
+    "workspace_apply_patch": "fs_write",
+}
+
+
+def capability_required_for(operation: str) -> str:
+    """The :class:`CapabilityPolicy` field a workspace operation needs.
+
+    Unknown operations require ``fs_write`` — the narrowest assumption is that an
+    operation nobody mapped is a mutation, so a new tool cannot sneak in under a
+    read-only profile.
+    """
+    return _TOOL_CAPABILITY.get(operation, "fs_write")
+
+
+def capability_granted(policy: CapabilityPolicy, capability: str) -> bool:
+    """Whether ``policy`` grants ``capability`` (missing attribute = not granted)."""
+    return bool(getattr(policy, capability, False))
 
 
 def workspace_requires_write_capability(operation: str) -> bool:
-    """True when ``operation`` needs fs_write/shell (i.e. is not a pure read)."""
+    """True when ``operation`` needs fs_write (i.e. is not a pure read).
+
+    纯执行但只读的 git 查询不在这里 —— 它们要的是 ``shell`` 能力，见
+    :func:`capability_required_for`（两把能力不能混为一谈，否则
+    ``:read-only`` 档案就再也跑不了 ``git status``）。
+    """
     return operation in WORKSPACE_WRITE_OPERATIONS
 
 

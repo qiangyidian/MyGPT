@@ -29,14 +29,38 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.apply_patch import PatchError, apply_ops, parse_patch
-from app.agents.sandbox.base import Runner, RunResult
-from app.agents.sandbox.local import LocalRunner
+from app.agents.exec_policy import argv_from_arguments, load_active_exec_policy
+from app.agents.sandbox.base import Runner, RunnerError, RunResult
 from app.tools.base import BaseTool, ToolError, ToolParameter
+from app.tools.context import forbidden_result
 
 # Cap on search matches so a huge workspace can't flood the context.
 _SEARCH_MAX_MATCHES = 200
 # Max bytes of a single file the read tool will load (bound memory / context).
 _READ_MAX_BYTES = 256 * 1024
+
+
+def default_runner() -> Runner:
+    """The runner a workspace tool uses when the caller did not inject one.
+
+    Exactly one place constructs runners — :func:`app.agents.sandbox.factory.
+    get_sandbox_runner`, keyed on ``SANDBOX_MODE``. The pre-wiring behaviour here
+    was ``LocalRunner()``, i.e. production silently built a dev-only runner that
+    refuses every command; a misconfigured sandbox must instead raise at the
+    factory (``SandboxConfigError``) so the tool call fails loudly.
+    """
+    from app.agents.sandbox.factory import get_sandbox_runner
+
+    return get_sandbox_runner()
+
+
+def _resolve_runner(runner: Runner | None) -> Runner:
+    return runner if runner is not None else default_runner()
+
+
+def _runner_error_result(exc: RunnerError) -> dict[str, Any]:
+    """A runner refused/failed → the canonical non-retryable denial shape."""
+    return forbidden_result(str(exc), stdout="", stderr="", exit_code=None, blocked=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -355,7 +379,10 @@ class WorkspaceShellTool(BaseTool):
     """Run a NON-INTERACTIVE command (argv list) in the workspace (requires workspace-write).
 
     Takes an argv LIST only — never a shell string — so ``sh -c`` injection is
-    impossible. Honours the runner's timeout + output cap.
+    impossible. Honours the runner's timeout + output cap, and consults the
+    exec policy (``EXEC_POLICY_FILE``) before spawning: a ``forbidden`` prefix is
+    refused here even if the caller reached this ``run()`` by bypassing the
+    ToolGateway.
     """
 
     name = "workspace_shell"
@@ -385,28 +412,54 @@ class WorkspaceShellTool(BaseTool):
         output_limit: int = 8192,
     ) -> None:
         self._root = Path(workspace_root)
-        self._runner = runner or LocalRunner()
+        # None → resolved from the sandbox factory at call time (one construction
+        # point for runners; never a hardcoded LocalRunner).
+        self._runner = runner
         self._output_limit = output_limit
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
-        command = kwargs.get("command")
-        if not isinstance(command, list) or not command:
-            raise ToolError("'command' must be a non-empty argv list (no shell strings)")
+        # One argv rule everywhere: a non-empty list of non-empty strings. A shell
+        # string (or a list with holes) cannot be policy-matched, so we refuse it
+        # instead of guessing what the model meant to run.
+        argv = argv_from_arguments({"command": kwargs.get("command")})
+        if argv is None:
+            raise ToolError(
+                "'command' must be a non-empty argv list of strings (no shell strings)"
+            )
+
+        # Exec policy: forbidden prefixes never reach the runner. ``allow`` here is
+        # deliberately NOT an approval bypass — the human gate stays authoritative
+        # (see ToolGateway step 2c).
+        decision = load_active_exec_policy().decide(argv)
+        if decision == "forbidden":
+            return forbidden_result(
+                f"命令被 exec 策略禁止执行 (forbidden by policy): {argv[0]}",
+                command=argv,
+                stdout="",
+                stderr="",
+                exit_code=None,
+                blocked=True,
+            )
+
         try:
             timeout = int(kwargs.get("timeout", 30))
         except (TypeError, ValueError):
             timeout = 30
-        result: RunResult = await self._runner.run(
-            command,
-            cwd=str(self._root.resolve()),
-            timeout=float(timeout),
-            output_limit=self._output_limit,
-        )
+        try:
+            result: RunResult = await _resolve_runner(self._runner).run(
+                argv,
+                cwd=str(self._root.resolve()),
+                timeout=float(timeout),
+                output_limit=self._output_limit,
+            )
+        except RunnerError as exc:
+            return _runner_error_result(exc)
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
+            "limits_enforced": result.limits_enforced,
         }
 
 
@@ -426,7 +479,7 @@ class WorkspaceGitStatusTool(BaseTool):
         self, workspace_root: Path, *, runner: Runner | None = None, output_limit: int = 8192
     ) -> None:
         self._root = Path(workspace_root)
-        self._runner = runner or LocalRunner()
+        self._runner = runner
         self._output_limit = output_limit
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
@@ -434,12 +487,15 @@ class WorkspaceGitStatusTool(BaseTool):
             timeout = int(kwargs.get("timeout", 15))
         except (TypeError, ValueError):
             timeout = 15
-        res = await self._runner.run(
-            ["git", "status", "--short"],
-            cwd=str(self._root.resolve()),
-            timeout=float(timeout),
-            output_limit=self._output_limit,
-        )
+        try:
+            res = await _resolve_runner(self._runner).run(
+                ["git", "status", "--short"],
+                cwd=str(self._root.resolve()),
+                timeout=float(timeout),
+                output_limit=self._output_limit,
+            )
+        except RunnerError as exc:
+            return _runner_error_result(exc)
         return _runner_result_dict(res)
 
 
@@ -459,7 +515,7 @@ class WorkspaceGitDiffTool(BaseTool):
         self, workspace_root: Path, *, runner: Runner | None = None, output_limit: int = 8192
     ) -> None:
         self._root = Path(workspace_root)
-        self._runner = runner or LocalRunner()
+        self._runner = runner
         self._output_limit = output_limit
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
@@ -467,12 +523,15 @@ class WorkspaceGitDiffTool(BaseTool):
             timeout = int(kwargs.get("timeout", 15))
         except (TypeError, ValueError):
             timeout = 15
-        res = await self._runner.run(
-            ["git", "diff"],
-            cwd=str(self._root.resolve()),
-            timeout=float(timeout),
-            output_limit=self._output_limit,
-        )
+        try:
+            res = await _resolve_runner(self._runner).run(
+                ["git", "diff"],
+                cwd=str(self._root.resolve()),
+                timeout=float(timeout),
+                output_limit=self._output_limit,
+            )
+        except RunnerError as exc:
+            return _runner_error_result(exc)
         return _runner_result_dict(res)
 
 
@@ -482,7 +541,54 @@ def _runner_result_dict(res: RunResult) -> dict[str, Any]:
         "stderr": res.stderr,
         "exit_code": res.exit_code,
         "timed_out": res.timed_out,
+        # 如实告诉调用方这次执行有没有真的被限额（False = 平台/模式没能施加）。
+        "limits_enforced": res.limits_enforced,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Capability denial stub
+# --------------------------------------------------------------------------- #
+_CAPABILITY_LABELS: dict[str, str] = {
+    "fs_read": "读取工作区文件",
+    "fs_write": "写入/修改工作区文件",
+    "shell": "在工作区里执行命令",
+    "network": "访问网络",
+}
+
+
+class DeniedWorkspaceTool(BaseTool):
+    """权限档案没放开该能力时的占位工具：只回一条中文拒绝，绝不碰 runner 或磁盘。
+
+    为什么注册一个「一定会拒绝」的工具，而不是干脆不注册：模型看到的工具清单保持
+    稳定，而且拿到的是「因为当前权限档案没有 X 能力所以不行」这种可解释的拒绝，
+    不是 ``Unknown tool`` —— 后者会诱导模型换个写法重试。真正的执行路径依旧由
+    :mod:`app.agents.sandbox.factory` 与 ToolGateway 把门，这个类不携带任何能力。
+    """
+
+    category = "workspace"
+    # 不标 dangerous：它除了返回一段拒绝文本什么都不做，为一次空操作走人工确认
+    # 只会稀释真正的确认门。
+    dangerous = False
+    parameters: list[ToolParameter] = []
+
+    def __init__(self, name: str, *, capability: str, profile_name: str) -> None:
+        self.name = name
+        self._capability = capability
+        self._profile = profile_name or "未配置"
+        label = _CAPABILITY_LABELS.get(capability, capability)
+        self.description = (
+            f"当前权限档案（{self._profile}）未放开「{label}」能力，"
+            "该工具已被禁用，调用只会返回拒绝。"
+        )
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        return forbidden_result(
+            f"权限档案 {self._profile} 未放开 {self._capability} 能力，"
+            f"工具 {self.name} 已禁用（需要运维调整 WORKSPACE_PERMISSION_PROFILE）",
+            capability=self._capability,
+            blocked=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -502,6 +608,7 @@ WORKSPACE_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
 
 __all__ = [
     "WORKSPACE_TOOL_CLASSES",
+    "DeniedWorkspaceTool",
     "WorkspaceApplyPatchTool",
     "WorkspaceGitDiffTool",
     "WorkspaceGitStatusTool",
@@ -510,5 +617,6 @@ __all__ = [
     "WorkspaceSearchTool",
     "WorkspaceShellTool",
     "WorkspaceWriteTool",
+    "default_runner",
     "resolve_under_root",
 ]

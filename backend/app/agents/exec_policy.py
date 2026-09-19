@@ -20,6 +20,12 @@ Design notes:
   * :func:`validate_pattern` keeps user-supplied patterns concrete: empty
     patterns and glob/wildcard tokens (``*``, ``?``, ``://``) are rejected, so a
     remembered approval can never widen into a blanket ``*`` permit.
+
+Production wiring (this used to be a dead module): :func:`load_active_exec_policy`
+reads ``EXEC_POLICY_FILE`` and the ToolGateway + ``workspace_shell`` consult the
+decision on every argv-carrying tool call. Unlike the network policy, a missing
+or corrupt file degrades to ``default="prompt"`` (ask), never ``allow`` --
+fail closed.
 """
 from __future__ import annotations
 
@@ -27,7 +33,10 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:  # pragma: no cover
+    from app.core.config import Settings
 
 Decision = Literal["allow", "prompt", "forbidden"]
 
@@ -174,3 +183,72 @@ class RuleStore:
         tmp.write_text(text, encoding="utf-8")
         # os.replace is atomic on both POSIX and Windows (overwrites target).
         os.replace(tmp, self.path)
+
+
+# --------------------------------------------------------------------------- #
+# Production wiring (settings -> the policy that actually gates a tool call)
+# --------------------------------------------------------------------------- #
+_VALID_DECISIONS: frozenset[str] = frozenset({"allow", "prompt", "forbidden"})
+
+
+def normalize_decision(value: object, *, fallback: Decision = "prompt") -> Decision:
+    """把一个来路不明（JSON/模型/运维手改）的 decision 收成合法值。
+
+    认不出来就按 ``fallback``（默认 prompt，即「要人确认」）—— 一个拼错的
+    ``"alow"`` 绝不允许被读成「不在规则里 ⇒ 放行」。
+    """
+    text = str(value or "").strip().lower()
+    return text if text in _VALID_DECISIONS else fallback  # type: ignore[return-value]
+
+
+def load_active_exec_policy(settings: Settings | None = None) -> ExecPolicy:
+    """Load ``EXEC_POLICY_FILE`` (see :class:`RuleStore`), or a strict no-rules policy.
+
+    Empty path → ``ExecPolicy(default="prompt")``: nothing pre-approved, unknown
+    commands must be confirmed. A missing/corrupt/invalid file degrades to the
+    SAME strict default (never allow-all), which is where this differs from
+    :func:`app.agents.network_policy.load_active_policy`.
+    """
+    if settings is None:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+    path = str(getattr(settings, "EXEC_POLICY_FILE", "") or "").strip()
+    strict = ExecPolicy(default="prompt")
+    if not path:
+        return strict
+    try:
+        raw = RuleStore(Path(path)).load()
+    except Exception:
+        return strict
+    rules: list[PrefixRule] = []
+    for r in raw.rules:
+        pattern = [str(t) for t in r.pattern] if isinstance(r.pattern, list) else []
+        try:
+            # Concrete prefixes only: a hand-edited ``["*"]`` rule would turn the
+            # policy into allow-all, which is the opposite of why it exists. An
+            # invalid rule is DROPPED (its command then falls to ``default``, i.e.
+            # "ask a human") rather than honoured.
+            validate_pattern(pattern)
+        except ValueError:
+            continue
+        rules.append(PrefixRule(pattern=pattern, decision=normalize_decision(r.decision)))
+    return ExecPolicy(rules=rules, default=normalize_decision(raw.default))
+
+
+def argv_from_arguments(arguments: dict | None) -> list[str] | None:
+    """Pull the argv list a tool call carries (``{"command": [...]}``), else None.
+
+    Only a *list of strings* counts: anything else (a shell string, a dict, a
+    mixed list) is not an argv we can policy-match, so the caller gets ``None``
+    and must decide for itself — the consumers treat "no argv" as "not
+    policy-gated here", never as "allowed".
+    """
+    if not isinstance(arguments, dict):
+        return None
+    raw = arguments.get("command")
+    if not isinstance(raw, list) or not raw:
+        return None
+    if not all(isinstance(tok, str) and tok for tok in raw):
+        return None
+    return [str(tok) for tok in raw]

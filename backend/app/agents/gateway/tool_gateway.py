@@ -9,6 +9,9 @@ through :class:`ToolGateway`. It enforces, in order:
   2b. **Tenant scope** — the run's ``user`` is bound as the tool execution
      context (see :mod:`app.tools.context`) so owner-scoped tools can check the
      caller instead of trusting an id argument.
+  2c. **Exec policy** — an argv-carrying call (``{"command": [...]}``) is refused
+     when ``EXEC_POLICY_FILE`` marks its prefix ``forbidden``. The policy can only
+     ever *tighten* the gates below, never release them.
   3. **SQL hardening** — ``db_query`` SQL must pass ``validate_readonly_sql``.
   4. **Approval** — dangerous tools need a valid (approved, non-expired)
      :class:`~app.models.ToolApproval` matching the exact arguments; otherwise a
@@ -34,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.continuation import normalize_usage
+from app.agents.exec_policy import ExecPolicy, argv_from_arguments, load_active_exec_policy
 from app.agents.policies import (
     UnsafeSQLError,
     arguments_hash,
@@ -101,6 +105,9 @@ class ToolGateway:
         # every AgentStep row so tools map back to the graph node that ran them.
         self._agent_id = ""
         self._task_id = ""
+        # Lazily-loaded argv command policy (``EXEC_POLICY_FILE``). One read per
+        # run: flipping the file mid-run must not change what this run may do.
+        self._exec_policy: ExecPolicy | None = None
         # Optional Guardian pre-approval judge (Codex pattern). Off by default —
         # runtimes opt in by passing a GuardianService + provider (+ breaker). When
         # set, dangerous tools are LLM-judged before the human-approval gate: allow
@@ -126,6 +133,12 @@ class ToolGateway:
         handles = list(self._spilled_handles)
         self._spilled_handles.clear()
         return handles
+
+    def policy_for_run(self) -> ExecPolicy:
+        """The argv command policy in force for this run (loaded once)."""
+        if self._exec_policy is None:
+            self._exec_policy = load_active_exec_policy()
+        return self._exec_policy
 
     # ------------------------------------------------------------------ #
     async def execute(
@@ -256,6 +269,26 @@ class ToolGateway:
                 tool_call_id, tool_name, args, started,
                 ok=False, status="blocked",
                 error=f"tool {tool_name!r} requires an authenticated user scope",
+            )
+
+        # 2c. Exec policy (argv level, EXEC_POLICY_FILE). A tool call that carries
+        # an argv list is matched against the concrete-prefix rules; ``forbidden``
+        # denies here and the tool is never resolved for execution.
+        #
+        # Deliberately ONE-DIRECTIONAL: ``allow`` never skips the approval gate in
+        # step 4 and ``prompt`` adds nothing to it. The repo's only approval-memory
+        # mechanism is the DB ``ToolApproval`` row (arguments-hash scoped); letting a
+        # flat JSON file stand in for a human decision would be an approval bypass
+        # with a worse audit trail. Unknown/unparsable policy files degrade to
+        # default ``prompt`` (= no release), never to allow-all.
+        argv = argv_from_arguments(args)
+        if argv is not None and self.policy_for_run().decide(argv) == "forbidden":
+            return await self._finalize(
+                tool_call_id, tool_name, args, started,
+                ok=False, status="blocked",
+                error=(
+                    f"命令被 exec 策略禁止执行 (forbidden by policy): {' '.join(argv[:3])}"
+                ),
             )
 
         # 3. SQL hardening for db_query (defense in depth; the tool also checks).

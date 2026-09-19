@@ -18,6 +18,45 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # URL (localhost) still overrides the docker service-name URL in the root .env.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# ---- 沙箱 runner 模式（唯一事实来源，见 app.agents.sandbox.factory） ----
+# "local"  = 子进程 runner，只在 dev/test 可用（LocalRunner 自己在非 dev/test 硬拒绝）；
+# "docker" = 生产用的隔离 runner（独立容器 + 资源/网络限额）。
+SANDBOX_MODE_LOCAL = "local"
+SANDBOX_MODE_DOCKER = "docker"
+SANDBOX_MODES: tuple[str, ...] = (SANDBOX_MODE_LOCAL, SANDBOX_MODE_DOCKER)
+
+# 环境开关取值的唯一解析口径：真值词表 + 假值词表。
+# 全仓库解析 settings/env 布尔都必须走 :func:`env_flag`，不要再各处手写
+# ``bool(x)`` —— ``bool("false") is True`` 正是 python_exec 曾被任意字符串放行的根因。
+_FLAG_TRUE_TOKENS: frozenset[str] = frozenset({"1", "true", "yes", "on", "y", "t", "enabled"})
+_FLAG_FALSE_TOKENS: frozenset[str] = frozenset(
+    {"0", "false", "no", "off", "n", "f", "disabled", ""}
+)
+
+
+def env_flag(value: object, *, default: bool = False) -> bool:
+    """把 settings / 环境变量里的开关值解析成布尔（仓库唯一入口）。
+
+    * ``bool`` 原样返回（pydantic 已经解析过的字段）；
+    * 其余按字符串规范化（去空白 + 小写）后查词表：``"1"/"true"/"yes"/"on"`` 为真，
+      ``"0"/"false"/"no"/"off"/""`` 为假；
+    * 词表外的取值返回 ``default`` —— 认不出来不等于「已开启」（fail closed）。
+
+    注：``app/agents/orchestrator.py`` 的 ``_truthy`` 与
+    ``app/agents/intent_service.py`` 的 ``_bool`` 是本函数两份更早的私有副本，
+    收敛到这里是为了让 python_exec 之类的安全开关只有一处解析口径。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    token = str(value).strip().lower()
+    if token in _FLAG_TRUE_TOKENS:
+        return True
+    if token in _FLAG_FALSE_TOKENS:
+        return False
+    return default
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -135,9 +174,12 @@ class Settings(BaseSettings):
     # this. Environments without the package still fall back to native with a
     # visible crewai_not_installed reason (orchestrator._crewai_status).
     CREWAI_ENABLED: bool = True
-    # python_exec is NOT a real sandbox (subprocess with process perms). In prod
-    # it stays disabled unless one of these opts it in AND a sandbox is configured.
+    # python_exec 不是真沙箱（子进程带本进程权限）。在生产里它保持关闭，除非
+    # ① 显式打开本开关 **且** ② SANDBOX_MODE=PYTHON_SANDBOX=docker 真的接上了隔离
+    # 后端 —— 两个条件缺一都不放行（见 app.agents.policies.tool_policy）。
     ALLOW_PYTHON_EXEC: bool = False
+    # 代码执行使用的隔离后端名。目前仓库里真实存在的只有 "docker"
+    # （app.agents.sandbox.docker）；"e2b" / "gvisor" 仍是占位，写了也不会放行。
     PYTHON_SANDBOX: str = ""  # e.g. "docker" | "e2b" | "gvisor" — reserved for Phase 5
     # User-configured model endpoints are SSRF-guarded: regular (non-admin)
     # users may only point at hosts that resolve to PUBLIC addresses. Set true
@@ -206,9 +248,13 @@ class Settings(BaseSettings):
     # to the existing CrewAI path, so enabling this can never make a turn worse.
     AGENT_WORKFLOW_ENGINE: str = ""
     # 逗号分隔的 profile 名单。总开关为真时，只有名单内的 profile 走引擎。
-    # 空字符串 = 空名单 → 没有任何 profile 走引擎（安全默认：开总开关不会
-    # 意外把所有 profile 都切过去）。每个 profile 可单独摘除 = 独立回滚。
-    AGENT_WORKFLOW_ENGINE_PROFILES: str = ""
+    # 默认 deep_research（产品决策）：运维一旦把总开关打开，灰度面就**只有**
+    # deep_research —— 最成熟、模板/工具/事件都最早验证的那个拓扑。其余 profile
+    # （parallel_research / debate / task_decomposition / write_review）必须显式
+    # 加进名单才上引擎，所以这份默认值不会放大灰度。
+    # 想退回「开总开关也不切任何 profile」：把这里置空即可（每个 profile 单独
+    # 摘除 = 独立回滚）。
+    AGENT_WORKFLOW_ENGINE_PROFILES: str = "deep_research"
     # LLM 规划器：开启后计划先由模型提议，产出必须通过 validate_plan()，
     # 否则回退模板。模型失败/超时/预算耗尽一律回退 —— LLM 永远不能让引擎
     # 挂掉。默认关：这是额外的模型调用，消耗用户 token 且发生在首 token 之前。
@@ -402,7 +448,8 @@ class Settings(BaseSettings):
     WORKSPACE_ROOT: str = ""
     # Sandbox runner mode: "local" (dev/test subprocess, NOT a real sandbox) or
     # "docker" (enterprise isolation, production-safe). LocalRunner hard-refuses
-    # to exec outside dev/test regardless of this setting.
+    # to exec outside dev/test regardless of this setting. An illegal value is a
+    # boot error (see _validate_sandbox_mode) — never a silent fallback to local.
     SANDBOX_MODE: str = "local"
     # Docker isolation knobs (read by app.agents.sandbox.docker.DockerRunnerConfig).
     SANDBOX_DOCKER_IMAGE: str = "python:3.11-slim"
@@ -410,6 +457,31 @@ class Settings(BaseSettings):
     SANDBOX_MEMORY_MB: int = Field(default=512, gt=0)
     SANDBOX_PIDS_LIMIT: int = Field(default=64, gt=0)
     SANDBOX_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    # local 模式的 CPU 时间上限（RLIMIT_CPU，秒）与内存上限（RLIMIT_AS，MB）。
+    # docker 模式用 --cpus/--memory，两者按模式各取所需。
+    SANDBOX_CPU_SECONDS: int = Field(default=30, gt=0)
+    SANDBOX_LOCAL_MEMORY_MB: int = Field(default=512, gt=0)
+    # 单条命令允许写出的文件体积上限（RLIMIT_FSIZE，MB）——防止一条命令把
+    # 磁盘打满（docker 侧由只读 rootfs + tmpfs 尺寸承担）。
+    SANDBOX_MAX_FSIZE_MB: int = Field(default=64, gt=0)
+    # 强制施加硬限额：True（默认）时，local 模式在无法施加 rlimit 的平台上
+    # （Windows 没有 resource 模块）**直接拒绝执行**，而不是假装已经限制。
+    # 设为 False 只应在明确的开发机上使用，且结果里会标记 limits_enforced=false。
+    SANDBOX_REQUIRE_LIMITS: bool = True
+    # python_exec / workspace 工具的单次 scratch 目录根。为空时回落到
+    # WORKSPACE_ROOT，再为空则回落到系统临时目录（只挂这一个空目录给容器）。
+    SANDBOX_SCRATCH_ROOT: str = ""
+    # 权限档案（app.agents.permission_profiles）→ 编译成沙箱能力：
+    # 决定注册哪些 workspace 工具，以及 docker 容器的
+    # 只读 rootfs / 网络 / 工作区挂载读写开关。默认 :workspace-write
+    # （可写工作区 + shell，无网络）。
+    WORKSPACE_PERMISSION_PROFILE: str = ":workspace-write"
+    # 可选档案白名单（逗号分隔）。为空 = 只允许两个安全内置档案
+    # （:read-only / :workspace-write）；:danger-full-access 必须显式列出才可选。
+    WORKSPACE_PROFILES_ALLOWED: str = ""
+    # 命令前缀策略文件（app.agents.exec_policy 的 JSON 形态）：allow/prompt/forbidden。
+    # 为空 = 无规则、默认 prompt（未知命令一律走人工确认），fail closed。
+    EXEC_POLICY_FILE: str = ""
     # Hard per-command output cap (chars of stdout/stderr the runner returns).
     # The ToolGateway's AGENT_MAX_TOOL_OUTPUT_CHARS budget is enforced separately
     # and is NOT duplicated here.
@@ -497,6 +569,23 @@ class Settings(BaseSettings):
     @classmethod
     def _abs_storage(cls, v: str) -> str:
         return str(Path(v))
+
+    @field_validator("SANDBOX_MODE")
+    @classmethod
+    def _validate_sandbox_mode(cls, v: str) -> str:
+        """SANDBOX_MODE 只认 ``local`` / ``docker``，非法值直接启动期报错。
+
+        不做静默回落：把 ``Docker`` 这类手误悄悄当成 local，生产就会用无隔离的
+        子进程去执行模型给出的代码；反过来把 local 拼错成别的也会让整套
+        workspace 工具看起来「已配置」。拼错必须响。
+        """
+        mode = (v or "").strip().lower()
+        if mode not in SANDBOX_MODES:
+            raise ValueError(
+                f"SANDBOX_MODE={v!r} 不支持，只能是 {', '.join(SANDBOX_MODES)} 之一"
+                "（生产用 docker：local runner 只在 dev/test 允许执行代码）"
+            )
+        return mode
 
     @model_validator(mode="after")
     def _guard_default_secrets(self) -> Settings:

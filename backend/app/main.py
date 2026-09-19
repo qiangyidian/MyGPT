@@ -73,6 +73,19 @@ async def lifespan(app: FastAPI):
         settings.CREWAI_ENABLED,
         settings.BACKGROUND_WORKER,
     )
+    # Sandbox boot state, from the ONE runner construction point (never raises):
+    # which mode, which permission profile, and whether that combination can
+    # actually exec. A prod box left on SANDBOX_MODE=local while claiming code
+    # execution is the misconfiguration this line exists to make visible — the
+    # same verdict GET /ready reports.
+    from app.agents.sandbox.factory import runner_descriptor
+
+    _sandbox = runner_descriptor()
+    logging.getLogger(__name__).log(
+        logging.INFO if _sandbox.get("ok") else logging.ERROR,
+        "sandbox runner at boot: %s",
+        _sandbox,
+    )
     await init_db(app)
     # Start the cross-worker approval signal subscriber (no-op without Redis).
     from app.agents.approval_bus import approval_bus
