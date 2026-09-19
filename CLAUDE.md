@@ -66,7 +66,7 @@ pytest tests -q --tb=short \
 - `ruff` 在 CI 里**钉死**为 `ruff==0.15.17`。浮动的版本会因为上游删规则而炸掉
   lint 门禁，而**红色 CI 会阻断部署信号**。改 `pyproject.toml` 规则时同步改钉的版本。
 - 上面两个 deselect 是网络依赖用例（会打真实模型端点），CI 里跳过。
-- `tests/test_durable_controls.py::test_multi_agent_approval_pauses_then_resumes`
+- `tests/test_agent_graph_lifecycle.py::test_multi_agent_approval_pauses_then_resumes`
   本地已知偶发死锁，会级联出一批 `OperationalError`，与本意改动无关；
   本地验证时可 deselect。
 - **`ruff format` 不在门禁里**（仓库有历史格式债，只跑 `ruff check`）。
