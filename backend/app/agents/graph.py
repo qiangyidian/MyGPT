@@ -278,6 +278,47 @@ def build_debate_graph(side_a: str, side_b: str) -> AgentGraph:
     )
 
 
+def build_write_review_graph(question: str) -> AgentGraph:
+    """Draft → Review → Finalize（严格串行）。
+
+    与 deep_research 的区别：这里不检索，质量靠**第二次触碰**保证 ——
+    审阅者给出结构化问题清单，定稿者据其修改。
+    """
+    return AgentGraph(
+        run_id="",
+        runtime="crewai",
+        flow_name="write_review",
+        mode=GraphMode.sequential,
+        status="pending",
+        nodes=[
+            AgentGraphNode(
+                id="drafter", name="Drafter", role="初稿撰写",
+                task_title="产出可审阅的初稿",
+                task_summary="按需求写出结构完整的初稿，交付给审阅者",
+                stage=0, lane=0,
+            ),
+            AgentGraphNode(
+                id="reviewer", name="Reviewer", role="质量审阅",
+                task_title="找出必须修改的问题",
+                task_summary="逐项检查事实、逻辑、结构与表达，输出结构化问题清单",
+                stage=1, lane=0,
+            ),
+            AgentGraphNode(
+                id="finalizer", name="Finalizer", role="定稿",
+                task_title="按审阅意见定稿",
+                task_summary="逐条落实审阅意见，产出可直接交付的最终版本",
+                stage=2, lane=0,
+            ),
+        ],
+        edges=[
+            AgentGraphEdge(id="drafter-reviewer", source="drafter", target="reviewer",
+                           type=EdgeType.handoff, label="移交初稿"),
+            AgentGraphEdge(id="reviewer-finalizer", source="reviewer", target="finalizer",
+                           type=EdgeType.handoff, label="移交问题清单"),
+        ],
+    )
+
+
 def build_single_agent_graph(question: str = "") -> AgentGraph:
     """Single-node graph for the native runtime.
 
@@ -387,6 +428,8 @@ def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
         return build_parallel_research_graph(question)
     if profile == "task_decomposition":
         return build_task_decomposition_graph(question)
+    if profile == "write_review":
+        return build_write_review_graph(question)
     if profile == "debate":
         from app.agents.planning import extract_debate_sides
 

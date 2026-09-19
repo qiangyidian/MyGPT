@@ -565,6 +565,7 @@ class ChatOrchestrator:
             build_parallel_research_stages,
             build_research_stages,
             build_task_decomposition_stages,
+            build_write_review_stages,
         )
         from app.agents.workflow.executor import StageAdapterExecutor
 
@@ -579,6 +580,7 @@ class ChatOrchestrator:
             "parallel_research": build_parallel_research_stages,
             "debate": build_debate_stages,
             "task_decomposition": build_task_decomposition_stages,
+            "write_review": build_write_review_stages,
         }
         # 与 plan 用同一个 profile 来源（见上）—— 两处必须一致，否则 plan 里
         # 的 step id 与这里取出的 stage 对不上，直接 KeyError。

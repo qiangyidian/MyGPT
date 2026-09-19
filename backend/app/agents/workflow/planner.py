@@ -255,6 +255,42 @@ def build_task_decomposition_plan(question: str, worker_count: int = 3) -> Plan:
     )
 
 
+def build_write_review_plan(question: str) -> Plan:
+    """Draft → Review → Finalize（严格串行）。"""
+    q = (question or "").strip()
+    return Plan(
+        version=1, goal=q, profile="write_review",
+        max_replans=1,
+        steps=[
+            Step(
+                id="drafter", role="drafter", name="Drafter",
+                task_description=f"Write a complete first draft for: {q}",
+                dependencies=[],
+                acceptance_criteria={"min_chars": 1},
+            ),
+            Step(
+                id="reviewer", role="reviewer", name="Reviewer",
+                task_description=(
+                    "Review the draft against the request. Output a STRUCTURED "
+                    "list of concrete problems (factual, logical, structural, "
+                    "clarity). Do NOT rewrite the draft yourself."
+                ),
+                dependencies=["drafter"],
+                acceptance_criteria={"min_chars": 1},
+            ),
+            Step(
+                id="finalizer", role="finalizer", name="Finalizer",
+                task_description=(
+                    "Produce the final version, addressing every point in the "
+                    "reviewer's list. Keep what was already good."
+                ),
+                dependencies=["reviewer"],
+                acceptance_criteria={"min_chars": 1},
+            ),
+        ],
+    )
+
+
 def build_plan_for_profile(profile: str, question: str) -> Plan:
     """Pick a plan template by profile. Mirrors
     :func:`app.agents.graph.build_graph_for_profile`."""
@@ -262,6 +298,8 @@ def build_plan_for_profile(profile: str, question: str) -> Plan:
         return build_parallel_research_plan(question)
     if profile == "task_decomposition":
         return build_task_decomposition_plan(question)
+    if profile == "write_review":
+        return build_write_review_plan(question)
     if profile == "debate":
         return build_debate_plan(question)
     # default + "deep_research"
