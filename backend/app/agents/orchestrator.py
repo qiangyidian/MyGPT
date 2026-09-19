@@ -68,6 +68,7 @@ from app.agents.schemas import (
     ev_runtime_selected,
 )
 from app.core.config import get_settings
+from app.db import AsyncSessionLocal
 from app.models import AgentRun
 
 logger = logging.getLogger(__name__)
@@ -402,6 +403,29 @@ class ChatOrchestrator:
 
         env = RunEnvironment.for_turn(ctx)
         env.attach_graph(graph)
+        # 计划门（与 walker 同语义）：计划先行、默认不阻塞；只有用户主动
+        # 上闸（RunControl.request_gate）才在这里等确认。
+        if bool(getattr(get_settings(), "PLAN_REQUIRE_CONFIRMATION", False)):
+
+            async def _plan_status() -> str | None:
+                from sqlalchemy import select
+
+                factory = (
+                    ctx.extra.get("persistence_session_factory")
+                    or AsyncSessionLocal
+                )
+                async with db_mutation_scope(ctx.extra.get("persistence_lock")):
+                    async with factory() as session:
+                        row = await session.execute(
+                            select(AgentRun.plan_status).where(AgentRun.id == run.id)
+                        )
+                        return row.scalar_one_or_none()
+
+            gated = await env.await_plan_confirmation(_plan_status)
+            if not gated:
+                logger.warning(
+                    "plan confirmation timed out for run %s; proceeding", run.id
+                )
         env.begin()
         # 图定义只落一次，与 walker 路径一致（刷新后可恢复链路）。
         await env.persist_graph(definition=True)

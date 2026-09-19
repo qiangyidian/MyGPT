@@ -314,6 +314,43 @@ class RunEnvironment:
         except Exception:
             logger.debug("durable command drain failed", exc_info=True)
 
+    async def await_plan_confirmation(self, plan_status_getter: Any) -> bool:
+        """等用户确认计划，或超时/未上闸时立即返回。
+
+        ``plan_status_getter`` 是一个 async 无参可调用，返回 ``AgentRun.
+        plan_status``（``draft`` / ``confirmed`` / ``updated``）。
+
+        返回 True 表示「可以继续执行」：
+          * 用户没上闸 → 立即 True（默认路径零等待）
+          * 用户上闸且确认/修改了计划 → True
+          * 超时 → False（调用方按默认计划继续，并应发出说明）
+        """
+        from app.agents.run_controls import get_or_create as _get_or_create
+
+        ctl = self.ctx.extra.get("run_control") or _get_or_create(self.run_id)
+        if ctl is None or not ctl.gate_requested:
+            return True
+        from app.core.config import get_settings
+
+        timeout_s = int(getattr(get_settings(), "PLAN_CONFIRM_TIMEOUT_S", 90))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            if ctl.cancel.is_set():
+                raise asyncio.CancelledError()
+            try:
+                status = await plan_status_getter()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("plan-status poll failed", exc_info=True)
+                status = None
+            if status in ("confirmed", "updated"):
+                ctl.clear_gate()
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
     # ------------------------------------------------------------------ #
     # 过程可见性
     # ------------------------------------------------------------------ #

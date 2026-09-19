@@ -29,6 +29,8 @@ class RunControl:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     # Instructions the user appended mid-run (newest last).
     instructions: list[str] = field(default_factory=list)
+    # 用户主动请求计划门禁（「暂停执行」按钮）。默认 False = 计划先行不阻塞。
+    gate_requested: bool = False
 
     def pause(self) -> None:
         self.paused.set()
@@ -50,6 +52,13 @@ class RunControl:
         pending = list(self.instructions)
         self.instructions = []
         return pending
+
+    def request_gate(self) -> None:
+        """用户请求在下一个 step 边界进入计划门禁。"""
+        self.gate_requested = True
+
+    def clear_gate(self) -> None:
+        self.gate_requested = False
 
 
 def get_or_create(run_id: str | object) -> RunControl:

@@ -50,7 +50,6 @@ from app.agents.events import append_event_safe
 from app.agents.persistence import persist_research_plan
 from app.agents.planning import build_plan, classify_intent
 from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
-from app.agents.run_controls import get as get_run_control
 from app.agents.run_environment import RunEnvironment
 from app.agents.runtime.stage_executor import (
     CrewAIStageExecutor,
@@ -596,7 +595,19 @@ class CrewAIRuntime:
                 requires_confirmation=_plan_gate,
             ))
             if _plan_gate:
-                gated = await self._await_plan_confirmation(ctx, stage_ctx)
+
+                async def _status() -> str | None:
+                    async with db_mutation_scope(stage_ctx.persistence_lock):
+                        factory = stage_ctx.persistence_session_factory
+                        async with factory() as session:
+                            row = await session.execute(
+                                select(AgentRun.plan_status).where(
+                                    AgentRun.id == ctx.run_id
+                                )
+                            )
+                            return row.scalar_one_or_none()
+
+                gated = await env.await_plan_confirmation(_status)
                 if not gated:
                     # Timed out waiting: proceed anyway (bounded wait beats a
                     # stuck run) but mark the plan so the audit trail knows.
@@ -738,39 +749,6 @@ class CrewAIRuntime:
             usage=usage,
             budget=snapshot,
         )
-
-    async def _await_plan_confirmation(self, ctx, stage_ctx) -> bool:
-        """Block until the user confirms/revises the plan, or the timeout hits.
-
-        Polls the durable run row (an isolated short session per poll — the
-        request-side plan/confirm endpoint writes plan_status there). Honors
-        cancel via the run control. Returns True when confirmed/updated, False
-        on timeout.
-        """
-        from app.core.config import get_settings
-
-        timeout_s = int(getattr(get_settings(), "PLAN_CONFIRM_TIMEOUT_S", 300))
-        ctl = ctx.extra.get("run_control") or get_run_control(ctx.run_id)
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
-            if ctl is not None and ctl.cancel.is_set():
-                raise asyncio.CancelledError()
-            try:
-                async with db_mutation_scope(stage_ctx.persistence_lock):
-                    factory = stage_ctx.persistence_session_factory
-                    async with factory() as session:
-                        row = await session.execute(
-                            select(AgentRun.plan_status).where(AgentRun.id == ctx.run_id)
-                        )
-                        status = row.scalar_one_or_none()
-                if status in ("confirmed", "updated"):
-                    return True
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug("plan-status poll failed", exc_info=True)
-            await asyncio.sleep(1.0)
-        return False
 
     async def _walk_stages(
         self,

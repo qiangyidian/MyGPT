@@ -186,13 +186,13 @@ class Settings(BaseSettings):
     # transient failure falls back to the keyword router immediately rather than
     # doubling the worst-case latency.
     INTENT_MAX_RETRIES: int = 0
-    # Plan-approval gate (B5): when truthy, a multi-agent deep_research run
-    # publishes its draft plan and WAITS (bounded by PLAN_CONFIRM_TIMEOUT_S)
-    # for the user to confirm/revise via /api/agent-runs/{id}/plan/confirm
-    # before executing. When falsy (default) the plan is advisory-only —
-    # published for review while the run proceeds immediately.
-    PLAN_REQUIRE_CONFIRMATION: bool = False
-    PLAN_CONFIRM_TIMEOUT_S: int = 300
+    # Plan-approval gate (B5): the plan is ALWAYS published first ("计划先行")
+    # and the user may confirm/revise it via /api/agent-runs/{id}/plan/confirm.
+    # 计划默认不阻塞执行 —— 只有用户主动上闸（RunControl.request_gate）后，
+    # run 才会在门禁处等待确认，最多等 PLAN_CONFIRM_TIMEOUT_S 秒后按当前
+    # 计划继续（用户没响应不应让任务失败）。
+    PLAN_REQUIRE_CONFIRMATION: bool = True
+    PLAN_CONFIRM_TIMEOUT_S: int = 90
     # Auto memory proposal (B7): after each chat turn, extract 0-3 candidate
     # memories (rule-based, no extra model calls) from the user's message and
     # store them INACTIVE for the user to review/enable in settings. Dedup is
