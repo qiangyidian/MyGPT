@@ -27,6 +27,18 @@ class ReindexResult(BaseModel):
     chunk_count: int = 0
 
 
+class UploadCapabilities(BaseModel):
+    """What the KB upload endpoint will actually accept right now.
+
+    The client used to hard-code its own ``accept=`` list, so it drifted from the
+    server: formats the backend had gained stayed greyed out in the file picker,
+    and formats it had dropped produced a rejected upload. This is the effective
+    (post parser-intersection) answer, so the picker can never offer a rejection.
+    """
+    allowed_extensions: list[str]
+    max_upload_mb: int
+
+
 class DocumentPreview(BaseModel):
     """Online preview payload: the parsed full text of a document.
 

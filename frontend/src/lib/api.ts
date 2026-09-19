@@ -35,6 +35,7 @@ import {
   ResearchPlanStep,
   RunActionResult,
   ToolInfo,
+  UploadCapabilities,
   User,
   UserMemory,
   UserMemoryEditInput,
@@ -394,6 +395,9 @@ export const api = {
     request<KnowledgeBase>("POST", "/api/knowledge-bases", body),
   getKnowledgeBase: (id: string) => request<KnowledgeBase>("GET", `/api/knowledge-bases/${id}`),
   deleteKnowledgeBase: (id: string) => request("DELETE", `/api/knowledge-bases/${id}`),
+  /** What the server will actually accept — the file picker must use this, not a local list. */
+  getUploadCapabilities: () =>
+    request<UploadCapabilities>("GET", "/api/upload-capabilities"),
   listDocuments: (kbId: string, page?: PageParams) =>
     request<DocFile[]>("GET", withPageParams(`/api/knowledge-bases/${kbId}/documents`, page)),
   uploadDocument: (kbId: string, file: File) => {

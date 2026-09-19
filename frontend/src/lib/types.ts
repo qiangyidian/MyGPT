@@ -302,6 +302,12 @@ export interface KnowledgeBase {
   created_at: string;
 }
 
+export interface UploadCapabilities {
+  /** Effective server-side allow-list, e.g. [".pdf", ".docx"]. */
+  allowed_extensions: string[];
+  max_upload_mb: number;
+}
+
 export interface DocFile {
   id: string;
   knowledge_base_id: string;

@@ -4,11 +4,18 @@ Nothing in the app should read os.environ directly — import `get_settings()` h
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_logger = logging.getLogger(__name__)
+
+# Extensions already reported as "configured but unparseable". ``allowed_extensions``
+# is consulted on every upload, so without this the diagnostic would spam.
+_warned_unparseable_exts: set[str] = set()
 
 # Repo root (this file is backend/app/core/config.py → parents[3]). The config
 # is loaded from the repo-root .env regardless of the current working directory:
@@ -109,7 +116,16 @@ class Settings(BaseSettings):
     STORAGE_BACKEND: str = "local"
     STORAGE_DIR: str = "./data/uploads"
     MAX_UPLOAD_MB: int = 20
-    ALLOWED_UPLOAD_EXT: str = ".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls"
+    # What the KB upload endpoint accepts. This is a *policy* list (operator can
+    # narrow it), not a capability list: the final allow-set is intersected with
+    # the parser registry in ``allowed_extensions`` below, so an entry nobody can
+    # parse back out is dropped instead of turning into an "uploaded, then
+    # indexing failed" document. Formats listed here that the parser registry
+    # doesn't know are reported as a startup/config warning, not silently kept.
+    ALLOWED_UPLOAD_EXT: str = (
+        ".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.markdown,.log,.json,"
+        ".csv,.xlsx,.xls,.html,.htm,.epub,.rtf,.odt,.ods,.odp"
+    )
 
     # ---- RAG ----
     RAG_CHUNK_SIZE: int = 500
@@ -556,7 +572,38 @@ class Settings(BaseSettings):
 
     @property
     def allowed_extensions(self) -> set[str]:
-        return {e.strip().lower() for e in self.ALLOWED_UPLOAD_EXT.split(",") if e.strip()}
+        """Extensions the KB upload path accepts: configured list ∩ parser registry.
+
+        The intersection is the point. A configured-but-unparseable extension is
+        worse than a missing one: the file is stored, billed and shown as a row,
+        then indexing dies on ``不支持的文件类型`` and the document sits at
+        ``failed`` forever with no path to recovery. Dropping it at the door is
+        the only outcome the user can act on, so the parser registry
+        (:data:`app.rag.parsers.SUPPORTED_EXTS`) holds the veto.
+        """
+        configured: set[str] = set()
+        for raw in self.ALLOWED_UPLOAD_EXT.split(","):
+            entry = raw.strip().lower()
+            if not entry:
+                continue
+            configured.add(entry if entry.startswith(".") else f".{entry}")
+        try:
+            # Imported lazily: ``app.rag.parsers`` depends on this module.
+            from app.rag.parsers import SUPPORTED_EXTS
+        except Exception:  # pragma: no cover - registry is pure-python, can't fail
+            return configured
+        parseable = configured & SUPPORTED_EXTS
+        refused = sorted(configured - parseable)
+        if refused:
+            fresh = [e for e in refused if e not in _warned_unparseable_exts]
+            if fresh:
+                _warned_unparseable_exts.update(fresh)
+                _logger.warning(
+                    "ALLOWED_UPLOAD_EXT lists %s but no parser can read them; "
+                    "uploads of these types will be rejected",
+                    ",".join(fresh),
+                )
+        return parseable
 
     @property
     def is_dev(self) -> bool:

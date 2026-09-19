@@ -76,8 +76,21 @@ EXT_RULES: dict[str, tuple[tuple[str, ...], tuple[bytes, ...]]] = {
               (_OFFICE2_MAGIC,)),
     ".txt":  (("text/plain", "text/markdown", "application/octet-stream"), ()),
     ".md":   (("text/markdown", "text/plain", "application/octet-stream"), ()),
+    ".markdown": (("text/markdown", "text/plain", "application/octet-stream"), ()),
+    ".log":  (("text/plain", "application/octet-stream"), ()),
+    # HTML has no magic bytes (it is defined by what is NOT binary), so like the
+    # other text formats it is accepted on extension alone.
+    ".html": (("text/html", "text/plain", "application/octet-stream"), ()),
+    ".htm":  (("text/html", "text/plain", "application/octet-stream"), ()),
     ".csv":  (("text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"), ()),
     ".json": (("application/json", "text/plain", "application/octet-stream"), ()),
+    # EPUB is an OCZIP container; the real one starts with "mimetypeapplication/
+    # epub+zip" at offset 30, so the plain ZIP local-header magic is what we can
+    # cheaply check here (same trade-off as the other zip-based office formats).
+    ".epub": (("application/epub+zip", "application/zip", "application/octet-stream"),
+              (b"PK\x03\x04",)),
+    ".rtf":  (("application/rtf", "text/rtf", "application/octet-stream"),
+              (_RTF_MAGIC,)),
 }
 
 # Bytes read from the head of the file: enough for every signature above (the

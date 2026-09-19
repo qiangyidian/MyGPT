@@ -30,7 +30,7 @@ from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
 from app.db import AsyncSessionLocal, get_db
 from app.models import Document, KnowledgeBase, User
-from app.schemas import DocumentOut, DocumentPreview, ReindexResult
+from app.schemas import DocumentOut, DocumentPreview, ReindexResult, UploadCapabilities
 from app.services import document_service
 
 router = APIRouter(prefix="/api", tags=["documents"])
@@ -62,6 +62,23 @@ async def _index_background(document_id: uuid.UUID) -> None:
     """Run ingestion outside the request lifecycle, with a fresh session."""
     async with AsyncSessionLocal() as session:
         await document_service.index_document(session, document_id)
+
+
+@router.get("/upload-capabilities", response_model=UploadCapabilities)
+async def get_upload_capabilities(
+    user: User = Depends(get_current_user),
+) -> UploadCapabilities:
+    """The effective KB-upload allow-list, straight from the code that enforces it.
+
+    ``settings.allowed_extensions`` is the configured list intersected with the
+    parser registry, so this is the only place a client can learn what will not
+    be rejected — anything harder-coded in the UI is a snapshot of a moving rule.
+    """
+    settings = get_settings()
+    return UploadCapabilities(
+        allowed_extensions=sorted(settings.allowed_extensions),
+        max_upload_mb=settings.MAX_UPLOAD_MB,
+    )
 
 
 @router.post(

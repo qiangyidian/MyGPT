@@ -466,4 +466,12 @@ class DefaultDocumentParser(DocumentParser):
         return fn(file_path, ext)
 
 
+# The dispatcher is the only place that knows what can actually be read back out
+# of a stored file, so the upload allow-list is intersected with it (see
+# ``Settings.allowed_extensions``). Two hand-maintained lists drift: formats this
+# registry could parse were left out of the allow-list, and formats it could not
+# were kept in it.
+SUPPORTED_EXTS: frozenset[str] = frozenset(_EXT_TO_PARSER)
+
+
 default_parser = DefaultDocumentParser()

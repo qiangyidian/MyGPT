@@ -9,6 +9,11 @@ import { RefreshCw, Trash2, Upload, Search, Eye } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { Citation, DocFile } from "@/lib/types";
 import { formatBytes } from "@/lib/utils";
+import {
+  describeKbUpload,
+  kbAcceptAttribute,
+  kbUploadRejectionMessage,
+} from "@/lib/kb-upload";
 import { resolveChatHome, withReturnTo } from "@/lib/navigation";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { BackLink } from "@/components/navigation/back-link";
@@ -49,6 +54,14 @@ function KbDetailContent() {
   const { data: kb } = useQuery({
     queryKey: ["kb", kbId],
     queryFn: () => api.getKnowledgeBase(kbId),
+  });
+
+  // The upload allow-list is the server's (configured types ∩ parseable types),
+  // so the picker can never offer a file the backend would reject.
+  const { data: uploadCaps } = useQuery({
+    queryKey: ["kb-upload-capabilities"],
+    queryFn: () => api.getUploadCapabilities(),
+    staleTime: 5 * 60 * 1000,
   });
 
   // Latest visible list (page 0 + appended pages), mirrored into a ref so the
@@ -160,11 +173,16 @@ function KbDetailContent() {
           <input
             type="file"
             className="hidden"
-            accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls"
+            accept={kbAcceptAttribute(uploadCaps)}
             onChange={(e) => {
               const f = e.target.files?.[0];
-              if (f) uploadMut.mutate(f);
               e.currentTarget.value = "";
+              if (!f) return;
+              // The picker can still be overridden to "all files"; catching it
+              // here saves a round trip and names the offending extension.
+              const rejection = kbUploadRejectionMessage(f, uploadCaps);
+              if (rejection) toast.error(rejection);
+              else uploadMut.mutate(f);
             }}
           />
           <Button asChild className="cursor-pointer gap-2" disabled={uploadMut.isPending}>
@@ -173,9 +191,7 @@ function KbDetailContent() {
             </span>
           </Button>
         </label>
-        <span className="text-xs text-muted-foreground">
-          支持 PDF / Word / TXT / Markdown / CSV / Excel
-        </span>
+        <span className="text-xs text-muted-foreground">{describeKbUpload(uploadCaps)}</span>
       </div>
 
       {/* Document list */}
