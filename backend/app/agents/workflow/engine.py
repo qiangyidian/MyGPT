@@ -323,6 +323,9 @@ class WorkflowEngine:
                 await self._error_attempt(step.id, attempt_number, exc, transient)
                 if transient:
                     observe_counter("workflow.steps", 1, outcome="retry")
+                    observe_counter(
+                        "workflow.step.retry", 1, step=step.id, attempt=attempt + 1
+                    )
                     await self._call_hook(
                         self._on_step_retry, step.id, attempt + 1, str(exc)
                     )

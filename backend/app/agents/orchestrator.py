@@ -70,6 +70,7 @@ from app.agents.schemas import (
 from app.core.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models import AgentRun
+from app.observability import observe_counter
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +355,11 @@ class ChatOrchestrator:
             return False
         if not selection.multi_agent_requested:
             return False
-        return selection.agent_profile in _engine_profiles(settings)
+        if selection.agent_profile not in _engine_profiles(settings):
+            return False
+        # 灰度面指标：只在引擎真正接管时发，profile 维度可量化。
+        observe_counter("agent.engine.profile", 1, profile=selection.agent_profile)
+        return True
 
     async def _run_engine_path(
         self, ctx: AgentTurnContext, run: AgentRun
