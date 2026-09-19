@@ -179,3 +179,14 @@ describe("AgentActivityFeed", () => {
     expect(html).not.toContain("查看完整产出");
   });
 });
+
+describe("新 profile 标签", () => {
+  it("任务分解与写-审-改都有中文标签", async () => {
+    const mod = await import("@/components/agents/agent-run-header");
+    const labels = mod.PROFILE_LABELS;
+    expect(labels.task_decomposition).toContain("任务分解");
+    expect(labels.write_review).toContain("写");
+    expect(labels.deep_research).toBeTruthy();
+    expect(labels.debate).toBeTruthy();
+  });
+});

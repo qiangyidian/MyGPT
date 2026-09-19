@@ -109,16 +109,18 @@ export function AgentRunHeader({
   );
 }
 
+/** profile → 面向用户的中文标签。导出以便单测直接断言，不必渲染。 */
+export const PROFILE_LABELS: Record<string, string> = {
+  deep_research: "深度研究",
+  parallel_research: "并行研究",
+  debate: "辩论",
+  task_decomposition: "任务分解",
+  write_review: "写-审-改",
+  single_agent: "单 Agent 对话",
+};
+
 function flowNameLabel(flow: string): string {
-  const map: Record<string, string> = {
-    deep_research: "深度研究",
-    parallel_research: "并行研究",
-    debate: "辩论",
-    task_decomposition: "任务分解",
-    write_review: "写-审-改",
-    single_agent: "单 Agent 对话",
-  };
-  return map[flow] ?? flow ?? "";
+  return PROFILE_LABELS[flow] ?? flow ?? "";
 }
 
 function runtimeLabel(runtime: string): string {
