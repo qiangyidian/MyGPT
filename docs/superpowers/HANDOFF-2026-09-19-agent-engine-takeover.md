@@ -329,9 +329,67 @@ cd frontend && npm run typecheck && npm run lint && npm run test
 12. `ruff check app tests` 全绿；后端全量无回归；前端全绿。
 13. 零迁移。
 
+
 ---
 
-## 10. 一句话总结当前状态
+## 11. 重要更正：本次任务的范围边界
+
+**本文档 §1-§10 只覆盖「多 Agent 引擎接管 + 规划/验收智能化」这一个项目（子项目 2+3）。**
+它是本次会话三个交付物之一，不是全部。
+
+### 11.1 本次会话实际交付了什么
+
+| # | 交付物 | 状态 | 文档 |
+|---|---|---|---|
+| 1 | **子项目 1**：`RunEnvironment` 统一 + 过程可见性 | ✅ 完成并已上生产 | spec: `2026-09-18-agent-run-environment-design.md`；plan: `2026-09-18-agent-run-environment.md` |
+| 2 | **子项目 2+3**：引擎接管 + 规划/验收智能化 | 🚧 17 任务完成 1 | spec: `2026-09-18-agent-engine-takeover-design.md`；plan: `2026-09-18-agent-engine-takeover.md` |
+| 3 | **本文档** | ✅ | `HANDOFF-2026-09-19-agent-engine-takeover.md` |
+
+### 11.2 ⚠️ 本文档**没有**覆盖的东西
+
+**A. 2026-08-14 前端「假功能」审计的遗留项**（记录在长期记忆 `frontend-fake-feature-audit-2026-08`，不在本仓库文档里）。它是一份独立的缺陷清单，本次会话**没有系统性处理**。接手者若被要求「完善产品」，需要先重新核对这份清单——其中多项**可能已被后续开发顺手修掉**。
+
+本文档作者已抽查若干项，**结论是这份记忆已过时，接手者必须以代码为准重新逐条核对**：
+
+| 审计项 | 记忆里的说法 | 2026-09-19 实测 |
+|---|---|---|
+| 音频附件假模态 | `ATTACHMENT_ALLOWED_EXT` 无音频扩展名 | **已修**：`config.py:226-232` 已含 `.mp3,.wav,.m4a,.ogg,.webm,.flac,.aac` |
+| 摆设开关 | `supports_structured_output` / `supports_reasoning_effort` 后端零消费 | **已修**：`native_runtime.py:210-221` 真实消费 |
+| 暂停后恢复按钮永不出现 | `ev_run_paused` 不落 `run_events` | **已修**：`crewai_runtime.py:650-654` 已持久化；前端 `execution-tab.tsx:78-86` 用 `paused_at` 对账 |
+| Artifacts 全链休眠 | `spill_tool_result` 生产调用点为 0 | **仍未修**：`context_manager.py:256` 定义了 `spill_tool_result`，但全仓库**无生产调用者**（`grep` 零命中）。注意前端 `InlineArtifactHandle` 已被 `message-bubble.tsx:440` 引用，所以链路只缺后端触发点 |
+| ArtifactCard 零 import | 组件存在但没人用 | **组件已不存在**（`components/artifacts/` 下只剩 `artifact-preview-panel.tsx` 与 `inline-artifact-handle.tsx`） |
+| 记忆页「Agent 自动提议」文案假 | 无自动 propose 路径 | **已修**：`chat_service.py:1339` + `MEMORY_AUTO_PROPOSE` 开关 |
+| MultiAgentPanel 孤儿组件 | 整文件未挂载 | **已消失**（全仓库零引用） |
+| 连接器 `last_used_at` 恒 null | 无写入代码 | **已修**：`connectors/sessions.py:147-162` 真实打戳 |
+| admin `uptime_s` 恒 0 | — | 该字段已不存在于 `api/admin.py` |
+| 前端密码校验 6 位 vs 后端 8 位 | 不一致 | 需重新核对（本次未查） |
+| 后端完整无 UI 入口 ×4（branches 树 / save-to-kb / connector rotate / admin audit） | — | 需重新核对（本次未查） |
+| onboarding 不调 `/test` 验证 key | — | 需重新核对（本次未查） |
+| 零项目死锁（`sidebar.tsx` 子菜单） | — | 需重新核对（本次未查） |
+| 重新生成跨刷新静默失效 | `lastSendRef` 不持久 | **仍未修**：`useChatStream.ts:110` 仍是 `useRef`（内存态，刷新即丢）。但 `canRegenerate` 的判定条件是否已改，本次未查 |
+
+**B. 其他进行中的项目**（本次会话只读不写，未纳入交付）：
+
+- 微信扫码登录（`docs/wechat-login.md`、`specs/2026-09-17-wechat-mp-login-design.md`）—— 与 sql2er 仓库共用同一公众号，有跨仓库契约（见长期记忆 `wechat-scan-login-cross-repo-contract`）。**改派生码逻辑/撞码策略会静默毁掉另一侧登录。**
+- 积分与兑换码（`docs/credits-operations.md`、`specs/2026-09-17-credits-and-redeem-codes-design.md`）—— 已上线（git log 有完整交付记录）。
+
+**C. 本次会话**没有**做的事情**（避免接手者误以为已完成）：
+
+- 未建立 CI 覆盖迁移的机制（`ci.yml` 仍不跑 alembic）
+- 未处理 `chunks_now.txt`（仓库根目录的未跟踪文件，来源不明，一直存在）
+- 未修 `CLAUDE.md` 里写错的 deselect 路径（见 §5.1，建议修）
+
+### 11.3 接手者的建议顺序
+
+1. 先处理 §8.1 的推送事故（人类裁决）
+2. 再做本项目的 Task 2-17（路线清晰，计划完备）
+3. 若被要求「完善产品」，**单独开一轮**核对 §11.2-A 的审计遗留项——那份清单已过时，必须逐条对照代码重新验证，**不要**直接照单施工
+
+---
+
+## 12. 一句话总结当前状态（修订）
+
+
 
 **17 个任务完成了 1 个。** 子项目 1 与 Task 1 在生产上；Task 2-17 全部未开始。
 
