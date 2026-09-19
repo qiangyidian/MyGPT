@@ -303,10 +303,90 @@ def build_single_agent_graph(question: str = "") -> AgentGraph:
     )
 
 
+_WORKER_COUNT_MIN = 1
+_WORKER_COUNT_MAX = 6
+
+
+def _clamp_workers(n: int) -> int:
+    """把 worker 数量夹到合理区间。
+
+    上限存在的理由：worker 数与并行度、token 消耗、面板宽度都成正比；
+    一个模型给出的超大 plan 不该把运行拖垮。
+    """
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        v = 3
+    return max(_WORKER_COUNT_MIN, min(_WORKER_COUNT_MAX, v))
+
+
+def build_task_decomposition_graph(
+    question: str, worker_count: int = 3
+) -> AgentGraph:
+    """Coordinator → Worker ×N（并行） → Integrator（全量 join）。
+
+    与 parallel_research 的区别：worker 数量动态，且整合者是**全量** join
+    （parallel_research 的 analyst 只汇合两条固定线）。
+    """
+    n = _clamp_workers(worker_count)
+    nodes = [
+        AgentGraphNode(
+            id="decomposer", name="Coordinator", role="任务拆解",
+            task_title="把任务拆成可并行的工作项",
+            task_summary="理解目标，拆出彼此独立、可同时推进的工作项",
+            stage=0, lane=0,
+        )
+    ]
+    edges = []
+    for i in range(1, n + 1):
+        wid = f"worker-{i}"
+        nodes.append(
+            AgentGraphNode(
+                id=wid, name=f"Worker {i}", role="执行",
+                task_title=f"执行工作项 {i}",
+                task_summary="独立完成分配到的子任务，产出可直接汇合的结果",
+                stage=1, lane=i - 1,
+            )
+        )
+        edges.append(
+            AgentGraphEdge(
+                id=f"decomposer-{wid}", source="decomposer", target=wid,
+                type=EdgeType.dependency, label="分发工作项",
+            )
+        )
+    nodes.append(
+        AgentGraphNode(
+            id="integrator", name="Integrator", role="结果整合",
+            task_title="汇合并整合全部工作项",
+            task_summary="汇总所有 worker 的产出，消除冲突，形成统一交付物",
+            stage=2, lane=0,
+        )
+    )
+    for i in range(1, n + 1):
+        edges.append(
+            AgentGraphEdge(
+                id=f"worker-{i}-integrator",
+                source=f"worker-{i}", target="integrator",
+                type=EdgeType.handoff, label=f"移交工作项 {i} 的产出",
+            )
+        )
+    return AgentGraph(
+        run_id="",
+        runtime="crewai",
+        flow_name="task_decomposition",
+        mode=GraphMode.parallel,
+        status="pending",
+        nodes=nodes,
+        edges=edges,
+    )
+
+
 def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
     """Pick the topology by agent_profile / intent."""
     if profile == "parallel_research":
         return build_parallel_research_graph(question)
+    if profile == "task_decomposition":
+        return build_task_decomposition_graph(question)
     if profile == "debate":
         from app.agents.planning import extract_debate_sides
 

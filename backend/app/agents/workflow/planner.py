@@ -198,11 +198,70 @@ def build_debate_plan(question: str) -> Plan:
     )
 
 
+def build_task_decomposition_plan(question: str, worker_count: int = 3) -> Plan:
+    """Coordinator → Worker ×N（并行） → Integrator（全量 join）。
+
+    worker 之间无依赖，所以 decomposer 完成后它们同时在 ready 集里，
+    引擎会真并行执行（max_concurrency == N）。
+    """
+    from app.agents.graph import _clamp_workers
+
+    q = (question or "").strip()
+    n = _clamp_workers(worker_count)
+    steps = [
+        Step(
+            id="decomposer",
+            role="coordinator",
+            name="Coordinator",
+            task_description=(
+                f"Break the request into {n} independent, parallelisable work "
+                f"items: {q}"
+            ),
+            dependencies=[],
+            acceptance_criteria={"min_chars": 1},
+        )
+    ]
+    for i in range(1, n + 1):
+        steps.append(
+            Step(
+                id=f"worker-{i}",
+                role="worker",
+                name=f"Worker {i}",
+                task_description=(
+                    f"Complete work item {i} from the coordinator's breakdown. "
+                    "Produce a self-contained result that needs no further work."
+                ),
+                dependencies=["decomposer"],
+                retry_policy=_TRANSIENT,
+                acceptance_criteria={"min_chars": 1},
+            )
+        )
+    steps.append(
+        Step(
+            id="integrator",
+            role="integrator",
+            name="Integrator",
+            task_description=(
+                "Merge every worker's output into one coherent deliverable; "
+                "resolve conflicts and remove duplication."
+            ),
+            dependencies=[f"worker-{i}" for i in range(1, n + 1)],
+            acceptance_criteria={"min_chars": 1},
+        )
+    )
+    return Plan(
+        version=1, goal=q, profile="task_decomposition",
+        steps=steps, max_replans=1,
+    )
+
+
 def build_plan_for_profile(profile: str, question: str) -> Plan:
     """Pick a plan template by profile. Mirrors
     :func:`app.agents.graph.build_graph_for_profile`."""
     if profile == "parallel_research":
         return build_parallel_research_plan(question)
+    if profile == "task_decomposition":
+        return build_task_decomposition_plan(question)
     if profile == "debate":
         return build_debate_plan(question)
     # default + "deep_research"
