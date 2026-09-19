@@ -71,6 +71,7 @@ class WorkflowEngine:
         on_step_end: Any = None,
         on_step_error: Any = None,
         on_step_retry: Any = None,
+        before_step: Any = None,
     ) -> None:
         self._executor = executor
         self._verifier = verifier
@@ -81,6 +82,7 @@ class WorkflowEngine:
         self._on_step_end = on_step_end
         self._on_step_error = on_step_error
         self._on_step_retry = on_step_retry
+        self._before_step = before_step
 
     # ------------------------------------------------------------------ #
     async def run(
@@ -237,6 +239,10 @@ class WorkflowEngine:
                 failed.add(step.id)
                 events[step.id].set()
                 return step.id, None
+            if self._before_step is not None:
+                # 与 on_step_start 不同：这里**不吞异常**。暂停阻塞与取消
+                # 都依赖它能中断执行（CancelledError 必须向上传播）。
+                await self._before_step(step.id)
             if step.skip:
                 # Already-done retained work: nothing to execute.
                 events[step.id].set()

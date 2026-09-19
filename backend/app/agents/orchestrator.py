@@ -438,6 +438,7 @@ class ChatOrchestrator:
             verifier=RuleBasedVerifier(),
             run_id=run.id,
             session_factory=ctx.extra.get("persistence_session_factory"),
+            before_step=lambda step_id: env.respect_controls(),
             on_step_start=env.step_started,
             on_step_end=lambda step_id, output, usage: env.step_completed(
                 step_id,
