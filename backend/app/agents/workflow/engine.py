@@ -70,6 +70,7 @@ class WorkflowEngine:
         on_step_start: Any = None,
         on_step_end: Any = None,
         on_step_error: Any = None,
+        on_step_retry: Any = None,
     ) -> None:
         self._executor = executor
         self._verifier = verifier
@@ -79,6 +80,7 @@ class WorkflowEngine:
         self._on_step_start = on_step_start
         self._on_step_end = on_step_end
         self._on_step_error = on_step_error
+        self._on_step_retry = on_step_retry
 
     # ------------------------------------------------------------------ #
     async def run(
@@ -315,6 +317,9 @@ class WorkflowEngine:
                 await self._error_attempt(step.id, attempt_number, exc, transient)
                 if transient:
                     observe_counter("workflow.steps", 1, outcome="retry")
+                    await self._call_hook(
+                        self._on_step_retry, step.id, attempt + 1, str(exc)
+                    )
                     continue
                 logger.warning(
                     "workflow step %s failed permanently: %s", step.id, exc

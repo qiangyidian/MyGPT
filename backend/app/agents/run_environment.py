@@ -204,6 +204,10 @@ class RunEnvironment:
         self.emitter.emit_agent_failed(step_id, error=error)
         self.emitter.cancel_downstream(step_id)
 
+    def step_retrying(self, step_id: str, *, attempt: int, error: str) -> None:
+        """标记节点正在重试（引擎 transient 重试的观测通道）。"""
+        self.emitter.emit_agent_retrying(step_id, attempt=attempt, error=error)
+
     def step_cancelled(self, step_id: str) -> None:
         self._stop_progress(step_id)
         self.emitter.emit_agent_cancelled(step_id)
