@@ -35,6 +35,13 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
+# 「未设置密码」哨兵。公众号扫码自动注册的账号在 users.password_hash 里存这个常
+# 量，而不是一个谁都不知道的随机哈希：它不是合法的 passlib 散列，verify_password
+# 恒 False（拿它登录必然失败），同时 auth_service.password_is_set() 能稳定识别出
+# 「这个账号还没设过密码」——不必给 users 加列、不必新增迁移。
+PASSWORD_NOT_SET = "!password-not-set"
+
+
 def validate_password_strength(password: str) -> None:
     """Enforce the configured password policy. Raises ValueError on violation.
 

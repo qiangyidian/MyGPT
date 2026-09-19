@@ -20,10 +20,18 @@ class MailServiceError(RuntimeError):
     """User-facing send failure (details logged server-side only)."""
 
 
+# 验证码用途 → 邮件文案里的动作名。未登记的用途回落到「登录」，与旧行为一致。
+_PURPOSE_ACTIONS: dict[str, str] = {
+    "register": "注册",
+    "login": "登录",
+    "reset": "重置密码",
+}
+
+
 def _build_message(to_email: str, code: str, purpose: str) -> EmailMessage:
     settings = get_settings()
     ttl_minutes = settings.EMAIL_CODE_TTL_SECONDS // 60
-    action = "注册" if purpose == "register" else "登录"
+    action = _PURPOSE_ACTIONS.get(purpose, "登录")
     message = EmailMessage()
     message["Subject"] = f"MyChat {action}验证码：{code}"
     message["From"] = settings.MAIL_FROM or settings.MAIL_USERNAME

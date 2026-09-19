@@ -13,11 +13,15 @@ from app.schemas.agent import (
     ToolCallAuditOut,
 )
 from app.schemas.auth import (
+    AuthMessageOut,
+    ChangePasswordRequest,
     DeleteAccountRequest,
     EmailCodeRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     RefreshResponse,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UserOut,
     WechatBindingOut,
@@ -95,6 +99,8 @@ __all__ = [
     "WechatCodeLoginRequest", "WechatBindingOut",
     "DeleteAccountRequest",
     "EmailCodeRequest",
+    "ChangePasswordRequest", "ForgotPasswordRequest", "ResetPasswordRequest",
+    "AuthMessageOut",
     # model config
     "ModelConfigCreate", "ModelConfigUpdate", "ModelConfigOut", "ModelTestResult",
     # conversation / message

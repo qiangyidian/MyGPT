@@ -41,6 +41,16 @@ def _key(ns: str, email: str) -> str:
     return f"{ns}:{email}"
 
 
+def _code_key(email: str, purpose: str) -> str:
+    """Code key, scoped by purpose: a code mailed out for registration can never
+    be redeemed as a password-reset code (or the other way round), and clearing
+    one purpose's code leaves the other purpose's pending code alone.
+
+    The throttles stay per address on purpose — see :func:`request_code`.
+    """
+    return f"{_CODE_NAMESPACE}:{purpose}:{email}"
+
+
 def _generate_code() -> str:
     # 6 digits, crypto-random, no leading-zero ambiguity (always 6 chars).
     return f"{secrets.randbelow(1_000_000):06d}"
@@ -60,6 +70,10 @@ async def request_code(email: str, purpose: str = "register") -> dict:
     # Resend interval: one in-flight code per address; SET NX keeps the
     # original TTL if a code is already pending. An interval of 0 disables
     # the gate (explicit opt-out for tests / tight dev loops).
+    #
+    # Deliberately keyed per ADDRESS, not per address+purpose: the throttle is
+    # the anti-mail-bombing budget, and splitting it per purpose would let one
+    # mailbox be mailed twice as fast (register + reset) for free.
     interval_key = _key(_INTERVAL_NAMESPACE, email_n)
     if settings.EMAIL_CODE_RESEND_INTERVAL > 0:
         got = await redis.set(
@@ -81,7 +95,7 @@ async def request_code(email: str, purpose: str = "register") -> dict:
 
     code = _generate_code()
     await redis.set(
-        _key(_CODE_NAMESPACE, email_n), code, ex=settings.EMAIL_CODE_TTL_SECONDS
+        _code_key(email_n, purpose), code, ex=settings.EMAIL_CODE_TTL_SECONDS
     )
 
     await send_verification_email(email_n, code, purpose)
@@ -90,7 +104,11 @@ async def request_code(email: str, purpose: str = "register") -> dict:
     # Dev/test only: echo the code when SMTP is off (never in production).
     # MUST key off is_prod — ENV values are dev|test|prod, and comparing
     # against a hand-typed "production" once silently disabled this guard.
-    if not settings.MAIL_ENABLED and not settings.is_prod:
+    #
+    # …and registration only. The reset flow's code IS the credential that
+    # rewrites a password, so echoing it outside production would turn every
+    # dev box into "reset any account you can name".
+    if not settings.MAIL_ENABLED and not settings.is_prod and purpose == "register":
         payload["debug_code"] = code
     return payload
 
@@ -109,7 +127,7 @@ async def verify_and_consume(email: str, code: str, purpose: str = "register") -
     settings = get_settings()
     email_n = _normalize(email)
     redis = get_redis()
-    key = _key(_CODE_NAMESPACE, email_n)
+    key = _code_key(email_n, purpose)
     stored = await redis.get(key)
     if not stored:
         return False
@@ -132,9 +150,9 @@ async def verify_and_consume(email: str, code: str, purpose: str = "register") -
     return False
 
 
-async def has_pending_code(email: str) -> bool:
+async def has_pending_code(email: str, purpose: str = "register") -> bool:
     redis = get_redis()
-    return bool(await redis.exists(_key(_CODE_NAMESPACE, _normalize(email))))
+    return bool(await redis.exists(_code_key(_normalize(email), purpose)))
 
 
 def _now() -> float:

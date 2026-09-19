@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import hash_password
+from app.core.security import PASSWORD_NOT_SET
 from app.models import User, WechatIdentity
 from app.services import wechat_auth_client
 from app.services.wechat_auth_client import WechatAuthError, WechatAuthUnavailable
@@ -61,13 +61,16 @@ async def _create_user_for_openid(db: AsyncSession, openid: str) -> User:
     """Auto-register a MyChat account for a never-seen WeChat follower.
 
     ``users`` requires non-null email / username / password_hash, so all three
-    are synthesized. The password is a random value nobody knows — the account
-    is reachable only through WeChat until the user sets a real one.
+    are synthesized. The password is NOT set — the column carries the
+    ``PASSWORD_NOT_SET`` sentinel instead of a random hash, so the account stays
+    WeChat-only, cannot be logged into with a password, and (importantly) the
+    改密 endpoint can tell "this user never had a password" from "they set one"
+    without adding a column. Setting a real password replaces the sentinel.
     """
     user = User(
         email=f"wx_{openid}@{_SYNTHETIC_EMAIL_DOMAIN}",
         username=await _unique_username(db, f"微信用户{openid[-6:]}"),
-        password_hash=hash_password(secrets.token_urlsafe(32)),
+        password_hash=PASSWORD_NOT_SET,
         role="user",
         is_active=True,
     )

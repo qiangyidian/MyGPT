@@ -14,6 +14,7 @@ still gets correct revocation semantics.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.security import (
     ACCESS_TOKEN_TYPE,
+    PASSWORD_NOT_SET,
     REFRESH_TOKEN_TYPE,
     create_access_token,
     create_refresh_token,
@@ -138,10 +140,10 @@ async def _blacklist_has(jti: str) -> bool:
 async def blacklist_access_token(token: str) -> None:
     """Blacklist a presented ACCESS token by its jti (logout / admin kill).
 
-    TTL-bounded: the entry is only meaningful until the token would expire
-    anyway, so the set self-cleans. With jti missing (legacy tokens) this is a
-    no-op — the ``token_version`` claim check in ``get_current_user`` covers
-    those.
+    TTL-bounded: the entry only has to live as long as the token itself could
+    still be accepted, so the set self-cleans instead of growing forever. With
+    jti missing (tokens issued before the jti claim existed) this is a no-op —
+    the ``token_version`` claim check in ``get_current_user`` covers those.
     """
     try:
         payload = decode_token(token)
@@ -153,7 +155,7 @@ async def blacklist_access_token(token: str) -> None:
     if not jti:
         return
     client = await _get_redis()
-    ttl = settings.JWT_ACCESS_EXPIRE_MINUTES * 60 + 60
+    ttl = _remaining_validity_seconds(payload)
     if client is not None:
         try:
             await client.sadd(ACCESS_BLACKLIST_KEY, jti)
@@ -162,6 +164,21 @@ async def blacklist_access_token(token: str) -> None:
             _mem_blacklist.add(jti)
     else:
         _mem_blacklist.add(jti)
+
+
+def _remaining_validity_seconds(payload: dict) -> int:
+    """Seconds until ``exp`` (+ a minute of clock-skew slack), min 60.
+
+    A token without a usable ``exp`` is treated as full-lifetime rather than
+    as instantly-expiring: over-retaining a blacklist entry is harmless,
+    under-retaining it would let a revoked token come back to life.
+    """
+    exp = payload.get("exp")
+    try:
+        remaining = int(exp) - int(time.time())
+    except (TypeError, ValueError):
+        remaining = settings.JWT_ACCESS_EXPIRE_MINUTES * 60
+    return max(remaining, 0) + 60
 
 
 async def is_access_revoked(token_payload: dict) -> bool:
@@ -237,19 +254,27 @@ async def authenticate(db: AsyncSession, email: str, password: str) -> User | No
 def issue_tokens(user: User) -> dict[str, Any]:
     """Issue a fresh access token (and refresh token) for ``user``.
 
+    The single token-minting path: every login / register / refresh / WeChat
+    route funnels through here, so no issued token can be missing the claims
+    revocation depends on.
+
     Returns a dict with ``access_token``, ``expires_in`` (seconds), and
     ``refresh_token``. Both tokens embed a unique ``jti`` (so logout can
-    revoke them) and the access token embeds ``ver`` (the user's
-    ``token_version``) so bumping the version instantly invalidates every
-    previously issued access token for that user.
+    revoke them) and the user's ``token_version`` as ``ver``: bumping the
+    version (password change, admin deactivation, account deletion) instantly
+    invalidates every previously issued access token *and* stops the older
+    refresh tokens from minting new ones.
     """
     refresh_jti = uuid.uuid4().hex
     access_jti = uuid.uuid4().hex
+    ver = int(getattr(user, "token_version", 0) or 0)
     access = create_access_token(
         subject=str(user.id),
-        extra={"jti": access_jti, "ver": int(getattr(user, "token_version", 0) or 0)},
+        extra={"jti": access_jti, "ver": ver},
     )
-    refresh = create_refresh_token(subject=str(user.id), extra={"jti": refresh_jti})
+    refresh = create_refresh_token(
+        subject=str(user.id), extra={"jti": refresh_jti, "ver": ver}
+    )
     expires_in = settings.JWT_ACCESS_EXPIRE_MINUTES * 60
     return {
         "access_token": access,
@@ -257,6 +282,34 @@ def issue_tokens(user: User) -> dict[str, Any]:
         "token_type": "bearer",
         "expires_in": expires_in,
     }
+
+
+def password_is_set(user: User) -> bool:
+    """Whether ``user`` has a password they could actually authenticate with.
+
+    公众号扫码自动注册的账号从不设密码（历史行存的是随机哈希，新行存
+    ``PASSWORD_NOT_SET`` 哨兵），所以「校验旧密码」对它们是不可完成的：改密端点据这
+    一条决定是否要求 old_password。哨兵方案之前创建的微信行只有随机哈希，无法用现有
+    字段区分「随机」与「本人设过」——详见 api/auth.py 的说明。
+    """
+    raw = (getattr(user, "password_hash", "") or "").strip()
+    if not raw or raw == PASSWORD_NOT_SET:
+        return False
+    # 不是 passlib 能解析的散列（脏数据 / 占位值）：任何人都无法通过旧密码校验。
+    return raw.startswith("$")
+
+
+async def set_password(db: AsyncSession, user: User, new_password: str) -> None:
+    """Persist a new password and bump ``token_version`` (kill every old session).
+
+    Bumping the version is what makes "改密后旧 token 立即失效" true rather than
+    aspirational: ``get_current_user`` compares the ``ver`` claim against the
+    column, and ``/api/auth/refresh`` does the same for refresh tokens.
+    """
+    user.password_hash = hash_password(new_password)
+    user.token_version = int(user.token_version or 0) + 1
+    await db.commit()
+    await db.refresh(user)
 
 
 async def is_refresh_valid(token: str) -> bool:
@@ -302,6 +355,10 @@ async def rotate_refresh(db: AsyncSession, token: str) -> dict[str, Any] | None:
     (A merge accident once left this function's body orphaned inside
     ``revoke_refresh`` — referencing an undefined ``db`` — which would have
     500'd the logout/refresh paths on legacy no-jti tokens.)
+
+    这条路径也检查 ``ver``：否则「改密/封号即踢下线」会被一次刷新调用绕过。
+    旧 token 里没有 ``ver`` 时放行，与 ``/api/auth/refresh``、``deps.py`` 保持一致，
+    免得把签发哨兵之前发出去的合法会话全部拒掉。
     """
     payload = await decode_refresh(token)
     if payload is None:
@@ -311,6 +368,8 @@ async def rotate_refresh(db: AsyncSession, token: str) -> dict[str, Any] | None:
         return None
     user = await db.get(User, uuid.UUID(user_id))
     if user is None or not user.is_active:
+        return None
+    if "ver" in payload and int(payload.get("ver") or 0) != int(user.token_version or 0):
         return None
     # Revoke the consumed token before issuing a new one.
     await revoke_refresh(token)

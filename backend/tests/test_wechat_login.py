@@ -19,8 +19,9 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
+from app.core.security import PASSWORD_NOT_SET, verify_password
 from app.models import User, WechatIdentity
-from app.services import wechat_auth_client, wechat_login_service
+from app.services import auth_service, wechat_auth_client, wechat_login_service
 from app.services.wechat_auth_client import (
     WechatAuthError,
     WechatAuthThrottled,
@@ -92,7 +93,11 @@ async def test_first_login_auto_registers_and_binds(db_session, redeem_as):
     # users requires non-null email / username / password_hash.
     assert user.email == f"wx_{openid}@wechat.local"
     assert user.username.startswith("微信用户")
-    assert user.password_hash  # random, unknown to anyone
+    # 「未设置密码」哨兵而不是随机哈希：它不是合法散列（密码登录必然失败），
+    # 却能被 auth_service.password_is_set() 认出来，改密端点据此免校验原密码。
+    assert user.password_hash == PASSWORD_NOT_SET
+    assert auth_service.password_is_set(user) is False
+    assert verify_password("anything", user.password_hash) is False
     identity = (
         await db_session.execute(
             select(WechatIdentity).where(WechatIdentity.openid == openid)
