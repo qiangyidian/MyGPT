@@ -187,6 +187,23 @@ class Settings(BaseSettings):
     # Max recovery retries before a run is terminally failed.
     RUN_MAX_RETRIES: int = 3
 
+    # ---- Durable ingestion queue (documents) ----
+    # The Document row *is* the job (status pending/parsing/... + the four
+    # ingest_* columns), so an upload survives a restart of whichever process
+    # accepted it and a poisoned file cannot retry forever.
+    # Lease TTL: how long one worker may own an ingestion before another may
+    # take over. Renewed every INGEST_LEASE_RENEW_SECONDS while alive, so this
+    # only bounds crash detection — a legitimately slow file is not stolen.
+    INGEST_LEASE_TTL_SECONDS: int = 300
+    INGEST_LEASE_RENEW_SECONDS: int = 60
+    # Attempts before a document goes terminally ``failed`` (a transient
+    # embedding-provider outage retries; a corrupt file stops after this).
+    INGEST_MAX_ATTEMPTS: int = 4
+    # Exponential backoff base: attempt N waits INGEST_BACKOFF_BASE_SECONDS * 2**(N-1).
+    INGEST_BACKOFF_BASE_SECONDS: int = 30
+    # Worker poll interval when nothing is claimable (an upload wakes it sooner).
+    INGEST_POLL_INTERVAL_SECONDS: float = 3.0
+
     # ---- Agent platform (CrewAI / tool safety) ----
     # Master switch for the CrewAI runtime. Even when True, the runtime is only
     # used when execution_mode="agent" and the `crewai` package is importable;

@@ -42,6 +42,8 @@ from app.rag import attachment_rag
 from app.rag.base import ParsedDocument
 from app.rag.ocr import image_to_text as ocr_image_to_text
 from app.rag.parsers import default_parser
+from app.services.ingestion_queue import enqueue as enqueue_ingestion
+from app.services.ingestion_queue import notify_ingestion_worker
 
 logger = logging.getLogger(__name__)
 
@@ -777,22 +779,15 @@ async def save_to_kb(
     # names (one doc double-indexed, another never indexed).
     user_obj = await db.get(User, user_id)
     doc = await document_service.upload(db, kb, user_obj, upload_file)
-    _spawn(_index_document_safe(doc.id))
+    # 走持久队列，而不是本进程的后台任务：收到这次保存的进程如果在索引完成前
+    # 重启，文档不会永远停在 pending —— 任何 worker 都能按租约接手。
+    await enqueue_ingestion(db, doc.id)
+    notify_ingestion_worker()
     att.knowledge_base_id = kb_id
     att.is_temporary = False
     await db.commit()
     await db.refresh(att)
     return att
-
-
-async def _index_document_safe(document_id: uuid.UUID) -> None:
-    """Background index with its own session; never raises."""
-    from app.services import document_service
-    try:
-        async with AsyncSessionLocal() as db:
-            await document_service.index_document(db, document_id)
-    except Exception:
-        logger.exception("save-to-kb indexing failed for document %s", document_id)
 
 
 # ---------------------------------------------------------------------------

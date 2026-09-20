@@ -2,7 +2,8 @@
 
 Builds the app context (settings, DB engine), picks the run queue transport
 from ``BACKGROUND_WORKER``, and runs the worker loop with graceful shutdown on
-SIGTERM/SIGINT. The worker claims runs from the queue, acquires leases, and
+SIGTERM/SIGINT. The knowledge-base ingestion queue is drained in the same
+process. The worker claims runs from the queue, acquires leases, and
 executes each run via :func:`app.agents.workflow.execution.execute_run`.
 
 Usage::
@@ -59,10 +60,21 @@ async def main() -> None:
             # Windows doesn't support add_signal_handler; fall back to KeyboardInterrupt.
             pass
 
+    # Knowledge-base ingestion shares this process: it is a DB-leased queue, so
+    # it needs no broker, and running it here means a document uploaded right
+    # before an API restart still gets indexed while the API is back.
+    from app.services import ingestion_queue
+
+    ingestion_worker = await ingestion_queue.build_worker()
+    ingestion_task = asyncio.create_task(
+        ingestion_worker.run_forever(stop_event=stop_event)
+    )
+
     try:
         await worker.run_forever(stop_event=stop_event)
+        await ingestion_task
     except KeyboardInterrupt:
-        pass
+        stop_event.set()
     logger.info("worker stopped")
 
 

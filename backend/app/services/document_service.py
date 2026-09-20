@@ -1,10 +1,13 @@
 """Document ingestion pipeline: upload -> parse -> split -> embed -> store.
 
-``index_document`` runs the full RAG ingestion for one file and is meant to be called
-as a background task after upload. It is idempotent for reindex (old chunks + vectors
-for the same document are removed first). Every step sets a coarse status on the
-Document row so the UI can show progress, and any failure flips it to ``failed`` with
-an error message rather than raising.
+``upload`` is what an HTTP request does; ``index_document`` is what the durable
+queue calls (app/services/ingestion_queue.py), so nothing here runs in the
+request that triggered it. ``index_document`` is idempotent for reindex (old
+chunks + vectors for the same document are removed first). Every step sets a
+coarse status on the Document row so the UI can show progress, and a failure
+flips it to ``failed`` with an error message and returns an
+:class:`~app.services.ingestion_queue.IngestionOutcome` instead of raising —
+the queue decides whether that failure is worth another attempt.
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ from app.rag.parsers import default_parser
 from app.rag.qdrant_store import get_vector_store
 from app.rag.rag_service import collection_name
 from app.rag.splitter import RecursiveTextSplitter
-from app.schemas import ReindexResult
+from app.services.ingestion_queue import IngestionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -141,17 +144,27 @@ async def _clear_existing(db: AsyncSession, doc: Document, collection: str) -> N
     await db.execute(_sa_delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
 
 
-async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
-    """Full ingestion pipeline for one document. Never raises; sets status."""
+async def index_document(
+    db: AsyncSession, document_id: uuid.UUID
+) -> IngestionOutcome:
+    """Full ingestion pipeline for one document. Never raises.
+
+    The returned :class:`~app.services.ingestion_queue.IngestionOutcome` is how
+    the queue learns what happened without this function propagating an
+    exception into whichever background task called it. ``retryable`` is the
+    split that matters: a provider outage should be retried, a file that has no
+    parseable text should not be attempted four more times.
+    """
     doc = await db.get(Document, document_id)
     if doc is None:
-        return
+        return IngestionOutcome(ok=False, error="Document not found", retryable=False)
     kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
     if kb is None:
         doc.status = "failed"
         doc.error_message = "Knowledge base not found"
         await db.commit()
-        return
+        # A KB row does not come back; retrying would just re-check and fail.
+        return IngestionOutcome(ok=False, error=doc.error_message, retryable=False)
 
     try:
         # 1. Parse.
@@ -254,23 +267,19 @@ async def index_document(db: AsyncSession, document_id: uuid.UUID) -> None:
         doc.chunk_count = len(chunk_rows)
         doc.error_message = None
         await db.commit()
+        return IngestionOutcome(ok=True)
     except Exception as exc:
         logger.exception("indexing failed for document %s", document_id)
         doc.status = "failed"
         doc.error_message = str(exc)[:500]
         await db.commit()
-
-
-async def reindex(db: AsyncSession, document_id: uuid.UUID) -> ReindexResult:
-    """Re-run ingestion for a document (clears old chunks + vectors first)."""
-    doc = await db.get(Document, document_id)
-    if doc is None:
-        return ReindexResult(document_id=document_id, status="not_found", chunk_count=0)
-    await index_document(db, document_id)
-    await db.refresh(doc)
-    return ReindexResult(
-        document_id=doc.id, status=doc.status, chunk_count=doc.chunk_count
-    )
+        # ValueError = the parser/splitter saying "this text is not usable",
+        # OSError = the stored file is gone or unreadable. Both are properties of
+        # the row, so a retry would produce the identical failure.
+        retryable = not isinstance(exc, (ValueError, OSError))
+        return IngestionOutcome(
+            ok=False, error=doc.error_message, retryable=retryable
+        )
 
 
 async def list_for_kb(

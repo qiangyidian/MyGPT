@@ -263,13 +263,14 @@ async def test_kb_upload_of_disallowed_extension_is_a_400_not_a_500(db_session):
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def no_background_index(monkeypatch):
-    """后台索引用的是生产 session factory（另一块内存库），端点测试里停掉。"""
+    """端点测试里摘掉「叫醒本进程 worker」这一步。
 
-    async def _noop(document_id):
-        return None
-
-    monkeypatch.setattr("app.api.documents._index_background", _noop)
-    return _noop
+    上传不再排后台任务，而是把 documents 行入队（见 app.services.ingestion_queue），
+    所以已经没有后台任务可停；但 ``notify_ingestion_worker`` 会立刻叫醒本进程的领取
+    循环 —— 测试环境里若装了 worker，它就会真去索引这个文件。入队本身保留：那正是
+    上传端点要断言的行为。
+    """
+    monkeypatch.setattr("app.api.documents.notify_ingestion_worker", lambda: False)
 
 
 async def _make_kb(db_session) -> KnowledgeBase:

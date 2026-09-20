@@ -111,10 +111,9 @@ async def lifespan(app: FastAPI):
     # Publish the singleton regardless of connect outcome: merge_mcp_tools is a
     # no-op when the registry is empty/disconnected, so this never breaks a turn.
     set_live_mcp_registry(mcp_registry)
-    # Re-enqueue documents/attachments whose parse/index tasks died with a
-    # previous process (a restart used to strand them in pending/parsing
-    # forever — the KB silently stopped working). Also start the periodic
-    # sweeper so a crash mid-parse between boots heals without a deploy.
+    # Chat attachments still parse as fire-and-forget tasks, so re-enqueue the
+    # ones a previous process died with, and keep sweeping for crashes between
+    # boots.
     from app.db import AsyncSessionLocal
     from app.services.stale_job_recovery import StaleJobSweeper, requeue_stale_jobs_once
 
@@ -125,6 +124,17 @@ async def lifespan(app: FastAPI):
     stale_sweeper = StaleJobSweeper(AsyncSessionLocal)
     stale_sweeper.start()
     app.state.stale_job_sweeper = stale_sweeper
+    # Knowledge-base ingestion: a durable queue whose rows are claimed under a
+    # lease, so an upload that outlives its process is picked up by whoever next
+    # polls and a permanently bad document stops being retried. Running the loop
+    # here means a single-process deployment indexes without a dedicated worker;
+    # a worker process may run the same loop concurrently (the claim is atomic).
+    from app.services import ingestion_queue
+
+    ingestion_worker = await ingestion_queue.build_worker()
+    ingestion_queue.set_active_worker(ingestion_worker)
+    ingestion_worker.start()
+    app.state.ingestion_worker = ingestion_worker
     # Data-retention pass (audit TTL, terminal run-event pruning, orphan
     # upload cleanup) — data previously grew without bound.
     from app.services.retention import RetentionSweeper
@@ -135,6 +145,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        ingestion_queue.set_active_worker(None)
+        await ingestion_worker.stop()
         await retention_sweeper.stop()
         await stale_sweeper.stop()
         await approval_bus.stop()

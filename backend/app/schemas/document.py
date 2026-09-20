@@ -17,6 +17,11 @@ class DocumentOut(ORMModel):
     status: str            # pending|parsing|chunking|embedding|indexed|failed
     error_message: str | None
     chunk_count: int
+    # Queue state, so a document that is *waiting to be retried* can be told
+    # apart from one that is finished failing — with neither, a stuck document
+    # looked identical in the UI in both cases.
+    ingest_attempts: int = 0
+    ingest_next_retry_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -25,6 +30,10 @@ class ReindexResult(BaseModel):
     document_id: uuid.UUID
     status: str
     chunk_count: int = 0
+    # The queue's own state, so a caller can tell "queued again" from "still
+    # burning retries" without a second request.
+    ingest_attempts: int = 0
+    ingest_next_retry_at: datetime | None = None
 
 
 class UploadCapabilities(BaseModel):

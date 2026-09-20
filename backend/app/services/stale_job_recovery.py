@@ -1,18 +1,24 @@
-"""Stale background-job recovery for documents + chat attachments.
+"""Stale background-job recovery for chat attachments.
 
-Document indexing and attachment parsing run as fire-and-forget background
-tasks inside whichever process accepted the upload. A process restart (deploy,
-crash) destroys those tasks and the rows sit in ``pending``/``parsing``
-forever — the knowledge base silently stopped working and nothing told the
-user. This module re-enqueues such rows:
+Attachment parsing runs as a fire-and-forget task inside whichever process
+accepted the upload, so a restart destroys it and the row sits in
+``pending``/``parsing`` forever — silently. This module re-enqueues such rows:
 
   * ``requeue_stale_jobs_once`` — called once at API boot (lifespan);
-  * ``StaleJobSweeper`` — periodic sweep (runs inside the recovery process /
-    recovery scheduler loop) so a mid-parse crash between boots also heals.
+  * ``StaleJobSweeper`` — periodic sweep, so a mid-parse crash between boots also
+    heals without waiting for a deploy.
 
-Both paths are idempotent and best-effort: they never raise, and a row that
-fails re-parsing lands in its normal ``failed`` terminal state via the
-existing parse/index error handling.
+It used to do the same for knowledge-base documents, and that half is gone on
+purpose: document ingestion is a durable, leased queue now
+(:mod:`app.services.ingestion_queue`), where a row whose worker died becomes
+claimable the moment its lease expires. That heals faster (a lease TTL, not a
+10-minute age threshold) and is safe to run in parallel, which this time
+heuristic could not be — it re-dispatched rows a live worker was still indexing,
+and the deduplication table below is per-process, so a second process could not
+see it.
+
+Idempotent and best-effort: never raises, and a row that keeps failing lands in
+its normal ``failed`` terminal state via the existing parse error handling.
 """
 from __future__ import annotations
 
@@ -35,23 +41,22 @@ _MAX_REQUEUE_PER_SWEEP = 50
 
 
 async def requeue_stale_jobs_once(session_factory: Any) -> tuple[int, int]:
-    """Boot-time sweep: re-enqueue documents + attachments lost to a restart.
+    """Boot-time sweep: re-enqueue attachments abandoned by a previous process.
 
-    Returns ``(documents, attachments)`` re-enqueued counts (for the log line).
+    Returns ``(0, attachments)``. The leading zero is the vestigial document
+    count callers log: documents are no longer this module's job, they are
+    claimed off their ingestion lease.
     """
-    docs = await _stale_documents(session_factory)
-    for document_id in docs:
-        _schedule_document_index(session_factory, document_id)
     atts = await _stale_attachments(session_factory)
     for attachment_id in atts:
         _schedule_attachment_parse(session_factory, attachment_id)
-    if docs or atts:
+    if atts:
         logger.warning(
-            "stale-job recovery: re-enqueued %d document(s) + %d attachment(s) "
-            "abandoned by a previous process",
-            len(docs), len(atts),
+            "stale-job recovery: re-enqueued %d attachment(s) abandoned by a "
+            "previous process",
+            len(atts),
         )
-    return len(docs), len(atts)
+    return 0, len(atts)
 
 
 class StaleJobSweeper:
@@ -89,31 +94,6 @@ class StaleJobSweeper:
                 pass
 
 
-async def _stale_documents(session_factory: Any) -> list[uuid.UUID]:
-    from app.models.document import Document
-
-    cutoff = datetime.now(UTC) - _STALE_AFTER
-    async with session_factory() as db:
-        result = await db.execute(
-            select(Document.id)
-            .where(
-                Document.status.in_(["pending", "parsing"]),
-                Document.created_at < cutoff,
-            )
-            .limit(_MAX_REQUEUE_PER_SWEEP)
-        )
-        ids = list(result.scalars().all())
-        if ids:
-            # Flip parsing → pending so the index task starts clean.
-            await db.execute(
-                Document.__table__.update()
-                .where(Document.id.in_(ids), Document.status == "parsing")
-                .values(status="pending")
-            )
-            await db.commit()
-        return list(ids)
-
-
 async def _stale_attachments(session_factory: Any) -> list[uuid.UUID]:
     from app.models.chat_attachment import ChatAttachment
 
@@ -139,19 +119,6 @@ async def _stale_attachments(session_factory: Any) -> list[uuid.UUID]:
             )
             await db.commit()
         return list(ids)
-
-
-def _schedule_document_index(session_factory: Any, document_id: uuid.UUID) -> None:
-    async def _run() -> None:
-        try:
-            from app.services.document_service import index_document
-
-            async with session_factory() as db:
-                await index_document(db, document_id)
-        except Exception:
-            logger.exception("stale-job recovery: reindex failed for %s", document_id)
-
-    _spawn(f"doc-index-{document_id}", _run())
 
 
 def _schedule_attachment_parse(session_factory: Any, attachment_id: uuid.UUID) -> None:

@@ -1,9 +1,11 @@
 """Document router: upload + list + delete + reindex.
 
 Upload validates type/size, persists the file, creates a ``pending`` Document row,
-and schedules the ingestion pipeline (parse -> split -> embed -> Qdrant) as a
-background task with its own DB session. All access is ownership-scoped via the
-document's knowledge base.
+and enqueues the ingestion pipeline (parse -> split -> embed -> Qdrant). The
+Document row is the queue entry (see app/services/ingestion_queue.py), so the job
+outlives the process that accepted the upload; waking the local worker is only a
+latency shortcut. All access is ownership-scoped via the document's knowledge
+base.
 """
 from __future__ import annotations
 
@@ -14,7 +16,6 @@ import uuid
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     HTTPException,
     Query,
@@ -28,10 +29,12 @@ from app.api.knowledge_bases import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
-from app.db import AsyncSessionLocal, get_db
+from app.db import get_db
 from app.models import Document, KnowledgeBase, User
 from app.schemas import DocumentOut, DocumentPreview, ReindexResult, UploadCapabilities
 from app.services import document_service
+from app.services.ingestion_queue import enqueue as enqueue_ingestion
+from app.services.ingestion_queue import notify_ingestion_worker
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -58,10 +61,25 @@ async def _load_owned_doc(db: AsyncSession, document_id: uuid.UUID, user: User) 
     return doc
 
 
-async def _index_background(document_id: uuid.UUID) -> None:
-    """Run ingestion outside the request lifecycle, with a fresh session."""
-    async with AsyncSessionLocal() as session:
-        await document_service.index_document(session, document_id)
+async def _queue_for_ingestion(db: AsyncSession, doc: Document) -> None:
+    """Put the document in the durable queue, then nudge the local worker.
+
+    The enqueue commits on the request's own session, so a document is never
+    visible as ``pending`` without also being schedulable. Waking the worker is
+    only a latency shortcut: any worker claims it on the next poll anyway.
+
+    ``doc`` is re-read because the enqueue is a bulk UPDATE, and the identity-map
+    synchronisation that comes with it expires the loaded row — a caller that
+    then serialises it (the response model) would trigger a lazy load outside the
+    event loop and die on ``MissingGreenlet``.
+
+    ``False`` (the queue refused because another worker owns the row) is passed
+    back for the caller to turn into its own error.
+    """
+    queued = await enqueue_ingestion(db, doc.id)
+    await db.refresh(doc)
+    notify_ingestion_worker()
+    return queued
 
 
 @router.get("/upload-capabilities", response_model=UploadCapabilities)
@@ -90,7 +108,6 @@ async def get_upload_capabilities(
 async def upload_document(
     kb_id: uuid.UUID,
     file: UploadFile,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentOut:
@@ -107,7 +124,7 @@ async def upload_document(
     # crosses it — together with the magic-byte content check.
     kb = await _load_owned_kb(db, kb_id, user)
     doc = await document_service.upload(db, kb, user, file)
-    background_tasks.add_task(_index_background, doc.id)
+    await _queue_for_ingestion(db, doc)
     return DocumentOut.model_validate(doc)
 
 
@@ -131,26 +148,36 @@ async def delete_document(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    doc = await _load_owned_doc(db, document_id, user)
-    await db.refresh(doc)
+    await _load_owned_doc(db, document_id, user)
     await document_service.delete(db, document_id)
 
 
 @router.post("/documents/{document_id}/reindex", response_model=ReindexResult)
 async def reindex_document(
     document_id: uuid.UUID,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ReindexResult:
-    """Kick off a reindex in the background; return the current snapshot."""
+    """Re-queue a document for ingestion and return the queue's snapshot of it.
+
+    Reindex goes through the same durable enqueue as an upload, which is what
+    resets the attempt counter and the backoff window: a document that failed
+    because the embedding endpoint was down becomes indexable again the moment a
+    human asks for it, while one that keeps failing still stops after
+    ``INGEST_MAX_ATTEMPTS`` instead of looping forever.
+    """
     doc = await _load_owned_doc(db, document_id, user)
-    # Mark pending immediately so the UI reflects that work is (re)starting.
-    doc.status = "pending"
-    doc.error_message = None
-    await db.commit()
-    background_tasks.add_task(_index_background, document_id)
-    return ReindexResult(document_id=doc.id, status="pending", chunk_count=doc.chunk_count)
+    if not await _queue_for_ingestion(db, doc):
+        # The queue refused: a worker holds a live lease, so indexing is running
+        # right now. Queuing it again would hand the same file to a second worker.
+        raise HTTPException(status.HTTP_409_CONFLICT, "文档正在索引中，请稍后再试")
+    return ReindexResult(
+        document_id=doc.id,
+        status=doc.status,
+        chunk_count=doc.chunk_count,
+        ingest_attempts=doc.ingest_attempts,
+        ingest_next_retry_at=doc.ingest_next_retry_at,
+    )
 
 
 # Extensions whose parsed text is (or likely is) Markdown source — render the
