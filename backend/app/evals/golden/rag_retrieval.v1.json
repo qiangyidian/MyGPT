@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "description": "离线检索质量 golden set：语料只用于跑通指标与基线检索器，不代表生产知识库内容。",
+  "docs": [
+    {
+      "doc_id": "finance-policy",
+      "document_name": "财务报销制度V5.md",
+      "chunks": [
+        {
+          "chunk_id": "finance-policy:0",
+          "text": "国内出差住宿标准：北京、上海、广州、深圳四个一线城市每晚上限 600 元，其余城市每晚上限 400 元。超过上限的部分需提交费用说明并经部门总监审批后方可报销。"
+        },
+        {
+          "chunk_id": "finance-policy:1",
+          "text": "出差餐补按自然日 120 元包干发放，无需提供餐饮发票。客户宴请属于另一类费用，必须事前在费用系统提交申请单。"
+        },
+        {
+          "chunk_id": "finance-policy:2",
+          "text": "发票抬头必须为公司全称与纳税人识别号。上一年度的发票最迟在次年 1 月 31 日前提交，逾期系统自动拒绝。"
+        }
+      ]
+    },
+    {
+      "doc_id": "security-policy",
+      "document_name": "信息安全规范.md",
+      "chunks": [
+        {
+          "chunk_id": "security-policy:0",
+          "text": "禁止通过聊天工具明文传递员工密码。需要下发临时密码时，使用一次性口令系统，接收人打开一次后即失效。"
+        },
+        {
+          "chunk_id": "security-policy:1",
+          "text": "API Key 只能存放在密钥管理服务中，严禁写入代码仓库、前端页面或日志。一旦发现 Key 泄露，负责人必须在 1 小时内完成轮换并吊销旧 Key。"
+        },
+        {
+          "chunk_id": "security-policy:2",
+          "text": "生产数据库访问走堡垒机，账号按最小权限授予，每季度复核一次权限清单。"
+        },
+        {
+          "chunk_id": "security-policy:3",
+          "text": "外包人员接入生产只能使用堡垒机的临时授权账号，账号口令由系统随机生成，到期自动回收。"
+        }
+      ]
+    },
+    {
+      "doc_id": "product-manual",
+      "document_name": "智能客服产品手册.pdf",
+      "chunks": [
+        {
+          "chunk_id": "product-manual:0",
+          "text": "知识库检索采用混合召回：向量召回负责语义相近的表述，关键词召回负责专有名词和精确短语，两路结果用 RRF 融合后再交给重排模型排序。"
+        },
+        {
+          "chunk_id": "product-manual:1",
+          "text": "单个文档上传大小上限为 20MB，超过上限的附件会被直接拒绝并提示压缩后重试；解析失败的文件会留在列表里并标注失败原因。"
+        },
+        {
+          "chunk_id": "product-manual:2",
+          "text": "回答里的引用编号与真正注入给模型的片段一一对应：没有被注入上下文的片段不会出现在引用列表中，点击引用可以看到原文片段和所属文档。"
+        }
+      ]
+    },
+    {
+      "doc_id": "ops-runbook",
+      "document_name": "运维手册.md",
+      "chunks": [
+        {
+          "chunk_id": "ops-runbook:0",
+          "text": "向量库 Qdrant 出现集群脑裂时，以最近的快照恢复单节点，恢复后重建 collection 别名并运行一致性校验脚本确认分片数量。"
+        },
+        {
+          "chunk_id": "ops-runbook:1",
+          "text": "发布顺序：先执行数据库迁移，再滚动更新 API 服务，最后重启后台 worker。回滚版本时不要回退已经应用的迁移，迁移只做向前兼容。"
+        },
+        {
+          "chunk_id": "ops-runbook:2",
+          "text": "数据库每天凌晨 03:00 做一次全量备份，备份文件本地保留 30 天，同时在对象存储保存一份异地副本用于灾难恢复。"
+        },
+        {
+          "chunk_id": "ops-runbook:3",
+          "text": "历史数据迁移：从旧库导出再灌入新库，跑完必须逐表核对行数与主键连续性，核对通过后才允许切流。"
+        }
+      ]
+    },
+    {
+      "doc_id": "hr-handbook",
+      "document_name": "员工手册.docx",
+      "chunks": [
+        {
+          "chunk_id": "hr-handbook:0",
+          "text": "年假需提前 3 个工作日在人事系统提交申请；单次申请 5 天及以上的假期需要部门总监审批，3 天以内由直属主管审批即可。"
+        },
+        {
+          "chunk_id": "hr-handbook:1",
+          "text": "每周最多安排 2 天远程办公，需要提前在团队协作日历登记，当天如需返回办公室按考勤异常处理。"
+        },
+        {
+          "chunk_id": "hr-handbook:2",
+          "text": "周末加班可在系统里转为调休，调休与年假走同一张审批单：提前 3 个工作日提交，5 天以上由部门总监审批。"
+        }
+      ]
+    },
+    {
+      "doc_id": "data-governance",
+      "document_name": "数据治理规范.md",
+      "chunks": [
+        {
+          "chunk_id": "data-governance:0",
+          "text": "日志脱敏要求：手机号保留前 3 位与后 4 位，中间以星号替换；身份证号、银行卡号与任何密钥字段一律整体替换为 [redacted]。"
+        },
+        {
+          "chunk_id": "data-governance:1",
+          "text": "报表导出的明细数据默认隐藏用户标识列，需要关联分析时另行申请脱敏后的映射表。"
+        }
+      ]
+    },
+    {
+      "doc_id": "release-process",
+      "document_name": "发布流程.md",
+      "chunks": [
+        {
+          "chunk_id": "release-process:0",
+          "text": "发布门禁必须包含数据库迁移校验脚本：分别验证空库升级到最新版本，以及在最新版本上重跑升级不报错，未通过门禁不允许打镜像。"
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "hotel-cap",
+      "query": "一线城市出差住宿一晚最多能报多少钱",
+      "k": 5,
+      "relevant": [
+        "finance-policy:0"
+      ]
+    },
+    {
+      "query_id": "apikey-leak",
+      "query": "API Key 泄露了应该怎么处理",
+      "k": 5,
+      "relevant": [
+        "security-policy:1"
+      ]
+    },
+    {
+      "query_id": "hybrid-retrieval",
+      "query": "知识库的混合检索是怎么把向量结果和关键词结果合起来的",
+      "k": 5,
+      "relevant": [
+        "product-manual:0"
+      ]
+    },
+    {
+      "query_id": "upload-size",
+      "query": "上传到知识库的附件最大支持多大",
+      "k": 5,
+      "relevant": [
+        "product-manual:1"
+      ]
+    },
+    {
+      "query_id": "citation-trace",
+      "query": "回答里的引用片段和真正注入给模型的上下文是什么关系",
+      "k": 5,
+      "relevant": [
+        "product-manual:2"
+      ]
+    },
+    {
+      "query_id": "rollback-migration",
+      "query": "发布回滚的时候数据库迁移要怎么处理",
+      "k": 5,
+      "relevant": [
+        "ops-runbook:1"
+      ]
+    },
+    {
+      "query_id": "backup-retain",
+      "query": "备份文件保留多久，有没有异地副本",
+      "k": 5,
+      "relevant": [
+        "ops-runbook:2"
+      ]
+    },
+    {
+      "query_id": "leave-approval",
+      "query": "请 6 天年假需要谁审批，要提前几天提单",
+      "k": 5,
+      "relevant": [
+        "hr-handbook:0"
+      ]
+    },
+    {
+      "query_id": "log-mask",
+      "query": "日志里的手机号要怎么脱敏",
+      "k": 5,
+      "relevant": [
+        "data-governance:0"
+      ]
+    },
+    {
+      "query_id": "migration-gate",
+      "query": "发布门禁为什么要跑数据库迁移校验",
+      "k": 5,
+      "relevant": [
+        "release-process:0"
+      ]
+    },
+    {
+      "query_id": "meal-and-invoice",
+      "query": "出差餐补和发票抬头分别有什么要求",
+      "k": 5,
+      "relevant": [
+        "finance-policy:1",
+        "finance-policy:2"
+      ]
+    },
+    {
+      "query_id": "temp-password",
+      "query": "临时密码可以直接发在工作群里吗",
+      "k": 5,
+      "relevant": [
+        "security-policy:0"
+      ]
+    },
+    {
+      "query_id": "rollback-revert-migration",
+      "query": "回滚发布时能不能把已经跑的数据库迁移一起回退",
+      "k": 5,
+      "relevant": [
+        "ops-runbook:1"
+      ]
+    },
+    {
+      "query_id": "comp-leave-approval",
+      "query": "调休需要几天前提交申请，由谁审批",
+      "k": 5,
+      "relevant": [
+        "hr-handbook:2"
+      ]
+    },
+    {
+      "query_id": "vendor-password",
+      "query": "把数据库口令直接发给外包同事可以吗",
+      "k": 5,
+      "relevant": [
+        "security-policy:0"
+      ]
+    }
+  ]
+}

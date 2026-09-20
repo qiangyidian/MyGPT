@@ -104,6 +104,11 @@ jobs:
           print('eval report:', report)
           assert report['failed'] == 0, 'offline eval contracts failed'
           assert report['passed'] >= 1, 'no offline eval contract passed'
+          # Retrieval quality is a release axis of its own: a silent recall
+          # regression must name itself here, not hide behind 'failed == 0'.
+          rag = [r for r in report['results'] if r['name'] == 'rag_retrieval_quality']
+          assert len(rag) == 1 and rag[0]['status'] == 'pass', rag
+          print('rag retrieval gate:', rag[0]['reason'])
           "
       - name: Observability + quota + readiness tests
         run: |

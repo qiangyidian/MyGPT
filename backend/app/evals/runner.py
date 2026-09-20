@@ -14,10 +14,13 @@ already-instrumented seam (no external credentials, no network, no DB):
      its token limit raises :class:`BudgetExceeded` AND the guard's ``snapshot()``
      reports ``exhausted=True`` with a reason (the data the chat layer emits on a
      ``finish_reason="budget"`` turn).
+  5. ``rag_retrieval_quality`` — the retrieval metrics + golden set + the CJK
+     tokenizer the keyword retriever uses, scored by a BM25 baseline over
+     ``app/evals/golden/rag_retrieval.v1.json`` (see app/evals/rag_retrieval.py).
 
-Live golden tasks (``live_golden_chat``) require a real model endpoint and are
-gated on ``EVAL_LIVE_MODEL_API_KEY``: present → run; absent → SKIP with a clear
-message (never FAIL on a missing credential).
+Live golden tasks (``live_golden_chat``, ``rag_retrieval_live``) require a real
+model endpoint / a seeded knowledge base and are gated on their env vars: present
+→ run; absent → SKIP with a clear message (never FAIL on a missing credential).
 """
 from __future__ import annotations
 
@@ -216,7 +219,7 @@ def _eval_budget_snapshot_present_on_finish() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Live golden contract (credential-gated).
+# Live golden chat (credential-gated).
 # --------------------------------------------------------------------------- #
 def _eval_live_golden_chat() -> dict[str, Any]:
     cred = os.environ.get(_LIVE_CREDENTIAL_ENV)
@@ -264,14 +267,33 @@ def _eval_live_golden_chat() -> dict[str, Any]:
         return _result("live_golden_chat", "fail", kind="live", reason=f"live call failed: {exc}")
 
 
+def _eval_rag_retrieval_quality() -> dict[str, Any]:
+    from app.evals.rag_retrieval import run_rag_retrieval_eval
+
+    return run_rag_retrieval_eval()
+
+
+# --------------------------------------------------------------------------- #
+# Live golden contracts (credential / deployment-gated).
+# --------------------------------------------------------------------------- #
+def _eval_live_rag_retrieval() -> dict[str, Any]:
+    from app.evals.rag_retrieval import run_live_rag_retrieval_eval
+
+    return run_live_rag_retrieval_eval()
+
+
 _OFFLINE_CONTRACTS: list[Callable[[], dict[str, Any]]] = [
     _eval_redaction_covers_secrets,
     _eval_quota_enforcement_visible,
     _eval_tool_allowlist_respected,
     _eval_budget_snapshot_present_on_finish,
+    _eval_rag_retrieval_quality,
 ]
 
-_LIVE_CONTRACTS: list[Callable[[], dict[str, Any]]] = [_eval_live_golden_chat]
+_LIVE_CONTRACTS: list[Callable[[], dict[str, Any]]] = [
+    _eval_live_golden_chat,
+    _eval_live_rag_retrieval,
+]
 
 
 def run_evals(*, include_live: bool = True) -> dict[str, Any]:
