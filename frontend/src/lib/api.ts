@@ -26,6 +26,8 @@ import {
   ModelTestResult,
   PendingApproval,
   Project,
+  ReindexResult,
+  RetrievalSettings,
   ProjectInput,
   ProviderManifest,
   RedeemBatchCreateResult,
@@ -394,6 +396,15 @@ export const api = {
   createKnowledgeBase: (body: { name: string; description?: string; embedding_model_id?: string | null }) =>
     request<KnowledgeBase>("POST", "/api/knowledge-bases", body),
   getKnowledgeBase: (id: string) => request<KnowledgeBase>("GET", `/api/knowledge-bases/${id}`),
+  /** PATCH: 省略的字段不动，显式 null 才恢复「继承平台默认」（与服务端一致）。 */
+  updateKnowledgeBase: (
+    id: string,
+    body: {
+      name?: string;
+      description?: string | null;
+      embedding_model_id?: string | null;
+    } & Partial<RetrievalSettings>
+  ) => request<KnowledgeBase>("PATCH", `/api/knowledge-bases/${id}`, body),
   deleteKnowledgeBase: (id: string) => request("DELETE", `/api/knowledge-bases/${id}`),
   /** What the server will actually accept — the file picker must use this, not a local list. */
   getUploadCapabilities: () =>
@@ -406,7 +417,7 @@ export const api = {
     return request<DocFile>("POST", `/api/knowledge-bases/${kbId}/documents`, fd);
   },
   deleteDocument: (id: string) => request("DELETE", `/api/documents/${id}`),
-  reindexDocument: (id: string) => request<{ document_id: string; status: string; chunk_count: number }>("POST", `/api/documents/${id}/reindex`),
+  reindexDocument: (id: string) => request<ReindexResult>("POST", `/api/documents/${id}/reindex`),
   previewDocument: (id: string, offset = 0) =>
     request<DocumentPreview>(
       "GET",

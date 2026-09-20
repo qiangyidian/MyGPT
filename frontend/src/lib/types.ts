@@ -291,7 +291,19 @@ export interface Citation {
   metadata?: Record<string, unknown>;
 }
 
-export interface KnowledgeBase {
+/** Per-KB retrieval / chunking overrides. ``null`` means "inherit the platform
+ *  default", not "off" — so clearing a field must send an explicit null. */
+export interface RetrievalSettings {
+  top_k: number | null;
+  score_threshold: number | null;
+  /** "Allow reranking": on if any selected KB enables it in a cross-KB query. */
+  rerank_enabled: boolean | null;
+  /** Only affects documents indexed after the change. */
+  chunk_size: number | null;
+  chunk_overlap: number | null;
+}
+
+export interface KnowledgeBase extends RetrievalSettings {
   id: string;
   user_id: string;
   name: string;
@@ -323,8 +335,21 @@ export interface DocFile {
     | "failed";
   error_message: string | null;
   chunk_count: number;
+  /** Attempts spent in the ingestion queue (``INGEST_MAX_ATTEMPTS`` bounds it). */
+  ingest_attempts: number;
+  /** Set while a failed ingestion waits to be retried; null = not scheduled. */
+  ingest_next_retry_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** POST /api/documents/{id}/reindex — the queue's snapshot after re-queueing. */
+export interface ReindexResult {
+  document_id: string;
+  status: string;
+  chunk_count: number;
+  ingest_attempts: number;
+  ingest_next_retry_at: string | null;
 }
 
 /** GET /api/documents/{id}/preview — one page of the parsed full text. */

@@ -9,6 +9,7 @@ import { RefreshCw, Trash2, Upload, Search, Eye } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { Citation, DocFile } from "@/lib/types";
 import { formatBytes } from "@/lib/utils";
+import { describeIngestQueue } from "@/lib/kb-ingest";
 import {
   describeKbUpload,
   kbAcceptAttribute,
@@ -18,6 +19,7 @@ import { resolveChatHome, withReturnTo } from "@/lib/navigation";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { BackLink } from "@/components/navigation/back-link";
 import { DocumentPreviewDialog } from "@/components/kb/document-preview-dialog";
+import { KbRetrievalSettings } from "@/components/kb/kb-retrieval-settings";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +34,13 @@ function statusVariant(s: DocFile["status"]) {
   if (s === "failed") return "destructive";
   if (IN_PROGRESS.has(s)) return "secondary";
   return "outline";
+}
+
+/** 队列在重试/已放弃时补一行说明；不需要说明时什么都不渲染。 */
+function QueueHint({ doc }: { doc: DocFile }) {
+  const line = describeIngestQueue(doc);
+  if (!line) return null;
+  return <div className="mt-1 text-xs text-muted-foreground">{line}</div>;
 }
 
 export default function KbDetailPage() {
@@ -236,6 +245,7 @@ function KbDetailContent() {
                   </td>
                   <td className="p-3">
                     <Badge variant={statusVariant(d.status)}>{d.status}</Badge>
+                    <QueueHint doc={d} />
                   </td>
                   <td className="hidden p-3 text-muted-foreground sm:table-cell">{d.chunk_count}</td>
                   <td className="p-3">
@@ -283,6 +293,8 @@ function KbDetailContent() {
           </div>
         ) : null}
       </div>
+
+      {kb && <KbRetrievalSettings kb={kb} />}
 
       {/* Retrieval test */}
       <div className="space-y-2 rounded-lg border border-border p-4">
