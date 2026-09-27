@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.core.config import get_settings
+from app.security.prompt_boundary import apply_untrusted_boundary
 
 # A remainder smaller than this is noise: dropping the chunk outright is more
 # honest than appending a sentence fragment to the prompt.
@@ -37,6 +38,10 @@ def format_context_block(hits: list) -> str:
     """Turn retrieved hits into a numbered context string with source markers.
 
     Each hit's payload is expected to carry ``document_name`` and ``text``.
+
+    正文是外部数据，所以每个 chunk 单独过一次不可信内容围栏：来源行（``[source i]``
+    及章节 / 页码）留在围栏之外，引用对齐与 ``[source N]`` 标记不受影响，只有正文
+    进围栏。围栏同时中和正文里出现的定界标记，避免文档自己提前闭合上下文。
     """
     if not hits:
         return ""
@@ -50,7 +55,8 @@ def format_context_block(hits: list) -> str:
         page = payload.get("page")
         if page:
             location += f" · 第 {page} 页"
-        lines.append(f"[source {i}] {name}{location}\n{text}")
+        body = apply_untrusted_boundary("rag", text)
+        lines.append(f"[source {i}] {name}{location}\n{body}")
     return "\n\n".join(lines)
 
 

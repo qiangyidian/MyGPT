@@ -4,7 +4,7 @@ import { create } from "zustand";
 import type { Citation, ContextTab } from "@/lib/types";
 
 /**
- * Generic right-side Context Panel state (Execution / Sources / Files / Artifact).
+ * Generic right-side Context Panel state (Execution / Sources / Files).
  *
  * Auto-open rules (see useContextPanel) may open the panel on certain events
  * (approval waiting, agent failure, citation click, attachment preview). Once

@@ -119,6 +119,7 @@ class RagService:
         question: str,
         kb_ids: list[uuid.UUID | str],
         top_k: int | None = None,
+        document_ids: list[uuid.UUID | str] | None = None,
     ) -> tuple[str, list[Citation]]:
         """Return (rag_context, citations) for the question across one or more KBs.
 
@@ -127,6 +128,12 @@ class RagService:
         across KBs, rerank, and dedup. Each hit is tagged with its source KB so
         citations name where a chunk came from. Best-effort: any failure
         (no KB, no collection yet, store error) returns ("", []).
+
+        ``document_ids`` narrows the turn to specific documents (an ``@文件``
+        reference): the filter applies to each KB's own hits *before* fusion, so
+        the cross-KB merge, the per-KB recall cap, the relevance gate and the
+        token budget all keep working unchanged. ``top_k`` stays the request-wide
+        override it has always been: unset, every KB keeps its own window.
         """
         # Observability (Task 11b): one span per retrieval operation. Inert when
         # exporters are off; the question text is NEVER placed in attributes
@@ -139,7 +146,9 @@ class RagService:
             kb_count=len(kb_ids) if kb_ids else 0,
             top_k=top_k or 0,
         ):
-            ctx, citations = await self._retrieve_impl(db, question, kb_ids, top_k)
+            ctx, citations = await self._retrieve_impl(
+                db, question, kb_ids, top_k, document_ids
+            )
         observe_histogram(
             "rag.latency_ms",
             int((_time.monotonic() - _started) * 1000),
@@ -153,6 +162,7 @@ class RagService:
         question: str,
         kb_ids: list[uuid.UUID | str],
         top_k: int | None = None,
+        document_ids: list[uuid.UUID | str] | None = None,
     ) -> tuple[str, list[Citation]]:
         if not question or not str(question).strip() or not kb_ids:
             return "", []
@@ -161,6 +171,7 @@ class RagService:
         # every per-KB column; otherwise each KB contributes its own recall
         # window and the request-wide trim is their sum.
         caller_top_k = int(top_k) if top_k else 0
+        doc_scope = {str(d) for d in (document_ids or [])} or None
         reranker = make_reranker(settings)
         overfetch = settings.RERANKER_OVERFETCH if not isinstance(reranker, NoopReranker) else 1
 
@@ -176,6 +187,12 @@ class RagService:
             ks = _KbRetrieval.from_kb(kb, settings)
             kb_settings[str(kb.id)] = ks
             fetch_k = ks.top_k * max(1, overfetch)
+            if doc_scope:
+                # Widen before filtering: the vector store's payload filter only
+                # matches a single value (see qdrant_store._to_filter), so several
+                # document ids are filtered here after the fetch — and filtering a
+                # window the size of the answer would usually leave nothing.
+                fetch_k *= _DOC_SCOPE_EXPAND
             try:
                 cfg = await _resolve_embedding_config(db, kb)
                 provider = get_provider_for_config(cfg)
@@ -194,8 +211,8 @@ class RagService:
                     k_hits = await KeywordRetriever(db).retrieve(
                         question, kb.id, top_k=fetch_k
                     )
-                    all_v.extend(_tag_kb(v_hits, kb))
-                    all_k.extend(_tag_kb(k_hits, kb))
+                    all_v.extend(_tag_kb(_in_document_scope(v_hits, doc_scope), kb))
+                    all_k.extend(_tag_kb(_in_document_scope(k_hits, doc_scope), kb))
                 else:
                     # Pass reranker=None + overfetch=1: top_k=fetch_k already bakes
                     # in the overfetch multiplier, so letting Retriever re-multiply
@@ -204,7 +221,7 @@ class RagService:
                     v_hits = await Retriever(embedder, store, None).retrieve(
                         question, collection_name(kb.id), top_k=fetch_k, overfetch=1
                     )
-                    all_v.extend(_tag_kb(v_hits, kb))
+                    all_v.extend(_tag_kb(_in_document_scope(v_hits, doc_scope), kb))
             except Exception as exc:
                 logger.warning("RAG retrieval failed for kb %s: %s", kb_id, exc)
                 continue
@@ -293,6 +310,25 @@ class RagService:
                 "retriever": payload.get("retriever"),
             },
         )
+
+
+# Extra recall factor while the turn is scoped to specific documents. The
+# document filter runs after the store returns its window, so without widening
+# it a 5-chunk fetch of a big KB rarely contains a chunk of the one mentioned
+# document, and an @-reference would answer "no context found".
+_DOC_SCOPE_EXPAND = 6
+
+
+def _in_document_scope(hits: list, scope: set[str] | None) -> list:
+    """Keep the hits whose own document is in ``scope`` (``None`` = unrestricted)."""
+    if not scope:
+        return hits
+    out: list = []
+    for h in hits:
+        payload = getattr(h, "payload", None) or {}
+        if str(payload.get("document_id") or "") in scope:
+            out.append(h)
+    return out
 
 
 def _tag_kb(hits: list, kb: KnowledgeBase) -> list:

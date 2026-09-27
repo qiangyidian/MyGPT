@@ -39,17 +39,17 @@ from sqlalchemy import select
 from app.agents.adapters.llm_adapter import CrewAILLMFactory
 from app.agents.adapters.tool_adapter import build_crewai_tool
 from app.agents.continuation import aggregate_usage
-from app.agents.crews import (
-    build_debate_stages,
-    build_parallel_research_stages,
-    build_research_stages,
-)
 from app.agents.crews.stage import StageSpec
 from app.agents.db_mutation import db_mutation_scope
 from app.agents.events import append_event_safe
 from app.agents.persistence import persist_research_plan
 from app.agents.planning import build_plan, classify_intent
-from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
+from app.agents.policies import (
+    DEFAULT_LIMITS,
+    BudgetExceeded,
+    BudgetGuard,
+    guard_for_context,
+)
 from app.agents.run_environment import RunEnvironment
 from app.agents.runtime.stage_executor import (
     CrewAIStageExecutor,
@@ -69,7 +69,11 @@ from app.agents.schemas import (
 from app.agents.stage_context import StageContext
 from app.agents.streaming_writer import StreamingWriterExecutor
 from app.agents.token_budget import PromptAdmissionError
-from app.core.config import get_settings
+from app.agents.workflow.topology import (
+    build_stage_specs,
+    multi_agent_profiles,
+    topology_for,
+)
 from app.core.pricing import usage_cost
 from app.models import AgentRun
 from app.providers.base import PROVIDER_ERR_TIMEOUT, ProviderError
@@ -97,24 +101,10 @@ def _acceptance_criteria_for(question: str, plan_steps: list[dict[str, Any]]) ->
     return criteria
 
 # Profiles that use the multi-agent graph + right-side panel.
-_MULTI_AGENT_PROFILES = {"deep_research", "parallel_research", "debate"}
-
-
-def _guard_for_context(ctx: Any) -> BudgetGuard:
-    """Resolve/inject the run guard, tolerating lightweight protocol fakes."""
-    guard = getattr(ctx, "budget_guard", None)
-    if guard is not None:
-        return guard
-    extra = getattr(ctx, "extra", {}) or {}
-    guard = BudgetGuard(
-        BudgetLimits.from_settings(
-            get_settings(),
-            extra.get("budget_overrides"),
-            allow_increase=bool(extra.get("budget_policy_authorized", False)),
-        )
-    )
-    ctx.budget_guard = guard
-    return guard
+# 来源是拓扑声明（app.agents.workflow.topology），不再是这里手写的一份 ——
+# 手写的这份漏了 write_review / task_decomposition，于是路由选出它们时
+# orchestrator 报 multi_agent_executed=True、walker 却静默走单 Agent（B14）。
+_MULTI_AGENT_PROFILES = multi_agent_profiles()
 
 
 def _writer_finish_reason(stages: list[StageSpec], outputs: dict[str, StageResult]) -> str:
@@ -314,7 +304,7 @@ class CrewAIRuntime:
         # Coerce null assistant content on CrewAI's outgoing chat body so
         # Anthropic-strict OpenAI-compatible gateways (GLM proxy) don't 422.
         _install_chat_body_sanitizer()
-        guard = _guard_for_context(ctx)
+        guard = guard_for_context(ctx)
         # 1. LLM from the existing ModelConfig.
         try:
             llm = CrewAILLMFactory.from_model_config(
@@ -357,7 +347,7 @@ class CrewAIRuntime:
         plan_summary, plan_steps = build_plan(intent, ctx.user_content)
         yield ev_plan_created(summary=plan_summary, steps=plan_steps)
 
-        guard = _guard_for_context(ctx)
+        guard = guard_for_context(ctx)
         tools = await self._build_tools(ctx, stage_ctx=None)
         try:
             agent = Agent(
@@ -519,25 +509,18 @@ class CrewAIRuntime:
         # 整个执行环境（stage_ctx 装配 / 审批桥 / emitter）由 RunEnvironment
         # 统一提供 —— 引擎路径用的是同一个构造器，两条 walker 因此拿到完全
         # 相同的运行时能力。
-        env = RunEnvironment.for_turn(ctx)
+        env = RunEnvironment.for_call(ctx)
         stage_ctx = env.stage_ctx
         guard = env.guard
         tools = await self._build_tools(ctx, stage_ctx=stage_ctx)
 
-        # Build graph + stages for the profile.
+        # Build graph + stages for the profile —— 走拓扑声明，别再在这里写
+        # if/elif：漏一支就是一条静默的降级路径（B14）。
         try:
-            if profile == "parallel_research":
-                graph, stages = build_parallel_research_stages(
-                    llm=llm, tools=tools, question=ctx.user_content
-                )
-            elif profile == "debate":
-                graph, stages = build_debate_stages(
-                    llm=llm, tools=tools, question=ctx.user_content
-                )
-            else:
-                graph, stages = build_research_stages(
-                    llm=llm, tools=tools, question=ctx.user_content
-                )
+            spec = topology_for(profile)
+            graph, stages = build_stage_specs(
+                spec, llm=llm, tools=tools, question=ctx.user_content
+            )
         except Exception as exc:
             logger.exception("crewai multi-agent setup failed: %s", exc)
             yield ev_error(code="crewai_setup_error", message=str(exc))
@@ -966,6 +949,9 @@ async def build_runtime_tools(
         allowed = set(filter_tool_names([s.name for s in sources], route))
         sources = [s for s in sources if s.name in allowed]
     tools: list[Any] = []
+    # 工具输出上限只有一个来源：guard 的 max_tool_output_chars。没有 guard 的
+    # 调用方退回 DEFAULT_LIMITS，而不是另一个手写的字面量 —— 否则调预算必漏此处。
+    guard = ctx.budget_guard
     for src in sources:
         try:
             tools.append(
@@ -976,11 +962,11 @@ async def build_runtime_tools(
                     run_id=ctx.run_id,
                     user_id=user_id,
                     stage_ctx=stage_ctx,
-                    budget_guard=ctx.budget_guard,
+                    budget_guard=guard,
                     max_result_chars=(
-                        ctx.budget_guard.limits.max_tool_output_chars
-                        if ctx.budget_guard is not None
-                        else 8_000
+                        guard.limits.max_tool_output_chars
+                        if guard is not None
+                        else DEFAULT_LIMITS.max_tool_output_chars
                     ),
                 )
             )

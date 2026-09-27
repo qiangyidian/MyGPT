@@ -103,3 +103,60 @@ def build_dynamic_stage(
         depends_on=[str(d) for d in (getattr(step, "dependencies", None) or [])],
     )
     return spec
+
+
+# --------------------------------------------------------------------------- #
+# 返修轮（写-审-改的「改」，B13）
+# --------------------------------------------------------------------------- #
+#: 注入返修提示词的标题。措辞保持中文指令式：审阅结论是**要处理的问题清单**，
+#: 不是可选参考 —— 否则模型会把同一份产出原样再交一次。
+_REVISION_HEADER = "上一轮审阅发现的问题（逐条修正后重做本步）"
+
+
+def revision_brief(step: Any) -> str:
+    """把一个返修步骤的审阅意见整理成任务描述片段。无意见时返回空串。"""
+    findings = [
+        str(f).strip()
+        for f in (getattr(step, "review_findings", None) or [])
+        if str(f).strip()
+    ]
+    if not findings:
+        return ""
+    lines = "\n".join(f"- {f}" for f in findings)
+    return f"{_REVISION_HEADER}：\n{lines}"
+
+
+def build_revise_stage(
+    *, step: Any, llm: Any, tools: list[Any], question: str
+) -> StageSpec:
+    """为**被返修过**的 Step 现场构造一个 stage：同一步，但任务描述里带着
+    上一轮的审阅结论。
+
+    为什么要有这个东西：``revise_plan`` 重跑一步时只把 ``skip`` 清掉，步骤的
+    ``task_description`` 与第一遍**一字不差**，于是 reviewer 的结论算完就丢，
+    「审 → 改」这条边在实现上是断的。这里补的是那半条边 —— 它同时要求
+    :func:`~app.agents.workflow.planner.revise_plan` 把 findings 盖进步骤
+    （``Step.review_findings``），两边缺一个都不成立。
+
+    模板 plan 的步骤（id 命中 crew builder 的那批）走的是查表路径，它们的
+    审阅意见由 :class:`~app.agents.workflow.executor.StageAdapterExecutor`
+    作为 context 注入；这个工厂服务的是「表里没有 / 已经是返修轮」的步骤。
+    """
+    brief = revision_brief(step)
+    if not brief:
+        # 没结论就没什么可改的：退化成普通的动态 stage，别硬造一段空提示词。
+        return build_dynamic_stage(
+            step=step, llm=llm, tools=tools, question=question
+        )
+    base = str(getattr(step, "task_description", "") or "").strip()
+    updated = {
+        "task_description": f"{base}\n\n{brief}".strip() if base else brief
+    }
+    return build_dynamic_stage(
+        step=step.model_copy(update=updated)
+        if hasattr(step, "model_copy")
+        else step,
+        llm=llm,
+        tools=tools,
+        question=question,
+    )

@@ -44,5 +44,13 @@ async def execute_run(
     # siblings).
     from app.services.chat_service import run_durable_turn
 
+    # Operator kill-switch state is process-local and TTL-gated, so a worker that
+    # has been running since before an admin disabled a tool would keep executing
+    # it forever without this. One SELECT per process per SNAPSHOT_TTL_SECONDS —
+    # free on every other run.
+    from app.services.tool_toggles import refresh_with
+
+    await refresh_with(session)
+
     async for evt in run_durable_turn(run_id, session):
         yield evt

@@ -18,11 +18,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: 1g
+    cpus: "2.0"
 
   # ------------------------------------------------------------------- redis
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # maxmemory MUST be below mem_limit: Redis forks for RDB/AOF rewrites and
+    # counts that COW against the cgroup, so a Redis capped exactly at the
+    # container limit gets SIGKILLed by Docker before it can ever report OOM.
+    #
+    # noeviction is not tunable: the durable run queue and the KB ingest stream
+    # live here as Redis Streams. An LRU/volatile policy under memory pressure
+    # deletes entries silently — that is "the user's paid-for run vanished",
+    # not a cache miss. With noeviction a full keyspace makes XADD error, and
+    # enqueue() surfaces that as a failed dispatch (the run row stays ``pending``
+    # for the recovery scheduler) instead of quietly dropping queue entries. The
+    # stream itself is already bounded by XADD maxlen=RUN_STREAM_MAXLEN (see
+    # app/agents/workflow/queue.py), so maxmemory only has to hold the *other*
+    # keyspaces (rate limits, SSE slots, refresh blacklist) in check.
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -30,6 +46,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    mem_limit: 768m
+    cpus: "1.0"
 
   # ------------------------------------------------------------------ qdrant
   qdrant:
@@ -46,6 +64,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    mem_limit: 1g
+    cpus: "2.0"
 
   # ----------------------------------------------------------------- backend
   backend:
@@ -67,6 +87,8 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    mem_limit: 2g
+    cpus: "2.0"
 
   # ----------------------------------------------------------- durable worker
   # Processes the durable run queue: claims runs, acquires leases, executes each
@@ -79,6 +101,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
+    environment:
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -94,6 +119,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    mem_limit: 2g
+    cpus: "2.0"
 
   # ------------------------------------------------------- recovery scheduler
   # Periodically scans for expired/stale leases, requeues retryable runs, and
@@ -104,6 +131,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
+    environment:
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,6 +143,8 @@ services:
       - ./backend:/app
     command: python -m app.recovery
     stop_grace_period: 10s
+    mem_limit: 512m
+    cpus: "0.5"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
       interval: 30s
@@ -142,6 +174,8 @@ services:
       - ./frontend:/app          # source mount -> edits hot-reload in the container
       - /app/node_modules        # keep the image's node_modules (don't shadow)
       - /app/.next               # isolated dev build cache
+    mem_limit: 2g
+    cpus: "2.0"
 
 volumes:
   postgres_data:

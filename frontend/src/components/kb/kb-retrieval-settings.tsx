@@ -6,7 +6,8 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Save } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import {
   retrievalFormFromSettings,
   retrievalPatch,
@@ -68,7 +69,7 @@ export function KbRetrievalSettings({ kb }: { kb: KnowledgeBase }) {
       qc.invalidateQueries({ queryKey: ["knowledge-bases"] });
     },
     onError: (e: unknown) =>
-      toast.error(e instanceof ApiError ? e.message : "保存失败"),
+      toast.error("保存失败", { description: userErrorMessage(e) }),
   });
 
   return (

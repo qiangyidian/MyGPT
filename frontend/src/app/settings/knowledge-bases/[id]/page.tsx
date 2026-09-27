@@ -6,7 +6,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { RefreshCw, Trash2, Upload, Search, Eye } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import type { Citation, DocFile } from "@/lib/types";
 import { formatBytes } from "@/lib/utils";
 import { describeIngestQueue } from "@/lib/kb-ingest";
@@ -114,7 +115,7 @@ function KbDetailContent() {
       const next = await api.listDocuments(kbId, { limit: DOC_PAGE_SIZE, offset: fetchedRows });
       setMorePages((pages) => [...pages, next]);
     } catch (e: unknown) {
-      toast.error(e instanceof ApiError ? e.message : "加载失败");
+      toast.error(userErrorMessage(e));
     } finally {
       setLoadingMore(false);
     }
@@ -126,7 +127,7 @@ function KbDetailContent() {
       toast.success("已上传，开始解析…");
       qc.invalidateQueries({ queryKey: ["kb-docs", kbId] });
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const reindexMut = useMutation({
@@ -135,7 +136,7 @@ function KbDetailContent() {
       toast.success("已开始重新向量化");
       qc.invalidateQueries({ queryKey: ["kb-docs", kbId] });
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const deleteMut = useMutation({
@@ -146,7 +147,7 @@ function KbDetailContent() {
       setMorePages((pages) => pages.map((p) => p.filter((d) => d.id !== id)));
       qc.invalidateQueries({ queryKey: ["kb-docs", kbId] });
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   // Retrieval test box
@@ -155,7 +156,7 @@ function KbDetailContent() {
   const searchMut = useMutation({
     mutationFn: () => api.searchKnowledgeBase(kbId, query),
     onSuccess: (res) => setCitations(res.citations),
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   // Online document preview

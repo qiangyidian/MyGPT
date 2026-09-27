@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from app.schemas import (
     ConversationUpdate,
     MessageOut,
 )
+from app.services.conversation_export import EXPORT_FORMATS, export_conversation
 from app.services.conversation_service import branch_from_message, list_for_user
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -140,6 +141,36 @@ async def get_conversation(
         messages=[MessageOut.model_validate(m) for m in reversed(msg_rows)],
     )
     return detail
+
+
+@router.get("/{conv_id}/export")
+async def export_conversation_file(
+    conv_id: uuid.UUID,
+    format: str = "markdown",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download the whole conversation as Markdown or JSON.
+
+    Owner/admin only (foreign id → 404, same as every other conversation route:
+    a 403 would confirm the conversation exists). Deliberately NOT the detail
+    endpoint's 200-message window — exporting your own data means all of it.
+    """
+    if format not in EXPORT_FORMATS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"不支持的导出格式：{format}",
+        )
+    conv = await _load_owned(db, conv_id, user)
+    try:
+        artifact = await export_conversation(db, conv, fmt=format)
+    except ValueError as exc:  # the service owns the message; keep it in Chinese
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return Response(
+        content=artifact.body,
+        media_type=artifact.media_type,
+        headers={"Content-Disposition": artifact.content_disposition()},
+    )
 
 
 @router.patch("/{conv_id}", response_model=ConversationOut)

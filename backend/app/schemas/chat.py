@@ -4,7 +4,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+# How many knowledge bases one turn may read from. Retrieval fans out per KB
+# (its own collection, possibly its own embedding model), so an uncapped list is
+# a per-turn cost multiplier the caller controls — and no merged context can hold
+# more than one prompt's worth of chunks anyway.
+MAX_KB_PER_REQUEST = 5
+# ``@`` mentions of any kind (KB / document / attachment) in one message.
+MAX_MENTIONS_PER_REQUEST = 8
+MENTION_KINDS = ("kb", "doc", "file")
 
 
 # ---- Task 10: typed multimodal message parts (additive) -------------------
@@ -65,6 +74,27 @@ class Citation(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class ChatMention(BaseModel):
+    """One ``@`` reference resolved by the composer's inline picker.
+
+    The client sends the pair it decoded out of the message text — never a label
+    — so a renamed document cannot change what a turn retrieves. ``kind`` maps to
+    the retrieval surface: ``kb`` adds a knowledge base to the turn's scope,
+    ``doc`` narrows retrieval to that document, ``file`` binds an existing chat
+    attachment to the outgoing message.
+    """
+
+    kind: str
+    id: uuid.UUID
+
+    @field_validator("kind")
+    @classmethod
+    def _check_kind(cls, v: str) -> str:
+        if v not in MENTION_KINDS:
+            raise ValueError(f"kind 必须是 {'/'.join(MENTION_KINDS)} 之一")
+        return v
+
+
 class ChatRequest(BaseModel):
     """POST /api/chat/stream body. conversation_id optional for ad-hoc chat.
 
@@ -81,6 +111,10 @@ class ChatRequest(BaseModel):
     knowledge_base_id: uuid.UUID | None = None
     # Phase 1+: search across multiple knowledge bases in one turn (multi-KB).
     knowledge_base_ids: list[uuid.UUID] = []
+    # ``@``-references typed in the composer (KB / document / attachment). They
+    # EXTEND the toolbar's multi-select for this turn; ownership is checked where
+    # the KB set is resolved (chat_service), not here.
+    mentions: list[ChatMention] = []
     content: str = ""
     regenerate: bool = False          # regenerate last assistant turn
     stream: bool = True
@@ -94,3 +128,33 @@ class ChatRequest(BaseModel):
     # ---- Agent platform: legacy fields (still accepted) ----
     execution_mode: str = "auto"      # auto | chat | agent
     agent_profile: str = "general"    # general | research | analyst | ...
+
+    @field_validator("knowledge_base_ids")
+    @classmethod
+    def _cap_knowledge_bases(cls, v: list[uuid.UUID]) -> list[uuid.UUID]:
+        """Collapse repeats, keep order, and refuse an over-fan-out request.
+
+        A repeated id is a client bug rather than an attack (the same KB's
+        collection would be fetched twice), so it is quietly dropped. The cap is
+        a 422: it fires before the SSE stream opens, so the caller still gets a
+        real status code instead of an error frame mid-stream.
+        """
+        out = list(dict.fromkeys(v))
+        if len(out) > MAX_KB_PER_REQUEST:
+            raise ValueError(f"一次最多选择 {MAX_KB_PER_REQUEST} 个知识库")
+        return out
+
+    @field_validator("mentions")
+    @classmethod
+    def _cap_mentions(cls, v: list[ChatMention]) -> list[ChatMention]:
+        out: list[ChatMention] = []
+        seen: set[tuple[str, uuid.UUID]] = set()
+        for mention in v:
+            key = (mention.kind, mention.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(mention)
+        if len(out) > MAX_MENTIONS_PER_REQUEST:
+            raise ValueError(f"一次最多引用 {MAX_MENTIONS_PER_REQUEST} 个目标")
+        return out

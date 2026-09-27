@@ -39,7 +39,7 @@ from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
-from app.models import AgentRun, AgentStep, ToolApproval, ToolCall, User
+from app.models import AgentRun, AgentStep, RunCommand, ToolApproval, ToolCall, User
 from app.schemas import (
     ActionResult,
     AgentRunOut,
@@ -70,6 +70,27 @@ async def _load_run(db: AsyncSession, run_id: uuid.UUID) -> AgentRun:
 async def _assert_owned(run: AgentRun, user: User) -> None:
     if run.user_id != user.id and user.role != "admin":
         raise HTTPException(NOT_FOUND, "Run not found")  # 404, not 403
+
+
+async def _gate_armed(db: AsyncSession, run: AgentRun) -> bool:
+    """这个运行的计划门现在是否上着 —— 读最后一条持久 ``gate`` 命令。
+
+    进程内的 ``RunControl.gate_requested`` 对 API 层不可见（worker 重启后由
+    run_environment 重放命令队列恢复），所以队列就是权威事实。确认/修改计划时
+    引擎自己清闸但不回写队列，因此这里按 ``plan_status`` 再收口一次：已经决定
+    过的计划不再对外显示「等待确认」。
+    """
+    if (run.plan_status or "") in ("confirmed", "updated"):
+        return False
+    payload = (
+        await db.execute(
+            select(RunCommand.payload)
+            .where(RunCommand.run_id == run.id, RunCommand.command_type == "gate")
+            .order_by(RunCommand.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return bool((payload or {}).get("enabled"))
 
 
 async def _build_run_out(db: AsyncSession, run: AgentRun):
@@ -105,6 +126,7 @@ async def _build_run_out(db: AsyncSession, run: AgentRun):
     # static definition (e.g. a run that initialized but never progressed).
     graph = getattr(run, "graph_state", None) or getattr(run, "graph_definition", None)
     out.graph = graph
+    out.gate_armed = await _gate_armed(db, run)
     return out
 
 

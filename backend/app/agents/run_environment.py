@@ -10,6 +10,9 @@ DAG 调度器 —— 共用本类作为唯一入口。
 ``CrewAIRuntime._run_multi_agent`` 里，导致引擎路径只能拿到一个裸的
 StageContext，从而缺失审批桥、流式字段、工具归属与 usage 归集。
 
+因此 ``for_call`` 是**唯一**受支持的构造入口（直接构造在 ``__post_init__``
+里硬报错）：任何一条 walker 只要绕过它，就会静默失去上面那些能力。
+
 命名说明：``app/agents/environments.py`` 是 Codex 风格的 workspace 环境
 （cwd / shell / ready 状态），与本类无关。
 """
@@ -23,7 +26,7 @@ from typing import Any
 
 from app.agents.graph import AgentGraph
 from app.agents.lifecycle import AgentLifecycleEmitter
-from app.agents.policies import BudgetExceeded
+from app.agents.policies import BudgetExceeded, guard_for_context
 from app.agents.schemas import (
     AgentTurnContext,
     ev_run_instruction_received,
@@ -35,18 +38,65 @@ from app.db import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# 一次 run 的默认装配值。
+#
+# 这些数字以前散在装配代码的字面量里（心跳间隔一个 5.0、计划门一个 90、
+# 输出截断一个 20_000），并且 persistence_session_factory 的「注入否则回退」
+# 这套读法在同一个类里重复了三遍（for_turn / _resolve_checkpoint /
+# persist_graph）—— 改一处漏两处的典型形状。现在只有一个来源：下面的常量
+# 加上 :meth:`RunEnvironment.persistence_session_factory` /
+# :attr:`RunEnvironment.persistence_lock` 两个取值口，其余地方一律读它们。
+# --------------------------------------------------------------------------- #
+DEFAULT_PLAN_CONFIRM_TIMEOUT_S = 90
+DEFAULT_STEP_PROGRESS_INTERVAL_S = 5.0
+
 # 单条 stage 产出的透出上限。超过即截断并在事件上标记 truncated，
 # ``chars`` 保留截断前的真实长度供 UI 显示提示。
-_STEP_OUTPUT_MAX_CHARS = 20_000
+DEFAULT_STEP_OUTPUT_MAX_CHARS = 20_000
 
 # 图快照是 best-effort 观测写：共用一条连接时可能与在途写者冲突，重试几次。
 _GRAPH_PERSIST_ATTEMPTS = 5
 _GRAPH_PERSIST_RETRY_DELAY_S = 0.05
 
+# :meth:`RunEnvironment.for_call` 构造实例时透传给 ``__post_init__`` 的哨兵。
+# 用对象身份而非布尔量，避免任何「构造期标志位」的交叉污染。
+_BUILD_TOKEN: Any = object()
+
+
+def resolve_session_factory(injected: Any) -> Any:
+    """「注入优先、否则回退到全局 session 工厂」的唯一写法。
+
+    这个 ``or AsyncSessionLocal`` 过去在 run_environment / orchestrator /
+    native_runtime / streaming_writer 里各写了一遍；漏掉任何一处，测试注入的
+    工厂就会在那条路径上被绕过，写成真的库。
+    """
+    return injected or AsyncSessionLocal
+
+
+def _settings() -> Any:
+    from app.core.config import get_settings
+
+    return get_settings()
+
+
+def _int_setting(name: str, default: int) -> int:
+    return int(getattr(_settings(), name, default))
+
+
+def _float_setting(name: str, default: float) -> float:
+    return float(getattr(_settings(), name, default) or default)
+
 
 @dataclass
 class RunEnvironment:
-    """一次 run 的共享执行环境。"""
+    """一次 run 的共享执行环境。
+
+    **只能经 :meth:`for_call` 构造。** 直接调用构造函数会绕过预算守卫、
+    provider、审批桥与持久 session 工厂的点位装配，产出一个「看起来正常、
+    运行期静默降级」的环境 —— 引擎路径当初缺失审批桥与 usage 归集就是这个
+    形状，所以这里用硬报错堵住，而不是靠注释约定。
+    """
 
     run_id: str
     ctx: AgentTurnContext
@@ -56,15 +106,21 @@ class RunEnvironment:
     # 运行中的心跳任务与各自的单调起点。finish() 会清空它们 —— 不允许泄漏。
     _progress_tasks: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
     _step_started_at: dict[str, float] = field(default_factory=dict, repr=False)
+    _build_token: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._build_token is not _BUILD_TOKEN:
+            raise TypeError(
+                "RunEnvironment 只能由 RunEnvironment.for_call(ctx) 构造："
+                "直接构造会跳过 guard / provider / 审批桥 / session 工厂的装配"
+            )
 
     # ------------------------------------------------------------------ #
     @classmethod
-    def for_turn(cls, ctx: AgentTurnContext) -> RunEnvironment:
+    def for_call(cls, ctx: AgentTurnContext) -> RunEnvironment:
         """装配 stage_ctx。此时 graph 尚未构建（它依赖 tools，tools 依赖
         stage_ctx），emitter 与审批桥由 :meth:`attach_graph` 建。"""
-        from app.agents.runtime.crewai_runtime import _guard_for_context
-
-        guard = _guard_for_context(ctx)
+        guard = guard_for_context(ctx)
         stage_ctx = make_stage_context(ctx.run_id, budget_guard=guard)
 
         # 流式 writer 字段：writer stage 直接调 provider 并增量改写助手消息。
@@ -75,12 +131,42 @@ class RunEnvironment:
         stage_ctx.user_content = ctx.user_content
         stage_ctx.cancel_event = asyncio.Event()
         stage_ctx.db = ctx.db
-        stage_ctx.persistence_session_factory = (
-            ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
-        )
-        stage_ctx.persistence_lock = ctx.extra.get("persistence_lock")
+        stage_ctx.persistence_session_factory = cls.session_factory_for(ctx)
+        stage_ctx.persistence_lock = cls.persistence_lock_for(ctx)
         stage_ctx.persist_continuation_checkpoint = cls._resolve_checkpoint(ctx)
-        return cls(run_id=ctx.run_id, ctx=ctx, stage_ctx=stage_ctx, guard=guard)
+        return cls(
+            run_id=ctx.run_id,
+            ctx=ctx,
+            stage_ctx=stage_ctx,
+            guard=guard,
+            _build_token=_BUILD_TOKEN,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 默认值取值点（B12：注入优先、否则回退，只此一份）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def session_factory_for(ctx: AgentTurnContext) -> Any:
+        """本次 run 的持久 session 工厂：注入优先，否则回退到全局工厂。"""
+        return resolve_session_factory(ctx.extra.get("persistence_session_factory"))
+
+    @staticmethod
+    def persistence_lock_for(ctx: AgentTurnContext) -> Any:
+        """本次 run 的持久化互斥锁（测试里是 asyncio.Lock，生产可为 None）。"""
+        return ctx.extra.get("persistence_lock")
+
+    @property
+    def persistence_session_factory(self) -> Any:
+        return self.session_factory_for(self.ctx)
+
+    @property
+    def persistence_lock(self) -> Any:
+        return self.persistence_lock_for(self.ctx)
+
+    @property
+    def plan_confirm_timeout_s(self) -> int:
+        """计划门的最长等待（秒）。唯一的 PLAN_CONFIRM_TIMEOUT_S 读取点。"""
+        return _int_setting("PLAN_CONFIRM_TIMEOUT_S", DEFAULT_PLAN_CONFIRM_TIMEOUT_S)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -120,11 +206,11 @@ class RunEnvironment:
         async def _fallback(checkpoint: dict[str, Any]) -> None:
             from app.services.chat_service import _persist_continuation_checkpoint
 
-            session_factory = (
-                ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
-            )
             await _persist_continuation_checkpoint(
-                session_factory, ctx.assistant_msg, ctx.run_id, checkpoint
+                RunEnvironment.session_factory_for(ctx),
+                ctx.assistant_msg,
+                ctx.run_id,
+                checkpoint,
             )
 
         return _fallback
@@ -290,9 +376,8 @@ class RunEnvironment:
         from app.agents.workflow.repository import CommandStore
 
         try:
-            factory = self.stage_ctx.persistence_session_factory
-            async with db_mutation_scope(self.stage_ctx.persistence_lock):
-                async with factory() as session:
+            async with db_mutation_scope(self.persistence_lock):
+                async with self.persistence_session_factory() as session:
                     store = CommandStore(session)
                     commands = await store.claim_pending(self.run_id)
                     for cmd in commands or []:
@@ -347,9 +432,7 @@ class RunEnvironment:
         ctl = self.ctx.extra.get("run_control") or _get_or_create(self.run_id)
         if ctl is None or not ctl.gate_requested:
             return True
-        from app.core.config import get_settings
-
-        timeout_s = int(getattr(get_settings(), "PLAN_CONFIRM_TIMEOUT_S", 90))
+        timeout_s = self.plan_confirm_timeout_s
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         while loop.time() < deadline:
@@ -372,9 +455,7 @@ class RunEnvironment:
     # 过程可见性
     # ------------------------------------------------------------------ #
     def _rich_events_enabled(self) -> bool:
-        from app.core.config import get_settings
-
-        return bool(getattr(get_settings(), "AGENT_RICH_STEP_EVENTS", False))
+        return bool(getattr(_settings(), "AGENT_RICH_STEP_EVENTS", False))
 
     def _emit_step_output(self, step_id: str, text: str | None) -> None:
         from app.agents.schemas import ev_step_output
@@ -382,8 +463,8 @@ class RunEnvironment:
         raw = text or ""
         if not raw:
             return
-        truncated = len(raw) > _STEP_OUTPUT_MAX_CHARS
-        body = raw[:_STEP_OUTPUT_MAX_CHARS] if truncated else raw
+        truncated = len(raw) > DEFAULT_STEP_OUTPUT_MAX_CHARS
+        body = raw[:DEFAULT_STEP_OUTPUT_MAX_CHARS] if truncated else raw
         self.stage_ctx.emit(
             ev_step_output(
                 run_id=self.run_id,
@@ -418,11 +499,10 @@ class RunEnvironment:
 
     async def _progress_loop(self, step_id: str) -> None:
         from app.agents.schemas import ev_step_progress
-        from app.core.config import get_settings
 
         loop = self.stage_ctx.loop
-        interval = float(
-            getattr(get_settings(), "AGENT_STEP_PROGRESS_INTERVAL_S", 5.0) or 5.0
+        interval = _float_setting(
+            "AGENT_STEP_PROGRESS_INTERVAL_S", DEFAULT_STEP_PROGRESS_INTERVAL_S
         )
         while True:
             await asyncio.sleep(interval)
@@ -462,13 +542,11 @@ class RunEnvironment:
         from app.agents.db_mutation import db_mutation_scope
         from app.agents.persistence import persist_graph_snapshot
 
-        session_factory = (
-            self.ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
-        )
+        session_factory = self.persistence_session_factory
         last_exc: Exception | None = None
         for attempt in range(_GRAPH_PERSIST_ATTEMPTS):
             try:
-                async with db_mutation_scope(self.ctx.extra.get("persistence_lock")):
+                async with db_mutation_scope(self.persistence_lock):
                     await persist_graph_snapshot(
                         session_factory,
                         run_id=self.ctx.run_id,

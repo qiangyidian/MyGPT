@@ -39,12 +39,16 @@ const VISIBLE_TABS: { id: ContextTab; label: string }[] = [
   { id: "files", label: "文件" },
 ];
 
+type RunPoll = ReturnType<typeof useAgentRunGraph>;
+
 function PanelBody({
   conversationId,
   onClose,
+  poll,
 }: {
   conversationId: string | null;
   onClose: () => void;
+  poll: RunPoll;
 }) {
   const { tab, setTab } = useContextPanel();
   return (
@@ -61,6 +65,21 @@ function PanelBody({
           <X className="h-4 w-4" />
         </Button>
       </div>
+      {/* 轮询停摆必须说出来：面板上停着的是一个早已过去的时刻，而它看起来和好着
+          一样。给一条中文说明 + 一个立刻重试的出口。 */}
+      {poll.pollStopped && (
+        <div className="flex items-start justify-between gap-2 border-b border-border bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <span>{poll.pollStoppedMessage}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 shrink-0 px-2 text-xs"
+            onClick={poll.restartPoll}
+          >
+            重试
+          </Button>
+        </div>
+      )}
       <Tabs value={tab} onValueChange={(v) => setTab(v as ContextTab)} className="flex min-h-0 flex-1 flex-col">
         <div className="px-3 pt-2">
           <TabsList className="grid w-full grid-cols-3">
@@ -91,7 +110,7 @@ export function ContextPanel({ conversationId }: { conversationId: string | null
   const activeRunId = useAgentRunStore((s) => s.active.runId);
   const isDesktop = useIsDesktop();
   // Drive the shared clock + poll fallback while mounted.
-  useAgentRunGraph();
+  const poll = useAgentRunGraph();
 
   const handleClose = () => close(activeRunId ?? undefined);
 
@@ -104,7 +123,7 @@ export function ContextPanel({ conversationId }: { conversationId: string | null
           open ? "opacity-100" : "w-0 min-w-0 overflow-hidden opacity-0"
         )}
       >
-        {open && <PanelBody conversationId={conversationId} onClose={handleClose} />}
+        {open && <PanelBody conversationId={conversationId} onClose={handleClose} poll={poll} />}
       </aside>
     );
   }
@@ -116,7 +135,7 @@ export function ContextPanel({ conversationId }: { conversationId: string | null
         <SheetDescription className="sr-only">
           执行过程、来源与附件。
         </SheetDescription>
-        <PanelBody conversationId={conversationId} onClose={handleClose} />
+        <PanelBody conversationId={conversationId} onClose={handleClose} poll={poll} />
       </SheetContent>
     </Sheet>
   );

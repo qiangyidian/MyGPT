@@ -1,10 +1,13 @@
 "use client";
 
 import { memo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   AlertTriangle,
   Check,
   Copy,
+  Loader2,
   Pencil,
   RefreshCw,
   Scissors,
@@ -20,8 +23,18 @@ import {
 import type { LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Markdown } from "@/components/markdown";
 import { Citations } from "@/components/citations";
@@ -30,6 +43,9 @@ import { AttachmentList } from "@/components/attachments/attachment-list";
 import { InlineArtifactHandle } from "@/components/artifacts/inline-artifact-handle";
 import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
 import { AgentInlineStatus } from "@/components/agents/agent-inline-status";
+import { VoicePlayback } from "@/components/chat/voice-playback";
+import { MessageVersions } from "@/components/chat/message-versions";
+import { CONVERSATION_DETAIL_QUERY_KEY } from "@/hooks/useConversations";
 import { useMessageFeedback } from "@/hooks/useMessageActions";
 import { useChatUiStore } from "@/stores/chat-ui-store";
 import type {
@@ -226,6 +242,46 @@ function FeedbackButtons({ messageId }: { messageId: string }) {
   );
 }
 
+/** 「删除这条之后」的确认框（条目 33）。
+ *
+ * 不可逆操作要写清后果，而不是只挂一句「确定吗」：这里说得出的是「之后每一轮都会
+ * 没掉」，以及被删内容仍能从历史版本找回 —— 少了后半句，用户就不敢按。
+ */
+function TruncateAfterDialog({
+  open,
+  onOpenChange,
+  onConfirm,
+  pending,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: () => void;
+  pending: boolean;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>删除这条提问之后的消息？</DialogTitle>
+          <DialogDescription>
+            之后的每一轮都会被删除，操作不可撤销。被删掉的内容会先存成历史版本，
+            还能从那一条的「历史版本」里找回。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button variant="destructive" size="sm" disabled={pending} onClick={onConfirm}>
+            {pending && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+            确认删除
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function formatMessageTime(iso: string | undefined): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -256,6 +312,17 @@ export const MessageBubble = memo(function MessageBubble({
   const isUser = message.role === "user";
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
+  const queryClient = useQueryClient();
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [confirmTruncate, setConfirmTruncate] = useState(false);
+  const [truncating, setTruncating] = useState(false);
+
+  // 这三处动作都改的是服务端的那条消息行，而消息列表的真相来自会话详情缓存，
+  // 所以每次成功后都要重取——只改本地 state 会在下一次刷新时被打回旧内容。
+  const refreshConversation = () =>
+    queryClient.invalidateQueries({
+      queryKey: CONVERSATION_DETAIL_QUERY_KEY(message.conversation_id),
+    });
 
   // Terminal status for an assistant message (null while streaming / complete).
   const status = !isUser && !isStreaming ? getMessageStatus(message) : null;
@@ -334,6 +401,41 @@ export const MessageBubble = memo(function MessageBubble({
     setEditing(false);
   };
 
+  const saveEditOnly = async () => {
+    const next = draft.trim();
+    if (!next) return;
+    if (next === message.content) {
+      setEditing(false);
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await api.updateMessageContent(message.id, next);
+      await refreshConversation();
+      setEditing(false);
+    } catch (e) {
+      toast.error("保存失败", { description: userErrorMessage(e) });
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const truncateAfter = async () => {
+    setTruncating(true);
+    try {
+      const res = await api.truncateMessagesAfter(message.id);
+      await refreshConversation();
+      setConfirmTruncate(false);
+      toast.success(
+        res.deleted > 0 ? `已删除这条之后的 ${res.deleted} 条消息` : "这条之后本来就没有消息"
+      );
+    } catch (e) {
+      toast.error("删除失败", { description: userErrorMessage(e) });
+    } finally {
+      setTruncating(false);
+    }
+  };
+
   return (
     <div
       className={cn(
@@ -409,6 +511,23 @@ export const MessageBubble = memo(function MessageBubble({
             <div className="mt-1 flex justify-end gap-1">
               <Button variant="ghost" size="sm" className="h-7 gap-1 text-xs" onClick={() => setEditing(false)}>
                 <X className="h-3 w-3" /> 取消
+              </Button>
+              {/* 两种改法差别很大，所以各给一个按钮而不是一个开关：
+                  「编辑并发送」在后面另起一轮；「仅保存正文」原地改掉这一条、
+                  一个字都不重新问。后者用来修错别字，不烧 token。 */}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 text-xs"
+                disabled={savingEdit}
+                onClick={saveEditOnly}
+              >
+                {savingEdit ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Check className="h-3 w-3" />
+                )}
+                仅保存正文
               </Button>
               <Button size="sm" className="h-7 gap-1 text-xs" onClick={commitEdit}>
                 <Check className="h-3 w-3" /> 编辑并发送
@@ -490,6 +609,11 @@ export const MessageBubble = memo(function MessageBubble({
               </time>
             )}
             {!isUser && message.content && <CopyButton text={safeContent} />}
+            {/* 喇叭：播的是同一条回答（去引用标记后的文本）。流式期间不给点——
+                那时文本还是半成品，而且每次点击都是后端一次花钱的合成。 */}
+            {!isUser && !isStreaming && message.content && (
+              <VoicePlayback messageId={message.id} content={safeContent} />
+            )}
             {!isUser && !isStreaming && <FeedbackButtons messageId={message.id} />}
             {!isUser && isLast && canRegenerate && !isStreaming && (
               <Button
@@ -516,8 +640,39 @@ export const MessageBubble = memo(function MessageBubble({
                 编辑
               </Button>
             )}
+            {/* 历史版本（条目 31）：改过 / 重新生成过的内容不再静默销毁。最后一条
+                流式消息没有版本可看，所以和反馈按钮同一套条件。 */}
+            {!isStreaming && message.content && (
+              <MessageVersions
+                message={{
+                  conversationId: message.conversation_id,
+                  id: message.id,
+                  role: message.role,
+                  content: message.content,
+                  createdAt: message.created_at,
+                  modelName: message.model_name,
+                }}
+              />
+            )}
+            {isUser && !isLast && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-9 max-sm:h-11 gap-1 px-2 text-xs text-muted-foreground"
+                onClick={() => setConfirmTruncate(true)}
+              >
+                <Scissors className="h-3 w-3" />
+                删除此后
+              </Button>
+            )}
           </div>
         )}
+        <TruncateAfterDialog
+          open={confirmTruncate}
+          onOpenChange={setConfirmTruncate}
+          onConfirm={truncateAfter}
+          pending={truncating}
+        />
       </div>
     </div>
   );

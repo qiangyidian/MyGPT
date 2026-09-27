@@ -43,6 +43,11 @@ spec:
                 name: mygpt-config
             - secretRef:
                 name: mygpt-secrets
+          env:
+            - name: DB_POOL_SIZE
+              value: "3"
+            - name: DB_MAX_OVERFLOW
+              value: "1"
           command: ["python", "-m", "app.recovery"]
           resources:
             requests:

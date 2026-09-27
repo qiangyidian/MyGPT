@@ -2,10 +2,8 @@
 
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
-import { useSearchParams } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
-import { resolveReturnTo } from "@/lib/navigation";
 
 interface BackLinkProps {
   /** Destination path (already validated/sanitised by the caller). */
@@ -30,27 +28,4 @@ export function BackLink({ href, label, variant = "ghost" }: BackLinkProps) {
       </Link>
     </Button>
   );
-}
-
-interface ReturnToLinkProps {
-  /** Visible + accessible label. */
-  label?: string;
-  /** Fallback when no valid `returnTo`/`next` param is present. */
-  fallback?: string;
-  variant?: "ghost" | "outline" | "secondary";
-}
-
-/**
- * "Return to chat" button that resolves its destination from the `returnTo`
- * (then `next`) query param via the shared open-redirect guard. Must be used
- * inside a `<NavSuspense>` boundary because it reads `useSearchParams`.
- */
-export function ReturnToLink({
-  label = "返回对话",
-  fallback = "/",
-  variant = "ghost",
-}: ReturnToLinkProps) {
-  const searchParams = useSearchParams();
-  const href = resolveReturnTo(searchParams, fallback);
-  return <BackLink href={href} label={label} variant={variant} />;
 }

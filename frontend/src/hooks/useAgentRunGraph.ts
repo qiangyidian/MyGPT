@@ -14,8 +14,15 @@
 //   3. A shared 1Hz clock (store.tick) that drives every live duration display
 //      in node cards — one interval for the whole panel, not one per node.
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import {
+  jitteredDelayMs,
+  backoffDelayMs,
+  POLL_STOPPED_MESSAGE,
+  RUN_POLL,
+  shouldStopPolling,
+} from "@/lib/poll-policy";
 import type {
   AgentGraphEdge,
   AgentGraphNode,
@@ -97,28 +104,77 @@ export function useAgentRunGraph() {
   }, [running, tick]);
 
   // ---- low-frequency poll fallback for running / waiting runs ----
+  //
+  // 固定 4 秒、永不停歇的轮询在服务端出错时最要命：每个客户端都在同一节奏上重试，
+  // 把还没倒的接口按得更死。所以这里换成「失败即退避、退避有上限、连续失败到次数
+  // 就停、页面在后台不发请求」——并且停止时要能被用户手动重启。
   const needsPoll =
     active.runId !== "" && ["running", "waiting_approval", "pending"].includes(active.status);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeRunRef = useRef(active.runId);
   activeRunRef.current = active.runId;
+  const failuresRef = useRef(0);
+  const [pollStopped, setPollStopped] = useState(false);
+
+  // 换一条 run 不继承上一条的失败记账。
   useEffect(() => {
-    if (needsPoll && !pollRef.current) {
-      pollRef.current = setInterval(() => {
-        // Poll only refreshes graph state; it must not reopen a dismissed panel.
-        if (activeRunRef.current) void restoreAgentGraph(activeRunRef.current, false);
-      }, 4000);
-    } else if (!needsPoll && pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
+    failuresRef.current = 0;
+    setPollStopped(false);
+  }, [active.runId]);
+
+  useEffect(() => {
+    if (!needsPoll || pollStopped) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    const arm = () => {
+      const delay = jitteredDelayMs(
+        backoffDelayMs(failuresRef.current, RUN_POLL),
+        Math.random
+      );
+      timer = setTimeout(() => {
+        if (cancelled) return;
+        // 后台标签页：这一轮不发也不续期，交给 visibilitychange 唤醒。
+        if (typeof document !== "undefined" && document.hidden) return;
+        void poll();
+      }, delay);
+    };
+
+    const poll = async () => {
+      if (cancelled) return;
+      const ok = await restoreAgentGraph(activeRunRef.current, false);
+      if (cancelled) return;
+      failuresRef.current = ok ? 0 : failuresRef.current + 1;
+      if (shouldStopPolling(failuresRef.current, RUN_POLL)) {
+        setPollStopped(true);
+        return;
+      }
+      arm();
+    };
+
+    const wake = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (timer) clearTimeout(timer);
+      void poll();
+    };
+
+    arm();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", wake);
     }
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", wake);
       }
     };
-  }, [needsPoll, restore]);
+  }, [needsPoll, pollStopped]);
 
-  return { restore };
+  /** 放弃后重新开始：失败清零、回到基准间隔。 */
+  const restartPoll = useCallback(() => {
+    failuresRef.current = 0;
+    setPollStopped(false);
+  }, []);
+
+  return { restore, pollStopped, pollStoppedMessage: POLL_STOPPED_MESSAGE, restartPoll };
 }

@@ -113,6 +113,21 @@ VALUES (gen_random_uuid(), :uid, -10, 0, 'usage', 'message', :msg_id, now());
 预期：第二次抛 `duplicate key value violates unique constraint "uq_credit_ledger_ref"`。
 若第二次成功，说明唯一部分索引没建上，检查迁移 0014 是否完整执行。
 
+## 兑换码批次列表怎么翻
+
+`GET /api/admin/redeem-batches` 收 `limit` / `offset` / `search` / `status` 四个参数，
+**筛选和搜索都在 SQL 里做**。这一点是有针对性的：列表一分页，浏览器里就只剩当前这一页，
+在前端做过滤等于「只在这一页里找」，看着像搜索坏了。
+
+- `status` 四取值：`all` / `operable`（还有未兑换码）/ `expired`（已过有效期）/
+  `settled`（未兑换码为 0）。注意 `operable` 按**字面**含义算 = 「还有未兑换的码」，
+  所以一个已过期但仍有码的批次会同时出现在 `operable` 与 `expired` 里 —— 这不是矛盾，
+  过期只是兑换失败的原因，那批码的行还在。
+- **后端不返回总数**，只有本页的行。判断"还有没有下一页"的口径是"这一页装满了
+  `limit"`；界面因此显示"本页 N 个批次"而不是"共 N 个"。要准数就直接把 `limit` 提到
+  500（上界）一次读完后在库里数。
+- `search` 匹配批次名与备注，通配符按字面处理（搜 `100%` 不会把所有批次都捞出来）。
+
 ## 常见问题
 
 ### 用户说兑换码用不了

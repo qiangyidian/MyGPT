@@ -9,12 +9,13 @@ import { RETURN_TO_PARAM, sanitizeInternalPath } from "@/lib/navigation";
  *
  * Server component: `redirect()` throws `NEXT_REDIRECT` during render.
  */
-export default function SettingsIndexPage({
+export default async function SettingsIndexPage({
   searchParams,
 }: {
-  searchParams?: Record<string, string | string[]>;
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const raw = searchParams?.[RETURN_TO_PARAM];
+  const resolvedSearchParams = await searchParams;
+  const raw = resolvedSearchParams?.[RETURN_TO_PARAM];
   const value = Array.isArray(raw) ? raw[0] : raw;
   const safeReturnTo = sanitizeInternalPath(value);
 

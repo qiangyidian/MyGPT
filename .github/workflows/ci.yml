@@ -26,7 +26,13 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -r requirements.txt
+      - name: Verify dependency lock is current
+        run: |
+          python -m pip install "uv==0.11.33"
+          uv pip compile requirements.txt --python-version 3.11 \
+            --generate-hashes --output-file requirements.lock.txt
+          git diff --exit-code -- requirements.lock.txt
+      - run: pip install --require-hashes -r requirements.lock.txt
       - name: Install dev tools
         # ruff is version-PINNED: floating installs break the lint gate when an
         # upstream release renames/removes a rule selector (the 2026-09 removal
@@ -45,8 +51,15 @@ jobs:
             --deselect tests/test_agent_phase2.py::test_agent_mode_emits_plan_created \
             --deselect tests/test_agent_phase5.py::test_full_native_agent_path \
             --cov=app --cov-report=term-missing --cov-report=xml
-      - name: Dependency audit (pip-audit)
-        run: pip-audit || true   # advisory; fails on known CVEs in installed deps
+      - name: Dependency audit (pip-audit, locked runtime dependencies)
+        # ChromaDB's four unfixed transitive advisories are narrowly excepted;
+        # the rationale and removal conditions are in backend/SECURITY.md.
+        run: >-
+          pip-audit -r requirements.lock.txt --no-deps --disable-pip --strict
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
       - uses: actions/upload-artifact@v4
         with:
           name: backend-coverage
@@ -62,7 +75,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
+      - run: npm ci --registry=https://registry.npmjs.org
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run test
@@ -94,7 +107,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install --require-hashes -r requirements.lock.txt
       - run: pip install pytest pytest-asyncio aiosqlite httpx
       - name: Offline eval suite
         run: |
@@ -113,3 +126,163 @@ jobs:
       - name: Observability + quota + readiness tests
         run: |
           pytest tests/test_observability_redaction.py tests/test_quotas.py tests/test_readiness.py -q --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Finding 36 — real-database gate. The sqlite job above never touches alembic
+  # and never runs two transactions against one row, so migration drift and the
+  # credit/quota race-safety claims were both unverified by CI. This job boots a
+  # real postgres:16 service, applies the migrations, asserts the revision
+  # reached head, then runs the concurrency suite that self-skips off Postgres.
+  # The sqlite job is left exactly as it was: this is additive coverage, not a
+  # replacement (it is 4x slower and needs a service container).
+  #
+  # PostgreSQL-specific migration and concurrency coverage is part of the
+  # required release signal. SQLite does not exercise row locks or production DDL.
+  backend-postgres:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    # ENV=prod is deliberate: the test env forces quotas + credits enforcement
+    # OFF (QuotaLimits/CreditPolicy.from_settings), so a `ENV=test` run against
+    # Postgres would verify that nothing is enforced. With prod + explicit
+    # QUOTAS_ENABLED/CREDITS_ENFORCED the concurrency tests exercise the code
+    # path that actually gates money.
+    env:
+      ENV: prod
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/mygpt_ci"
+      JWT_SECRET: "ci-only-not-a-real-secret"
+      ADMIN_PASSWORD: "ci-not-changeme"
+      FERNET_KEY: "3EXibrIOjdtKqx0MhocCAsUnZMyJePU24XqH0RSOIg4="
+      REDEEM_CODE_PEPPER: "ci-only-pepper-not-for-production"
+      QUOTAS_ENABLED: "true"
+      CREDITS_ENFORCED: "true"
+      REDIS_URL: "redis://localhost:6379/0"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mygpt_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mygpt_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install --require-hashes -r requirements.lock.txt
+      - run: pip install pytest pytest-asyncio aiosqlite httpx
+      # Migrations are the point of this job, so they run first and loudly: a
+      # migration that only works on a freshly created schema (create_all) and
+      # not on an existing one is exactly what CI has been missing.
+      - name: Alembic upgrade head (real Postgres, from empty)
+        run: python -m alembic upgrade head
+      - name: Alembic current == head (no silent partial apply)
+        # `heads` is resolved from the repo, never hardcoded — a pinned literal
+        # here stops testing the real head the moment a migration lands.
+        run: |
+          HEAD=$(python -m alembic heads | awk '{print $1}' | head -n1)
+          CUR=$(python -m alembic current | awk '{print $1}' | tail -n1)
+          echo "head=$HEAD current=$CUR"
+          test -n "$HEAD" && test "$HEAD" = "$CUR"
+      - name: Downgrade -1 and re-upgrade (migration reversibility)
+        run: |
+          python -m alembic downgrade -1
+          python -m alembic upgrade head
+      - name: Credit/quota concurrency on real Postgres
+        run: pytest tests/test_postgres_concurrency.py -q --tb=short
+      - name: Credit + quota + durable-queue suites against Postgres
+        # The regular suites run here too (same DB), so anything that quietly
+        # depends on sqlite leniency — a TEXT column storing UUIDs, an ignored
+        # FOR UPDATE, a partial index create_all never builds — shows up as a
+        # failure in this job instead of in production.
+        run: |
+          pytest tests/test_credit_service.py tests/test_credits_settlement.py \
+            tests/test_credits_enforcement.py tests/test_quotas.py \
+            tests/test_workflow_queue.py -q --tb=short
+
+  # ---------------------------------------------------------------------------
+  # 迁移链门禁（唯一的差异点：它是**强制**的）。
+  #
+  # 上面 backend-postgres 已经跑过 alembic upgrade head，但它挂着
+  # continue-on-error: true —— 一次断裂的迁移链在 PR 上是绿的，然后
+  # push 到 main 直接 auto-deploy，炸的是生产库。这个 job 只做一件事：
+  # 「迁移链能不能升上去」，没有任何测试噪音，所以它没有理由继续 advisory。
+  #
+  # 与 security.yml（pip-audit / bandit / semgrep / trivy / mypy）无重叠，
+  # 也不改 backend-postgres：那条 job 继续负责并发与真实 SQL 语义。
+  # 仓库里没有 release-check.yml，因此不存在第三处重复门禁。
+  migrations:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    env:
+      # ENV=test：alembic 不读任何业务开关，用 test 是为了让 config 的秘密门禁
+      # （prod 要求强 JWT_SECRET / ADMIN_PASSWORD / pepper）不参与这条 job ——
+      # 它验证的是 DDL，不是部署配置。
+      ENV: test
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/mygpt_migrations"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mygpt_migrations
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mygpt_migrations"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install --require-hashes -r requirements.lock.txt
+      # 分叉的多 head 会让 `alembic upgrade head` 直接报错，但更常见的是它在
+      # 合并时悄悄产生：两条 PR 各自从 0018 长出一个 0019。
+      - name: Single alembic head (no branching)
+        run: |
+          HEADS=$(python -m alembic heads | awk 'NF {print $1}' | sort -u)
+          echo "$HEADS"
+          test "$(echo "$HEADS" | wc -l)" -eq 1
+      - name: Alembic upgrade head (real Postgres 16, from empty)
+        run: python -m alembic upgrade head
+      - name: Alembic current == head (no silent partial apply)
+        run: |
+          HEAD=$(python -m alembic heads | awk '{print $1}' | head -n1)
+          CUR=$(python -m alembic current | awk '{print $1}' | tail -n1)
+          echo "head=$HEAD current=$CUR"
+          test -n "$HEAD" && test "$HEAD" = "$CUR"
+      - name: Downgrade -1 and re-upgrade (reversibility)
+        run: |
+          python -m alembic downgrade -1
+          python -m alembic upgrade head
+      # 守卫式迁移（0016-0019 的 _has_table/_has_column 风格）必须能在 --sql
+      # 离线模式下生成 DDL：离线脚本是对着一个「反射查不到东西」的假连接跑的，
+      # 所以那条路径不能靠 op.get_bind() 决定要不要出 DDL。这里只生成
+      # 「上一个 head -> 新 head」这一段，历史迁移（0000 用
+      # create_all(op.get_bind())）本来就不支持离线，整链生成会误报。
+      - name: Alembic --sql offline mode (newest revision only)
+        run: |
+          HEAD=$(python -m alembic heads | awk '{print $1}' | head -n1)
+          HEAD_FILE=$(grep -rlE "^revision(:[^=]*)? *= *['\"]${HEAD}['\"]" migrations/versions | head -n1)
+          PRIOR=$(sed -nE "s/^down_revision(:[^=]*)? *= *['\"]([^'\"]+)['\"].*/\2/p" "$HEAD_FILE" | head -n1)
+          if [ -z "$PRIOR" ]; then
+            echo "base revision has no down_revision; nothing incremental to generate"
+            exit 0
+          fi
+          echo "generating ${PRIOR}:${HEAD} offline"
+          python -m alembic upgrade "${PRIOR}:head" --sql > /tmp/alembic_offline.sql
+          test -s /tmp/alembic_offline.sql
+          tail -n 40 /tmp/alembic_offline.sql
+      # 脚本自己起一个一次性 Postgres（空库 -> head、上一个 revision -> head
+      # 两条路径都跑），端口特意错开上面 services 的 5432。
+      - name: scripts/verify_migrations.sh (empty + incremental paths)
+        working-directory: .
+        env:
+          PG_PORT: "55432"
+        run: bash scripts/verify_migrations.sh

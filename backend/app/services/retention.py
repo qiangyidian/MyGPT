@@ -264,13 +264,35 @@ async def sweep_orphan_collections(
 
 
 class RetentionSweeper:
-    """Periodic retention pass; safe to run in the API process or recovery."""
+    """Periodic retention pass; safe to run in the API process or recovery.
 
-    def __init__(self, session_factory: Any, interval_seconds: int = 6 * 3600) -> None:
+    Leader-gated by default (finding 39): every API replica plus the worker used
+    to start one of these, so a 3-replica deploy ran the same DELETE-heavy pass
+    three times concurrently — redundant work that also deadlocks the prune
+    queries against each other on Postgres. With ``leader_name`` set, only the
+    holder of the Postgres advisory lock sweeps; a peer takes over within one
+    heartbeat if the leader dies, so gating costs availability, not coverage.
+    Pass ``leader_name=None`` to force unconditional running (single-process
+    dev, or a test that wants the pass to happen now).
+    """
+
+    def __init__(
+        self,
+        session_factory: Any,
+        interval_seconds: int = 6 * 3600,
+        *,
+        leader_name: str | None = "retention",
+    ) -> None:
         self._session_factory = session_factory
         self._interval = max(int(interval_seconds), 600)
         self._task = None
         self._stop = None
+        self._gate = None
+        if leader_name is not None:
+            from app.core.leader import LeaderGate
+
+            self._gate = LeaderGate(leader_name, session_factory=session_factory)
+        self._leader_name = leader_name
 
     def start(self) -> None:
         import asyncio
@@ -291,6 +313,8 @@ class RetentionSweeper:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        if self._gate is not None:
+            await self._gate.release()
 
     async def _loop(self) -> None:
         import asyncio
@@ -298,7 +322,10 @@ class RetentionSweeper:
         assert self._stop is not None
         while not self._stop.is_set():
             try:
-                await self.run_once()
+                may_run = True if self._gate is None else await self._gate.acquire()
+                if may_run:
+                    await self.run_once()
+                    self._beat()
             except Exception:
                 logger.exception("retention sweep failed")
             try:
@@ -306,8 +333,38 @@ class RetentionSweeper:
             except TimeoutError:
                 pass
 
+    def _beat(self) -> None:
+        """Record progress for the container health probe (best-effort)."""
+        if self._leader_name is None:
+            return
+        try:
+            from app.healthcheck import beat
+
+            beat(self._leader_name, detail={"interval_seconds": self._interval})
+        except Exception:  # pragma: no cover - a probe file must never break a sweep
+            logger.debug("retention heartbeat failed", exc_info=True)
+
     async def run_once(self) -> None:
         await prune_audit_events(self._session_factory)
         await prune_terminal_run_events(self._session_factory)
         await sweep_orphan_uploads(self._session_factory)
         await sweep_orphan_collections(self._session_factory)
+        await self._release_holds()
+
+    async def _release_holds(self) -> None:
+        """退还被杀进程留下的悬挂轮次预留（finding 40）。
+
+        准入预留是"这轮会跑完并结算"的承诺；OOMKill 之后没人兑现，用户的余额
+        就长期被压低。这条只在 leader 锁下运行，所以两个进程不会抢同一批 hold。
+        与其余 sweep 一样 best-effort：失败只影响一批预留，不该带走整个 sweep。
+        """
+        from app.services.credit_service import release_stale_turn_holds
+
+        try:
+            async with self._session_factory() as session:
+                n = await release_stale_turn_holds(session)
+                await session.commit()
+            if n:
+                logger.info("retention: released %d stale turn hold(s)", n)
+        except Exception:
+            logger.warning("retention: stale turn-hold release failed", exc_info=True)

@@ -17,16 +17,20 @@ their owning modules.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from app.api import (
     admin,
+    admin_redeem,
+    admin_runtime,
     agent_runs,
     artifacts,
     auth,
@@ -38,9 +42,13 @@ from app.api import (
     documents,
     knowledge_bases,
     memories,
+    mentions,
     messages,
+    message_versions,
     projects,
+    prompts,
     retrieval,
+    speech,
     tools,
     wechat,
 )
@@ -111,16 +119,22 @@ async def lifespan(app: FastAPI):
     # Publish the singleton regardless of connect outcome: merge_mcp_tools is a
     # no-op when the registry is empty/disconnected, so this never breaks a turn.
     set_live_mcp_registry(mcp_registry)
-    # Chat attachments still parse as fire-and-forget tasks, so re-enqueue the
-    # ones a previous process died with, and keep sweeping for crashes between
-    # boots.
+    # Chat attachments still parse as fire-and-forget tasks, so a restart leaves
+    # rows stuck in ``pending``/``parsing``; this sweeper re-enqueues them. It is
+    # leader-gated on its own advisory lock (same mechanism and default as the
+    # retention sweeper below), so scaling this API to N replicas yields one
+    # sweeper plus N-1 standbys instead of N processes flipping the same expired
+    # rows every interval.
+    #
+    # There is deliberately no separate boot-time pass here, unlike earlier
+    # versions of this block: a rollout starts every replica at the same instant,
+    # so "one bounded pass per process start" was N concurrent re-parses of the
+    # same attachment (the in-process task dedup cannot see across processes).
+    # The gate's first tick fires the moment the loop starts, so the previous
+    # deployment's leftovers still get healed at boot — exactly once.
     from app.db import AsyncSessionLocal
-    from app.services.stale_job_recovery import StaleJobSweeper, requeue_stale_jobs_once
+    from app.services.stale_job_recovery import StaleJobSweeper
 
-    try:
-        await requeue_stale_jobs_once(AsyncSessionLocal)
-    except Exception:
-        logging.getLogger(__name__).warning("stale-job boot sweep failed", exc_info=True)
     stale_sweeper = StaleJobSweeper(AsyncSessionLocal)
     stale_sweeper.start()
     app.state.stale_job_sweeper = stale_sweeper
@@ -142,9 +156,41 @@ async def lifespan(app: FastAPI):
     retention_sweeper = RetentionSweeper(AsyncSessionLocal)
     retention_sweeper.start()
     app.state.retention_sweeper = retention_sweeper
+    # Queue-depth gauges for /metrics + Alertmanager (finding 38). Runs in the
+    # API process on purpose: the worker exposes no scrape surface, so a queue
+    # metric only it observed would be invisible to a scrape. Every replica
+    # samples the same Redis, and a gauge is absolute, so replicas agree instead
+    # of fighting (no leader needed).
+    metric_tasks: list[asyncio.Task] = []
+    if get_settings().PROMETHEUS_ENABLED:
+        from app.agents.workflow.queue import run_queue_depth_poller
+        from app.services.credit_service import run_credit_pool_poller
+
+        # Queue depth (capacity changes fast, one sample is a Redis round-trip);
+        # the credit pool less often (an aggregate scan, and the real-time
+        # "someone hit zero" signal is the rejection counter instead). Both
+        # cadences are settings, not literals: the queue one is what an operator
+        # shortens while debugging a backlog, and each sample costs a round trip
+        # against a Redis/DB that is already loaded.
+        settings = get_settings()
+        metric_tasks = [
+            asyncio.create_task(
+                run_queue_depth_poller(interval=settings.RUN_QUEUE_DEPTH_POLL_SECONDS)
+            ),
+            asyncio.create_task(
+                run_credit_pool_poller(interval=settings.CREDIT_POOL_POLL_SECONDS)
+            ),
+        ]
+    app.state.metric_pollers = metric_tasks
     try:
         yield
     finally:
+        for task in metric_tasks:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         ingestion_queue.set_active_worker(None)
         await ingestion_worker.stop()
         await retention_sweeper.stop()
@@ -166,11 +212,17 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    # Docs off in production (see ``Settings.docs_enabled``): the trio of
+    # /docs, /redoc and /openapi.json publishes the entire route surface.
+    docs_on = settings.docs_enabled
     app = FastAPI(
         title="AI Chat Platform",
         description="Multi-user AI chat with RAG, tool calling, and an admin console.",
         version="1.0.0",
         lifespan=lifespan,
+        docs_url="/docs" if docs_on else None,
+        redoc_url="/redoc" if docs_on else None,
+        openapi_url="/openapi.json" if docs_on else None,
     )
 
     # CORS: credentials=True so the httponly refresh cookie can be set/cleared
@@ -208,10 +260,14 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(chat_attachments.router)
     app.include_router(messages.router)
+    app.include_router(message_versions.router)
     app.include_router(models_api.router)
     app.include_router(knowledge_bases.router)
     app.include_router(documents.router)
     app.include_router(retrieval.router)
+    # @文件 / @知识库 内联引用的候选项（composer 的类型预测数据源）。
+    app.include_router(mentions.router)
+    app.include_router(prompts.router)
     app.include_router(tools.router)
     app.include_router(admin.router)
     app.include_router(agent_runs.router)
@@ -223,6 +279,11 @@ def create_app() -> FastAPI:
     app.include_router(wechat.router)
     app.include_router(credits.router)
     app.include_router(credits.admin_router)
+    # 语音输入/播报：默认关闭（SPEECH_ENABLED=false），能力探测见 /api/speech/capabilities。
+    app.include_router(speech.router)
+    # 管理后台的观测与运营面（都是 admin-only，鉴权在每个路由的依赖里）。
+    app.include_router(admin_runtime.router)
+    app.include_router(admin_redeem.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> JSONResponse:
@@ -247,17 +308,39 @@ def create_app() -> FastAPI:
         return JSONResponse(result, status_code=status_code)
 
     @app.get("/metrics", tags=["health"], include_in_schema=False)
-    async def metrics() -> Response:
+    async def metrics(request: Request) -> Response:
         # Prometheus scrape endpoint. The app already registers counters and
         # histograms (LLM latency/tokens, tool calls, queue depth, HTTP RED)
         # — without this route they were instrumented but unreachable, so the
         # production deployment was effectively a black box. Gated on
         # PROMETHEUS_ENABLED (default off) so the exposition surface only
         # exists when an operator actually scrapes it.
+        #
+        # Authentication (finding 38): the exposition leaks route templates,
+        # provider/model label values and queue depth — a roadmap for an
+        # attacker, and it is served on the same public port as the app. So a
+        # bearer token is required whenever METRICS_TOKEN is set; config.py
+        # refuses to boot a non-dev deployment with PROMETHEUS_ENABLED on and
+        # METRICS_TOKEN empty, which means the only way to get an unauthenticated
+        # /metrics is to be in dev. Scrape configs carry it as
+        # ``authorization: credentials`` from a secret, not a URL query (query
+        # strings land in access logs and proxy caches).
         from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
         if not get_settings().PROMETHEUS_ENABLED:
             raise HTTPException(status_code=404, detail="Not Found")
+        import secrets as _secrets
+
+        expected = get_settings().METRICS_TOKEN
+        if expected:
+            header = request.headers.get("authorization", "")
+            scheme, _, token = header.partition(" ")
+            if scheme.lower() != "bearer" or not _secrets.compare_digest(
+                token.strip(), expected
+            ):
+                # 404, not 401: an unauthenticated probe must not learn that a
+                # metrics surface exists here at all.
+                raise HTTPException(status_code=404, detail="Not Found")
         return Response(
             content=generate_latest(),
             media_type=CONTENT_TYPE_LATEST,

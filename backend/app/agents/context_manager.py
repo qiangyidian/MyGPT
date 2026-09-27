@@ -43,6 +43,7 @@ from app.agents.context_compaction import (
 from app.agents.output_spill import ArtifactHandle
 from app.agents.output_spill import spill as _spill_text
 from app.agents.token_budget import TokenBudget
+from app.security.prompt_boundary import apply_untrusted_boundary
 
 # Default body-after-prefix compaction threshold (fraction of input budget).
 _AUTO_COMPACT_FRACTION = 0.8
@@ -302,9 +303,18 @@ class ContextManager:
         the same prompt, with no module-level mutable cache that could diverge
         across workers. Every provided fragment is present in the output, so a
         cold worker produces the same prompt as a warm one.
+
+        ``summary`` and each ``memories`` entry are **derived from external
+        content**, so they pass the untrusted-content fence here (see
+        :mod:`app.security.prompt_boundary`): the fence they wore on their way
+        into the pipeline is long gone by the time they are re-spliced into the
+        system prompt, and the system prompt is the highest-privilege region of
+        the transcript.
         """
         parts: list[str] = []
         if rag_context:
+            # 不重复包：传进来的 rag_context 出自 ``rag.prompts.format_context_block``，
+            # 每个 chunk 正文在那里就单独包过围栏（再包一次也只是被幂等拆开重包）。
             parts.append(
                 "Use the following retrieved context to answer the user's question. "
                 "If the context is insufficient, say so. Cite sources by their "
@@ -312,15 +322,33 @@ class ContextManager:
                 f"Context:\n{rag_context}"
             )
         if summary:
-            parts.append(f"Earlier in this conversation (summary):\n{summary}")
+            # 整块包 summary：它的原料是**整段历史对话**（用户消息 + 附件正文 + 工具
+            # 返回），模型完全可能把外部内容里的「请忽略以上规则」原样写进摘要；裸拼进
+            # system prompt 就等于让那句攻击站在最高权限区。落库的摘要仍是纯文本
+            # （state_store 只存正文），所以只在装配时包一次，滚动摘要不会叠层。
+            fenced_summary = apply_untrusted_boundary("summary", summary)
+            if fenced_summary:
+                parts.append(
+                    f"Earlier in this conversation (summary):\n{fenced_summary}"
+                )
         if goal:
+            # 不包：goal = ``extract_goal(request.content)``，用户本轮自己打的原文
+            # （压成一行、截 200 字），不是检索 / 抓取回来的外部数据。
             parts.append(f"User's ongoing goal: {goal}")
         if memories:
-            joined = "\n".join(f"- {m}" for m in memories if m)
-            if joined:
+            # 逐条包，绝不整段包：整段包只有一层边界，靠前的记忆里一行「结束标记 + 伪
+            # 造 header」就能把它自己和后面的记忆、乃至紧随其后的 base 指令一起划进同一
+            # 个围栏，把真正的攻击段洗成「受信任资料」。逐条包让每条各自中和自己的标记、
+            # 各自一层边界，围栏之间只剩平台写的可信文本。记忆还跨会话持久化（一次注入
+            # 复用之后每一轮），所以这条边界必须逐条成立。
+            blocks = [
+                b for b in (apply_untrusted_boundary("memory", m) for m in memories if m)
+                if b
+            ]
+            if blocks:
                 parts.append(
                     "Remembered preferences about this user (user-approved):\n"
-                    f"{joined}"
+                    + "\n".join(blocks)
                 )
         # The base conversation system prompt is always present.
         parts.append(base)

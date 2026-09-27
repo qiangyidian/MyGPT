@@ -1,0 +1,417 @@
+# Pre-rollout schema migration Job: `alembic upgrade head` as a one-shot.
+#
+# HOW TO USE THIS IN AN INCIDENT
+# ------------------------------
+# Symptom -> first command:
+#   * Rollout stuck, new API pods `0/1 Ready`, nothing dying:
+#         kubectl -n mygpt get pods -l app.kubernetes.io/component=api
+#         kubectl -n mygpt describe pod <new-api-pod>      # look at the /ready body
+#     If the readiness probe is the thing failing, port-forward and read the
+#     per-component JSON: `db_migration.ok=false` names both revisions.
+#     Fix = run this Job, then the pods go ready on their own (no restart needed).
+#   * Job stuck Pending (never starts): a scheduling problem — node taints /
+#     missing nodeSelector match, or the image cannot be pulled
+#     (`kubectl -n mygpt describe pod <migrate-pod>` shows the event).
+#   * Job Running, then DeadlineExceeded with no alembic output: almost always
+#     egress. The pod must reach postgres:5432 — see `migrate-egress` in
+#     network-policies.yaml; under default-deny-all a missing rule blackholes the
+#     TCP connect (it hangs, it does not refuse).
+#   * Job keeps restarting: `kubectl -n mygpt logs job/migrate --all-containers`
+#     — the pre-upgrade-check initContainer prints the repo heads and the DB
+#     revision BEFORE anything is attempted, so a branched migration chain or an
+#     unreachable DB is visible in the first screenful.
+#   * Need to re-run after editing this file: a finished Job's pod template is
+#     immutable, so `apply` refuses a changed template. Either let
+#     `ttlSecondsAfterFinished` reap it (24h) or delete it first:
+#         kubectl -n mygpt delete job migrate --wait=true
+#
+# WHY A JOB AT ALL, AND WHY IT MUST PRECEDE THE ROLLOUT
+# ----------------------------------------------------
+# `/ready` (app/main.py -> app.core.health.check_readiness) gates on
+# `db_migration`, which compares `SELECT version_num FROM alembic_version`
+# against `REPO_MIGRATION_HEAD` — resolved dynamically from
+# backend/migrations/versions (app/core/health.py:_resolve_migration_head, so
+# this file deliberately does not name the current revision). The verdicts
+# (classify_db_revision):
+#   * db == head    -> ready;
+#   * db BEHIND     -> 503 FOREVER. This is the gate working as designed: a stale
+#                      image, or an image carrying migrations the DB never ran,
+#                      must not receive traffic;
+#   * db AHEAD      -> ready (expand-contract code rollback stays healthy);
+#   * unknown rev   -> 503.
+# Consequence: the Deployment cannot self-upgrade. `maxUnavailable`/`maxSurge`
+# govern pod replacement, but a replacement pod that comes up while the DB is
+# behind its own head never passes readiness, so the rollout stalls with the old
+# ReplicaSet still serving. That stall is the *safe* outcome (no traffic on a
+# mismatched schema, no data loss) — but it is a stall, and only this Job clears
+# it. Ordering is therefore: Job succeeds -> then roll the image.
+#
+# WHY A STANDALONE JOB AND NOT AN initContainer (the default choice)
+# ------------------------------------------------------------------
+#   1. Migrations are a property of a *release*, not of a pod. As an
+#      initContainer, alembic re-runs on every pod start — including an HPA-driven
+#      scale-out (hpa.yaml), which would put DDL on the critical path of a
+#      capacity event and make a scale-up fail like a migration.
+#   2. A blocked initContainer is invisible: `Init:0/1` with no gate, while the
+#      Deployment just sits. A failed Job is a first-class object you can log,
+#      re-run and alert on.
+#   3. Rollback safety: running the Job separately is what makes "image rolled
+#      back, DB left ahead" the documented-and-allowed `ahead` case above.
+#   Use the initContainer variant (commented block at the bottom of this file)
+#   only when there is no CI step and no operator in the loop — then accept (1)
+#   and keep `rollingUpdate.maxSurge: 1` so pods serialize on the lock.
+#
+# CONCURRENCY: two Jobs / two pods at once would interleave DDL. Alembic has no
+# built-in mutual exclusion (`backend/migrations/env.py:run_migrations_online`
+# just connects and runs). We serialize the same way every other singleton in
+# this repo does — a Postgres session advisory lock — reusing the key derivation
+# from `backend/app/core/leader.py`: `_lock_key(name)` (sha256 -> signed int4)
+# inside `LEADER_LOCK_NAMESPACE` (app/core/config.py:740), i.e. the exact
+# `(class, obj)` pair `AdvisoryLeader.__init__` builds. We deliberately do NOT
+# reuse `AdvisoryLeader.try_acquire` itself: it is non-blocking by design because
+# a losing standby must keep doing its non-singleton work and poll again, whereas
+# a migration must WAIT for its peer and must fail if it cannot. Same key, same
+# namespace, blocking `pg_advisory_lock` instead. `_lock_key` is module-private
+# on purpose; importing it here means a re-key or rename in leader.py breaks this
+# Job loudly at start (ImportError) instead of silently taking a different lock.
+# The long-term home for this is `env.py:run_migrations_online()` so compose,
+# CI and k8s all inherit it — out of scope here because it changes dev behaviour.
+#
+# The apply-all flow (`kubectl apply -n mygpt -f deploy/k8s/`, see config.yaml)
+# is safe with this file in the directory while the template is unchanged — apply
+# matches the existing Job and no-ops. Changing the image tag inside the 24h TTL
+# window is the one case that errors ("field is immutable"); the delete-and-
+# reapply line above is the remedy, and `ttlSecondsAfterFinished` makes it
+# unnecessary a day later.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: mygpt
+  labels:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: migrate
+spec:
+  # Bounded: a migration that fails is a code/config problem, not a transient
+  # one, and three attempts of a deadlocking ALTER TABLE is enough to see it.
+  backoffLimit: 2
+  # Hard ceiling on ONE attempt (lock wait + all revisions). Without it a
+  # blocked pg_advisory_lock or a wedged DDL leaves the Job running forever while
+  # the rollout waits on it.
+  activeDeadlineSeconds: 900
+  # Reap the completed Job a day later: keeps `kubectl apply -f deploy/k8s/`
+  # working (a completed Job with an edited, immutable template is rejected) and
+  # keeps `kubectl get jobs` honest about what the last rollout actually did.
+  ttlSecondsAfterFinished: 86400
+  completionMode: NonIndexed
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mygpt
+        app.kubernetes.io/component: migrate
+    spec:
+      # Never restart in place: each attempt is a fresh pod so `backoffLimit`
+      # counts attempts and the logs stay attributable.
+      restartPolicy: Never
+      # Same pod-level posture as the api Deployment (api.yaml): uid/gid 1001 =
+      # the `app` user from backend/Dockerfile, seccomp on, no SA token (this
+      # pod talks only to Postgres, never to the API server).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      # PLACEMENT: api.yaml declares no nodeSelector/affinity, so this Job
+      # inherits the same unconstrained placement — that is the "consistent with
+      # api" reading today. If you start pinning the api pods to a pool, mirror
+      # the label HERE as well, or a taint leaves this Job Pending forever while
+      # the rollout blocks on it. Do NOT reuse sandbox-runner.yaml's
+      # `mygpt/sandbox: "true"` — that pool is the privileged DinD blast radius.
+      #   nodeSelector:
+      #     mygpt/pool: "app"
+      # NOTE: the `initContainers:` block further down runs BEFORE the
+      # `containers:` block below (k8s reads a mapping, not an ordered list);
+      # it is listed after the payload only so the upgrade itself stays first.
+      containers:
+        - name: migrate
+          # Same image + same entry convention as the API (backend/Dockerfile:
+          # WORKDIR /app, USER app, migrations baked in — no source mount).
+          image: mygpt/backend:v1.0.0   # build & push from backend/Dockerfile
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          envFrom:
+            - configMapRef:
+                name: mygpt-config
+            - secretRef:
+                name: mygpt-secrets
+          # Identical env to the api on purpose: migrations/env.py imports
+          # app.core.config, so the Job runs the same prod guards
+          # (_guard_default_secrets, METRICS_TOKEN). A weak/absent secret therefore
+          # fails this Job at import — annoying once, and better than discovering
+          # it after the schema has moved.
+          # No CMD in backend/Dockerfile to inherit: the compose `migrate`
+          # service (docker-compose.prod.yml) shows the correct call form,
+          # `command: ["alembic", "upgrade", "head"]`. We wrap it in-process to
+          # hold the advisory lock across the whole upgrade — `psql` is not in
+          # the slim image, so the lock has to live in the same Python process.
+          #
+          # Equivalent to, and just as idempotent as, `alembic upgrade head`:
+          # at head it is a no-op that exits 0.
+          command:
+            - python
+            - "-c"
+            - |
+              import sys
+              sys.path.insert(0, "/app")            # mirrors migrations/env.py:13
+
+              import sqlalchemy as sa
+              from alembic import command
+              from alembic.config import Config
+
+              from app.core.config import get_settings
+              from app.core.leader import _lock_key
+
+              LOCK_NAME = "alembic-migrate"        # own name => own int4, no
+                                                   # collision with the runtime
+                                                   # loops ("retention-sweeper",
+                                                   # "run-stream-reclaim", ...)
+              settings = get_settings()
+              # Identical async->sync driver rewrite to migrations/env.py:26-31,
+              # so this Job and `alembic upgrade head` resolve one URL.
+              url = (
+                  settings.DATABASE_URL
+                  .replace("+asyncpg", "+psycopg2")
+                  .replace("postgresql://", "postgresql+psycopg2://")
+                  .replace("+aiosqlite", "")
+              )
+              engine = sa.create_engine(url, poolclass=sa.pool.NullPool)
+              ns, obj = settings.LEADER_LOCK_NAMESPACE, _lock_key(LOCK_NAME)
+
+
+              def revision(conn):
+                  """What /ready's db_migration check reads, verbatim."""
+                  try:
+                      value = conn.execute(
+                          sa.text("SELECT version_num FROM alembic_version")
+                      ).scalar()
+                  except Exception:
+                      conn.rollback()               # a missing table is not fatal here
+                      return "<no alembic_version>"
+                  return str(value) if value else "<empty alembic_version>"
+
+
+              with engine.connect() as lock_conn:
+                  if engine.dialect.name == "postgresql":
+                      # Bounded wait, so a wedged peer fails this Job instead of
+                      # quietly eating activeDeadlineSeconds. Deliberately no
+                      # statement_timeout: a legitimate CREATE INDEX on a large
+                      # table must not be killed mid-flight.
+                      lock_conn.execute(sa.text("SET lock_timeout = '300s'"))
+                      print(
+                          f"[migrate] waiting for advisory lock ({ns}, {obj})",
+                          flush=True,
+                      )
+                      lock_conn.execute(
+                          sa.text(
+                              "SELECT pg_advisory_lock(CAST(:ns AS int), CAST(:obj AS int))"
+                          ),
+                          {"ns": ns, "obj": obj},
+                      )
+                      lock_conn.commit()            # session lock survives COMMIT;
+                                                    # no idle-in-transaction snapshot
+                      print(f"[migrate] lock held; db at {revision(lock_conn)}", flush=True)
+                  else:
+                      # Dev/test on SQLite: no advisory locks (same degradation
+                      # AdvisoryLeader makes in leader.py:131).
+                      print("[migrate] non-postgres dialect: no advisory lock taken", flush=True)
+                  rc = 0
+                  try:
+                      command.upgrade(Config("/app/alembic.ini"), "head")
+                  except BaseException:
+                      rc = 1
+                      raise
+                  finally:
+                      print(
+                          f"[migrate] db now at {revision(lock_conn)} "
+                          "(expected: the repo head from migrations/versions; "
+                          "/ready compares against exactly this)",
+                          flush=True,
+                      )
+                      if engine.dialect.name == "postgresql":
+                          try:
+                              lock_conn.execute(
+                                  sa.text(
+                                      "SELECT pg_advisory_unlock(CAST(:ns AS int), CAST(:obj AS int))"
+                                  ),
+                                  {"ns": ns, "obj": obj},
+                              )
+                              lock_conn.commit()
+                          except Exception:
+                              pass                  # closing the session frees it
+                          print(f"[migrate] lock released (rc={rc})", flush=True)
+          resources:
+            # Same ceiling as the compose `migrate` one-shot (1 cpu / 512Mi): a
+            # migration is single-threaded DDL; a bigger box only makes a bad
+            # lock wait more expensive.
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      initContainers:
+        # ---- pre-upgrade report: see what you are about to change ----
+        # Read-only. Prints the repo head(s) and the DB revision, lists exactly
+        # the revisions `upgrade head` will apply, and REFUSES to continue when
+        # the chain has branched (two heads) — the case where `upgrade head`
+        # dies with "Multiple head revisions" *after* the api pods were already
+        # restarted. Uses only alembic from the image, no new tooling.
+        - name: pre-upgrade-check
+          image: mygpt/backend:v1.0.0
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          envFrom:
+            - configMapRef:
+                name: mygpt-config
+            - secretRef:
+                name: mygpt-secrets
+          command:
+            - /bin/sh
+            - "-c"
+            - |
+              set -eu
+              echo "=== [pre-upgrade] repo heads (migrations/versions in THIS image) ==="
+              # No pipe on this one: `if !` needs alembic's own exit status, and
+              # stderr is left unpiped so a traceback lands in `kubectl logs`.
+              if ! HEADS_RAW="$(alembic heads)"; then
+                echo "[pre-upgrade] FAIL: 'alembic heads' did not run — the image's" >&2
+                echo "[pre-upgrade]       migrations/versions directory is unreadable." >&2
+                exit 1
+              fi
+              HEADS="$(printf '%s\n' "$HEADS_RAW" | awk 'NF{print $1}' | sort -u)"
+              printf '%s\n' "$HEADS" | sed 's/^/[pre-upgrade] head: /'
+              N="$(printf '%s\n' "$HEADS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+              if [ "$N" -ne 1 ]; then
+                echo "[pre-upgrade] FAIL: $N alembic heads — the chain is branched." >&2
+                echo "[pre-upgrade]       merge them (alembic merge) before deploying;" >&2
+                echo "[pre-upgrade]       app/core/health.py:_resolve_migration_head raises" >&2
+                echo "[pre-upgrade]       on this too, so /ready could never go green." >&2
+                exit 1
+              fi
+              HEAD="$(printf '%s\n' "$HEADS" | head -n1)"
+              echo "=== [pre-upgrade] current database revision ==="
+              if ! CUR_RAW="$(alembic current)"; then
+                echo "[pre-upgrade] FAIL: 'alembic current' did not run. Either the DB is" >&2
+                echo "[pre-upgrade]       unreachable or alembic_version does not exist" >&2
+                echo "[pre-upgrade]       (a schema built with AUTO_CREATE_TABLES=true —" >&2
+                echo "[pre-upgrade]       /ready's db_migration fails on that as well)." >&2
+                exit 1
+              fi
+              CUR="$(printf '%s\n' "$CUR_RAW" | awk 'NF{print $1; exit}')"
+              if [ -z "$CUR" ]; then
+                echo "[pre-upgrade] no revision recorded -> FRESH database, will apply:"
+                alembic history | sed 's/^/[pre-upgrade]   /'
+              elif [ "$CUR" = "$HEAD" ]; then
+                echo "[pre-upgrade] db is at $CUR == this image's head: the upgrade is a no-op."
+                echo "[pre-upgrade] if the rollout is still parked on db_migration, the api"
+                echo "[pre-upgrade] image being rolled knows a head THIS image does not — i.e."
+                echo "[pre-upgrade] this Job ran with an old tag (see order-of-operations in"
+                echo "[pre-upgrade] config.yaml). /ready compares the DB against the head"
+                echo "[pre-upgrade] compiled into the api pod, not against this one."
+              else
+                echo "[pre-upgrade] db at $CUR -> head $HEAD. Revisions to apply:"
+                alembic history --rev-range "$CUR..head" | sed 's/^/[pre-upgrade]   /'
+              fi
+              echo "=== [pre-upgrade] ok ==="
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem + alembic's fileConfig() want a writable /tmp.
+        - name: tmp
+          emptyDir: {}
+
+# =============================================================================
+# ALTERNATIVE B — migration as an initContainer on the api Deployment.
+# =============================================================================
+# When to pick this instead of the Job above:
+#   * you have no CI pipeline and no human running kubectl before a rollout, and
+#     you accept that the FIRST pod of the rollout performs the upgrade;
+#   * single-replica / low-risk installs where a stalled rollout is cheaper than
+#     a missing migration step.
+# Why it is NOT the default here: every pod start re-runs alembic — including an
+# HPA scale-out (hpa.yaml) and every pod rescheduled by node failure — so DDL
+# sits on the capacity path; and a blocked initContainer is a bare `Init:0/1`.
+# If you enable it, ALSO: (a) add `migrate` to the `migrate-egress` NetworkPolicy
+# podSelector so the api pods may talk to Postgres for DDL, and (b) set
+# strategy.rollingUpdate.maxSurge: 1 so at most one pod runs alembic at a time
+# (the advisory lock below makes concurrent runs SAFE, not merely tolerated —
+# keep it either way).
+#
+# Paste into api.yaml under spec.template.spec.initContainers (before
+# `containers:`). Same lock derivation as the Job:
+#
+#         - name: migrate
+#           image: mygpt/backend:v1.0.0
+#           imagePullPolicy: IfNotPresent
+#           workingDir: /app
+#           envFrom:
+#             - configMapRef: {name: mygpt-config}
+#             - secretRef: {name: mygpt-secrets}
+#           command:
+#             - python
+#             - "-c"
+#             - |
+#               import sys; sys.path.insert(0, "/app")
+#               import sqlalchemy as sa
+#               from alembic import command
+#               from alembic.config import Config
+#               from app.core.config import get_settings
+#               from app.core.leader import _lock_key
+#               s = get_settings()
+#               url = (s.DATABASE_URL.replace("+asyncpg", "+psycopg2")
+#                        .replace("postgresql://", "postgresql+psycopg2://"))
+#               eng = sa.create_engine(url, poolclass=sa.pool.NullPool)
+#               with eng.connect() as c:
+#                   if eng.dialect.name == "postgresql":
+#                       c.execute(sa.text("SET lock_timeout = '300s'"))
+#                       c.execute(sa.text(
+#                           "SELECT pg_advisory_lock(CAST(:ns AS int), CAST(:obj AS int))"
+#                       ), {"ns": s.LEADER_LOCK_NAMESPACE, "obj": _lock_key("alembic-migrate")})
+#                       c.commit()
+#                   command.upgrade(Config("/app/alembic.ini"), "head")
+#           securityContext:
+#             allowPrivilegeEscalation: false
+#             readOnlyRootFilesystem: true
+#             capabilities: {drop: ["ALL"]}
+#           resources:
+#             requests: {cpu: "100m", memory: "128Mi"}
+#             limits: {cpu: "1000m", memory: "512Mi"}
+#           volumeMounts:
+#             - {name: tmp, mountPath: /tmp}

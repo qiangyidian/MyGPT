@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements.lock.txt .
+RUN pip install --require-hashes -r requirements.lock.txt
 
 # Run as a non-root user (the image otherwise ran everything as root).
 RUN groupadd --system --gid 1001 app \

@@ -123,7 +123,6 @@ export function AttachmentPreview({
                 <Loader2 className="h-5 w-5 animate-spin" />
               </div>
             ) : blobUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
               <img src={blobUrl} alt={attachment?.original_filename ?? ""} className="mx-auto max-h-[55vh] rounded" />
             ) : (
               <p className="text-sm text-muted-foreground">无法预览此图片。</p>

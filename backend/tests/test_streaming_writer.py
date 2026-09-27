@@ -1342,7 +1342,7 @@ async def test_graph_failure_rolls_back_only_independent_session(db_session):
     ctx.extra["persistence_session_factory"] = graph_sessions
     snapshot = {"nodes": [{"id": "writer", "status": "running"}], "edges": []}
     # 图持久化已从 CrewAIRuntime 迁到 RunEnvironment（两条 walker 共用）。
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     env._emitter = SimpleNamespace(snapshot=lambda: snapshot)
 
     # Graph persistence is best-effort for ordinary SQLAlchemy failures.
@@ -1371,7 +1371,7 @@ async def test_crewai_writer_checkpoint_cancellation_never_emits_false_success(
             ChatDelta(finish_reason="length"),
         ]]
     )
-    # provider 的构建已随装配逻辑迁到 RunEnvironment.for_turn。
+    # provider 的构建已随装配逻辑迁到 RunEnvironment.for_call。
     monkeypatch.setattr(
         "app.providers.registry.get_provider_for_config",
         lambda _cfg, **_kw: provider,

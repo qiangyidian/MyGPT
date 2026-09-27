@@ -200,12 +200,14 @@ class StreamingWriterExecutor:
                 await persist_checkpoint(checkpoint)
                 return
             from app.agents.db_mutation import db_mutation_scope
-            from app.db import AsyncSessionLocal
+            from app.agents.run_environment import resolve_session_factory
             from app.services.chat_service import (
                 _persist_continuation_checkpoint,
             )
 
-            session_factory = stage_ctx.persistence_session_factory or AsyncSessionLocal
+            session_factory = resolve_session_factory(
+                stage_ctx.persistence_session_factory
+            )
             async with db_mutation_scope(stage_ctx.persistence_lock):
                 await _persist_continuation_checkpoint(
                     session_factory,

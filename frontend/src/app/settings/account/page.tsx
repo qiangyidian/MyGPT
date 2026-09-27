@@ -5,7 +5,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShieldCheck, Unlink } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
+import { ChangePasswordCard } from "@/components/change-password-card";
 import { WechatLoginPanel } from "@/components/wechat-login-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,7 +23,12 @@ const BINDING_KEY = ["wechat-binding"] as const;
 const LOGIN_INFO_KEY = ["wechat-login-info"] as const;
 
 /**
- * 账号安全 — currently just the WeChat binding.
+ * 账号安全 — 密码 + WeChat binding.
+ *
+ * 改密放在这里而不是只放登录页：已登录用户（尤其是公众号扫码进来的）需要一个
+ * 明确的地方换掉口令，并且要知道换完之后其它设备会掉线。后端已经有
+ * ``POST /api/auth/password``（校验原密码 + bump token_version），此前只是没有
+ * 任何表单调用它。
  *
  * Binding is what makes scan login usable for an account that already exists.
  * Without it, an admin (or anyone who registered by email) who scans the
@@ -131,12 +138,13 @@ export default function AccountSettingsPage() {
           )}
         </CardContent>
       </Card>
+
+      <ChangePasswordCard />
     </div>
   );
 }
 
+// 统一中文映射：不再把 ApiError 的原始 message（可能是英文）直接显示出来。
 function toMessage(err: unknown): string {
-  if (err instanceof ApiError) return err.message;
-  if (err instanceof Error) return err.message;
-  return "操作失败，请稍后重试";
+  return userErrorMessage(err);
 }

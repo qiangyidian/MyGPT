@@ -1,0 +1,154 @@
+name: Security + Type Scan
+
+# Finding 37 — dependency, source and type scanning. The existing CI gate is
+# correctness-only (ruff + pytest + build), which catches nothing in this
+# category: a CVE in a transitive dependency, a hardcoded secret, an unsafe
+# deserialisation, or a type error on the money paths.
+#
+# Dependency vulnerability checks are release gates. Source SAST, container
+# misconfiguration and broad typing scans remain advisory until their existing
+# findings have been triaged into a maintained baseline.
+#
+# The `backend` job of ci.yml already runs pip-audit inline; it is repeated here
+# on the schedule so a CVE published *after* the last merge
+# still gets reported — dependency scanning on PR alone is a snapshot of the day
+# you wrote the code.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # 03:17 Beijing time, daily. Off the :00 mark on purpose — runner load at
+    # the top of the hour makes action installs time out more often.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  python-deps:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install --require-hashes -r requirements.lock.txt
+      - name: pip-audit (strict locked runtime dependencies)
+        # ChromaDB's four unfixed advisories are narrowly excepted. Their
+        # rationale and removal conditions live in backend/SECURITY.md.
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.lock.txt --no-deps --disable-pip --strict \
+            --ignore-vuln PYSEC-2026-311 \
+            --ignore-vuln PYSEC-2026-3813 \
+            --ignore-vuln PYSEC-2026-3814 \
+            --ignore-vuln PYSEC-2026-3815 \
+            --progress-spinner off
+      - name: Bandit (source-level SAST)
+        continue-on-error: true
+        # B101 (assert used) is excluded because the codebase asserts invariants
+        # in pure-policy modules on purpose; -s would only hide real findings in
+        # a first triage pass. Recursion over app/, not tests/.
+        run: |
+          pip install bandit
+          bandit -r app -x app/evals -s B101 \
+            || echo "::warning title=bandit::source SAST findings (advisory)"
+
+  frontend-deps:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: frontend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --registry=https://registry.npmjs.org
+      - name: npm audit
+        # `--audit-level=high` keeps the signal above the noise of dev-server
+        # advisories that never ship to the browser; moderate findings stay
+        # visible in the log without becoming a wall of text.
+        run: |
+          npm audit --audit-level=high --registry=https://registry.npmjs.org
+
+  semgrep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep (community rules, no token needed)
+        continue-on-error: true
+        # `p/ci` is the free, no-account-r required ruleset (secret leakage +
+        # injection basics). Deliberately not `p/default`: that one pulls
+        # language rules this repo does not use and buries the real findings.
+        run: |
+          pip install "semgrep>=1.60"
+          semgrep scan --config p/ci --error --metrics=off backend/app \
+            || echo "::warning title=semgrep::static analysis findings (advisory)"
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: [python-deps]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image for scanning
+        # Built locally, never pushed: this scans the filesystem the deployed
+        # image actually ships (OS packages + baked-in pip install), which is
+        # the half of the supply chain requirements.txt cannot see.
+        run: docker build -t mygpt-backend:scan ./backend
+      - name: Trivy (OS + language CVEs, image + config)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: mygpt-backend:scan
+          format: table
+          exit-code: "0"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Trivy misconfig scan (Dockerfile + k8s manifests)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: "0"
+          severity: CRITICAL,HIGH
+
+  # ---- mypy: narrow, non-blocking type report (finding 37) -----------------
+  # The target list is the pure-policy/service layer ONLY: the modules where a
+  # type error is a money or auth bug rather than a cosmetic one. Widening it
+  # repo-wide would produce a few hundred errors on first run and get the job
+  # deleted, which is the failure mode this is designed to avoid. Add a module
+  # here when its existing errors are at zero.
+  typecheck-python:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    env:
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      REDIS_URL: "redis://localhost:6379/0"
+      ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install --require-hashes -r requirements.lock.txt
+      - name: mypy (policy + auth + quota + credit layer)
+        continue-on-error: true
+        run: |
+          pip install mypy
+          python -m mypy \
+            app/credits.py \
+            app/quotas.py \
+            app/core/config.py \
+            app/core/security.py \
+            app/core/leader.py \
+            app/services/credit_service.py \
+            --no-error-summary \
+            || echo "::warning title=mypy::type errors in the policy layer (advisory)"

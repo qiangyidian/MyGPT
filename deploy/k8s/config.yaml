@@ -6,7 +6,31 @@
 # EMBEDDING_API_KEY, ADMIN_PASSWORD, QDRANT_API_KEY (if used). Services pull
 # them with envFrom.secretRef.
 #
+# Two more keys the workloads below assume, both secret-bearing and easy to
+# forget because they are connection strings rather than "credentials":
+#   DATABASE_URL  — `alembic` in migrate-job.yaml reads it through
+#                   app/core/config.py; unset, it falls back to
+#                   postgresql+asyncpg://postgres:postgres@localhost:5432/ai_chat
+#                   and the Job fails against a host that does not exist.
+#   METRICS_TOKEN — PROMETHEUS_ENABLED is "true" below, and config.py refuses to
+#                   boot a non-dev process with metrics on and no token, so
+#                   omitting it crash-loops every workload in this namespace.
+#                   Also what a Prometheus / prometheus-adapter scrape must send
+#                   as `Authorization: Bearer` (see hpa.yaml).
+#
 # Apply with:  kubectl apply -n mygpt -f deploy/k8s/
+# Order of operations for a release that carries migrations:
+#   1. kubectl apply the directory (config/Deployment/Service/PDB/HPA/policies),
+#   2. kubectl -n mygpt delete job migrate --wait=true   (only if one finished in
+#      the last 24h — a finished Job's template is immutable),
+#   3. kubectl -n mygpt apply -f deploy/k8s/migrate-job.yaml
+#      (point its image at the NEW tag first — the migrations live in the image,
+#       so an old-image Job upgrades to an old head and changes nothing)
+#   4. kubectl -n mygpt wait --for=condition=complete job/migrate --timeout=15m
+#   5. set the new image tag on api.yaml / worker.yaml / recovery.yaml + this
+#      Job's and apply.
+# Skipping 2-4 is survivable, not invisible: /ready's db_migration check 503s
+# every new pod until the DB catches up, so the rollout parks. See migrate-job.yaml.
 ---
 apiVersion: v1
 kind: Namespace
@@ -21,7 +45,9 @@ metadata:
 data:
   # ---- App ----
   ENV: "prod"
-  AUTO_CREATE_TABLES: "false"        # prod uses Alembic (the migrate Job / initContainer)
+  AUTO_CREATE_TABLES: "false"        # prod uses Alembic: migrate-job.yaml, never
+                                     # create_all (a schema built that way has no
+                                     # alembic_version row and /ready fails on it)
   BACKEND_CORS_ORIGINS: "https://chat.example.com"
   # ---- Durable worker (Task 5) ----
   # durable => the API only enqueues; the `worker` Deployment consumes the Redis
@@ -34,7 +60,13 @@ data:
   QDRANT_URL: "http://qdrant:6333"
   QDRANT_EMBEDDING_DIM: "1024"
   # ---- Storage ----
-  STORAGE_BACKEND: "minio"           # local works too; MinIO/S3 is prod-default
+  # `local` is not a downgrade here: this same file provisions the `uploads`
+  # PVC below and both api.yaml and worker.yaml mount it (RWX), so the object
+  # store *is* the shared volume. MinIO/S3 has no implementation at all
+  # (app/core/storage.py raises, and the startup guard rejects the value), so
+  # "minio" here would have taken every upload down with a 500 the moment
+  # anyone applied this ConfigMap.
+  STORAGE_BACKEND: "local"
   STORAGE_DIR: "/data/uploads"
   MAX_UPLOAD_MB: "20"
   # ---- Sandbox runner ----

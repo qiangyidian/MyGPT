@@ -8,9 +8,10 @@
 
 # ---- Secrets / environment --------------------------------------------------
 # Real env files carry secrets (JWT key, Fernet key, API keys) and must never
-# be committed. The two tracked safe files:
-#   .env.example  documented template (no secrets)
-#   dev.env       native-dev port overrides only (no secrets)
+# be committed. Tracked environment exceptions must contain public values only:
+#   .env.example             documented template
+#   dev.env                  native-dev port overrides
+#   frontend/.env.production public NEXT_PUBLIC_API_BASE_URL for local builds
 .env
 .env.*
 !.env.example
@@ -160,3 +161,9 @@ bash.exe.stackdump
 # openai/codex) must never be committed: they bloat the repo and vendor
 # third-party code under a different license. Keep such clones OUTSIDE the repo.
 codex/
+
+# ---- Backup artifacts -------------------------------------------------------
+# scripts/backup.sh 的默认落点就是 <repo>/backups，里面是整库 dump + 用户上传卷
+# 的归档 —— 全是真数据。一旦混进工作树，下一次 `git add .` 就把用户资料提交进
+# 了一个会推到远端的仓库。
+backups/

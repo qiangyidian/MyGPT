@@ -81,6 +81,10 @@ class AgentRunOut(BaseModel):
     plan_status: str | None = None
     user_instructions: dict[str, Any] | None = None
     paused_at: datetime | None = None
+    # 计划门当前是否上着闸（最后一条持久 ``gate`` 命令的 enabled）。门旗标本身
+    # 只活在进程内的 RunControl 上，库里唯一的事实来源是 run_commands 队列 ——
+    # 前端要靠它把「等待你的确认」和「执行中」分开，否则按钮只能瞎猜。
+    gate_armed: bool = False
 
 
 class ApproveRequest(BaseModel):

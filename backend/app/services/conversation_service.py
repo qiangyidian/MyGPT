@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
+from app.core.like import LIKE_ESCAPE, like_pattern
 from app.models import Conversation, Message
 from app.schemas import ConversationCreate, ConversationUpdate
 
@@ -31,14 +32,26 @@ async def list_for_user(
     """Return the user's conversations, pinned-first then newest, with search.
 
     ``archived`` selects the archived set (default: only active conversations).
-    ``q`` is a case-insensitive title substring. Limit/offset paginate.
+    ``q`` is a case-insensitive (``ILIKE``) substring match over the title and the
+    fixed-length ``last_message_preview`` column — both live on the conversation
+    row, so no join and no extra index is needed. Full-text search over
+    ``messages.content`` is deliberately NOT done here: that column has no
+    trigram/GIN index, so a leading-wildcard scan of it would turn the sidebar's
+    hot path into a full-history table scan for every keystroke. Limit/offset
+    paginate.
     """
     stmt = select(Conversation).where(
         Conversation.user_id == user_id,
         Conversation.is_archived.is_(archived),
     ).options(noload(Conversation.messages))  # sidebar list must not pull messages
-    if q:
-        stmt = stmt.where(Conversation.title.ilike(f"%{q}%"))
+    term = (q or "").strip()
+    if term:
+        stmt = stmt.where(
+            Conversation.title.ilike(like_pattern(term), escape=LIKE_ESCAPE)
+            | Conversation.last_message_preview.ilike(
+                like_pattern(term), escape=LIKE_ESCAPE
+            )
+        )
     stmt = stmt.order_by(
         Conversation.is_pinned.desc(),
         Conversation.updated_at.desc(),

@@ -1,25 +1,28 @@
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
-COPY package.json ./
-RUN pnpm install --no-frozen-lockfile
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
-FROM node:20-alpine AS dev
+FROM node:22-alpine AS dev
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 EXPOSE 3000
-CMD ["npx", "next", "dev", "-H", "0.0.0.0", "-p", "3000"]
+CMD ["npm", "run", "dev", "--", "-H", "0.0.0.0"]
 
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN pnpm build
+# NEXT_PUBLIC_* values are compiled into browser bundles by Next.js. Pass the
+# public API origin as a build arg; a runtime-only environment variable is too
+# late for the standalone production bundle.
+ARG NEXT_PUBLIC_API_BASE_URL
+ENV NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+RUN test -n "$NEXT_PUBLIC_API_BASE_URL" || (echo "NEXT_PUBLIC_API_BASE_URL is required for a production build" >&2; exit 1)
+RUN npm run build
 
-FROM node:20-alpine AS prod
+FROM node:22-alpine AS prod
 WORKDIR /app
 ENV NODE_ENV=production
 # Run as the unprivileged node user — the prod stage previously ran as root.

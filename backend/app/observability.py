@@ -339,6 +339,22 @@ class _NoopCounter:
         return None
 
 
+def _prom_name(name: str) -> str:
+    """Map an instrumentation name onto a legal Prometheus metric name.
+
+    Call sites use dotted names (``"queue.enqueues"``, ``"tool.calls"``) which
+    read well in traces and logs, but ``prometheus_client`` rejects anything
+    outside ``[a-zA-Z0-9_]`` at construction time. Because every ``_Prom*``
+    constructor ran inside a bare ``try`` in :func:`observe_counter`, that
+    rejection was swallowed and **every dotted metric was silently dropped** —
+    only the two underscore-named HTTP metrics ever reached ``/metrics``.
+    Normalising here is what makes the alert rules (``queue_*``, ``tool_*``)
+    actually fire on something. ``route``/``template`` in the trace name stays
+    as ``_`` too, so a scrape-side name is stable and greppable.
+    """
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+
+
 class _PromCounter(_NoopCounter):
     def __init__(self, name: str, description: str = "") -> None:
         super().__init__(name, description)
@@ -347,7 +363,9 @@ class _PromCounter(_NoopCounter):
         # Fixed labelnames: bounded cardinality (see _METRIC_LABEL_KEYS). The
         # full attributes dict survives in traces/logs + the test recorder; only
         # the small fixed schema becomes Prom labels.
-        self._c = _Counter(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
+        self._c = _Counter(
+            _prom_name(name), description or name, labelnames=list(_METRIC_LABEL_KEYS)
+        )
 
     def inc(self, amount: float = 1, attributes: dict[str, Any] | None = None) -> None:
         try:
@@ -370,7 +388,9 @@ class _PromHistogram(_NoopHistogram):
         super().__init__(name, description)
         from prometheus_client import Histogram as _Histogram  # type: ignore
 
-        self._h = _Histogram(name, description or name, labelnames=list(_METRIC_LABEL_KEYS))
+        self._h = _Histogram(
+            _prom_name(name), description or name, labelnames=list(_METRIC_LABEL_KEYS)
+        )
 
     def record(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
         try:
@@ -395,6 +415,70 @@ def histogram(name: str, description: str = "") -> Any:
         if _emit_metrics()
         else _NoopHistogram(name, description)
     )
+
+
+class _NoopGauge:
+    def __init__(self, name: str, description: str = "") -> None:
+        self.name = name
+        self.description = description
+
+    def set(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
+        return None
+
+
+class _PromGauge(_NoopGauge):
+    """Point-in-time value (queue depth, pending count) — never incremented.
+
+    Gauges are the only metric type that can express "how backed up is it
+    *now*", which is what the queue-lag alert needs; a counter would report the
+    same 0 for an idle-but-healthy queue and a stalled-but-draining one.
+    """
+
+    def __init__(self, name: str, description: str = "") -> None:
+        super().__init__(name, description)
+        from prometheus_client import Gauge as _Gauge  # type: ignore
+
+        self._g = _Gauge(
+            _prom_name(name), description or name, labelnames=list(_METRIC_LABEL_KEYS)
+        )
+
+    def set(self, amount: float = 0, attributes: dict[str, Any] | None = None) -> None:
+        try:
+            self._g.labels(**_extract_labels(sanitize_attributes(attributes))).set(amount)
+        except Exception:
+            pass
+
+
+def gauge(name: str, description: str = "") -> Any:
+    """Return a gauge handle (Prometheus when enabled, no-op otherwise)."""
+    return _PromGauge(name, description) if _emit_metrics() else _NoopGauge(name, description)
+
+
+_gauge_handles: dict[str, Any] = {}
+
+
+def observe_gauge(name: str, value: float, **attributes: Any) -> None:
+    """Set gauge ``name`` to ``value`` (absolute, not additive).
+
+    Same gating + recorder contract as :func:`observe_counter`: a hot-path call
+    with metrics off and no recorder costs two boolean checks.
+    """
+    if not _emit_metrics() and _metric_recorder is None:
+        return
+    clean = sanitize_attributes(attributes)
+    if _emit_metrics():
+        try:
+            h = _gauge_handles.get(name)
+            if h is None:
+                h = gauge(name)
+                _gauge_handles[name] = h
+            h.set(value, clean)
+        except Exception:
+            pass
+    if _metric_recorder is not None:
+        _metric_recorder.append(
+            {"kind": "gauge", "name": name, "value": value, "attributes": dict(clean)}
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -599,15 +683,18 @@ __all__ = [
     "bind_correlation_id",
     "clear_correlation_id",
     "counter",
+    "gauge",
     "get_correlation_id",
     "get_metric_recorder",
     "get_span_recorder",
     "histogram",
     "new_correlation_id",
     "observe_counter",
+    "observe_gauge",
     "observe_histogram",
     "observe_span",
     "sanitize_attributes",
+    "scrub_text",
     "set_metric_recorder",
     "set_span_recorder",
     "span",

@@ -18,6 +18,7 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { Download, FileText, Loader2 } from "lucide-react";
 
 import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { formatBytes } from "@/lib/utils";
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
@@ -111,7 +112,7 @@ export function DocumentPreviewDialog({
 
           {error && (
             <div className="p-6 text-sm text-destructive">
-              预览加载失败：{error instanceof Error ? error.message : "未知错误"}
+              预览加载失败：{userErrorMessage(error)}
             </div>
           )}
 

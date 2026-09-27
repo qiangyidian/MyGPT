@@ -11,6 +11,7 @@ import { AgentFlowGraph } from "@/components/agents/agent-flow-graph";
 import { AgentActivityFeed } from "@/components/agents/agent-activity-feed";
 import { AgentRunHeader } from "@/components/agents/agent-run-header";
 import { PlanReview } from "@/components/agents/plan-review";
+import { PlanGateControl } from "@/components/agents/plan-gate-control";
 import { RunControls } from "@/components/agents/run-controls";
 import { useDurableAgentRun } from "@/hooks/useDurableAgentRun";
 import { useAgentRunStore } from "@/stores/agent-run-store";
@@ -63,7 +64,7 @@ function DurableRunSurface({ runId }: { runId: string }) {
   const { state } = useDurableAgentRun(runId);
 
   // The run detail feeds the plan review (acceptance criteria + status).
-  const { data: run } = useQuery({
+  const { data: run, refetch: refetchRun } = useQuery({
     queryKey: ["agent-run-detail", runId],
     queryFn: () => api.getAgentRun(runId),
     refetchInterval: (query) => {
@@ -103,16 +104,27 @@ function DurableRunSurface({ runId }: { runId: string }) {
       />
 
       {plan && (plan.summary || (plan.steps && plan.steps.length > 0)) && (
-        <PlanReview
-          runId={runId}
-          summary={plan.summary ?? ""}
-          steps={plan.steps ?? []}
-          acceptanceCriteria={plan.acceptanceCriteria}
-          status={planStatus}
-          gating={reconciled.paused || reconciled.blocked}
-          onApprove={(id) => api.confirmPlan(id)}
-          onRevise={(id, rev) => api.updatePlan(id, rev)}
-        />
+        <div className="space-y-2">
+          <PlanReview
+            runId={runId}
+            summary={plan.summary ?? ""}
+            steps={plan.steps ?? []}
+            acceptanceCriteria={plan.acceptanceCriteria}
+            status={planStatus}
+            gating={Boolean(run?.gate_armed) || reconciled.paused || reconciled.blocked}
+            onApprove={(id) => api.confirmPlan(id)}
+            onRevise={(id, rev) => api.updatePlan(id, rev)}
+          />
+          {/* 计划门：让下一道计划真的停下来等确认（确认后 PlanReview 消失）。 */}
+          <PlanGateControl
+            runId={runId}
+            armed={Boolean(run?.gate_armed)}
+            runStatus={run?.status ?? ""}
+            planStatus={planStatus}
+            onGate={(id, enabled) => api.setPlanGate(id, enabled)}
+            onDecided={() => void refetchRun()}
+          />
+        </div>
       )}
     </div>
   );

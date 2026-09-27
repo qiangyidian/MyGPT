@@ -10,12 +10,18 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Sidebar } from "@/components/sidebar";
 import { AgentGlobalProgress } from "@/components/agents/agent-global-progress";
 import { useAuth } from "@/hooks/useAuth";
-import { useConversationDetail, useConversations } from "@/hooks/useConversations";
+import {
+  CONVERSATION_SEARCH_DEBOUNCE_MS,
+  useConversationDetail,
+  useConversations,
+  useDebouncedValue,
+} from "@/hooks/useConversations";
 import { useProjects } from "@/hooks/useProjects";
 import { useOnlineStatus } from "@/hooks/useOnlineStatus";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useModels } from "@/hooks/useModels";
 import { ApiError } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import {
   buildLoginUrl,
   buildReturnTo,
@@ -55,13 +61,33 @@ export function AppShell({ children }: AppShellProps) {
 
   const online = useOnlineStatus();
   const [viewMode, setViewMode] = useState<"active" | "archived">("active");
+  // 搜索框的即时值 vs 真正发出去的 `q`：列表是服务端分页 + 服务端搜索，
+  // 每按一个键就打一次接口会把第一页反复打没（分页游标也一起重置）。
+  const [searchInput, setSearchInput] = useState("");
+  const searchQuery = useDebouncedValue(searchInput, CONVERSATION_SEARCH_DEBOUNCE_MS);
   const {
     conversations,
     create,
     delete: deleteConversation,
     updateAsync,
-  } = useConversations({ archived: viewMode === "archived" });
-  const { projects, create: createProject, assign, unassign } = useProjects();
+    isPending: conversationsPending,
+    isFetching: conversationsFetching,
+    isError: conversationsError,
+    refetch: refetchConversations,
+    hasNextPage,
+    isLoadingMore,
+    loadedCount,
+    loadMore,
+  } = useConversations({ archived: viewMode === "archived", q: searchQuery });
+  const {
+    projects,
+    isLoading: projectsLoading,
+    create: createProject,
+    rename: renameProject,
+    deleteProject,
+    assign,
+    unassign,
+  } = useProjects();
   const { chatModels, isLoading: modelsLoading } = useModels();
 
   const handleAssignToProject = (conversationId: string, projectId: string) => {
@@ -73,6 +99,26 @@ export function AppShell({ children }: AppShellProps) {
   };
   const handleCreateProject = async (name: string) => {
     await createProject({ name });
+  };
+
+  // 项目改名 / 删除（条目 30）：侧边栏内联改名与确认框已经拦过一遍校验，
+  // 这里的 toast 只是兜住服务端那一份（并发改名、权限变化等）。
+  const handleRenameProject = async (projectId: string, name: string) => {
+    try {
+      await renameProject({ id: projectId, body: { name } });
+      toast.success("项目已重命名");
+    } catch (err) {
+      toast.error("重命名失败", { description: userErrorMessage(err) });
+    }
+  };
+
+  const handleDeleteProject = async (projectId: string) => {
+    await deleteProject(projectId);
+  };
+
+  // 会话级系统提示词（条目 31）：null = 恢复平台默认，后端把列写回 NULL。
+  const handleUpdateSystemPrompt = async (conversationId: string, systemPrompt: string | null) => {
+    await updateAsync({ id: conversationId, body: { system_prompt: systemPrompt } });
   };
 
   // activeId is the single source of truth for the displayed conversation.
@@ -159,7 +205,7 @@ export function AppShell({ children }: AppShellProps) {
       setViewMode("active");
       setSidebarOpen(false);
     } catch (err) {
-      toast.error("创建对话失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("创建对话失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -175,7 +221,7 @@ export function AppShell({ children }: AppShellProps) {
       if (activeId === id) setActiveConversationId(null);
       toast.success("对话已删除");
     } catch (err) {
-      toast.error("删除失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("删除失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -183,7 +229,7 @@ export function AppShell({ children }: AppShellProps) {
     try {
       await updateAsync({ id, body: { title } });
     } catch (err) {
-      toast.error("重命名失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("重命名失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -191,7 +237,7 @@ export function AppShell({ children }: AppShellProps) {
     try {
       await updateAsync({ id, body: { pinned } });
     } catch (err) {
-      toast.error("操作失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("操作失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -200,7 +246,7 @@ export function AppShell({ children }: AppShellProps) {
       await updateAsync({ id, body: { archived } });
       toast.success(archived ? "已归档" : "已取消归档");
     } catch (err) {
-      toast.error("操作失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("操作失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -269,10 +315,23 @@ export function AppShell({ children }: AppShellProps) {
       onLogout={handleLogout}
       viewMode={viewMode}
       onViewModeChange={setViewMode}
-      projects={projects}
+      searchQuery={searchInput}
+      onSearchQueryChange={setSearchInput}
+      isSearchPending={searchInput.trim() !== searchQuery.trim()}
+      hasNextPage={hasNextPage}
+      isLoadingMore={isLoadingMore}
+      loadedCount={loadedCount}
+      isListFetching={conversationsFetching || conversationsPending}
+      isListError={conversationsError}
+      onRetryList={() => void refetchConversations()}
+      onLoadMore={loadMore}
+      projects={projectsLoading ? null : projects}
       onAssignToProject={handleAssignToProject}
       onRemoveFromProject={handleRemoveFromProject}
       onCreateProject={handleCreateProject}
+      onRenameProject={handleRenameProject}
+      onDeleteProject={handleDeleteProject}
+      onUpdateSystemPrompt={handleUpdateSystemPrompt}
       returnTo={homeReturnTo}
     />
   );

@@ -2,9 +2,22 @@
 #
 # image: replace `mygpt/backend:v1.0.0` with your registry tag (built from
 # backend/Dockerfile). Readiness is the STRICT /ready gate (Task 11): 200 only
-# when the DB revision == repo head (0014_credits_redeem), Qdrant client/server skew
-# <= 1, storage writable, a runner available, and an eligible chat model
-# configured. Liveness is the lenient /health (DB up).
+# when the DB revision == the repo alembic head, Qdrant client/server skew <= 1,
+# storage writable, a runner available, and an eligible chat model configured.
+# Liveness is the lenient /health (DB up).
+#
+# The head is NOT a constant: app/core/health.py:REPO_MIGRATION_HEAD resolves it
+# at import by walking backend/migrations/versions, so nothing here restates it —
+# a number written here goes stale the moment a revision lands. (The hardcoded
+# 0014-era name that used to sit on line 5 had quietly drifted five revisions,
+# which is precisely the drift _resolve_migration_head was written to prevent.)
+#
+# Ordering with the migration Job: /ready returns 503 while the DB is BEHIND this
+# image's head (and stays 503 — it never self-heals), and returns 200 while the
+# DB is AHEAD (expand-contract rollback). So run migrate-job.yaml BEFORE rolling
+# an image that ships migrations: without it, replacement pods start, fail
+# readiness, and the rollout parks with the old ReplicaSet still taking traffic.
+# See migrate-job.yaml for the full reasoning; hpa.yaml owns the replica count.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -15,7 +28,18 @@ metadata:
     app.kubernetes.io/name: mygpt
     app.kubernetes.io/component: api
 spec:
-  replicas: 2
+  # NO `replicas:` here on purpose. hpa.yaml (autoscaling/v2, minReplicas: 2)
+  # owns this field, and re-declaring it is not idempotent: the documented flow
+  # is `kubectl apply -n mygpt -f deploy/k8s/`, which would then reset the count
+  # to 2 on every apply — including the apply you do in the middle of an
+  # incident. That reset is a direct scale-down, not an Eviction API call, so
+  # api-pdb below does NOT gate it: surplus pods vanish instantly and every SSE
+  # stream on them dies. Omitting the field costs one thing instead: on a brand
+  # new cluster the Deployment starts at the API-server default of 1 replica and
+  # the HPA raises it to 2 on its first sync — so check `kubectl top pods` and
+  # `kubectl describe hpa api` once after the first apply (if metrics-server is
+  # missing the HPA will not act, and you stay at 1). Running without an HPA?
+  # Put `replicas: 2` back and delete hpa.yaml.
   selector:
     matchLabels:
       app.kubernetes.io/name: mygpt
@@ -46,8 +70,14 @@ spec:
                 name: mygpt-config
             - secretRef:
                 name: mygpt-secrets
-          # Migrations are run as a one-shot Job/initContainer before traffic;
-          # the runtime /ready gate is the backstop if a pod lags the head.
+          # Migrations are NOT run from this pod. They are a separate one-shot:
+          # deploy/k8s/migrate-job.yaml (`alembic upgrade head`, serialized on a
+          # Postgres advisory lock), applied BEFORE the rollout. Keeping the
+          # Deployment out of the DDL business matters now that hpa.yaml owns the
+          # replica count: an initContainer here would re-run alembic on every
+          # scale-out and on every reschedule. /ready's db_migration check is the
+          # backstop that makes a skipped migration fail closed (never Ready,
+          # never takes traffic) instead of serving a mismatched schema.
           readinessProbe:
             httpGet:
               path: /ready
@@ -108,6 +138,10 @@ metadata:
   name: api-pdb
   namespace: mygpt
 spec:
+  # Gates VOLUNTARY disruption only (drain, eviction, rollout) — it does not
+  # apply to a scale-down driven by a spec change or by hpa.yaml, which is why
+  # the Deployment deliberately declares no `replicas:`. minAvailable: 1 is safe
+  # at every size the HPA can pick, because minReplicas is 2.
   minAvailable: 1
   selector:
     matchLabels:

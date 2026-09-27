@@ -1,11 +1,16 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { Loader2, MessageSquare } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
+// 注册分支的密码规则：常量与中文文案的唯一来源（后端 `app/core/security.py` 的抄本）。
+// 登录分支不套它 —— 后端 `LoginRequest.password` 刻意没有长度规则。
+import { passwordProblem, passwordPolicySummary } from "@/lib/password-policy";
 import { resolveReturnTo } from "@/lib/navigation";
 import { useAuth } from "@/hooks/useAuth";
 import { NavSuspense } from "@/components/navigation/page-loading";
@@ -157,18 +162,9 @@ function LoginForm() {
       setError("请输入邮箱验证码（点击「发送验证码」获取）");
       return;
     }
-    // Mirror the backend policy (PASSWORD_MIN_LENGTH=8 + upper/lower/digit)
-    // so a weak password is caught client-side instead of as a 400.
-    if (password.length < 8) {
-      setError("密码至少 8 位");
-      return;
-    }
-    if (
-      !/[a-z]/.test(password) ||
-      !/[A-Z]/.test(password) ||
-      !/\d/.test(password)
-    ) {
-      setError("密码需包含大写字母、小写字母和数字");
+    const problem = passwordProblem(password);
+    if (problem) {
+      setError(problem);
       return;
     }
     if (password !== confirm) {
@@ -260,7 +256,15 @@ function LoginForm() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="login-password">密码</Label>
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="login-password">密码</Label>
+                      <Link
+                        href="/forgot-password"
+                        className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+                      >
+                        忘记密码？
+                      </Link>
+                    </div>
                     <PasswordInput
                       id="login-password"
                       autoComplete="current-password"
@@ -354,7 +358,7 @@ function LoginForm() {
                     <PasswordInput
                       id="reg-password"
                       autoComplete="new-password"
-                      placeholder="至少 8 位，含大小写字母和数字"
+                      placeholder={passwordPolicySummary()}
                       value={password}
                       onChange={(e) => {
                         setPassword(e.target.value);
@@ -422,16 +426,5 @@ function ErrorBox({ message }: { message: string }) {
   );
 }
 
-// Backend auth errors arrive in English; map the common ones to Chinese so the
-// form reads consistently (unknown messages fall through untouched).
-const AUTH_ERROR_ZH: Record<string, string> = {
-  "Invalid email or password": "邮箱或密码错误",
-  "Account disabled": "账号已被禁用",
-  "Email or username already registered": "邮箱或用户名已被注册",
-};
-
-function toMessage(err: unknown): string {
-  if (err instanceof ApiError) return AUTH_ERROR_ZH[err.message] ?? err.message;
-  if (err instanceof Error) return err.message;
-  return "操作失败，请稍后重试";
-}
+// 英文/内部信息一律交给统一映射：后端自己的中文优先，未收录的英文不会漏给用户。
+const toMessage = userErrorMessage;

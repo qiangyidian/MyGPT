@@ -12,20 +12,28 @@ import {
   type ChatStreamHandlers,
 } from "@/lib/api";
 import { buildChatBody } from "@/lib/chat-request";
-import { extractWebCitations, mergeCitations } from "@/lib/web-citations";
+import { userErrorMessage } from "@/lib/api-error";
+import {
+  initialStreamState,
+  rebuildLastSendFromMessages,
+  reduce,
+  type AssistantCommit,
+  type StreamEvent,
+  type StreamState,
+} from "@/lib/chat-stream-state";
 import {
   CONVERSATIONS_QUERY_KEY,
   CONVERSATION_DETAIL_QUERY_KEY,
 } from "@/hooks/useConversations";
 import type {
   AgentStep,
+  ChatMention,
   Citation,
   FinishReason,
   GenerationStatus,
   Message,
   PendingApproval,
 } from "@/lib/types";
-import { finishReasonToStatus } from "@/lib/types";
 import type { AgentEdgeStatus, AgentGraphNode } from "@/lib/agent-graph-types";
 import { coerceGraph } from "@/hooks/useAgentRunGraph";
 import { useAgentRunStore } from "@/stores/agent-run-store";
@@ -40,6 +48,8 @@ export interface SendOptions {
   knowledgeBaseId?: string | null;
   /** Per-turn multi-KB selection. */
   knowledgeBaseIds?: string[];
+  /** ``@``-references decoded from the sent text (extends knowledgeBaseIds). */
+  mentions?: ChatMention[];
   /** User-facing capability mode (Phase 1). */
   mode?: UserChatMode;
   /** Attachment ids to bind to the outgoing user message. */
@@ -103,6 +113,10 @@ export interface ChatStreamState {
  * On stream done, the final assistant message is appended to the
  * conversation detail cache so the message list shows it persistently,
  * and the streaming text is cleared.
+ *
+ * 「事件 + 状态 → 新状态」的转移全在 `lib/chat-stream-state.ts` 的 `reduce` 里
+ * （纯的、可单测）；本文件只采集事件、把结果写回 React，并执行留在浏览器侧的副
+ * 作用（缓存失效、图 store、toast、取消 run）。
  */
 export function useChatStream(): ChatStreamState {
   const queryClient = useQueryClient();
@@ -117,6 +131,9 @@ export function useChatStream(): ChatStreamState {
   // run keeps executing on the worker, and reattach picks it back up when
   // the user returns to the conversation).
   const userStopRef = useRef(false);
+
+  // 当前这一轮状态核的入口，见 `createTurn`。
+  const turnApplyRef = useRef<((event: StreamEvent) => void) | null>(null);
 
   // Close the in-flight SSE subscription when the consumer unmounts, so
   // navigating away mid-stream doesn't leak the connection. This does NOT
@@ -194,26 +211,11 @@ export function useChatStream(): ChatStreamState {
       const detail = queryClient.getQueryData(
         CONVERSATION_DETAIL_QUERY_KEY(conversationId)
       ) as { messages?: Message[] } | undefined;
-      const msgs = detail?.messages ?? [];
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i];
-        if (m.role !== "user") continue;
-        const meta = m.metadata as
-          | { send_params?: { mode?: string; model_id?: string | null; knowledge_base_ids?: string[]; attachment_ids?: string[] } }
-          | undefined;
-        const sp = meta?.send_params;
-        lastSendRef.current = {
-          content: m.content,
-          opts: {
-            conversationId,
-            mode: (sp?.mode as SendOptions["mode"]) ?? undefined,
-            modelId: sp?.model_id ?? null,
-            knowledgeBaseIds: sp?.knowledge_base_ids,
-            attachmentIds: sp?.attachment_ids,
-          },
-        };
-        return;
-      }
+      const rebuilt = rebuildLastSendFromMessages(
+        detail?.messages ?? [],
+        conversationId
+      );
+      if (rebuilt) lastSendRef.current = rebuilt;
     },
     [queryClient]
   );
@@ -238,80 +240,43 @@ export function useChatStream(): ChatStreamState {
   );
 
   // ---- Turn session factory ---------------------------------------------
-  // One streaming turn = a bundle of mutable locals + SSE handlers. Both
-  // the live send path (run) and the durable reattach path create one, so a
-  // reattached run rebuilds identical state (text / steps / citations /
+  // One streaming turn = a state-core `state` + SSE handlers that feed it.
+  // Both the live send path (run) and the durable reattach path create one,
+  // so a reattached run rebuilds identical state (text / steps / citations /
   // graph) and finalizes through the same commit logic.
-  const createTurnSession = (seedConversationId: string | null) => {
-    // Mutable locals tracked across stream events.
-    let resolvedConversationId = seedConversationId;
-    let assistantMessageId = "";
-    let resolvedRunId = "";
-    // Refs so the onDone/onError closures can read the accumulated values
-    // without depending on stale React state.
-    let accumulated = "";
-    let accumulatedCitations: Citation[] = [];
-    let stepSeq = 0;
-    const stepById = new Map<string, AgentStep>();
+  const createTurn = useCallback((seedConversationId: string | null) => {
+    let state = initialStreamState(seedConversationId);
+    // 「已经写进 React 的值」的镜像：只有变了的字段才 setState，调用点与渲染次数
+    // 都等同于老实现逐个 setState 的写法。
+    let published: StreamState | null = null;
+    let shownText = "";
+    let shownSources = state.citations;
+    let appliedCommit: AssistantCommit | null = null;
 
-    const upsertStep = (step: AgentStep) => {
-      const next = [...stepById.values()];
-      // preserve insertion order by sequence
-      next.sort((a, b) => a.sequence - b.sequence);
-      accumulatedStepsRef.current = next;
-      setSteps(next);
-    };
-    const accumulatedStepsRef = { current: [] as AgentStep[] };
-
-    // Terminal-once guard: a single turn commits exactly one assistant
-    // message, whether it ends via done, error, cancel, or a dropped socket.
-    // Without this, onDone + the React Query refetch + a stray second done
-    // could append duplicate assistant messages.
-    let terminated = false;
-
-    const errorFinish = (code?: string): FinishReason => {
-      switch (code) {
-        case "provider_timeout":
-          return "timeout";
-        case "stream_disconnected":
-          return "stream_disconnected";
-        case "provider_error":
-          return "provider_error";
-        default:
-          return "error";
-      }
-    };
-
-    /** Commit the (possibly partial) assistant message exactly once. */
-    const commitAssistant = (
-      convId: string,
-      content: string,
-      fr: FinishReason,
-      msgId: string,
-      extraMeta: Record<string, unknown> = {}
-    ) => {
-      if (terminated) return;
-      terminated = true;
+    /**
+     * 落库本轮的 assistant 消息（可能是半截）。内容与终态闸门都来自状态核的
+     * `commit`，这里只补上 wall clock 与图 store 才能给出的两个字段。
+     */
+    const writeAssistantMessage = (commit: AssistantCommit) => {
       const isMulti = useAgentRunStore.getState().active.nodes.length >= 2;
       const msg: Message = {
-        id: msgId,
-        conversation_id: convId,
+        id: commit.messageId,
+        conversation_id: commit.conversationId,
         role: "assistant",
-        content,
+        content: commit.content,
         metadata: {
-          finish_reason: fr,
-          citations: accumulatedCitations,
-          steps: accumulatedStepsRef.current,
-          run_id: resolvedRunId || undefined,
+          finish_reason: commit.finishReason,
+          citations: commit.citations,
+          steps: commit.steps,
+          run_id: commit.runId || undefined,
           multi_agent: isMulti || undefined,
-          ...extraMeta,
         },
         model_name: null,
         created_at: new Date().toISOString(),
       };
-      appendMessage(convId, msg);
+      appendMessage(commit.conversationId, msg);
       queryClient.invalidateQueries({
-        queryKey: CONVERSATION_DETAIL_QUERY_KEY(convId),
+        queryKey: CONVERSATION_DETAIL_QUERY_KEY(commit.conversationId),
       });
       // The backend auto-titles a fresh conversation from this turn (cheap
       // truncation immediately, LLM refinement after the answer) — refetch
@@ -325,25 +290,68 @@ export function useChatStream(): ChatStreamState {
       queryClient.invalidateQueries({
         queryKey: ["credits"],
       });
-      setFinishReason(fr);
-      setStatus(finishReasonToStatus(fr));
     };
+
+    const publish = () => {
+      if (state.text !== shownText) {
+        shownText = state.text;
+        enqueueStreamingText(state.text);
+      }
+      if (state.citations !== shownSources) {
+        shownSources = state.citations;
+        // Mirror into the Context Panel so the Sources tab can render them.
+        useContextPanelStore.getState().setSources(state.citations);
+      }
+      if (!published || published.conversationId !== state.conversationId) {
+        setCurrentConversationId(state.conversationId);
+      }
+      // runId 一轮内只前进不清空（老实现也只在 run_started / runtime_selected /
+      // 形状合法的 agent_graph 上写它）。
+      if (state.runId && (!published || published.runId !== state.runId)) {
+        setCurrentRunId(state.runId);
+      }
+      if (!published || published.citations !== state.citations) {
+        setCitations(state.citations);
+      }
+      if (!published || published.steps !== state.steps) setSteps(state.steps);
+      if (!published || published.stepsSinceTextFrom !== state.stepsSinceTextFrom) {
+        setStepsSinceTextFrom(state.stepsSinceTextFrom);
+      }
+      if (!published || published.pendingApprovals !== state.pendingApprovals) {
+        setPendingApprovals(state.pendingApprovals);
+      }
+      if (!published || published.error !== state.error) setError(state.error);
+      if (!published || published.status !== state.status)
+        setStatus(state.status);
+      if (!published || published.finishReason !== state.finishReason)
+        setFinishReason(state.finishReason);
+      published = state;
+      // 终态闸门在 reducer 里；这里的身份比较只防「同一个终态被重复 publish」。
+      if (state.commit && state.commit !== appliedCommit) {
+        appliedCommit = state.commit;
+        writeAssistantMessage(state.commit);
+      }
+    };
+
+    const apply = (event: StreamEvent) => {
+      state = reduce(state, event);
+      publish();
+    };
+    // 审批是在流之外被用户解掉的（REST 调用成功之后），但仍要改这一轮的状态，
+    // 所以把当前轮的 `apply` 挂出去；否则 React 与状态核会各持一份审批列表。
+    turnApplyRef.current = apply;
 
     const handlers: ChatStreamHandlers = {
       onMeta: (convId, msgId) => {
-        resolvedConversationId = convId;
-        assistantMessageId = msgId;
-        setCurrentConversationId(convId);
+        apply({ kind: "meta", conversationId: convId, messageId: msgId });
         // Bump the conversation list so a new conversation appears.
         queryClient.invalidateQueries({ queryKey: CONVERSATIONS_QUERY_KEY });
       },
       onRunStarted: (e) => {
-        resolvedRunId = e.runId;
-        setCurrentRunId(e.runId);
+        apply({ kind: "run_started", runId: e.runId });
       },
       onRuntimeSelected: (e) => {
-        resolvedRunId = e.runId;
-        setCurrentRunId(e.runId);
+        apply({ kind: "runtime_selected", runId: e.runId });
         // Track the runtime selection on the agent-run store so the panel
         // can show runtime/profile and, crucially, a FALLBACK warning when a
         // multi-agent request couldn't run (never a silent single-model run).
@@ -370,8 +378,7 @@ export function useChatStream(): ChatStreamState {
       onAgentGraph: (e) => {
         const g = coerceGraph(e.runId, e.graph);
         if (!g) return;
-        resolvedRunId = e.runId;
-        setCurrentRunId(e.runId);
+        apply({ kind: "agent_graph", runId: e.runId });
         useAgentRunStore.getState().setActiveRun(e.runId);
         useAgentRunStore.getState().dispatch({ type: "GRAPH_INITIALIZED", runId: e.runId, graph: g });
         // Auto-open the Execution tab ONLY for genuine multi-agent crews
@@ -444,33 +451,12 @@ export function useChatStream(): ChatStreamState {
         });
       },
       onPlanCreated: (e) => {
-        e.steps.forEach((p) => {
-          stepSeq += 1;
-          stepById.set(p.id, {
-            id: p.id,
-            sequence: stepSeq,
-            type: "plan",
-            title: p.title,
-            summary: p.id === e.steps[0]?.id ? e.summary : undefined,
-            status: "pending",
-          });
-        });
-        upsertStep(stepById.get(e.steps[0]?.id ?? "") as AgentStep);
+        apply({ kind: "plan", summary: e.summary, steps: e.steps });
       },
-      // Research-plan lifecycle surfaced as steps too (durable runs).
+      // Research-plan lifecycle surfaced as steps too (durable runs) — the two
+      // frames carry the same payload, so they feed the same event.
       onResearchPlan: (e) => {
-        e.steps.forEach((p) => {
-          stepSeq += 1;
-          stepById.set(p.id, {
-            id: p.id,
-            sequence: stepSeq,
-            type: "plan",
-            title: p.title,
-            summary: p.id === e.steps[0]?.id ? e.summary : undefined,
-            status: "pending",
-          });
-        });
-        upsertStep(stepById.get(e.steps[0]?.id ?? "") as AgentStep);
+        apply({ kind: "plan", summary: e.summary, steps: e.steps });
       },
       onRunPaused: (e) => {
         useAgentRunStore.getState().dispatch({
@@ -487,84 +473,38 @@ export function useChatStream(): ChatStreamState {
         });
       },
       onRunInstructionReceived: (e) => {
-        stepSeq += 1;
-        const step: AgentStep = {
-          id: `instr-${stepSeq}`,
-          sequence: stepSeq,
-          type: "approval",
-          title: `已接收追加指引：${e.instruction}`,
-          status: "done",
-        };
-        stepById.set(step.id, step);
-        upsertStep(step);
+        apply({ kind: "instruction_received", instruction: e.instruction });
       },
       onStepStarted: (e) => {
-        // If the step id was already announced (plan), flip to running;
-        // otherwise create a new step of the given type.
-        const existing = stepById.get(e.stepId);
-        stepSeq += 1;
-        const step: AgentStep = existing
-          ? { ...existing, status: "running", type: (e.type as AgentStep["type"]) || existing.type, title: e.title }
-          : {
-              id: e.stepId,
-              sequence: stepSeq,
-              type: (e.type as AgentStep["type"]) || "agent",
-              title: e.title,
-              status: "running",
-              startedAt: new Date().toISOString(),
-            };
-        stepById.set(e.stepId, step);
-        upsertStep(step);
+        apply({
+          kind: "step_started",
+          stepId: e.stepId,
+          title: e.title,
+          type: e.type,
+        });
       },
       onStepCompleted: (e) => {
-        const existing = stepById.get(e.stepId);
-        if (existing) {
-          stepById.set(e.stepId, {
-            ...existing,
-            status: (e.status as AgentStep["status"]) || "done",
-            finishedAt: new Date().toISOString(),
-          });
-          upsertStep(stepById.get(e.stepId) as AgentStep);
-        }
+        apply({ kind: "step_completed", stepId: e.stepId, status: e.status });
       },
       onToken: (delta) => {
-        accumulated += delta;
-        enqueueStreamingText(accumulated);
-        // Text resuming consumes the batch before it: everything emitted so
-        // far is now "narration history", and the next step starts a fresh
-        // batch to be shown after this text.
-        setStepsSinceTextFrom(accumulatedStepsRef.current.length);
+        apply({ kind: "token", delta });
       },
       onCitations: (cits) => {
-        // Merge (not replace): KB document citations arrive early, web sources
-        // arrive later via onToolResult — both must coexist in the Sources tab.
-        accumulatedCitations = mergeCitations(accumulatedCitations, cits);
-        setCitations(accumulatedCitations);
-        // Mirror into the Context Panel so the Sources tab can render them.
-        useContextPanelStore.getState().setSources(accumulatedCitations);
+        apply({ kind: "citations", citations: cits });
       },
       onToolCall: (e) => {
-        stepSeq += 1;
-        const step: AgentStep = {
+        apply({
+          kind: "tool_call",
           id: e.id,
-          sequence: stepSeq,
-          type: "tool",
-          title: e.name,
-          status: "running",
-          startedAt: new Date().toISOString(),
-          tool: {
-            name: e.name,
-            dangerous: e.dangerous,
-            argumentsPreview: e.arguments,
-          },
-        };
-        stepById.set(e.id, step);
-        upsertStep(step);
+          name: e.name,
+          arguments: e.arguments,
+          dangerous: e.dangerous,
+        });
         // Attribute the tool to its agent in the multi-agent graph store.
         if (e.agent_id) {
           useAgentRunStore.getState().dispatch({
             type: "TOOL_STARTED",
-            runId: resolvedRunId,
+            runId: state.runId,
             agentId: e.agent_id,
             callId: e.id,
             name: e.name,
@@ -573,108 +513,71 @@ export function useChatStream(): ChatStreamState {
         }
       },
       onToolResult: (e) => {
-        const existing = stepById.get(e.id);
-        if (existing) {
-          const resultPreview =
-            typeof e.result === "string"
-              ? e.result
-              : e.result != null
-                ? JSON.stringify(e.result)
-                : undefined;
-          stepById.set(e.id, {
-            ...existing,
-            status: e.ok ? "done" : "error",
-            finishedAt: new Date().toISOString(),
-            tool: {
-              ...(existing.tool ?? { name: e.name }),
-              name: e.name,
-              ok: e.ok,
-              resultPreview,
-            },
-          });
-          upsertStep(stepById.get(e.id) as AgentStep);
-        }
+        apply({
+          kind: "tool_result",
+          id: e.id,
+          name: e.name,
+          ok: e.ok,
+          result: e.result,
+        });
         if (e.agent_id) {
           useAgentRunStore.getState().dispatch({
             type: "TOOL_COMPLETED",
-            runId: resolvedRunId,
+            runId: state.runId,
             agentId: e.agent_id,
             callId: e.id,
             ok: e.ok,
           });
         }
-        // Promote real web tool output into verifiable Sources. web_search /
-        // http_get results arrive here as a stringified-JSON payload; turning
-        // them into web Citations makes the "来源" tab list the actual pages
-        // and search hits the agent used (merged with any KB citations).
-        if (e.ok && (e.name === "web_search" || e.name === "http_get")) {
-          const web = extractWebCitations(e.name, e.result);
-          if (web.length) {
-            accumulatedCitations = mergeCitations(accumulatedCitations, web);
-            setCitations(accumulatedCitations);
-            useContextPanelStore.getState().setSources(accumulatedCitations);
-          }
-        }
       },
       onApprovalRequired: (ap) => {
-        setPendingApprovals((prev) =>
-          prev.some((p) => p.approvalId === ap.approvalId) ? prev : [...prev, ap]
-        );
+        apply({ kind: "approval_required", approval: ap });
       },
-      onDone: ({ messageId, finishReason: fr }) => {
-        const finalId = messageId || assistantMessageId;
-        if (resolvedConversationId) {
-          commitAssistant(resolvedConversationId, accumulated, fr, finalId);
-        } else {
-          terminated = true;
-          setFinishReason(fr);
-          setStatus(finishReasonToStatus(fr));
-        }
+      onDone: (e) => {
+        apply({
+          kind: "done",
+          messageId: e.messageId,
+          finishReason: e.finishReason,
+        });
       },
-      onError: ({ code, message }) => {
-        const fr = errorFinish(code);
-        setError(message);
-        if (resolvedConversationId) {
-          // Preserve whatever was streamed before the error.
-          commitAssistant(resolvedConversationId, accumulated, fr, assistantMessageId);
-        } else {
-          terminated = true;
-          setFinishReason(fr);
-          setStatus(finishReasonToStatus(fr));
-        }
+      onError: (e) => {
+        apply({
+          kind: "error",
+          code: e.code,
+          message: e.message,
+          status: e.status,
+          detail: e.detail,
+        });
       },
     };
+    // 把「轮初清空」也交给同一份状态：构造出一轮，React 里就只剩这一轮的状态。
+    publish();
+
     return {
       handlers,
-      commitAssistant,
+      apply,
       /** Pre-seed ids (reattach: the events log carries no meta frame). */
       seed(convId: string | null, msgId: string | null) {
-        if (convId) {
-          resolvedConversationId = convId;
-          setCurrentConversationId(convId);
-        }
-        if (msgId) assistantMessageId = msgId;
+        apply({ kind: "seed", conversationId: convId, messageId: msgId });
       },
-      markTerminated() {
-        terminated = true;
-      },
-      get resolvedConversationId() {
-        return resolvedConversationId;
-      },
-      get assistantMessageId() {
-        return assistantMessageId;
-      },
-      get resolvedRunId() {
-        return resolvedRunId;
-      },
-      get accumulated() {
-        return accumulated;
-      },
-      get terminated() {
-        return terminated;
+      get state() {
+        return state;
       },
     };
-  };
+  }, [
+    appendMessage,
+    enqueueStreamingText,
+    queryClient,
+    setCitations,
+    setCurrentConversationId,
+    setCurrentRunId,
+    setError,
+    setFinishReason,
+    setPendingApprovals,
+    setStatus,
+    setSteps,
+    setStepsSinceTextFrom,
+  ]);
 
   const run = useCallback(
     async (content: string, opts: SendOptions, isRegenerate: boolean) => {
@@ -685,13 +588,6 @@ export function useChatStream(): ChatStreamState {
 
       setIsStreaming(true);
       syncStreamingText("");
-      setCitations([]);
-      setSteps([]);
-      setStepsSinceTextFrom(0);
-      setPendingApprovals([]);
-      setError(null);
-      setStatus("complete");
-      setFinishReason(null);
       // Reset the multi-agent graph store for a new turn (a new agent_graph
       // event will repopulate it; this also clears any dismissal so the panel
       // can auto-open for the new run).
@@ -712,9 +608,7 @@ export function useChatStream(): ChatStreamState {
       // bubble stayed hidden until the backend's meta frame arrived, so the
       // user saw nothing (no sent-message echo, no streaming animation) for a
       // beat after pressing send.
-      setCurrentConversationId(initialConversationId);
-
-      const session = createTurnSession(initialConversationId);
+      const turn = createTurn(initialConversationId);
 
       // Optimistically append the user's own message into the cache so it
       // appears instantly in the message list.
@@ -755,6 +649,8 @@ export function useChatStream(): ChatStreamState {
             modelId: opts.modelId,
             knowledgeBaseId: opts.knowledgeBaseId,
             knowledgeBaseIds: opts.knowledgeBaseIds,
+            // Inline @refs (知识库/文档/文件): scoping happens server-side.
+            mentions: opts.mentions,
             content,
             regenerate: isRegenerate,
             // Phase 1: send the user-facing mode + bound attachments. The
@@ -764,7 +660,7 @@ export function useChatStream(): ChatStreamState {
             // B6: reasoning-effort hint (honored only by capable models).
             reasoningEffort: useChatUiStore.getState().reasoningEffort,
           }),
-          session.handlers,
+          turn.handlers,
           controller.signal
         );
       } catch (err) {
@@ -772,65 +668,43 @@ export function useChatStream(): ChatStreamState {
           // Genuine error (fetch failure, etc.). User aborts are handled in the
           // `finally` — parseSSEStream swallows AbortError so streamChat resolves
           // without throwing on a mid-stream Stop, and the cancel must still run.
-          const message = err instanceof Error ? err.message : "发生未知错误";
-          setError(message);
-          if (session.resolvedConversationId && session.accumulated) {
-            session.commitAssistant(
-              session.resolvedConversationId,
-              session.accumulated,
-              "error",
-              session.assistantMessageId
-            );
-          } else {
-            session.markTerminated();
-            setFinishReason("error");
-            setStatus("error");
-          }
+          turn.apply({ kind: "fetch_failed", error: err });
         }
       } finally {
-        if (!session.terminated) {
-          if (controller.signal.aborted) {
-            if (userStopRef.current) {
-              // USER Stop (button): preserve partial as cancelled and cancel
-              // the backend run — the only path allowed to do so.
-              if (session.resolvedConversationId && session.accumulated) {
-                session.commitAssistant(
-                  session.resolvedConversationId,
-                  session.accumulated,
-                  "cancelled",
-                  session.assistantMessageId || `cancelled-${Date.now()}`
-                );
-              } else {
-                session.markTerminated();
-                setFinishReason("cancelled");
-                setStatus("cancelled");
-              }
-              if (session.resolvedRunId) {
-                api.cancelAgentRun(session.resolvedRunId).catch(() => undefined);
-              }
-            }
-            // Unmount cleanup abort: do nothing here. The durable run keeps
-            // executing on the worker; the partial stays uncommitted and the
-            // reattach path (conversation remount) replays the full event
-            // log, so returning to the page shows the finished answer.
-          } else if (session.resolvedConversationId && session.accumulated) {
-            // Socket dropped with NO terminal event and NO user abort.
-            setError("连接中断，已保留已生成内容");
-            session.commitAssistant(
-              session.resolvedConversationId,
-              session.accumulated,
-              "stream_disconnected",
-              session.assistantMessageId || `interrupted-${Date.now()}`
-            );
-          }
+        const wasTerminated = turn.state.terminated;
+        const userStop = userStopRef.current;
+        turn.apply({
+          kind: "stream_end",
+          reason: controller.signal.aborted
+            ? userStop
+              ? "user_stop"
+              : "unmount"
+            : "socket_closed",
+        });
+        if (
+          !wasTerminated &&
+          controller.signal.aborted &&
+          userStop &&
+          turn.state.runId
+        ) {
+          // USER Stop（按钮）是唯一有权取消后端 run 的路径。
+          api.cancelAgentRun(turn.state.runId).catch(() => undefined);
         }
+        // 卸载式 abort 什么都不做：后端 durable run 继续跑，半截正文不入账，回到
+        // 会话时由 reattach 整段重放补回视图。
         setIsStreaming(false);
         abortRef.current = null;
         userStopRef.current = false;
         syncStreamingText("");
       }
     },
-    [isStreaming, currentConversationId, appendMessage, queryClient]
+    [
+      isStreaming,
+      currentConversationId,
+      appendMessage,
+      createTurn,
+      syncStreamingText,
+    ]
   );
 
   const send = useCallback(
@@ -899,18 +773,11 @@ export function useChatStream(): ChatStreamState {
 
         const controller = new AbortController();
         abortRef.current = controller;
-        const session = createTurnSession(conversationId);
+        const turn = createTurn(conversationId);
         // The durable event log has no meta frame — seed the ids up front.
-        session.seed(conversationId, active.messageId);
+        turn.seed(conversationId, active.messageId);
         setIsStreaming(true);
         syncStreamingText("");
-        setCitations([]);
-        setSteps([]);
-        setStepsSinceTextFrom(0);
-        setPendingApprovals([]);
-        setError(null);
-        setFinishReason(null);
-        setStatus("complete");
 
         const resubscribe = () => reattachedRunsRef.current.delete(active.runId);
         try {
@@ -919,7 +786,7 @@ export function useChatStream(): ChatStreamState {
             {
               onEvent: (e) => {
                 dispatchChatStreamEvent(
-                  session.handlers,
+                  turn.handlers,
                   e.event_type,
                   JSON.stringify(e.data)
                 );
@@ -935,7 +802,7 @@ export function useChatStream(): ChatStreamState {
           // Closing the tail must never cancel the backend run — unlike the
           // inline path, an abort here only ends THIS subscription. The next
           // reattach replays from sequence 0 and rebuilds everything.
-          if (!session.terminated) {
+          if (!turn.state.terminated) {
             resubscribe();
           }
           setIsStreaming(false);
@@ -946,9 +813,7 @@ export function useChatStream(): ChatStreamState {
         reattachInFlightRef.current = false;
       }
     },
-    // `createTurnSession` is a stable-shape factory re-created per render; its
-    // identity changing just re-creates this callback, which is harmless.
-    [isStreaming, createTurnSession]
+    [isStreaming, createTurn, syncStreamingText]
   );
 
   // Resolve a pending approval; removes it from the list on success.
@@ -958,10 +823,10 @@ export function useChatStream(): ChatStreamState {
       if (!ap) return;
       try {
         await api.approveToolCall(ap.runId, ap.approvalId);
-        setPendingApprovals((prev) => prev.filter((p) => p.approvalId !== approvalId));
-      } catch {
-        // surface as a generic error
-        setError("确认失败，请重试");
+        turnApplyRef.current?.({ kind: "approval_resolved", approvalId });
+      } catch (err) {
+        // 统一映射：401/409（审批已失效）等都各有其文案，不再一律"请重试"。
+        setError(userErrorMessage(err));
       }
     },
     [pendingApprovals]
@@ -973,9 +838,9 @@ export function useChatStream(): ChatStreamState {
       if (!ap) return;
       try {
         await api.rejectToolCall(ap.runId, ap.approvalId, reason);
-        setPendingApprovals((prev) => prev.filter((p) => p.approvalId !== approvalId));
-      } catch {
-        setError("拒绝失败，请重试");
+        turnApplyRef.current?.({ kind: "approval_resolved", approvalId });
+      } catch (err) {
+        setError(userErrorMessage(err));
       }
     },
     [pendingApprovals]

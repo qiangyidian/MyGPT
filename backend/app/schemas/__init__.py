@@ -1,5 +1,17 @@
 """Pydantic schemas (request/response DTOs). Re-exported for convenient imports."""
-from app.schemas.admin import AdminUserUpdate, AuditLogOut, SystemStatus, UsageStat
+from app.schemas.admin import (
+    AdminUserUpdate,
+    AuditEventPage,
+    AuditEventRow,
+    AuditLogOut,
+    FeatureFlagOut,
+    FeatureFlagPage,
+    SystemStatus,
+    UsageMetrics,
+    UsageReportPage,
+    UsageReportRow,
+    UsageStat,
+)
 from app.schemas.agent import (
     ActionResult,
     AgentRunOut,
@@ -39,6 +51,7 @@ from app.schemas.connector import (
     ProviderManifestOut,
 )
 from app.schemas.credit import (
+    BatchStatusFilter,
     CreditAccountOut,
     CreditAccountRowOut,
     CreditAdjustRequest,
@@ -81,11 +94,17 @@ from app.schemas.model_config import (
     ModelTestResult,
 )
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
+from app.schemas.prompt_template import (
+    PromptTemplateCreate,
+    PromptTemplateOut,
+    PromptTemplateUpdate,
+)
 from app.schemas.tool import (
     ToolInfo,
     ToolParameter,
     ToolTestRequest,
     ToolTestResult,
+    ToolToggleRequest,
 )
 from app.schemas.user_memory import (
     UserMemoryBulkAction,
@@ -122,6 +141,8 @@ __all__ = [
     # projects + memories (Phase 3)
     "ProjectCreate", "ProjectUpdate", "ProjectOut",
     "MemoryOut", "MemoryUpdate",
+    # 提示词库（个人模板 + 系统预置）
+    "PromptTemplateCreate", "PromptTemplateUpdate", "PromptTemplateOut",
     # Task 7: opt-in semantic user memory
     "UserMemoryOut", "UserMemoryPropose", "UserMemoryEdit", "UserMemoryBulkAction",
     # Task 9: MCP connectors
@@ -132,12 +153,16 @@ __all__ = [
     "DocumentOut", "DocumentPreview", "ReindexResult", "UploadCapabilities",
     # tools
     "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult",
+    "ToolToggleRequest",
     # admin
     "AdminUserUpdate", "UsageStat", "SystemStatus", "AuditLogOut",
+    "UsageMetrics", "UsageReportRow", "UsageReportPage",
+    "AuditEventRow", "AuditEventPage",
+    "FeatureFlagOut", "FeatureFlagPage",
     # credits + redeem codes
     "CreditAccountOut", "RedeemRequest", "RedeemResultOut",
     "LedgerEntryOut", "LedgerPageOut",
     "RedeemBatchCreate", "RedeemBatchCreateOut", "RedeemBatchOut",
     "RedeemBatchProgressOut", "RedeemCodeOut", "VoidBatchOut",
-    "CreditAccountRowOut", "CreditAdjustRequest",
+    "CreditAccountRowOut", "CreditAdjustRequest", "BatchStatusFilter",
 ]

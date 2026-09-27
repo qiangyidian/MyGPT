@@ -423,21 +423,15 @@ def build_task_decomposition_graph(
 
 
 def build_graph_for_profile(profile: str, question: str) -> AgentGraph:
-    """Pick the topology by agent_profile / intent."""
-    if profile == "parallel_research":
-        return build_parallel_research_graph(question)
-    if profile == "task_decomposition":
-        return build_task_decomposition_graph(question)
-    if profile == "write_review":
-        return build_write_review_graph(question)
-    if profile == "debate":
-        from app.agents.planning import extract_debate_sides
+    """Pick the topology by agent_profile / intent.
 
-        sides = extract_debate_sides(question)
-        return build_debate_graph(
-            sides.side_a if sides else "A", sides.side_b if sides else "B"
-        )
-    return build_deep_research_graph(question)
+    拓扑本身**声明**在 :mod:`app.agents.workflow.topology`（B15）：这里只是
+    执行那份声明。以前这个函数自己写一串 if —— 于是「有哪些 profile」这件事
+    在 graph / planner / walker / orchestrator 里各有一份，互相能对上纯属巧合。
+    """
+    from app.agents.workflow.topology import build_graph, topology_for
+
+    return build_graph(topology_for(profile), question)
 
 
 # --------------------------------------------------------------------------- #

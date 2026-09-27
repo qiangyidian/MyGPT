@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { PasswordInput } from "@/components/ui/password-input";
-import { ApiError } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 
 interface DeleteAccountDialogProps {
   open: boolean;
@@ -46,9 +46,7 @@ export function DeleteAccountDialog({
       onOpenChange(false);
       onDeleted();
     } catch (err) {
-      const message =
-        err instanceof ApiError ? err.message : "注销失败，请稍后重试";
-      toast.error(message);
+      toast.error("注销失败", { description: userErrorMessage(err) });
     } finally {
       setPending(false);
     }

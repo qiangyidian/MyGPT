@@ -14,6 +14,8 @@ carried over as ``skip``) and marks only the flagged steps for re-execution.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from app.agents.workflow.schemas import (
     Plan,
     PlanValidationError,
@@ -309,18 +311,15 @@ def build_write_review_plan(question: str) -> Plan:
 
 
 def build_plan_for_profile(profile: str, question: str) -> Plan:
-    """Pick a plan template by profile. Mirrors
-    :func:`app.agents.graph.build_graph_for_profile`."""
-    if profile == "parallel_research":
-        return build_parallel_research_plan(question)
-    if profile == "task_decomposition":
-        return build_task_decomposition_plan(question)
-    if profile == "write_review":
-        return build_write_review_plan(question)
-    if profile == "debate":
-        return build_debate_plan(question)
-    # default + "deep_research"
-    return build_deep_research_plan(question)
+    """Pick a plan template by profile.
+
+    Mirrors :func:`app.agents.graph.build_graph_for_profile` —— 两者都只是
+    :mod:`app.agents.workflow.topology` 那份声明的执行器（B15）：拓扑只在
+    那里写一次，这里不再自己存一份 if 链。
+    """
+    from app.agents.workflow.topology import build_plan, topology_for
+
+    return build_plan(topology_for(profile), question)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,6 +440,8 @@ def revise_plan(
     plan: Plan,
     revise_step_ids: list[str],
     observations: dict[str, StepObservation],
+    *,
+    findings: Sequence[str] = (),
 ) -> Plan:
     """Return a NEW versioned plan that reworks only ``revise_step_ids``.
 
@@ -451,6 +452,10 @@ def revise_plan(
     judge a plan whose final answer never reflects the revision. The plan's
     ``version`` increments and ``replan_count`` advances by one. The revised
     plan is validated before being returned.
+
+    ``findings`` 是上一轮审阅说出来的话。它会被**盖到每个重跑的步骤上**
+    （``review_findings`` + ``revision_round``），执行器据此改写提示词 —— 没有
+    这一步，返修就只是把同一份 prompt 再发一次，「改」环节拿不到「审」的结论。
     """
     revise_set = set(revise_step_ids or [])
     # Reject verifier bugs early: an unknown revise id would otherwise mark every
@@ -461,6 +466,8 @@ def revise_plan(
         raise PlanValidationError(
             f"revise_step_ids reference unknown step(s): {sorted(unknown)}"
         )
+    findings_text = [str(f).strip() for f in (findings or ()) if str(f).strip()]
+    next_round = plan.replan_count + 1
     carried: dict[str, StepObservation] = {}
     # 被改动步骤的**全部传递下游**也必须重跑：它们手上的观测是按旧上游算出
     # 的，留着不重算就等于让 verifier 复核一份永远不会更新的过期答案。
@@ -469,8 +476,16 @@ def revise_plan(
     new_steps: list[Step] = []
     for s in plan.steps:
         if s.id in must_rerun:
-            # Rework: a fresh, runnable copy (skip stays False).
-            new_steps.append(s.model_copy(update={"skip": False}))
+            # Rework: a fresh, runnable copy (skip stays False) + 审阅意见。
+            new_steps.append(
+                s.model_copy(
+                    update={
+                        "skip": False,
+                        "revision_round": next_round,
+                        "review_findings": list(findings_text),
+                    }
+                )
+            )
         else:
             # Retain: carry its observation and mark skipped.
             new_steps.append(s.model_copy(update={"skip": True}))

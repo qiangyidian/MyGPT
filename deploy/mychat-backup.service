@@ -1,14 +1,33 @@
 [Unit]
-Description=MyGPT backup job (pg_dump + Qdrant snapshots + uploads tar)
+Description=MyGPT backup job (pg_dump + Qdrant snapshots + uploads tar + rclone offsite sync)
 After=network-online.target
 Wants=network-online.target
+# Failure visibility. The job's own ERR trap (scripts/backup.sh) already prints
+# the failing step to the journal and pushes to BACKUP_ALERT_URL when one is set;
+# OnFailure= is the belt-and-braces hook that fires even when the process is
+# killed by TimeoutStartSec (a trap cannot run on SIGKILL). The unit below only
+# writes a separate journal entry + optional webhook push, so it is safe to leave
+# unconfigured. It deliberately does NOT route through Alertmanager: Prometheus
+# scrapes the API, never a systemd oneshot, so there is no backup rule to fire.
+OnFailure=mychat-backup-alert.service
 
 [Service]
 Type=oneshot
 # Backups are only useful if they run as a real user against the real stores.
-# Storage dir matches the deployment's STORAGE_DIR so uploads are included.
-Environment=STORAGE_DIR=/data/uploads
 WorkingDirectory=/root/MyGPT
 ExecStart=/root/MyGPT/scripts/backup.sh
-# Give a large uploads tree / slow snapshot API time to finish.
+# Offsite + retention come from the repo .env (chmod 600) by default. Put them in
+# a separate file only when the backup credentials must not sit next to the app's:
+#   BACKUP_RCLONE_REMOTE=mygpt-offsite
+#   BACKUP_RCLONE_PREFIX=backups/mychat-prod     (must be an rclone *crypt* remote)
+#   RETAIN_REMOTE_DAYS=30
+#   BACKUP_ALERT_URL=https://<your 企业微信/钉钉 robot webhook>
+EnvironmentFile=-/etc/mychat/backup.env
+# STORAGE_DIR is intentionally NOT hardcoded here any more: /data/uploads is the
+# compose-container path and the host-side job cannot see into the uploads_data
+# named volume, while the host-native deployment keeps uploads under
+# /opt/mychat-data/uploads (see DEPLOY-SERVER.md). backup.sh now reads the real
+# value from .env; uncomment and set it only for a deliberate override.
+# Environment=STORAGE_DIR=/data/uploads
+# Give a large uploads tree / slow snapshot API + offsite push time to finish.
 TimeoutStartSec=2h

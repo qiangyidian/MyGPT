@@ -1,0 +1,215 @@
+# Alert / recording rules for MyGPT (finding 38).
+#
+# Mounted at /etc/prometheus/rules/mygpt.yml (see docker-compose.prod.yml), which
+# is the path listed in prometheus.yml's rule_files.
+#
+# HARD RULE: every metric name below is emitted by code in this repo — nothing
+# here is aspirational. Two consequences worth knowing before editing:
+#
+#   1. Instrumentation uses dotted names ("queue.stream_length"), and
+#      prometheus_client only accepts [a-zA-Z0-9_]. app/observability.py now
+#      normalises dots to underscores at registration, so the exposed names are
+#      the underscore forms below (counters additionally get prometheus_client's
+#      "_total" suffix). Before that fix every dotted metric was silently dropped
+#      at construction, which is why only the two http_* series ever appeared.
+#
+#   2. Only what the **API process** observes is scrapable: the worker and the
+#      recovery scheduler expose no port (see the note in prometheus.yml), so
+#      worker-side series (workflow_steps_total, model_calls_total recorded
+#      during a durable run, …) never reach this registry. Queue depth and the
+#      credit pool are therefore sampled *in the API* by the pollers started from
+#      app.main's lifespan, and worker liveness is asserted by the container exec
+#      probe (python -m app.healthcheck worker), not by a series. The
+#      MyGPTQueueNoProgress / MyGPTQueueMetricsAbsent rules below are what a
+#      scrape can honestly say about a worker it cannot see; they are backlog
+#      detectors, not a "worker_up" gauge. Adding a real one means giving the
+#      worker an authenticated exposition endpoint — deliberately out of scope.
+#
+# Severity convention: critical = pages (routed to the paging receiver in
+# alertmanager.yml), warning = ticket, info = dashboard annotation only.
+
+groups:
+  # --------------------------------------------------------------------------- 
+  # Recording rules: the expensive expressions the alerts (and Grafana) reuse.
+  # --------------------------------------------------------------------------- 
+  - name: mygpt.api.rules
+    interval: 30s
+    rules:
+      - record: mygpt:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m]))
+      - record: mygpt:http_errors:rate5m
+        expr: sum(rate(http_requests_total{outcome="error"}[5m]))
+      - record: mygpt:http_error_ratio:rate5m
+        expr: |
+          mygpt:http_errors:rate5m
+          /
+          clamp_min(mygpt:http_requests:rate5m, 1e-9)
+      - record: mygpt:http_p99_latency:rate5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+      # 402s arrive as outcome="client_error" (4xx), so credit exhaustion cannot
+      # be read off the HTTP error ratio; the dedicated counter is the signal.
+      - record: mygpt:credit_admissions_rejected:rate15m
+        expr: sum(rate(credit_admission_rejected_total[15m]))
+
+  # --------------------------------------------------------------------------- 
+  # Alerts
+  # --------------------------------------------------------------------------- 
+  - name: mygpt.alerts
+    rules:
+      - alert: MyGPTApiTargetDown
+        expr: up{job="mygpt-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MyGPT /metrics 抓取目标不可达"
+          description: >-
+            实例 {{ $labels.instance }} 已 2 分钟抓取失败。可能是 API 进程挂了，
+            也可能是 METRICS_TOKEN 轮换后 scrape 配置没跟上（token 不匹配时
+            /metrics 返回 404，与端点不存在无法区分——这是有意的，见 app/main.py）。
+            先查 `docker compose ps` / `systemctl status mychat-backend`。
+
+      - alert: MyGPTAPIHighErrorRate
+        expr: |
+          mygpt:http_error_ratio:rate5m > 0.05
+          and mygpt:http_requests:rate5m > 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MyGPT API 5xx 比例超过 5%"
+          description: >-
+            近 5 分钟服务端错误率 {{ $value | humanizePercentage }}。速率下限 >1/s
+            是为了不让低峰期一次 500 就把人叫醒；反代把流量全挡在应用之外（应用
+            侧零请求）在这里与"夜间没人用"不可区分，故意不做成告警——那属于
+            MyGPTApiTargetDown / 外部探活的范围。outcomes 只有 ok / client_error /
+            error 三值，且 route/method 不是标签（app/observability.py 固定标签集），
+            所以定位要看日志里的 correlation id。
+
+      - alert: MyGPTAPILatencyHigh
+        expr: mygpt:http_p99_latency:rate5m > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT API p99 延迟超过 10s"
+          description: >-
+            p99 = {{ $value | humanizeDuration }}。注意 histogram 覆盖全站请求，
+            聊天 SSE 与长补全本身就慢，先看是否只有非聊天路由变慢。
+
+      # ---------------------------------------------------------------- queue
+      - alert: MyGPTQueueBacklogGrowing
+        expr: |
+          delta(queue_stream_length[10m]) > 0
+          and queue_stream_length > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT 运行队列积压增长（容量不足）"
+          description: >-
+            stream 长度 {{ $value }}，10 分钟内仍在上涨：入队速度持续高于消费速度。
+            先看 worker 副本数与 run 时长，再考虑扩容（compose scale / k8s HPA）。
+
+      - alert: MyGPTQueueNoProgress
+        expr: |
+          queue_pending_entries > 0
+          and delta(queue_pending_entries[10m]) >= 0
+          and queue_stream_length > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MyGPT worker 疑似停摆：有已投递未 ack 的条目且不减"
+          description: >-
+            pending（XREADGROUP 已投递、未 XACK）15 分钟没有下降，说明消费方要么
+            全挂了要么卡在长回合里。XAUTOCLAIM 的接管（app/agents/workflow/queue.py
+            reclaim_stale，阈值 RUN_STREAM_CLAIM_IDLE_SECONDS）只在 recovery 抢到
+            leader 时运行，所以这条也覆盖"recovery 没起来"的情形。
+            处置：`docker compose logs worker recovery`；确认
+            python -m app.healthcheck recovery 是否通过。
+
+      - alert: MyGPTQueueMetricsAbsent
+        expr: absent(queue_stream_length)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT 队列水位指标消失（观测盲区）"
+          description: >-
+            10 分钟没有 queue_stream_length 样本。三种可能：PROMETHEUS_ENABLED 被
+            关掉、API 进程没起来、或者 BACKGROUND_WORKER 不是 durable（内存队列没有
+            stream_depth，因此不导出该指标）。这属于"我们看不见"而不是"没事"，
+            所以按 warning 报出。
+
+      # --------------------------------------------------------------- credits
+      - alert: MyGPTCreditAdmissionsRejected
+        expr: mygpt:credit_admissions_rejected:rate15m > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT 积分准入正在拒绝用户"
+          description: >-
+            近 15 分钟平均每秒 {{ $value }} 次因余额不足被挡（402）。零星几条是个别
+            用户见底；持续升高说明兑换/发放链路出了问题（兑换码用尽、pepper 轮换后
+            哈希对不上、或后台发放接口报错）。查 admin 兑换页 + credit_ledger 中
+            reason='redeem' 的近期流水。
+
+      - alert: MyGPTCreditPoolNearlyExhausted
+        expr: |
+          credit_pool_consumed
+          / clamp_min(credit_pool_granted, 1)
+          > 0.9
+          and credit_pool_granted > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT 累计发放额已被消耗 90%"
+          description: >-
+            消耗/发放 = {{ $value | humanizePercentage }}。这是账本层面的池子水位
+            （lifetime_consumed / lifetime_granted 聚合），用于提前发现"该补预算了"，
+            不阻塞请求。5 分钟才采一次样（credit_service.run_credit_pool_poller），
+            所以 for 给到 30m，别按分钟调。
+
+      - alert: MyGPTCreditNegativeBalanceSurge
+        expr: delta(credit_pool_accounts_negative[15m]) > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT 余额转负账户数快速增加"
+          description: >-
+            余额可为负是设计（终账可能超过准入时的预留），但 15 分钟内新增 20+ 个
+            负账户通常意味着单轮扣费过大或 CREDITS_MAX_CHARGE_PER_TURN 配得比
+            CREDITS_TURN_RESERVE 高太多。对照 docs/credits-operations.md 的调分流程。
+
+      # ------------------------------------------------------------- process/infra
+      - alert: MyGPTApiRestartedRecently
+        expr: (time() - process_start_time_seconds < 120) and up{job="mygpt-api"} == 1
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "MyGPT API 进程刚重启"
+          description: >-
+            实例 {{ $labels.instance }} 启动不足 2 分钟。单次是部署；反复出现是
+            OOM / 崩溃循环，配合容器 restart 计数看。process_start_time_seconds 来自
+            prometheus_client 的默认进程采集器。
+
+      - alert: MyGPTScrapeExpositionEmpty
+        expr: scrape_samples_scraped{job="mygpt-api"} < 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MyGPT /metrics 抓到的样本数异常少"
+          description: >-
+            抓取成功但几乎没有应用指标——通常是应用 import 期就异常（例如
+            Fernet/MultiFernet 构造失败），或 PROMETHEUS_ENABLED 关闭导致
+            自定义指标全部退化成 no-op。

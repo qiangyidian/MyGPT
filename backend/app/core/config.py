@@ -65,6 +65,91 @@ def env_flag(value: object, *, default: bool = False) -> bool:
     return default
 
 
+# ---- 秘密配置的占位值判定（启动即拒，见 Settings._guard_default_secrets）------
+# 出现在仓库里的值（.env / .env.example / tests/conftest.py）就是「谁都有」的 key。
+# 生产配置留着它，效果等同于用公开 key 加密真实 API key / 用公开 pepper 哈希真实
+# 兑换码，而且配置文件看起来是「配好了」的 —— 这种静默失败必须启动就响。
+_PLACEHOLDER_PREFIXES: tuple[str, ...] = (
+    "change_me",
+    "change-me",
+    "changeme",
+    "replace_me",
+    "replace-me",
+    "your-",
+    "your_",
+    "todo-",
+    "xxx",
+    "<",
+)
+# 仓库内出现过的演示值原文。写成原文 + 统一小写比较，别手抄小写形式（base64 里
+# 一个字母抄错，这条守卫就永远命不中）。``.github/workflows/ci.yml`` 那把
+# ENV=prod 用的 key 不在这里：它只活在一个用完即弃的 CI 数据库里，列进来只会
+# 让那条门禁天天红。
+_DEMO_FERNET_KEYS: tuple[str, ...] = (
+    "D2uoDaxL1wmEs8LHy89xJ0s3pJGsdeP6n2IbVfef98g=",  # .env / backend/.env
+    "ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=",  # tests/conftest.py
+)
+_DEMO_SECRETS: frozenset[str] = frozenset(
+    {key.lower() for key in _DEMO_FERNET_KEYS}
+    | {
+        "please-change-this",
+        "please-change-this-to-a-long-random-string",
+        "long-random-fernet-key",
+        "changeme123",
+        "your-secret-key",
+        "your-pepper",
+    }
+)
+
+_FERNET_GENERATE_HINT = (
+    'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+)
+_TOKEN_GENERATE_HINT = 'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+
+
+def is_placeholder_secret(value: str) -> bool:
+    """空 / CHANGE_ME 之类的前缀 / 仓库里的演示值 —— 三种都算「没配」。"""
+    token = (value or "").strip()
+    if not token:
+        return True
+    lowered = token.lower()
+    if lowered in _DEMO_SECRETS:
+        return True
+    return any(lowered.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
+
+
+def fernet_key_problem(key: str) -> str | None:
+    """``None`` = 可以直接交给 ``Fernet()``；否则返回一句中文的问题描述。
+
+    「合法 Fernet token」在这里就要判定，不能留给第一次解密：``MultiFernet`` 是
+    构造时才解析 key 的，而那发生在第一个用到加密字段的请求里（=500）。
+    """
+    token = (key or "").strip()
+    if is_placeholder_secret(token):
+        return "是占位/演示值（生产用它等于没加密）"
+    if len(token) != 44:
+        return f"长度 {len(token)} 个字符，Fernet key 必须是 44 字符的 url-safe base64"
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet(token.encode())
+    except Exception as exc:
+        return f"不是合法的 Fernet token（{type(exc).__name__}: {exc}）"
+    return None
+
+
+def redeem_code_pepper_problem(value: str) -> str | None:
+    """兑换码 pepper 的可用性判定（与 :func:`fernet_key_problem` 同一口径）。"""
+    token = (value or "").strip()
+    if not token:
+        return "未配置"
+    if is_placeholder_secret(token):
+        return "是仓库里的演示/占位值"
+    if len(token) < 16:
+        return f"只有 {len(token)} 个字符，太短、可被离线暴力核对"
+    return None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(_REPO_ROOT / ".env"), ".env"),
@@ -77,6 +162,11 @@ class Settings(BaseSettings):
     ENV: str = "dev"
     AUTO_CREATE_TABLES: bool = True
     BACKEND_CORS_ORIGINS: str = "http://localhost:3000"
+    # ``/docs`` + ``/redoc`` + ``/openapi.json`` together publish every route,
+    # its parameters and its auth model — on a public ingress that is a ready-made
+    # attack map, so they are off unless ENV is dev/test. ``None`` = derive from
+    # ENV; set it explicitly (true/false) to override either way.
+    DOCS_ENABLED: bool | None = None
 
     # ---- Security ----
     JWT_SECRET: str = "please-change-this"
@@ -84,12 +174,28 @@ class Settings(BaseSettings):
     JWT_ACCESS_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_EXPIRE_DAYS: int = 7
     FERNET_KEY: str = ""  # may be empty in dev (we generate one lazily, see security.py)
+    # Zero-downtime key rotation (Task: finding 42). Comma-separated list of
+    # Fernet keys, NEWEST FIRST: ``FERNET_KEYS=newkey,oldkey``. The first entry
+    # encrypts everything written from now on; the remaining entries stay
+    # decrypt-capable so ciphertext produced under a previous key keeps working.
+    # ``FERNET_KEY`` (if set) is appended last, so an existing deployment can
+    # rotate by simply publishing ``FERNET_KEYS`` and keeping ``FERNET_KEY``
+    # pointed at the retiring key. With both set, ``FERNET_KEYS`` wins.
+    FERNET_KEYS: str = ""
 
     # ---- Database ----
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/ai_chat"
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_DB: str = "ai_chat"
+    # Per-process SQLAlchemy pool budget. These values must be included in the
+    # deployment-wide connection calculation: API replicas, workers and the
+    # recovery process each own an engine and therefore an independent pool.
+    # The API HPA is capped at eight replicas. A six-connection pool plus two
+    # overflow slots leaves capacity for workers, recovery, migrations and
+    # operators on PostgreSQL's standard 100-connection limit.
+    DB_POOL_SIZE: int = Field(default=6, ge=1, le=100)
+    DB_MAX_OVERFLOW: int = Field(default=2, ge=0, le=100)
 
     # ---- Redis ----
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -182,13 +288,47 @@ class Settings(BaseSettings):
     SSE_STREAM_POLL_INTERVAL_SECONDS: float = 0.15
     # xreadgroup block timeout for the Redis transport (seconds, 0 = non-blocking).
     WORKER_BLOCK_TIMEOUT_SECONDS: int = 5
+    # Per-tenant ceiling on concurrently open SSE / event-tail streams. One
+    # browser tab reconnecting on a flaky network used to be able to pile up
+    # streams, each holding a DB connection for its poll loop: a handful of
+    # users could exhaust the pool and take the API down for everyone. The
+    # counter is a Redis SET per tenant (same primitive as the concurrent-run
+    # quota), so it is correct across replicas; the process-local fallback
+    # covers the single-worker/dev topology.
+    MAX_SSE_STREAMS_PER_TENANT: int = 4
+    # Redis key TTL (seconds) for an SSE stream slot. A stream that dies without
+    # releasing (pod evicted mid-reply) is reclaimable after this, so a crash
+    # cannot permanently burn one of the tenant's slots.
+    SSE_STREAM_SLOT_TTL_SECONDS: int = 600
+    # Hard cap on the durable run stream. XADD is ``maxlen=N`` with
+    # ``approximate=True`` (the ``~`` form), so Redis trims oldest entries past
+    # this — an un-capped stream grows forever (every run leaves an entry) and
+    # eventually takes the Redis instance down with it.
+    RUN_STREAM_MAXLEN: int = 100_000
+    # Pending entries idler than this are reclaimed by XAUTOCLAIM and requeued,
+    # which is what recovers a run whose worker died after XREADGROUP but before
+    # the lease/recovery path could act on it.
+    RUN_STREAM_CLAIM_IDLE_SECONDS: int = 120
+    # How many entries of the consumer group's PEL one scan reads (``ack``,
+    # the enqueue de-dup and ``pending_ids`` all walk the PEL). It is a knob and
+    # not a literal because the scan is a **correctness** window, not a
+    # performance one: entries past the cap are invisible, so a deployment that
+    # ever carries more unacked runs than this would XADD a second entry for a
+    # run that is already pending — the same run executed twice, which is exactly
+    # what the de-dup exists to prevent. Raise it with the backlog you expect.
+    RUN_STREAM_PENDING_SCAN: int = 1000
+    # How often the API samples queue depth for ``/metrics`` (stream length +
+    # PEL size). Capacity moves fast and one sample is a Redis round trip, so
+    # this is short by default; Alertmanager's own ``for:`` window, not this, is
+    # what decides when a backlog actually pages someone.
+    RUN_QUEUE_DEPTH_POLL_SECONDS: float = 15.0
     # Recovery scheduler scan interval.
     RECOVERY_SCAN_INTERVAL_SECONDS: int = 30
     # Max recovery retries before a run is terminally failed.
     RUN_MAX_RETRIES: int = 3
 
     # ---- Durable ingestion queue (documents) ----
-    # The Document row *is* the job (status pending/parsing/... + the four
+    # The Document row *is* the job (status pending/parsing/... + the five
     # ingest_* columns), so an upload survives a restart of whichever process
     # accepted it and a poisoned file cannot retry forever.
     # Lease TTL: how long one worker may own an ingestion before another may
@@ -335,6 +475,49 @@ class Settings(BaseSettings):
     MAX_ATTACHMENTS_PER_MESSAGE: int = 10
     # Background parse timeout for a single attachment (seconds).
     ATTACHMENT_PARSE_TIMEOUT: int = 60
+
+    # ---- 语音输入 (ASR) / 语音播报 (TTS) ----
+    # 总开关，默认关闭。关闭时两个语音端点在**任何出站调用之前**返回中文 503，
+    # 且 ``GET /api/speech/capabilities`` 把 asr_enabled/tts_enabled 报成 false ——
+    # 前端的麦克风/喇叭按钮据此置灰，不靠客户端猜。
+    # 出站只走 app.providers.registry（ModelConfig 行 + Fernet 解密），所以
+    # **供应商密钥永远不进浏览器**；这里不放厂商 key（仓库约定是密钥在数据行里）。
+    SPEECH_ENABLED: bool = False
+    # 用哪个 ModelConfig 做转写/合成（填该行的 UUID）。留空 = 在用户可见的
+    # （自有 + 系统级）配置里自动挑：先按能力位 supports_audio_input /
+    # supports_audio_output 过滤，再优先命中下面关键字的模型名 —— 国内网关上
+    # 「聊天模型」和「语音模型」通常是两批行，所以专任语音模型要排在前面。
+    SPEECH_ASR_MODEL_ID: str = ""
+    SPEECH_TTS_MODEL_ID: str = ""
+    SPEECH_ASR_MODEL_KEYWORDS: str = (
+        "whisper,paraformer,sensevoice,gpt-4o-transcribe,gpt-4o-mini-transcribe,audio"
+    )
+    SPEECH_TTS_MODEL_KEYWORDS: str = "tts,cosyvoice,sambert,gpt-4o-tts,audio"
+    # 单次转写接受的音频字节上限。上限在**读取阶段**执行（read(cap+1)），
+    # 所以谎报 Content-Length 的客户端最多只能让进程多持有 1 字节。
+    SPEECH_MAX_AUDIO_MB: int = 10
+    # 录音时长上限（秒）。服务端不解码音频（那要新依赖），所以这个值的双重身份是
+    # 故意的：① /api/speech/capabilities 透出给前端，MediaRecorder 到点自动停止；
+    # ② 作为计费估算的时长钳制（见 estimate_asr_usage）。真正的硬约束是上面那条。
+    SPEECH_MAX_DURATION_SECONDS: int = 120
+    # 合成端点的文本长度上限（字符，中文一个字算一个）。超限在挑模型之前拒绝。
+    SPEECH_MAX_TEXT_CHARS: int = 4000
+    # 合成结果体积上限 —— provider 的 speak() 只能整段返回 bytes（客户端层表达
+    # 不出「边合成边吐字节」），所以必须有一道显式的输出封顶，超过即 502 丢弃。
+    SPEECH_MAX_SYNTH_MB: int = 25
+    # 传给 OpenAI 兼容 /audio/speech 的音色与格式（格式须是 speech_service._FORMAT_MIME 的键）。
+    SPEECH_TTS_VOICE: str = "alloy"
+    SPEECH_TTS_RESPONSE_FORMAT: str = "mp3"
+    # 传给 /audio/transcriptions 的 language（空 = 不传，让模型自行判定）。
+    # 中文市场一般设 "zh"；显式配置能避免英文语音被硬翻成中文。
+    SPEECH_ASR_LANGUAGE: str = ""
+    # 用量估算：transcribe/speak 的响应里**没有 usage 字段**，所以语音的成本只能
+    # 服务端按字节/字符估算，再进同一张定价表（MODEL_PRICING_JSON）与同一套
+    # 积分/配额结算。whisper 的公开口径约 1500 token/分钟音频。
+    SPEECH_ASR_TOKENS_PER_MINUTE: int = 1500
+    # 白名单之外的容器用什么码率折算时长（字节×8/码率）。命中白名单的容器
+    # 用 speech_service._ALLOWED_AUDIO_MIME 里各自的典型码率。
+    SPEECH_AUDIO_BITS_PER_SECOND: int = 48_000
 
     # ---- File parsing / multimodal (engineering-grade attachments) ----
     # OCR backend for scanned PDFs / image text extraction.
@@ -543,6 +726,13 @@ class Settings(BaseSettings):
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "mygpt-backend"
     PROMETHEUS_ENABLED: bool = False
+    # Bearer token required on GET /metrics (finding 38). The exposition is not
+    # anonymous here: the payload carries route templates, tenant-scoped quota
+    # label values and queue depths, which is a reconnaissance gift on a
+    # public ingress. Empty + ENV not in (dev, test) refuses to boot (see
+    # ``_guard_default_secrets``), so "metrics on" can never mean "metrics
+    # world-readable". Local/dev scrapes stay token-free.
+    METRICS_TOKEN: str = ""
     # ---- Quotas (Task 11) ----
     # Multi-axis per-tenant caps. Disabled in test (see QuotaLimits.from_settings)
     # so the suite is never blocked; production opts in via QUOTAS_ENABLED=true.
@@ -559,6 +749,19 @@ class Settings(BaseSettings):
     # How long a reserved concurrent-run slot lives before other admissions
     # may reclaim it (protects against a release lost to a Redis outage).
     QUOTA_RUN_TTL_SECONDS: int = 3600
+    # ---- Worker leader election (advisory locks) ----
+    # The singleton loops (recovery scan, retention/orphan sweeper) must run on
+    # exactly one process even when several workers/recoveries are up. Postgres
+    # advisory locks give that for free: the lock is tied to the session, so a
+    # crashed holder's lock is released by the server the moment its backend
+    # connection dies — no stale lock rows, no expiry clock to tune.
+    LEADER_ELECTION_ENABLED: bool = True
+    # Stable lock namespace (any int4). Shared by every process in the deploy;
+    # the per-loop key is derived from it (see app.core.leader).
+    LEADER_LOCK_NAMESPACE: int = 720_517
+    # How often the leader re-asserts its lock (pg_try_advisory_lock is held by
+    # the connection, so this is liveness bookkeeping, not acquisition).
+    LEADER_HEARTBEAT_SECONDS: int = 10
 
     # ---- Credits / redeem codes ----
     # 预付费积分。CREDITS_ENFORCED 默认关 = 观察模式：扣分照常记账、余额照常
@@ -573,6 +776,18 @@ class Settings(BaseSettings):
     CREDITS_SIGNUP_BONUS: int = 0
     # 单次管理员调分的绝对值上限（防误操作把余额打成天文数字）。
     CREDITS_MAX_ADJUST: int = 10_000_000
+    # ---- 轮次准入与单轮上限（finding 40）----
+    # 一轮开始前必须能覆盖的预留额（准入下界）。取值刻意远小于
+    # CREDITS_MAX_CHARGE_PER_TURN：它的职责不是"预付一整轮"，而是把
+    # "余额已经见底"的账号在调用模型之前挡下来；真正的单轮失控由下面
+    # 那个上限兜住。准入以原子条件 UPDATE 扣预留（见
+    # :func:`app.services.credit_service.admit_turn`），轮末按实际扣分
+    # 结算并退还差额，所以并发多轮不会各自看到同一个旧余额一起放行。
+    CREDITS_TURN_RESERVE: int = 50
+    # 单轮扣分硬上限：一轮（含其全部工具/子步骤）最多扣这么多积分，
+    # 超出部分不计费也不放行 —— 没有这条，一个 200 步的长任务可以把
+    # 账户余额一路拖成负数，绕过准入闸门。
+    CREDITS_MAX_CHARGE_PER_TURN: int = 200_000
     # 单批兑换码生成上限。
     REDEEM_MAX_CODES_PER_BATCH: int = 5000
     # 兑换码哈希的 HMAC pepper。留空会回落到由 JWT_SECRET 派生的键 ——
@@ -580,6 +795,12 @@ class Settings(BaseSettings):
     # 应用层秘密的攻击者无法从 6 字符明文前缀 + 哈希暴力反推全码。
     # 显式配置的收益：轮换 JWT_SECRET 不影响已存的兑换码哈希。
     REDEEM_CODE_PEPPER: str = ""
+    # How often the API exports the credit pool water levels as gauges. Kept
+    # long on purpose: one sample is an aggregate scan over credit_accounts, and
+    # the real-time "this user just hit zero" signal is the rejection counter,
+    # not this gauge — a fast poll would buy nothing and put a full-table sum on
+    # the scrape path.
+    CREDIT_POOL_POLL_SECONDS: float = 300.0
     # ---- Data retention (app.services.retention) ----
     AUDIT_RETENTION_DAYS: int = 365
     RUN_EVENT_RETENTION_DAYS: int = 90
@@ -593,6 +814,24 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def fernet_keys(self) -> list[str]:
+        """Fernet keys in rotation order: index 0 encrypts, all of them decrypt.
+
+        ``FERNET_KEYS`` (comma-separated, newest first) with ``FERNET_KEY``
+        appended — so a running deployment rotates by publishing
+        ``FERNET_KEYS=<new>,<old>`` without editing the old variable, and an
+        empty result (dev) means "no explicit key, use the dev fallback".
+        Whitespace and duplicates are dropped; the first key wins.
+        """
+        raw = [*self.FERNET_KEYS.split(","), self.FERNET_KEY]
+        out: list[str] = []
+        for entry in raw:
+            key = entry.strip().strip('"').strip("'")
+            if key and key not in out:
+                out.append(key)
+        return out
 
     @property
     def allowed_extensions(self) -> set[str]:
@@ -640,10 +879,38 @@ class Settings(BaseSettings):
         # "production" vs "prod" mismatch once made prod echo email codes).
         return self.ENV == "prod"
 
+    @property
+    def docs_enabled(self) -> bool:
+        if self.DOCS_ENABLED is not None:
+            return self.DOCS_ENABLED
+        return self.ENV in ("dev", "test")
+
     @field_validator("STORAGE_DIR")
     @classmethod
     def _abs_storage(cls, v: str) -> str:
         return str(Path(v))
+
+    @field_validator("STORAGE_BACKEND")
+    @classmethod
+    def _validate_storage_backend(cls, v: str) -> str:
+        """``STORAGE_BACKEND`` 目前只认 ``local``；``minio`` / ``s3`` 启动期就拒。
+
+        不是保守，是把一条**必然失败**的配置挪到能看见的地方：对象存储后端从未实现
+        （:func:`app.core.storage.get_storage` 那条分支 ``raise``），而部署清单曾经把
+        minio 写成生产默认值 —— 于是"已经用上对象存储"的部署会在**第一个用户上传文件
+        时**才 500，而那时备份策略、桶名、权限都早已按 minio 的前提配好了。拼错或选了
+        没实现的后端，代价不该由第一个用户来付。
+
+        空值按默认 ``local`` 处理：那在这个仓库里表示"没配"，不是"配了个别的"。
+        """
+        chosen = (v or "").strip().lower() or "local"
+        if chosen != "local":
+            raise ValueError(
+                f"STORAGE_BACKEND={v!r} 不支持：目前只有 local 一个后端"
+                "（MinIO/S3 没有实现，app/core/storage.py 会直接 raise）。多副本要共享"
+                "上传目录，请挂 RWX 的 PVC 并把 STORAGE_DIR 指过去。"
+            )
+        return chosen
 
     @field_validator("SANDBOX_MODE")
     @classmethod
@@ -676,17 +943,19 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "ADMIN_PASSWORD must be changed from the default in non-dev environments"
                 )
-            # Without a stable FERNET_KEY, stored API keys are encrypted with an
+            # Without a stable Fernet key, stored API keys are encrypted with an
             # ephemeral per-process random key and become undecryptable on any
             # restart/redeploy — a silent data-loss/availability bug. Fail startup
-            # in real deployments so this can't ship unnoticed.
-            if not self.FERNET_KEY:
+            # in real deployments so this can't ship unnoticed. ``FERNET_KEYS``
+            # alone counts as configured: that is the documented rotation shape
+            # (``FERNET_KEYS=新,旧`` with FERNET_KEY left empty).
+            if not self.fernet_keys:
                 raise ValueError(
-                    "FERNET_KEY must be set in non-dev environments — otherwise "
-                    "stored API keys are encrypted with an ephemeral random key "
-                    "and become undecryptable on restart. Generate one with: "
-                    "python -c \"from cryptography.fernet import Fernet; "
-                    "print(Fernet.generate_key().decode())\""
+                    "未配置 FERNET_KEY：生产环境里存进库的 API key 会用一把随进程"
+                    "随机生成的密钥加密，任何一次重启后就再也解不开。请在 .env 里写"
+                    "一把稳定的 key 并备份；轮换时配 "
+                    "FERNET_KEYS=新key,旧key（逗号分隔、新→旧，全部都能解密）。生成"
+                    f"新 key：{_FERNET_GENERATE_HINT}"
                 )
             # Without the shared secret every scan login fails at runtime with
             # an opaque 503 — and the tempting "fix" is to disable the check.
@@ -699,6 +968,49 @@ class Settings(BaseSettings):
                     "/etc/wxauth/apps.json for app "
                     f"{self.WECHAT_AUTH_APP_ID!r}"
                 )
+            # Redeem codes are bearer cash: the DB stores only
+            # HMAC(pepper, code) + a 6-char prefix. Left empty, hash_code()
+            # derives the pepper from JWT_SECRET — safe-ish, but it silently
+            # couples "rotate the session-signing key" to "every unredeemed code
+            # in the DB becomes unverifiable", and it means a deployment can
+            # ship without ever having thought about the pepper. In a real
+            # deployment that has to be a deliberate decision, not a fallback.
+            pepper_problem = redeem_code_pepper_problem(self.REDEEM_CODE_PEPPER)
+            if pepper_problem is not None:
+                raise ValueError(
+                    f"REDEEM_CODE_PEPPER {pepper_problem}：兑换码库里只存 6 字符前缀 +"
+                    " HMAC 摘要，pepper 是唯一的离线暴力屏障 —— 用演示值哈希过的生产"
+                    "兑换码，等于任何读过仓库的人都能照着前缀把余下的码试出来，而且"
+                    "事后无法区分「谁生成的」。换成一串独立随机值并备份（换了它，之前"
+                    f"未兑换的码全部失效）：{_TOKEN_GENERATE_HINT}"
+                )
+            # /metrics off by default; once an operator turns it on the
+            # exposition must not be anonymous (route templates + tenant
+            # label values + queue depth).
+            if self.PROMETHEUS_ENABLED and not self.METRICS_TOKEN:
+                raise ValueError(
+                    "METRICS_TOKEN must be set when PROMETHEUS_ENABLED is on in "
+                    "non-dev environments — GET /metrics is authenticated with "
+                    "'Authorization: Bearer <METRICS_TOKEN>'. Generate one: "
+                    "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+                )
+        # 每一把 Fernet key 都必须「现在就合法」：MultiFernet 是在构造时才解析
+        # key 的，而那发生在第一个读写加密字段的请求里 —— 畸形/占位的 key 不能
+        # 等到那时候才 500。占位值在 dev/test 只警告（仓库自带的 .env 就是演示
+        # 值，测试库要能起），但畸形 key 一律拒绝：那只会是手抄错了。
+        for idx, key in enumerate(self.fernet_keys):
+            problem = fernet_key_problem(key)
+            if problem is None:
+                continue
+            message = (
+                f"FERNET_KEY(S) 第 {idx + 1} 项{problem}。生成一把新的："
+                f"{_FERNET_GENERATE_HINT}；轮换时配 FERNET_KEYS=新key,旧key"
+                "（逗号分隔、新→旧，任一历史值仍可解密）"
+            )
+            if self.ENV in ("dev", "test") and is_placeholder_secret(key):
+                _logger.warning("启动检查（%s 环境放行）：%s", self.ENV, message)
+                continue
+            raise ValueError(message)
         return self
 
 

@@ -50,12 +50,20 @@ import uuid
 from typing import Any
 
 from app.agents.events import append_event_safe
+from app.agents.schemas import BudgetExceeded
 from app.agents.workflow.attempts import AttemptRepository
 from app.agents.workflow.checkpoints import (
     StepCheckpointStore,
     apply_checkpoints,
 )
 from app.agents.workflow.planner import revise_plan, validate_plan
+from app.agents.workflow.revision import (
+    ACTION_ACCEPT,
+    ReplanBudget,
+    ReviewTrace,
+    ReviewVerdict,
+    decide_revision,
+)
 from app.agents.workflow.schemas import (
     Plan,
     Step,
@@ -89,6 +97,8 @@ class WorkflowEngine:
         on_step_cancel: Any = None,
         before_step: Any = None,
         budget_remaining_seconds: Any = None,
+        replan_units_remaining: Any = None,
+        on_replan: Any = None,
     ) -> None:
         self._executor = executor
         self._verifier = verifier
@@ -106,6 +116,13 @@ class WorkflowEngine:
         # 步骤可以越过 AGENT_MAX_RUNTIME_SECONDS 一直挂着，而暂停/取消要等它让出
         # 控制权才进得来（before_step 在其之后）。
         self._budget_remaining = budget_remaining_seconds
+        # 返修额度（B13）：引擎照样**不认识** BudgetGuard —— 只经这两个回调读
+        # 与花额度。``replan_units_remaining`` 返回 ``int | None``（None = 这一
+        # 路没有预算闸门，只按计划上限走）；``on_replan`` 在真要返修之前调一次，
+        # 由注入方落账（``BudgetGuard.enter_replan()``）。它抛 BudgetExceeded
+        # 即预算收口，与计划上限耗尽走同一条终态。
+        self._replan_units_remaining = replan_units_remaining
+        self._on_replan = on_replan
         # 本轮从检查点复用的步骤 id（跨进程 resume 的成果，供结果与埋点读出）。
         self._reused_steps: list[str] = []
 
@@ -146,6 +163,9 @@ class WorkflowEngine:
         replans = 0
         peak_concurrency = 0
         verifier_history: list[VerifierResult] = []
+        # 审阅台账（B13）：verdict + 由它做出的决定，一路记到最后，进
+        # WorkflowResult.review_log → 终态事件 → run.output。
+        review_trace = ReviewTrace()
         current = plan
 
         while True:
@@ -168,6 +188,18 @@ class WorkflowEngine:
 
             verdict = await verifier_impl.verify(current, observations)
             verifier_history.append(verdict)
+            # 审 → 改的**判定**收在纯函数 decide_revision 里（B15 的「一处声明」
+            # 同思路）：引擎原先内联的那条 ``replans >= max_replans`` 判据原样
+            # 搬过去，另加两条它本来就缺的：预算余量、以及「结论要落账」。
+            decision = decide_revision(
+                ReviewVerdict.from_verifier_result(verdict, round_index=replans),
+                ReplanBudget(
+                    plan_max=int(current.max_replans or 0),
+                    replans_used=replans,
+                    guard_remaining=self._replan_units_left(),
+                ),
+            )
+            review_trace.record(verdict, decision, round_index=replans)
 
             if verdict.verdict == VerificationVerdict.pass_:
                 # 整轮成功 → 检查点没有复用价值了，清掉，免得终态 run 的行了无
@@ -180,6 +212,7 @@ class WorkflowEngine:
                     observations=observations,
                     findings=verdict.findings,
                     verifier_results=verifier_history,
+                    review_log=review_trace.as_list(),
                     reused_steps=self._reused_steps,
                 )
             if verdict.verdict == VerificationVerdict.fail:
@@ -190,10 +223,25 @@ class WorkflowEngine:
                     observations=observations,
                     findings=verdict.findings,
                     verifier_results=verifier_history,
+                    review_log=review_trace.as_list(),
                     error=verdict.note or "verification failed",
                 )
-            # revise
-            if replans >= current.max_replans:
+            if decision.action == ACTION_ACCEPT:
+                # 审阅要求返修却没点名任何步骤：本轮产出按现状收。
+                await self._clear_checkpoints()
+                return WorkflowResult(
+                    status="completed",
+                    replans=replans,
+                    max_concurrency=peak_concurrency,
+                    observations=observations,
+                    findings=verdict.findings,
+                    verifier_results=verifier_history,
+                    review_log=review_trace.as_list(),
+                    reused_steps=self._reused_steps,
+                )
+            if decision.stops:
+                # 计划上限耗尽 / 返修预算耗尽 —— 与既有行为同一条终态，只是
+                # 理由现在来自判定，且会带着台账一起出去。
                 return WorkflowResult(
                     status="failed",
                     replans=replans,
@@ -201,14 +249,36 @@ class WorkflowEngine:
                     observations=observations,
                     findings=verdict.findings,
                     verifier_results=verifier_history,
-                    error="replan budget exhausted",
+                    review_log=review_trace.as_list(),
+                    error=decision.reason or "replan budget exhausted",
                 )
             # Consume one replan unit: produce a NEW versioned plan retaining
             # completed valid work and reworking only the flagged steps.
+            #
+            # 先花额度再改计划：``on_replan`` 是注入方的账本（BudgetGuard），
+            # 花不掉就不该动计划 —— 反过来会让「预算已耗尽」的 run 白改一版
+            # plan 才报错。BudgetExceeded 与上限耗尽走同一条 failed 终态。
+            if self._on_replan is not None:
+                try:
+                    await self._call_on_replan(decision)
+                except BudgetExceeded as exc:
+                    review_trace.entries[-1]["decision"]["budget_blocked"] = True
+                    review_trace.entries[-1]["decision"]["reason"] = str(exc)
+                    return WorkflowResult(
+                        status="failed",
+                        replans=replans,
+                        max_concurrency=peak_concurrency,
+                        observations=observations,
+                        findings=verdict.findings,
+                        verifier_results=verifier_history,
+                        review_log=review_trace.as_list(),
+                        error=str(exc),
+                    )
             current = revise_plan(
                 current,
                 revise_step_ids=verdict.revise_step_ids,
                 observations=observations,
+                findings=decision.findings,
             )
             replans += 1
             observe_counter("workflow.replans", 1, version=current.version)
@@ -216,7 +286,29 @@ class WorkflowEngine:
                 "version": current.version,
                 "revise_step_ids": list(verdict.revise_step_ids),
                 "replan_count": current.replan_count,
+                # 结论与决定一起发：面板/trace 上要看得见「是谁说要改、改哪些、
+                # 依据是什么」，而不是只有一个版本号跳变。
+                "findings": list(decision.findings),
+                "decision": decision.as_trace(),
             })
+
+    # ------------------------------------------------------------------ #
+    def _replan_units_left(self) -> int | None:
+        """预算里的返修余量读数；没注入取值器 = 不设预算闸门。"""
+        if self._replan_units_remaining is None:
+            return None
+        try:
+            value = self._replan_units_remaining()
+        except Exception:  # pragma: no cover - 读数失败不该打挂执行
+            logger.debug("replan units read failed", exc_info=True)
+            return None
+        return None if value is None else int(value)
+
+    async def _call_on_replan(self, decision: Any) -> None:
+        """``on_replan`` 既可能是协程也可能是同步落账函数。"""
+        result = self._on_replan(decision.as_trace())
+        if inspect.isawaitable(result):
+            await result
 
     # ------------------------------------------------------------------ #
     def _resolve_verifier(

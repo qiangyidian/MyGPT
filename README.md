@@ -47,7 +47,7 @@ docker compose up -d
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock.txt
 # 本地用 .env 里指向 localhost 的 DATABASE_URL/REDIS_URL/QDRANT_URL
 uvicorn app.main:app --reload --port 8000
 ```
@@ -55,9 +55,8 @@ uvicorn app.main:app --reload --port 8000
 前端：
 ```bash
 cd frontend
-corepack enable && corepack prepare pnpm@9.12.0 --activate
-pnpm install
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 pnpm dev
+npm ci
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
 ```
 
 ---
@@ -102,6 +101,14 @@ alembic revision --autogenerate -m "init"
 alembic upgrade head
 ```
 
+后端依赖由 `requirements.txt` 声明版本范围，并通过带哈希的
+`requirements.lock.txt` 固定实际解析结果。运行时、CI 和容器镜像都从锁文件安装。
+依赖有意升级后，在 backend 目录运行：
+
+```bash
+uv pip compile requirements.txt --python-version 3.11 --generate-hashes --output-file requirements.lock.txt
+```
+
 积分与兑换码的运维操作（上线顺序、对账 SQL、常见问题）见
 [docs/credits-operations.md](docs/credits-operations.md)。
 
@@ -111,7 +118,7 @@ alembic upgrade head
 
 ```
 ai-chat-platform/
-  frontend/        Next.js (pnpm)
+  frontend/        Next.js (npm, package-lock.json)
     src/app/       pages (login, chat, settings, knowledge-bases, admin)
     src/components/
     src/hooks/     useChatStream, useAuth, ...
@@ -148,6 +155,8 @@ cp .env.example .env.prod          # 编辑：ENV=prod、FERNET_KEY、POSTGRES_P
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ```
 
+生产 `.env.prod` 需要配置浏览器可访问的 `NEXT_PUBLIC_API_BASE_URL`。Compose 会把该地址作为构建参数交给 Next.js；仅设置容器运行环境变量无法修改已编译的浏览器 bundle。
+
 `docker-compose.prod.yml` 与开发版的区别：
 
 | 项 | 开发 | 生产 |
@@ -164,13 +173,13 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 
 两层保障，确保落后于迁移头的镜像拿不到流量：
 
-- **部署时**：`migrate` 服务在 API/worker/recovery 启动前执行 `alembic upgrade head`（仓库 head = `0010_artifacts`）。Kubernetes 下用 initContainer/Job 等价实现。
+- **部署时**：`migrate` 服务在 API/worker/recovery 启动前执行 `alembic upgrade head`。迁移版本会持续变化，当前 head 始终以 `cd backend && alembic heads` 为准。Kubernetes 下由迁移 Job 执行同一命令。
 - **运行时**：`GET /ready`（`app/core/health.py` 的 `check_readiness`）断言 DB 的 alembic revision == 仓库 head，否则返回 **503**。这是 LB / k8s readinessProbe 的硬门。
 
 验证脚本（隔离临时库，不碰真实数据）：
 
 ```bash
-./scripts/verify_migrations.sh     # 空 库 + 增量(0009→head) 两条路径都到 0010_artifacts
+./scripts/verify_migrations.sh     # 在隔离数据库验证空库升级和上一版本增量升级；head 从 Alembic 动态解析
 ```
 
 ### 3. Qdrant 客户端/服务端版本对齐
@@ -218,7 +227,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now mychat-backup.timer
 
 - **Postgres**：`pg_dump -F c`（并行恢复友好）。PITR（按时间点恢复）需额外开启 WAL 归档（`archive_mode=on` + `archive_command`）+ 基础备份，演练脚本用逻辑 dump 做一致性校验。
 - **Qdrant**：每集合快照 API 上传恢复。
-- **对象存储**：`uploads.tar`；恢复演练做 tar 往返校验和；若备份目录带 `MANIFEST.sha256` 则按清单校验。生产建议 `STORAGE_BACKEND=minio`（对象存储自带版本化）。
+- **对象存储**：`uploads.tar`；恢复演练做 tar 往返校验和；若备份目录带 `MANIFEST.sha256` 则按清单校验。**目前落盘只有 `STORAGE_BACKEND=local` 一条路**（MinIO/S3 后端未实现，`app/core/storage.py` 会直接 raise，启动检查也会拒掉这个值），所以 `uploads.tar` 是附件的唯一副本，异地同步是必需项而不是加分项。
 - **演练目标隔离**：脚本启动一次性 postgres/qdrant 容器还原，**绝不**写真实库；校验 alembic current == 仓库迁移头（动态解析，新增迁移无需改脚本）+ Qdrant 集合数 + 校验和，PASS/FAIL 明确。
 
 > 脚本沿用仓库的 `.sh`（bash）约定（与 `backup.sh`/`restore.sh` 一致）；Task 13 计划提到 `.ps1`，此处按仓库惯例统一为 `.sh`。

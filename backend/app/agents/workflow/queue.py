@@ -76,6 +76,17 @@ class RunQueue(Protocol):
         determined the lease is expired."""
         ...
 
+    async def reclaim_stale(self, owner: str, *, limit: int = 100) -> int:
+        """Requeue entries stuck in this group's pending list with no live
+        consumer. Returns how many were requeued.
+
+        Only the Redis transport has anything to reclaim; every other
+        transport's PEL is the process itself, so a no-op (0) is the honest
+        answer. Callers must gate this behind leader election — concurrent
+        reclaimers would each claim and requeue the same entry.
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # In-memory transport (tests / single-worker fallback)
@@ -161,6 +172,11 @@ class InMemoryQueue:
                 self._pending[uid] = _time.monotonic()
                 self._cond.notify_all()
 
+    async def reclaim_stale(self, owner: str, *, limit: int = 100) -> int:
+        """No pending list to reclaim: the in-memory queue dies with its process,
+        and everything it held is re-derived from the DB by recovery on boot."""
+        return 0
+
 
 # --------------------------------------------------------------------------- #
 # Redis Streams transport (production)
@@ -187,6 +203,17 @@ class RedisStreamQueue:
         settings = get_settings()
         self._stream = stream or settings.RUN_QUEUE_STREAM
         self._group = group or settings.RUN_QUEUE_GROUP
+        # XADD cap (approximate, i.e. the ``~`` form) — every run leaves a stream
+        # entry, so without this the stream grows for the lifetime of the Redis
+        # instance. Approximate trimming only cuts whole nodes, which is what
+        # keeps it cheap; entries still inside the consumer group's PEL are NOT
+        # freed by trimming, so an unacked run is never silently lost (its
+        # reclaim path below reads the PEL, not the stream body).
+        self._maxlen = max(int(settings.RUN_STREAM_MAXLEN), 1000)
+        self._claim_idle_ms = max(int(settings.RUN_STREAM_CLAIM_IDLE_SECONDS), 1) * 1000
+        # PEL entries a single scan reads; see RUN_STREAM_PENDING_SCAN in config
+        # for why truncating this is a correctness problem, not a slow one.
+        self._pending_scan = max(int(settings.RUN_STREAM_PENDING_SCAN), 1)
         self._initialized = False
 
     async def _ensure_group(self) -> None:
@@ -219,51 +246,81 @@ class RedisStreamQueue:
                 return
             await self._client.xadd(
                 self._stream, {"run_id": str(uid)},
+                maxlen=self._maxlen, approximate=True,
             )
         except Exception as exc:
             logger.warning("enqueue %s failed: %s", uid, exc)
 
+    async def _pending_entries(self) -> list[tuple[str, str]]:
+        """``(message_id, run_id)`` for entries still unacked in our group.
+
+        Two round trips no matter how deep the backlog: one ``XPENDING`` for the
+        ids, one ``XRANGE`` spanning them. The previous shape issued an
+        ``XRANGE`` **per pending entry** from three places, so ``enqueue`` — the
+        hottest path in the worker, run for every submission — paid a full
+        walk of the pending set (N network round trips) just to ask "is this run
+        already queued?", and ``ack`` did it again on completion.
+
+        An entry whose body ``maxlen`` already trimmed away yields no ``run_id``
+        and is left out: there is nothing to match or ack from a body we cannot
+        read, and :meth:`reclaim_stale` handles those explicitly (it acks a
+        deleted claim rather than reviving it).
+        """
+        try:
+            info = await self._client.xpending_range(
+                self._stream,
+                self._group,
+                min="-",
+                max="+",
+                count=self._pending_scan,
+            )
+        except Exception as exc:
+            logger.debug("xpending %s: %s", self._stream, exc)
+            return []
+        # XPENDING returns PEL entries in ascending id order, so the first and
+        # last ids bound the span the single XRANGE has to cover.
+        pending: list[str] = []
+        for entry in info or []:
+            msg_id = entry.get("message_id") if isinstance(entry, dict) else None
+            if msg_id is not None:
+                pending.append(str(msg_id))
+        if not pending:
+            return []
+        try:
+            rows = await self._client.xrange(
+                self._stream, min=pending[0], max=pending[-1]
+            )
+        except Exception as exc:
+            logger.debug("xrange %s: %s", self._stream, exc)
+            return []
+        want = set(pending)
+        found: list[tuple[str, str]] = []
+        for msg_id, data in rows or []:
+            mid = str(msg_id)
+            if mid not in want:
+                # Inside the span but not pending (already acked, or a newer
+                # entry) — acking it would hand another consumer's in-flight
+                # run back to the queue.
+                continue
+            rid = (data or {}).get("run_id")
+            if rid:
+                found.append((mid, str(rid)))
+        return found
+
     async def _has_pending(self, uid: uuid.UUID) -> bool:
         """True if the run_id has an unacked entry in the consumer group."""
-        try:
-            # XPENDING returns summary; we check the PEL entries.
-            info = await self._client.xpending_range(
-                self._stream, self._group, min="-", max="+", count=1000
-            )
-            for entry in info:
-                msg_id = entry.get("message_id") if isinstance(entry, dict) else None
-                if msg_id is None:
-                    continue
-                fields = await self._client.xrange(self._stream, msg_id, msg_id, count=1)
-                for _mid, data in fields:
-                    if data.get("run_id") == str(uid):
-                        return True
-        except Exception:
-            pass
-        return False
+        target = str(uid)
+        return any(rid == target for _mid, rid in await self._pending_entries())
 
     async def pending_ids(self) -> list[uuid.UUID]:
         await self._ensure_group()
-        try:
-            info = await self._client.xpending_range(
-                self._stream, self._group, min="-", max="+", count=1000
-            )
-            result = []
-            for entry in info:
-                msg_id = entry.get("message_id") if isinstance(entry, dict) else None
-                if msg_id is None:
-                    continue
-                fields = await self._client.xrange(self._stream, msg_id, msg_id, count=1)
-                for _mid, data in fields:
-                    rid = data.get("run_id")
-                    if rid:
-                        try:
-                            result.append(uuid.UUID(rid))
-                        except (ValueError, TypeError):
-                            pass
-            return result
-        except Exception:
-            return []
+        result: list[uuid.UUID] = []
+        for _mid, rid in await self._pending_entries():
+            try:
+                result.append(uuid.UUID(rid))
+            except (ValueError, TypeError):
+                pass
+        return result
 
     async def dequeue(self, owner: str, timeout: float = 0.0) -> uuid.UUID | None:
         await self._ensure_group()
@@ -295,31 +352,183 @@ class RedisStreamQueue:
         """Ack all PEL entries whose run_id field matches."""
         uid = _as_uuid(run_id)
         await self._ensure_group()
+        target = str(uid)
+        # One scan, then a single XACK: the old loop acked each match with its
+        # own round trip *and* re-read the PEL per entry, so finishing a run
+        # cost as much traffic as the whole backlog.
+        matching = [
+            mid for mid, rid in await self._pending_entries() if rid == target
+        ]
+        if not matching:
+            return False
         try:
-            info = await self._client.xpending_range(
-                self._stream, self._group, min="-", max="+", count=1000
-            )
-            acked = False
-            for entry in info:
-                msg_id = entry.get("message_id") if isinstance(entry, dict) else None
-                if msg_id is None:
-                    continue
-                fields = await self._client.xrange(self._stream, msg_id, msg_id, count=1)
-                for _mid, data in fields:
-                    if data.get("run_id") == str(uid):
-                        await self._client.xack(self._stream, self._group, msg_id)
-                        acked = True
-            return acked
+            await self._client.xack(self._stream, self._group, *matching)
         except Exception as exc:
             logger.warning("ack %s failed: %s", uid, exc)
             return False
+        return True
 
     async def requeue(self, run_id: uuid.UUID | str) -> None:
         uid = _as_uuid(run_id)
         try:
-            await self._client.xadd(self._stream, {"run_id": str(uid)})
+            await self._client.xadd(
+                self._stream, {"run_id": str(uid)},
+                maxlen=self._maxlen, approximate=True,
+            )
         except Exception as exc:
             logger.warning("requeue %s failed: %s", uid, exc)
+
+    async def reclaim_stale(self, owner: str, *, limit: int = 100) -> int:
+        """Requeue PEL entries no consumer has touched in ``_claim_idle_ms``.
+
+        This is the crash window the lease/recovery path cannot see: a worker
+        that dies *after* ``XREADGROUP`` delivered a message but *before* it
+        wrote a lease row leaves an entry claimed to a consumer that no longer
+        exists. Nothing re-reads it — ``XREADGROUP`` only hands out new entries
+        via ``>``, and recovery scans the database, not the stream. The run sits
+        pending forever.
+
+        ``XAUTOCLAIM`` moves those entries to ``owner`` (which also resets their
+        idle clock and delivers them exactly once to this caller), then we
+        ``XADD`` a fresh entry so any live worker picks it up and ``XACK`` the
+        claimed id. The old entry stays in the stream for audit, matching
+        :meth:`requeue`.
+
+        Returns the number of entries requeued. Only ever called from a
+        leader-gated loop (see :mod:`app.core.leader`), so two processes cannot
+        race the same claim; a duplicate requeue would anyway be harmless
+        because ``execute_run`` re-checks the run's terminal status under lease.
+        """
+        await self._ensure_group()
+        claimed: list[Any] = []
+        try:
+            resp = await self._client.xautoclaim(
+                self._stream, self._group, owner,
+                min_idle_time=self._claim_idle_ms, start_id="0-0", count=limit,
+            )
+            # redis-py returns (next-cursor, messages[, deleted-ids]) — the
+            # DELETED variant on Redis >= 7). Accept the shapes that matter.
+            if isinstance(resp, (list, tuple)) and len(resp) >= 2:
+                claimed = resp[1] or []
+        except Exception as exc:
+            # Older servers (< 6.2) have no XAUTOCLAIM — log once per call, the
+            # lease-based recovery scheduler still covers every other crash path.
+            logger.debug("xautoclaim %s: %s", self._stream, exc)
+            return 0
+        requeued = 0
+        for item in claimed:
+            msg_id, data = self._claim_entry(item)
+            if msg_id is None:
+                continue
+            rid = (data or {}).get("run_id")
+            if not rid:
+                # A claim whose body was already trimmed carries no run to
+                # revive; ack it so it stops showing up in XPENDING.
+                await self._drop_claim(msg_id, owner)
+                continue
+            try:
+                await self._client.xadd(
+                    self._stream, {"run_id": str(rid)},
+                    maxlen=self._maxlen, approximate=True,
+                )
+                await self._client.xack(self._stream, self._group, msg_id)
+                requeued += 1
+                logger.info("reclaimed stalled run %s (stream id %s)", rid, msg_id)
+            except Exception as exc:
+                logger.warning("reclaim %s failed: %s", rid, exc)
+        return requeued
+
+    @staticmethod
+    def _claim_entry(item: Any) -> tuple[str | None, dict[str, Any] | None]:
+        """Normalise one XAUTOCLAIM item to ``(message_id, fields)``.
+
+        redis-py hands back a flat ``[id, {fields}, id, {fields}, ...]`` list on
+        some versions and ``[(id, {fields}), ...]`` on others; a claim with a
+        deleted body comes back as a bare id. Both shapes plus the bare id are
+        handled so the reclaim never silently no-ops on a client upgrade.
+        """
+        if isinstance(item, (list, tuple)):
+            if len(item) == 2 and isinstance(item[1], dict):
+                return str(item[0]), item[1]
+            if len(item) == 1:
+                return str(item[0]), None
+            return None, None
+        if isinstance(item, dict):
+            mid = item.get("message_id") or item.get("id")
+            return (str(mid), item) if mid else (None, None)
+        return (str(item), None) if item else (None, None)
+
+    async def _drop_claim(self, msg_id: str, owner: str) -> None:
+        """Ack a claim with no recoverable body (trimmed entry)."""
+        try:
+            await self._client.xack(self._stream, self._group, msg_id)
+        except Exception as exc:
+            logger.debug("ack of trimmed claim %s failed: %s", msg_id, exc)
+
+    async def stream_depth(self) -> tuple[int, int]:
+        """Return ``(stream_length, pending_entries)`` for this transport.
+
+        The two numbers answer different operational questions and are alerted
+        on separately: a large *length* with a small *pending* count means work
+        is arriving faster than it drains (capacity), while a growing *pending*
+        count means entries were delivered and never acked (workers are dying or
+        wedged). Reading both from the API process is what lets ``/metrics``
+        expose queue lag at all — the worker has no scrape surface, so a metric
+        only it observed would be invisible to Alertmanager.
+        """
+        try:
+            length = int(await self._client.xlen(self._stream))
+        except Exception:
+            length = 0
+        pending = 0
+        try:
+            await self._ensure_group()
+            summary = await self._client.xpending(self._stream, self._group)
+            if isinstance(summary, dict):
+                pending = int(summary.get("pending") or 0)
+            elif isinstance(summary, (list, tuple)) and summary:
+                pending = int(summary[0] or 0)
+        except Exception as exc:
+            logger.debug("xpending %s: %s", self._stream, exc)
+        return length, pending
+
+
+# --------------------------------------------------------------------------- #
+# Queue-depth gauge poller (metrics for Alertmanager)
+# --------------------------------------------------------------------------- #
+async def run_queue_depth_poller(
+    stop: asyncio.Event | None = None, *, interval: float = 15.0
+) -> None:
+    """Publish ``queue.stream_length`` / ``queue.pending_entries`` as gauges.
+
+    Started from the API lifespan only when ``PROMETHEUS_ENABLED``; exits on
+    ``stop`` or task cancellation. Best-effort by design: a Redis blip must not
+    take the scrape down with it, so a failed sample is skipped (the previous
+    value ages out and ``absent_over_time``/staleness handles it) rather than
+    exported as a misleading zero.
+    """
+    from app.observability import observe_gauge
+
+    poll = max(float(interval), 1.0)
+    while stop is None or not stop.is_set():
+        try:
+            queue = await get_run_queue()
+            depth = getattr(queue, "stream_depth", None)
+            if depth is not None:
+                length, pending = await depth()
+                observe_gauge("queue.stream_length", float(length))
+                observe_gauge("queue.pending_entries", float(pending))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("queue depth poll failed", exc_info=True)
+        if stop is None:
+            await asyncio.sleep(poll)
+            continue
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll)
+        except TimeoutError:
+            pass
 
 
 # --------------------------------------------------------------------------- #

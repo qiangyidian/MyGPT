@@ -18,6 +18,10 @@ spec:
 # API: allow ingress on 8000 from anywhere (front it with an Ingress/TLS
 # terminator), and egress to postgres/redis/qdrant + DNS + egress to external
 # model providers (model endpoints live outside the cluster).
+# Note the scrape shares port 8000: GET /metrics is exported by the api process
+# (including the queue gauges hpa.yaml can optionally scale on), so a Prometheus
+# / prometheus-adapter target needs no extra policy here — only the bearer
+# METRICS_TOKEN. Worker and recovery need one: they expose no port at all.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -106,6 +110,40 @@ spec:
       ports:
         - protocol: TCP
           port: 6333
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+---
+# Migration one-shot (deploy/k8s/migrate-job.yaml): Postgres + DNS, nothing else.
+# Both its containers (pre-upgrade-check and migrate) run `alembic`, which opens
+# exactly the DATABASE_URL connection; it never touches Redis, Qdrant, or an
+# external provider, so no 443 egress. No ingress either (nothing talks to it).
+# This policy is also the answer to "the migrate pod sits Pending-ish for 15
+# minutes then DeadlineExceeded": under default-deny-all a missing egress rule
+# blackholes the TCP connect instead of refusing it, so the Job looks hung.
+# If your Postgres lives OUTSIDE this namespace (a managed instance reached by
+# hostname), the `component: postgres` podSelector matches nothing and you must
+# extend this with the provider's ipBlock — same caveat applies to worker-egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: migrate-egress
+  namespace: mygpt
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: migrate
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
     - to:
         - namespaceSelector: {}
       ports:

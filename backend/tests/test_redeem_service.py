@@ -5,9 +5,10 @@ import uuid
 from datetime import datetime, timedelta, UTC
 
 import pytest
+from sqlalchemy import update
 
 from app.credits import normalize_code, hash_code
-from app.models import RedeemCode
+from app.models import RedeemCode, RedeemCodeBatch
 from app.services import credit_service, redeem_service
 
 ADMIN = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
@@ -289,3 +290,83 @@ async def test_concurrent_grants_accumulate_rather_than_overwrite(db_session):
     account = await credit_service.read_account(db_session, user)
     assert account.balance == 500
     assert account.lifetime_granted == 500
+
+# --------------------------------------------------------------------------- #
+# 批次列表：分页 + 服务端筛选
+# --------------------------------------------------------------------------- #
+
+
+async def _named_batch(db, name, *, count=2, credits=100, note=None):
+    return await redeem_service.create_batch(
+        db,
+        admin_id=ADMIN,
+        name=name,
+        credits_per_code=credits,
+        count=count,
+        note=note,
+    )
+
+
+async def test_list_batches_pages_without_gaps_or_repeats(db_session):
+    """OFFSET 分页必须全序：并列的 created_at 若没有 ``id`` 兜底就会重复或漏行。"""
+    for i in range(5):
+        await _named_batch(db_session, f"批次{i}")
+    await db_session.commit()
+
+    names: list[str] = []
+    offset = 0
+    while True:
+        page = await redeem_service.list_batches(db_session, limit=2, offset=offset)
+        names.extend(row.batch.name for row in page)
+        if len(page) < 2:
+            break
+        offset += 2
+    assert sorted(names) == sorted(f"批次{i}" for i in range(5))
+
+
+async def test_list_batches_search_treats_wildcards_literally(db_session):
+    """``%`` 是用户真能打出来的字符：它该匹配字面量，而不是命中所有批次。"""
+    await _named_batch(db_session, "双十一100%", note="渠道 A")
+    await _named_batch(db_session, "普通批次")
+    await db_session.commit()
+
+    assert [r.batch.name for r in await redeem_service.list_batches(db_session, search="100%")] == [
+        "双十一100%"
+    ]
+    # 备注同样可搜：运营记的是渠道，不是批次名。
+    assert [r.batch.name for r in await redeem_service.list_batches(db_session, search="渠道")] == [
+        "双十一100%"
+    ]
+    assert await redeem_service.list_batches(db_session, search="不存在的关键字") == []
+
+
+async def test_list_batches_status_filter_is_server_side(db_session):
+    """筛选项必须在 SQL 里做：分页后前端只有一页数据，浏览器里 filter 会漏掉旧批次。"""
+    kept, _ = await _named_batch(db_session, "还在核销")
+    done, codes = await _named_batch(db_session, "已兑完", count=1)
+    await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
+    voided, _ = await _named_batch(db_session, "已作废", count=1)
+    await redeem_service.void_batch(db_session, batch_id=voided.id)
+    expired, _ = await _named_batch(db_session, "已过期", count=1)
+    await db_session.execute(
+        update(RedeemCodeBatch)
+        .where(RedeemCodeBatch.id == expired.id)
+        .values(expires_at=datetime.now(UTC) - timedelta(days=1))
+    )
+    await db_session.commit()
+
+    def names(rows):
+        return sorted(row.batch.name for row in rows)
+
+    assert names(await redeem_service.list_batches(db_session, status="operable")) == [
+        "还在核销",
+        "已过期",
+    ]
+    assert names(await redeem_service.list_batches(db_session, status="settled")) == [
+        "已作废",
+        "已兑完",
+    ]
+    assert names(await redeem_service.list_batches(db_session, status="expired")) == ["已过期"]
+    # 不传 status = 不加条件；永久批次（expires_at 为 NULL）不算过期。
+    assert len(await redeem_service.list_batches(db_session)) == 4
+    assert kept.id is not None and done.id is not None

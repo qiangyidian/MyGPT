@@ -12,7 +12,15 @@ So the queue has leases (with an owner, so a taken-over job cannot be written
 back by the process that lost it), a bounded attempt count, and exponential
 backoff between attempts.
 
-The ``Document`` row *is* the job: ``status`` is the state machine and the four
+Ownership is proved by ``ingest_claim_version``, not by ``ingest_claimed_by``:
+every claim bumps that counter in the same UPDATE that takes the lease, and
+every write-back (progress, verdict) carries ``WHERE ingest_claim_version =
+:claimed``. A worker name is not an identity (a restarted process reuses it) and
+``ingest_attempts`` is reset by ``enqueue``, so both were ABA-able: the wedged
+first attempt could wake up and overwrite what the second attempt had already
+stored.
+
+The ``Document`` row *is* the job: ``status`` is the state machine and the five
 ``ingest_*`` columns are the scheduling metadata (see app/models/document.py).
 A separate table would add a second source of truth that can drift from the
 document it describes, and every enqueue would have to keep both in step. It
@@ -33,6 +41,7 @@ document it is queueing. Callers that need the new state re-read the row.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -63,6 +72,18 @@ _BACKOFF_CAP_SECONDS = 1800
 
 
 @dataclass(frozen=True)
+class Claim:
+    """一次领取的凭据：哪个文档 + 这是第几次领取。
+
+    ``version`` 必须跟着这次领取一路带到写回处，否则「我还持有吗」这个问题没有
+    答案。写成 str/id 之类可复用的东西都会被 ABA 绕过（见模块 docstring）。
+    """
+
+    document_id: uuid.UUID
+    version: int
+
+
+@dataclass(frozen=True)
 class IngestionOutcome:
     """What one ingestion run decided. ``retryable`` is the pipeline's call.
 
@@ -78,10 +99,31 @@ class IngestionOutcome:
 
 
 IndexFn = Callable[[AsyncSession, uuid.UUID], Awaitable[IngestionOutcome]]
+# 实现者可选地接受 ``claim_version`` 关键字（见 :func:`_wants_claim_version`）：
+# 只有拿到它，流水线中途的状态写回才谈得上「还是不是我领的那一次」。
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _wants_claim_version(fn: object) -> bool:
+    """``index_fn`` 是否愿意接收领取版本（旧的两参数替身继续可用）。"""
+    try:
+        parameters = inspect.signature(fn).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+        return False
+    if "claim_version" in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def _supports_update_returning(db: AsyncSession) -> bool:
+    """只有 Postgres 走 ``UPDATE ... RETURNING``；其余方言读回同一事务的结果。"""
+    try:
+        return db.get_bind().dialect.name == "postgresql"
+    except Exception:  # pragma: no cover - a session without a bind is a bug
+        return False
 
 
 def backoff_seconds(attempts: int, base_seconds: int) -> int:
@@ -148,6 +190,10 @@ async def enqueue(
         "ingest_next_retry_at": None,
         "ingest_lease_expires_at": None,
         "ingest_claimed_by": None,
+        # ``ingest_claim_version`` deliberately NOT touched: it is the only thing
+        # that can still tell a wedged worker "the run you are finishing is not
+        # the run you started". Resetting it here would hand that worker's stale
+        # write-back a matching version again.
     }
     if reset_attempts:
         values["ingest_attempts"] = 0
@@ -173,16 +219,24 @@ async def enqueue(
     return True
 
 
-async def claim(
+async def claim_job(
     db: AsyncSession,
     *,
     worker_id: str,
     settings: Settings | None = None,
-) -> uuid.UUID | None:
+) -> Claim | None:
     """Take ownership of one queued document, or return None if nothing is free.
 
     Also counts the attempt, so a worker that claims and then dies cannot be
-    picked up forever without progress.
+    picked up forever without progress, and bumps ``ingest_claim_version`` —
+    the number the whole rest of this run has to quote when it writes back.
+
+    The bump and the lease are one conditional UPDATE (never SELECT-then-UPDATE:
+    that window is precisely where two workers both believe they won). On
+    Postgres the new version comes straight back out of that statement; other
+    dialects (SQLite dev/test) re-read it inside the same transaction, where no
+    competitor can have touched the row again — the lease we just wrote is what
+    makes the follow-up read a lookup rather than a race.
     """
     knobs = _knobs(settings)
     now = _now()
@@ -200,9 +254,9 @@ async def claim(
         .all()
     )
     expires_at = now + timedelta(seconds=knobs["ttl"])
-    claimed: uuid.UUID | None = None
+    returning = _supports_update_returning(db)
     for document_id in candidate_ids:
-        result = await db.execute(
+        stmt = (
             update(Document)
             .where(Document.id == document_id, *_claimable_predicate(_now()))
             .values(
@@ -210,14 +264,47 @@ async def claim(
                 ingest_lease_expires_at=expires_at,
                 ingest_claimed_by=worker_id,
                 ingest_attempts=Document.ingest_attempts + 1,
+                ingest_claim_version=Document.ingest_claim_version + 1,
             )
             .execution_options(synchronize_session=False)
         )
-        if result.rowcount == 1:
-            claimed = document_id
-            break
+        if returning:
+            result = await db.execute(stmt.returning(Document.ingest_claim_version))
+            if result.rowcount != 1:
+                continue
+            version = int(result.scalar_one())
+            await db.commit()
+            return Claim(document_id, version)
+        result = await db.execute(stmt)
+        if result.rowcount != 1:
+            continue
+        version = int(
+            (
+                await db.execute(
+                    select(Document.ingest_claim_version).where(
+                        Document.id == document_id
+                    )
+                )
+            ).scalar_one()
+        )
+        await db.commit()
+        return Claim(document_id, version)
     await db.commit()
-    return claimed
+    return None
+
+
+async def claim(
+    db: AsyncSession,
+    *,
+    worker_id: str,
+    settings: Settings | None = None,
+) -> uuid.UUID | None:
+    """领取并只回报文档 id —— 历史调用方的形状，见 :func:`claim_job`。
+
+    拿不到领取版本就写不回结果，新代码请用 ``claim_job``。
+    """
+    job = await claim_job(db, worker_id=worker_id, settings=settings)
+    return None if job is None else job.document_id
 
 
 async def renew(
@@ -226,21 +313,27 @@ async def renew(
     *,
     worker_id: str,
     settings: Settings | None = None,
+    claim_version: int | None = None,
 ) -> bool:
     """Extend our own unexpired lease. ``False`` means someone else owns it.
 
     Renewal is what lets the lease be short: crash detection is fast without a
-    slow file being stolen mid-run.
+    slow file being stolen mid-run. ``claim_version`` is the stronger of the two
+    guards (a worker name can be reused, this number cannot), so a caller that
+    has one should always pass it.
     """
     knobs = _knobs(settings)
     now = _now()
+    conditions = [
+        Document.id == document_id,
+        Document.ingest_claimed_by == worker_id,
+        Document.ingest_lease_expires_at > now,
+    ]
+    if claim_version is not None:
+        conditions.append(Document.ingest_claim_version == claim_version)
     result = await db.execute(
         update(Document)
-        .where(
-            Document.id == document_id,
-            Document.ingest_claimed_by == worker_id,
-            Document.ingest_lease_expires_at > now,
-        )
+        .where(*conditions)
         .values(ingest_lease_expires_at=now + timedelta(seconds=knobs["ttl"]))
         .execution_options(synchronize_session=False)
     )
@@ -255,12 +348,16 @@ async def finish(
     worker_id: str,
     outcome: IngestionOutcome,
     settings: Settings | None = None,
+    claim_version: int | None = None,
 ) -> str:
     """Close out a claim: ``done`` | ``retry`` | ``failed`` | ``lost`` | ``gone``.
 
     ``lost`` is the split-brain guard: if another process took the document over
     (our lease expired and was claimed), writing our verdict would clobber
-    its state, so we leave the row to it.
+    its state, so we leave the row to it. With ``claim_version`` that check is
+    exact — the row has moved on to another attempt, full stop. Without it
+    (legacy callers, and rows that predate the version column) all that is left
+    is the worker-name comparison, which an ABA can walk through.
     """
     knobs = _knobs(settings)
     # Read the columns, not the ORM entity: a session that just claimed this row
@@ -268,18 +365,29 @@ async def finish(
     # whose staleness would decide the wrong verdict here.
     state = (
         await db.execute(
-            select(Document.ingest_attempts, Document.ingest_claimed_by).where(
-                Document.id == document_id
-            )
+            select(
+                Document.ingest_attempts,
+                Document.ingest_claimed_by,
+                Document.ingest_claim_version,
+            ).where(Document.id == document_id)
         )
     ).first()
     if state is None:
         # Deleted while indexing; the chunk/vector cleanup already ran.
         return "gone"
-    attempts, owner = state
-    if owner != worker_id:
+    attempts, owner, current_version = state
+    if claim_version is not None and current_version != claim_version:
         logger.warning(
-            "ingestion of document %s was taken over by %s; %s is dropping its result",
+            "文档 %s 有一次被接管过的僵尸写入：接管者已把领取版本推进到 %s，"
+            "这次写回的是 %s，结果已丢弃（不会覆盖接管者的状态）",
+            document_id,
+            current_version,
+            claim_version,
+        )
+        return "lost"
+    if claim_version is None and owner != worker_id:
+        logger.warning(
+            "文档 %s 已被 %s 接管，worker %s 丢弃自己的结果",
             document_id,
             owner,
             worker_id,
@@ -305,14 +413,25 @@ async def finish(
 
     # The owner guard is repeated in the WHERE: if the lease was taken over
     # between the read and here, this matches nothing and their state stands.
+    guard = (
+        Document.ingest_claim_version == claim_version
+        if claim_version is not None
+        else Document.ingest_claimed_by == worker_id
+    )
     result = await db.execute(
         update(Document)
-        .where(Document.id == document_id, Document.ingest_claimed_by == worker_id)
+        .where(Document.id == document_id, guard)
         .values(**values)
         .execution_options(synchronize_session=False)
     )
     await db.commit()
     if result.rowcount != 1:
+        logger.warning(
+            "文档 %s 的写回（领取版本 %s）没有落库：读取与写入之间它就被接管了，"
+            "这是一次僵尸写入，已丢弃",
+            document_id,
+            claim_version,
+        )
         return "lost"
 
     if outcome.ok:
@@ -352,6 +471,7 @@ class IngestionWorker:
         self.worker_id = worker_id or f"ingest-{uuid.uuid4().hex[:8]}"
         self._settings = settings
         self._knobs = _knobs(settings)
+        self._passes_claim_version = _wants_claim_version(index_fn)
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -363,13 +483,13 @@ class IngestionWorker:
     async def run_once(self) -> tuple[uuid.UUID, str] | None:
         """Process at most one document. Returns ``(document_id, verdict)``."""
         async with self._session_factory() as db:
-            document_id = await claim(db, worker_id=self.worker_id, settings=self._settings)
-        if document_id is None:
+            job = await claim_job(db, worker_id=self.worker_id, settings=self._settings)
+        if job is None:
             return None
 
-        heartbeat = asyncio.create_task(self._heartbeat(document_id))
+        heartbeat = asyncio.create_task(self._heartbeat(job.document_id, job.version))
         try:
-            outcome = await self._execute(document_id)
+            outcome = await self._execute(job.document_id, job.version)
         finally:
             heartbeat.cancel()
             try:
@@ -380,23 +500,27 @@ class IngestionWorker:
         async with self._session_factory() as db:
             verdict = await finish(
                 db,
-                document_id,
+                job.document_id,
                 worker_id=self.worker_id,
                 outcome=outcome,
                 settings=self._settings,
+                claim_version=job.version,
             )
-        return document_id, verdict
+        return job.document_id, verdict
 
-    async def _execute(self, document_id: uuid.UUID) -> IngestionOutcome:
+    async def _execute(self, document_id: uuid.UUID, claim_version: int) -> IngestionOutcome:
         """Run the pipeline, turning any raise into a retryable outcome.
 
         A lease lost mid-run cannot be un-started (the pipeline writes the row
-        as it goes); what the lease buys is that *nobody else* is waiting an
-        unbounded time for it, and :func:`finish` makes sure the loser does not
-        then overwrite the new owner's verdict.
+        as it goes); what the claim version buys is that it *stops* writing as
+        soon as it notices, and that :func:`finish` then refuses the verdict.
         """
         try:
             async with self._session_factory() as db:
+                if self._passes_claim_version:
+                    return await self._index_fn(  # type: ignore[call-arg]
+                        db, document_id, claim_version=claim_version
+                    )
                 return await self._index_fn(db, document_id)
         except asyncio.CancelledError:
             raise
@@ -404,7 +528,7 @@ class IngestionWorker:
             logger.exception("ingestion worker %s crashed on %s", self.worker_id, document_id)
             return IngestionOutcome(ok=False, error=str(exc), retryable=True)
 
-    async def _heartbeat(self, document_id: uuid.UUID) -> None:
+    async def _heartbeat(self, document_id: uuid.UUID, claim_version: int) -> None:
         """Renew the lease while the pipeline runs.
 
         Losing it is logged, not interrupted: :func:`finish` is what refuses to
@@ -416,13 +540,22 @@ class IngestionWorker:
             try:
                 async with self._session_factory() as db:
                     held = await renew(
-                        db, document_id, worker_id=self.worker_id, settings=self._settings
+                        db,
+                        document_id,
+                        worker_id=self.worker_id,
+                        settings=self._settings,
+                        claim_version=claim_version,
                     )
             except Exception:  # a blip must not look like a lost lease
                 logger.exception("ingestion lease renewal failed for %s", document_id)
                 continue
             if not held:
-                logger.warning("lost the lease on document %s", document_id)
+                logger.warning(
+                    "文档 %s 的租约已不在 worker %s 手里（领取版本 %s），停止续期",
+                    document_id,
+                    self.worker_id,
+                    claim_version,
+                )
                 return
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:

@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Sequence
 
 from sqlalchemy import delete as _sa_delete
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -144,8 +144,36 @@ async def _clear_existing(db: AsyncSession, doc: Document, collection: str) -> N
     await db.execute(_sa_delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
 
 
+class _ClaimLost(Exception):
+    """这次领取已不属于本进程（被接管，或行已被删）。再写就是覆盖接管者的状态。"""
+
+
+async def _write_progress(
+    db: AsyncSession, doc: Document, claim_version: int | None, **values: object
+) -> None:
+    """把进度写回 ``documents`` 行；带 ``claim_version`` 时是条件 UPDATE。
+
+    没带版本的调用方（手工调用 / 老代码）走 ORM 赋值那条原路径 —— 那时没有任何
+    归属信息可以校验，也就无从判断该不该写。
+    """
+    if claim_version is None:
+        for name, value in values.items():
+            setattr(doc, name, value)
+        await db.commit()
+        return
+    result = await db.execute(
+        update(Document)
+        .where(Document.id == doc.id, Document.ingest_claim_version == claim_version)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    if result.rowcount != 1:
+        raise _ClaimLost
+
+
 async def index_document(
-    db: AsyncSession, document_id: uuid.UUID
+    db: AsyncSession, document_id: uuid.UUID, *, claim_version: int | None = None
 ) -> IngestionOutcome:
     """Full ingestion pipeline for one document. Never raises.
 
@@ -154,23 +182,33 @@ async def index_document(
     exception into whichever background task called it. ``retryable`` is the
     split that matters: a provider outage should be retried, a file that has no
     parseable text should not be attempted four more times.
+
+    ``claim_version`` 是队列领取时拿到的那个版本号。带上它，这里每一步进度写回都
+    变成「还是我领的那一次才写」；一个卡死后才醒过来的 worker 因此不会把接管者
+    已经落库的状态改回自己这一轮的结论。
     """
     doc = await db.get(Document, document_id)
     if doc is None:
         return IngestionOutcome(ok=False, error="Document not found", retryable=False)
     kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
     if kb is None:
-        doc.status = "failed"
-        doc.error_message = "Knowledge base not found"
-        await db.commit()
+        try:
+            await _write_progress(
+                db, doc, claim_version, status="failed", error_message="Knowledge base not found"
+            )
+        except _ClaimLost:
+            await db.rollback()
+            return IngestionOutcome(
+                ok=False, error="本次领取已被其他 worker 接管", retryable=False
+            )
         # A KB row does not come back; retrying would just re-check and fail.
-        return IngestionOutcome(ok=False, error=doc.error_message, retryable=False)
+        return IngestionOutcome(ok=False, error="Knowledge base not found", retryable=False)
 
     try:
         # 1. Parse.
-        doc.status = "parsing"
-        doc.error_message = None
-        await db.commit()
+        await _write_progress(
+            db, doc, claim_version, status="parsing", error_message=None
+        )
         parsed = await asyncio.to_thread(default_parser.parse, doc.file_path, doc.file_type)
         text = parsed.text
         if not text or not text.strip():
@@ -178,8 +216,7 @@ async def index_document(
 
         # 2. Split. The KB may override the chunk shape; ``None`` keeps the
         # platform default (RecursiveTextSplitter falls back to settings).
-        doc.status = "chunking"
-        await db.commit()
+        await _write_progress(db, doc, claim_version, status="chunking")
         splitter = RecursiveTextSplitter(
             chunk_size=kb.chunk_size, chunk_overlap=kb.chunk_overlap
         )
@@ -192,8 +229,7 @@ async def index_document(
         spans = annotate(chunk_texts, parsed)
 
         # 3. Embed (batched) + store.
-        doc.status = "embedding"
-        await db.commit()
+        await _write_progress(db, doc, claim_version, status="embedding")
         cfg = await _resolve_embedding_config(db, kb)
         provider = get_provider_for_config(cfg)
         embedder = ProviderEmbedder(provider, model=cfg.embedding_model_name)
@@ -263,23 +299,44 @@ async def index_document(
             ]
             await store.upsert(collection, points)
 
-        doc.status = "indexed"
-        doc.chunk_count = len(chunk_rows)
-        doc.error_message = None
-        await db.commit()
+        await _write_progress(
+            db,
+            doc,
+            claim_version,
+            status="indexed",
+            chunk_count=len(chunk_rows),
+            error_message=None,
+        )
         return IngestionOutcome(ok=True)
+    except _ClaimLost:
+        # 被接管的一轮：回滚掉尚未提交的分块行，什么都不留下。
+        await db.rollback()
+        logger.warning(
+            "文档 %s 的本次摄取（领取版本 %s）已被其他 worker 接管，这一轮的进度与结果作废",
+            document_id,
+            claim_version,
+        )
+        return IngestionOutcome(ok=False, error="本次领取已被其他 worker 接管", retryable=False)
     except Exception as exc:
         logger.exception("indexing failed for document %s", document_id)
-        doc.status = "failed"
-        doc.error_message = str(exc)[:500]
-        await db.commit()
+        message = str(exc)[:500]
+        try:
+            await _write_progress(
+                db, doc, claim_version, status="failed", error_message=message
+            )
+        except _ClaimLost:
+            await db.rollback()
+            logger.warning(
+                "文档 %s 已被其他 worker 接管（领取版本 %s），失败状态不写回",
+                document_id,
+                claim_version,
+            )
+            return IngestionOutcome(ok=False, error=message, retryable=False)
         # ValueError = the parser/splitter saying "this text is not usable",
         # OSError = the stored file is gone or unreadable. Both are properties of
         # the row, so a retry would produce the identical failure.
         retryable = not isinstance(exc, (ValueError, OSError))
-        return IngestionOutcome(
-            ok=False, error=doc.error_message, retryable=retryable
-        )
+        return IngestionOutcome(ok=False, error=message, retryable=retryable)
 
 
 async def list_for_kb(

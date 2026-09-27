@@ -8,7 +8,8 @@ import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { AttachmentCard } from "@/components/attachments/attachment-card";
 import { AttachmentPreview } from "@/components/attachments/attachment-preview";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import type { ChatAttachment, KnowledgeBase } from "@/lib/types";
 import {
@@ -66,7 +67,7 @@ export function FilesTab({ conversationId }: { conversationId: string | null }) 
       setSaveTarget(null);
     },
     onError: (e) =>
-      toast.error(e instanceof ApiError ? e.message : "存入知识库失败"),
+      toast.error("存入知识库失败", { description: userErrorMessage(e) }),
   });
 
   if (query.isLoading) {

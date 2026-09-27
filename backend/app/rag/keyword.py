@@ -32,6 +32,7 @@ from sqlalchemy import ColumnElement, case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.like import LIKE_ESCAPE, like_pattern
 from app.models import Document, DocumentChunk
 from app.rag.base import SearchHit
 
@@ -80,16 +81,10 @@ def _tokenize(text: str) -> tuple[list[str], list[str]]:
     return _latin_tokens(text), _cjk_grams(text)
 
 
-def _escape_ilike(term: str) -> str:
-    """Escape SQL LIKE wildcards so a query token matches literally."""
-    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _candidate_conditions(terms: Sequence[str]) -> list:
     seen = list(dict.fromkeys(terms))  # dedup, keep order: repeated grams are common
     return [
-        DocumentChunk.content.ilike("%" + _escape_ilike(t) + "%", escape="\\")
-        for t in seen
+        DocumentChunk.content.ilike(like_pattern(t), escape=LIKE_ESCAPE) for t in seen
     ]
 
 

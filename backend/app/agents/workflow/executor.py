@@ -104,15 +104,27 @@ class StageAdapterExecutor:
     back to a :class:`~app.agents.workflow.schemas.StepObservation`.
     """
 
-    def __init__(self, stages: dict, stage_ctx: Any, stage_factory: Any = None) -> None:
+    def __init__(
+        self,
+        stages: dict,
+        stage_ctx: Any,
+        stage_factory: Any = None,
+        revise_factory: Any = None,
+    ) -> None:
         # ``stages`` is typed loosely (dict[str, StageSpec]) to avoid importing
         # crewai at module load time; the runtime builds it from the crew
         # builders. ``stage_factory(step) -> StageSpec`` covers ids the template
         # builders don't know about (an LLM planner's own steps); without one,
         # an unknown id still fails loudly rather than running a stranger.
+        #
+        # ``revise_factory(step) -> StageSpec`` 同理，但只服务**被返修过**的步骤
+        # （``step.revision_round > 0``）：模板 builder 只认原始那一步，返修轮
+        # 需要的是「同一个角色，但带着上一轮的审阅意见重做」。不给 revise_factory
+        # 也不至于丢结论 —— 审阅意见仍会作为 context 注入（见 execute）。
         self._stages = stages
         self._stage_ctx = stage_ctx
         self._stage_factory = stage_factory
+        self._revise_factory = revise_factory
         self._built: dict[str, Any] = {}
         # Lazy import so the workflow package imports cleanly without crewai.
         from app.agents.runtime.stage_executor import (
@@ -127,6 +139,17 @@ class StageAdapterExecutor:
             return spec
         if step.id in self._built:
             return self._built[step.id]
+        round_index = int(getattr(step, "revision_round", 0) or 0)
+        # 返修轮：模板 builder 只认原始那一步（查表已落空），这里用带审阅意见的
+        # 返修 spec —— 每一轮各占一个缓存位，第 2 轮的意见和第 1 轮不同。
+        if round_index and self._revise_factory is not None:
+            key = f"{step.id}@r{round_index}"
+            cached = self._built.get(key)
+            if cached is not None:
+                return cached
+            spec = self._revise_factory(step)
+            self._built[key] = spec
+            return spec
         if self._stage_factory is None:
             raise KeyError(
                 f"no stage built for step {step.id!r} (profile stages: "
@@ -149,6 +172,19 @@ class StageAdapterExecutor:
         if pending:
             self._stage_ctx.pending_instructions = []
             block = "[用户追加指导]\n" + "\n".join(f"- {i}" for i in pending)
+            context = f"{context}\n\n{block}" if context else block
+        # 返修轮必须看见上一轮的审阅结论（B13）：``revise_plan`` 把 findings
+        # 盖在步骤上，这里把它接进 context，否则「改」出来的东西和第一遍
+        # 一字不差 —— 审环节白跑。
+        findings = [
+            str(f).strip()
+            for f in (getattr(step, "review_findings", None) or [])
+            if str(f).strip()
+        ]
+        if findings:
+            block = "[上一轮审阅意见，须逐条处理]\n" + "\n".join(
+                f"- {f}" for f in findings
+            )
             context = f"{context}\n\n{block}" if context else block
         result = await self._inner.execute(
             agent_id=step.id,

@@ -10,11 +10,16 @@ import os
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
-from cryptography.fernet import Fernet, InvalidToken
-from jose import jwt
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
+import jwt
 from passlib.context import CryptContext
 
-from app.core.config import get_settings
+from app.core.config import (
+    _FERNET_GENERATE_HINT,
+    fernet_key_problem,
+    get_settings,
+    is_placeholder_secret,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,24 +98,71 @@ def create_refresh_token(subject: str, extra: dict | None = None) -> str:
 
 
 def decode_token(token: str) -> dict[str, Any]:
-    """Raises JWTError on invalid/expired tokens."""
+    """Raises PyJWT's InvalidTokenError on invalid or expired tokens."""
     return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
 
 
 # ---- API key encryption (Fernet) ------------------------------------------
-# Module-level cache for the dev-fallback Fernet. Without it, _fernet() used to
-# generate a FRESH random key on every call, so ciphertext encrypted in one call
-# was immediately undecryptable by the next. Caching makes dev at least
+# Module-level cache for the dev-fallback MultiFernet. Without it, _fernet() used
+# to generate a FRESH random key on every call, so ciphertext encrypted in one
+# call was immediately undecryptable by the next. Caching makes dev at least
 # consistent within a single process. Production must set FERNET_KEY (enforced
 # at startup by config._guard_default_secrets) and never hits this fallback.
-_FALLBACK_FERNET: Fernet | None = None
+_FALLBACK_FERNET: MultiFernet | None = None
+# Cache of built rotators keyed by the resolved key list, so rotating
+# ``FERNET_KEYS`` (which requires a restart anyway) does not leave a stale
+# MultiFernet holding the previous key set alive in a long-lived process, and a
+# misconfigured entry is reported once instead of on every request.
+_FERNET_CACHE: tuple[tuple[str, ...], MultiFernet] | None = None
 
 
-def _fernet() -> Fernet:
-    global _FALLBACK_FERNET
-    key = settings.FERNET_KEY
-    if key:
-        return Fernet(key.encode() if isinstance(key, str) else key)
+def _fernet() -> MultiFernet:
+    """Return the process-wide rotator: key[0] encrypts, every key decrypts.
+
+    Rotation semantics (finding 42): publish
+    ``FERNET_KEYS=<new-key>,<old-key>`` and restart. Rows written before the
+    rotation still carry the old key's version byte and decrypt via the second
+    entry; every row written after it uses the new key. Once no ciphertext
+    references the old key it is dropped from the list, which makes the retired
+    key unable to decrypt anything it should not.
+
+    ``config._guard_default_secrets`` already rejects bad keys at boot, but a
+    process can still reach here with an unvalidated list (tests patch the
+    settings object). Re-check lazily so the failure is one Chinese, actionable
+    error at this boundary rather than an English ``ValueError`` from
+    ``Fernet()`` inside the first request that touches an encrypted column.
+    Placeholder values only warn here: refusing them is the boot guard's job
+    (non-dev only), and the repo's own demo key must keep working in dev/test.
+    """
+    global _FALLBACK_FERNET, _FERNET_CACHE
+    keys = settings.fernet_keys
+    if keys:
+        if _FERNET_CACHE is not None and _FERNET_CACHE[0] == tuple(keys):
+            return _FERNET_CACHE[1]
+        fatal: list[str] = []
+        for i, key in enumerate(keys):
+            problem = fernet_key_problem(key)
+            if problem is None:
+                continue
+            if is_placeholder_secret(key):
+                logger.warning("FERNET_KEY(S) 第 %s 项%s", i + 1, problem)
+            else:
+                fatal.append(f"第 {i + 1} 项{problem}")
+        if fatal:
+            raise RuntimeError(
+                "FERNET_KEY(S) 不可用：" + "；".join(fatal)
+                + "。请改成合法的 Fernet key，生成命令：" + _FERNET_GENERATE_HINT
+                + "；轮换时配 FERNET_KEYS=新key,旧key（逗号分隔、新→旧）。"
+            )
+        try:
+            rotator = MultiFernet([Fernet(k.encode()) for k in keys])
+        except Exception as exc:  # pragma: no cover - defensive, checks above pass
+            raise RuntimeError(
+                f"FERNET_KEY(S) 被 cryptography 拒绝：{exc}。每一项都必须是 44 字符的 "
+                f"url-safe base64 Fernet key，生成命令：{_FERNET_GENERATE_HINT}"
+            ) from exc
+        _FERNET_CACHE = (tuple(keys), rotator)
+        return rotator
     # Dev-only fallback: stable per-process random key. NOT safe for prod —
     # config._guard_default_secrets refuses to boot non-dev without FERNET_KEY.
     if _FALLBACK_FERNET is None:
@@ -121,7 +173,7 @@ def _fernet() -> Fernet:
             "import Fernet; print(Fernet.generate_key().decode())\""
         )
         rand_key = base64.urlsafe_b64encode(os.urandom(32)).decode()
-        _FALLBACK_FERNET = Fernet(rand_key.encode())
+        _FALLBACK_FERNET = MultiFernet([Fernet(rand_key.encode())])
     return _FALLBACK_FERNET
 
 

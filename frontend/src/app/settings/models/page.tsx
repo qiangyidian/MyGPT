@@ -5,7 +5,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Plus, Pencil, Trash2, FlaskConical, Zap, Bot } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import type { ModelConfig, ModelConfigInput } from "@/lib/types";
 import {
   parseOptionalNumber,
@@ -82,7 +83,7 @@ export default function ModelsPage() {
       invalidate();
       setOpen(false);
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error("创建失败", { description: userErrorMessage(e) }),
   });
 
   const updateMut = useMutation({
@@ -93,7 +94,7 @@ export default function ModelsPage() {
       invalidate();
       setOpen(false);
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error("保存失败", { description: userErrorMessage(e) }),
   });
 
   const deleteMut = useMutation({
@@ -102,16 +103,21 @@ export default function ModelsPage() {
       toast.success("已删除");
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error("删除失败", { description: userErrorMessage(e) }),
   });
 
   const testMut = useMutation({
     mutationFn: (id: string) => api.testModel(id),
     onSuccess: (res) => {
       if (res.ok) toast.success(`连接成功 · ${res.latency_ms}ms`);
-      else toast.error(`连接失败：${res.error ?? "未知错误"}`);
+      // `res.error` 是上游异常的原文（含类名），必须过一遍映射再展示。
+      else
+        toast.error(
+          "连接失败",
+          res.error ? { description: userErrorMessage(res.error) } : undefined
+        );
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error("连接测试失败", { description: userErrorMessage(e) }),
   });
 
   function openCreate() {

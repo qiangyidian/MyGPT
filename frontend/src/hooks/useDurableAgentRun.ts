@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { streamRunEvents } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import {
   applyEvent,
   disconnectSubscription,
@@ -177,13 +178,13 @@ export function useDurableAgentRun(
             setState((s) => (s ? disconnectSubscription(s) : s));
             scheduleReconnect();
           },
-          onError: ({ message }) => {
+          onError: (e) => {
             if (generationRef.current !== myGeneration) return;
             setState((s) =>
               s
                 ? {
                     ...s,
-                    error: message,
+                    error: userErrorMessage(e),
                     subscriptionStatus: "disconnected",
                   }
                 : s,

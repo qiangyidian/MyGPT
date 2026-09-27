@@ -1,0 +1,25 @@
+[Unit]
+Description=MyGPT backup failure alert (fires from mychat-backup.service OnFailure=)
+After=network-online.target
+Wants=network-online.target
+# No OnFailure= here on purpose: an alerting unit that alerts on its own failure
+# is a loop waiting to happen.
+
+[Service]
+Type=oneshot
+# Nothing in this unit knows MyGPT: it is journal + one webhook POST, so it keeps
+# working when the backup job died before it could send its own alert (OOM kill,
+# TimeoutStartSec SIGKILL — scripts/backup.sh's ERR trap cannot run there).
+#
+# Channel reality check, so nobody pages a channel that does not exist:
+#   * the journal line is ALWAYS written — that is the guaranteed channel;
+#   * BACKUP_ALERT_URL is an optional 企业微信/钉钉 robot webhook, the same
+#     receiver class ops-critical uses in deploy/monitoring/alertmanager.yml.
+#     Set it in /etc/mychat/backup.env (shared with mychat-backup.service).
+#   * Alertmanager is NOT in this path: Prometheus only scrapes the API's
+#     /metrics, so no rule in deploy/monitoring/rules/mygpt.yml can ever see a
+#     systemd oneshot. Do not expect a metric here.
+EnvironmentFile=-/etc/mychat/backup.env
+# Leading "-" = a failed/empty URL push must not mark this unit failed too.
+ExecStart=/usr/bin/logger -t mychat-backup -p daemon.err "backup job FAILED on %H - inspect: systemctl status mychat-backup.service ; journalctl -u mychat-backup.service --no-pager -n 200"
+ExecStart=-/usr/bin/curl -fsS -m 20 -X POST -H "Content-Type: application/json" --data-binary "{\"text\":\"[MyGPT] %H 的备份任务失败（mychat-backup.service）。查看：journalctl -u mychat-backup.service -n 200\"}" "$BACKUP_ALERT_URL"

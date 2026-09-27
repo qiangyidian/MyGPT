@@ -1,6 +1,24 @@
 "use client";
 
+import { request } from "./api-client";
+export { API_BASE, ApiError } from "./api-client";
+export {
+  dispatchChatStreamEvent,
+  findActiveConversationRun,
+  streamChat,
+  streamRunEvents,
+} from "./api-stream";
+export type {
+  ActiveConversationRun,
+  ChatStreamHandlers,
+  RunEventStreamHandlers,
+} from "./api-stream";
+
 import {
+  AdminAgentRunPage,
+  AdminRunCommandRow,
+  AdminRunEventPage,
+  AdminRunSummary,
   AgentRun,
   AgentStep,
   ArtifactMeta,
@@ -18,23 +36,27 @@ import {
   CreditLedgerPage,
   DocFile,
   DocumentPreview,
+  FeatureFlagPage,
   KnowledgeBase,
+  MentionList,
+  Message,
   MessageFeedback,
   MessageFeedbackRating,
   ModelConfig,
   ModelConfigInput,
   ModelTestResult,
-  PendingApproval,
   Project,
+  ProjectImpact,
+  ProjectPatch,
   ReindexResult,
   RetrievalSettings,
   ProjectInput,
   ProviderManifest,
   RedeemBatchCreateResult,
   RedeemBatchProgress,
-  RedeemCodeInfo,
+  RedeemCodeActionResult,
+  RedeemCodePage,
   RedeemResult,
-  ResearchPlanStep,
   RunActionResult,
   ToolInfo,
   UploadCapabilities,
@@ -45,146 +67,18 @@ import {
   WechatBinding,
   WechatLoginInfo,
 } from "./types";
-import { getAccessToken, setAccessToken } from "./auth";
-import { parseSSEStream } from "./sse-parser";
-import type { FinishReason } from "./types";
+import { setAccessToken } from "./auth";
+import type { SpeechCapabilities, SpeechTranscribeResult } from "./types";
+import type {
+  MessageTruncateResult,
+  MessageVersionDTO,
+  PromptScope,
+  PromptTemplate,
+  PromptTemplateInput,
+  VersionActivateResult,
+} from "./types";
+import type { RedeemBatchQuery } from "./redeem-batch";
 
-// Browser-visible API base. MUST be baked at build time for any non-local
-// deployment (a build without NEXT_PUBLIC_API_BASE_URL once shipped to
-// production and every request silently hit http://localhost:8000 — the user
-// saw "Failed to fetch"). In the browser, a missing variable is a hard error
-// instead of a silent localhost fallback; on the server (SSR/prerender) the
-// fallback stays so static builds don't crash.
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  (typeof window !== "undefined"
-    ? (() => {
-        throw new Error(
-          "NEXT_PUBLIC_API_BASE_URL 未设置：请在前端构建时提供后端 API 地址"
-        );
-      })()
-    : "http://localhost:8000");
-
-export class ApiError extends Error {
-  status: number;
-  code: string;
-  constructor(status: number, code: string, message: string) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
-
-// These endpoints answer 401 with *credential* errors ("Invalid email or
-// password", a bad scan code), not session expiry — running the refresh dance
-// on them would mask the real message behind "会话已过期", so they bypass the
-// retry below.
-const CREDENTIAL_AUTH_PATHS = new Set([
-  "/api/auth/login",
-  "/api/auth/register",
-  "/api/auth/login/wechat",
-]);
-
-let refreshing: Promise<boolean> | null = null;
-
-async function refreshAccessToken(): Promise<boolean> {
-  if (refreshing) return refreshing;
-  refreshing = (async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/auth/refresh`, {
-        method: "POST",
-        credentials: "include",
-        // Bound the refresh so a hung backend can't lock up every concurrent
-        // 401 retry — `refreshing` is a shared singleton (see below).
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!res.ok) return false;
-      const data = await res.json();
-      setAccessToken(data.access_token);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      refreshing = null;
-    }
-  })();
-  return refreshing;
-}
-
-async function request<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  opts: { raw?: boolean; headers?: Record<string, string>; signal?: AbortSignal } = {}
-): Promise<T> {
-  const doFetch = async (token: string | null): Promise<Response> => {
-    const headers: Record<string, string> = { ...(opts.headers || {}) };
-    if (body !== undefined && !(body instanceof FormData)) {
-      headers["Content-Type"] = "application/json";
-    }
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-    return fetch(`${API_BASE}${path}`, {
-      method,
-      headers,
-      credentials: "include",
-      // Forward an optional caller signal so long-lived calls can be cancelled
-      // (a hung backend otherwise leaves the promise pending until the browser's
-      // own ~300s network timeout).
-      signal: opts.signal,
-      body:
-        body === undefined
-          ? undefined
-          : body instanceof FormData
-            ? body
-            : JSON.stringify(body),
-    });
-  };
-
-  let res: Response;
-  try {
-    res = await doFetch(getAccessToken());
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    // fetch() rejects with a bare TypeError on network failure; surface a
-    // Chinese, actionable message instead of the browser's raw English.
-    if (typeof navigator !== "undefined" && navigator.onLine === false) {
-      throw new ApiError(0, "offline", "网络连接已断开，请检查网络后重试");
-    }
-    throw new ApiError(0, "network_error", "网络请求失败，请稍后重试");
-  }
-
-  if (res.status === 401 && !CREDENTIAL_AUTH_PATHS.has(path)) {
-    const ok = await refreshAccessToken();
-    if (ok) {
-      try {
-        res = await doFetch(getAccessToken());
-      } catch {
-        throw new ApiError(0, "network_error", "网络请求失败，请稍后重试");
-      }
-    } else {
-      setAccessToken(null);
-      throw new ApiError(401, "unauthorized", "会话已过期，请重新登录");
-    }
-  }
-
-  if (!res.ok) {
-    let code = "error";
-    let message = res.statusText;
-    try {
-      const data = await res.json();
-      code = data.code || code;
-      message = data.message || data.detail || message;
-    } catch {
-      /* ignore */
-    }
-    throw new ApiError(res.status, code, message);
-  }
-  if (opts.raw) return res as unknown as T;
-  if (res.status === 204) return undefined as unknown as T;
-  return (await res.json()) as T;
-}
-
-/** A paginated list request: server-side page size + zero-based skip. */
 export interface PageParams {
   limit?: number;
   offset?: number;
@@ -201,6 +95,91 @@ function withPageParams(path: string, page?: PageParams): string {
   if (page.offset != null) qs.set("offset", String(page.offset));
   const q = qs.toString();
   return q ? `${path}?${q}` : path;
+}
+
+// --------------------------------------------------------------------------- //
+// 管理端：用量报表 + 审计列表（对应 backend/app/schemas/admin.py 的 DTO）
+// --------------------------------------------------------------------------- //
+
+/** 一组用量求和项。``requests`` 是 assistant 行数：token 与成本只记在这些行上。 */
+export interface AdminUsageMetrics {
+  messages: number;
+  user_messages: number;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface AdminUsageRow extends AdminUsageMetrics {
+  /** 分组键：按天是日期，按模型是模型名（NULL 时为空串），按用户是用户 id。 */
+  key: string;
+  /** 给人看的分组名；模型缺名时后端给「未记录模型」，不会是空白。 */
+  label: string;
+  email: string | null;
+  username: string | null;
+}
+
+/** 取值与后端白名单同源：`admin_service.USAGE_GROUP_BY`（`backend/app/services/admin_service.py:30`）。 */
+export type AdminUsageGroupBy = "day" | "model" | "user";
+
+export interface AdminUsageQuery {
+  /** UTC 日历日 `YYYY-MM-DD`，含当天；不传时后端补最近 30 天（`admin_service.py:34`）。 */
+  start?: string;
+  end?: string;
+  groupBy?: AdminUsageGroupBy;
+  /** 上限 500 = `admin_service.USAGE_MAX_LIMIT`（`admin_service.py:36`）。 */
+  limit?: number;
+  offset?: number;
+}
+
+export interface AdminUsagePage {
+  /** 服务端补齐后实际生效的区间（含两端）。 */
+  start: string;
+  end: string;
+  group_by: AdminUsageGroupBy;
+  items: AdminUsageRow[];
+  /** 分组总数（不是消息数），给翻页用。 */
+  total: number;
+  limit: number;
+  offset: number;
+  /** 整个区间的合计，与这一页装了哪几行无关。 */
+  totals: AdminUsageMetrics;
+}
+
+export interface AdminAuditRow {
+  id: string;
+  actor_id: string | null;
+  actor_email: string | null;
+  actor_username: string | null;
+  action: string;
+  target: string | null;
+  detail: Record<string, unknown> | null;
+  created_at: string | null;
+}
+
+export interface AdminAuditQuery {
+  action?: string;
+  /** 前缀匹配，如 `credits:`。 */
+  actionPrefix?: string;
+  /** 用户 id（精确）或邮箱 / 用户名（模糊）。 */
+  actor?: string;
+  /** 关键字：匹配 target。 */
+  q?: string;
+  /** UTC 日历日 `YYYY-MM-DD`，含当天。 */
+  start?: string;
+  end?: string;
+  /** 上限 500 = `AUDIT_MAX_LIMIT`（`backend/app/api/admin.py:34`）。 */
+  limit?: number;
+  offset?: number;
+}
+
+export interface AdminAuditPage {
+  items: AdminAuditRow[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 // ===========================================================================
@@ -290,6 +269,41 @@ export const api = {
     }
   },
 
+  // ---- 密码：修改 / 找回 ----
+  /**
+   * 改密（需登录）。成功后服务端会 bump token_version，旧 access/refresh 全部
+   * 失效，并当场下发新会话 —— 所以这里必须换掉本地 token，否则下一次请求就
+   * 拿着一个已被拉黑的令牌去撞 401。密码只走请求体，绝不进 query string。
+   */
+  async changePassword(oldPassword: string | null, newPassword: string) {
+    const data = await request<{
+      access_token: string;
+      expires_in: number;
+      user: User;
+    }>("POST", "/api/auth/password", {
+      old_password: oldPassword || null,
+      new_password: newPassword,
+    });
+    setAccessToken(data.access_token);
+    return data;
+  },
+  /** 找回密码第一步：发重置验证码。邮箱是否存在都返回同一句话（防枚举）。 */
+  async requestPasswordReset(email: string) {
+    return request<{ ok: boolean; message: string }>(
+      "POST",
+      "/api/auth/password/forgot",
+      { email }
+    );
+  },
+  /** 找回密码第二步：凭验证码设置新密码（不需要登录，也不会建立会话）。 */
+  async resetPasswordWithEmailCode(email: string, code: string, newPassword: string) {
+    return request<{ ok: boolean; message: string }>("POST", "/api/auth/password/reset", {
+      email,
+      code,
+      new_password: newPassword,
+    });
+  },
+
   // ---- Conversations ----
   listConversations: (opts?: { q?: string; archived?: boolean; limit?: number; offset?: number }) => {
     const params = new URLSearchParams();
@@ -309,7 +323,10 @@ export const api = {
       title: string;
       model_id: string | null;
       knowledge_base_id: string | null;
-      system_prompt: string;
+      // `null` clears the override so the conversation falls back to the
+      // platform default — the PATCH handler distinguishes "omitted" from
+      // "sent as null", so widening this to null is what 恢复默认 needs.
+      system_prompt: string | null;
       pinned: boolean;
       archived: boolean;
     }>
@@ -361,6 +378,23 @@ export const api = {
       { raw: true }
     );
     return res.blob();
+  },
+
+  /**
+   * 导出整段会话（Markdown / JSON）。走 raw 是因为文件名在响应头里，
+   * 而 central request() 会把 body 直接 JSON 解析掉。
+   */
+  exportConversation: async (
+    id: string,
+    format: "markdown" | "json"
+  ): Promise<{ blob: Blob; contentDisposition: string | null }> => {
+    const res = await request<Response>(
+      "GET",
+      `/api/conversations/${id}/export?format=${format}`,
+      undefined,
+      { raw: true }
+    );
+    return { blob: await res.blob(), contentDisposition: res.headers.get("content-disposition") };
   },
 
   // ---- Message feedback ----
@@ -444,6 +478,116 @@ export const api = {
       top_k: topK,
     }),
 
+  // ---- @-references (composer type-ahead) ----
+  /** Candidates for the ``@`` picker: the caller's knowledge bases, documents in
+   *  them, and this conversation's attachments. Server caps the result set; pass
+   *  ``conversationId`` to include the attachment branch (omitting it is a
+   *  knowledge-base-only search). */
+  searchMentions: (q: string, conversationId?: string | null, limit = 20) => {
+    const params = new URLSearchParams({ q, limit: String(limit) });
+    if (conversationId) params.set("conversation_id", conversationId);
+    return request<MentionList>("GET", `/api/mentions?${params.toString()}`);
+  },
+
+  // ---- 语音（ASR 输入 / TTS 播报）----
+  /**
+   * 能力探测。**不受 SPEECH_ENABLED 拦截** —— 前端必须先能问到「是关的」，
+   * 才能把麦克风/喇叭渲染成带中文说明的禁用态，而不是拿到 503 之后靠猜。
+   */
+  getSpeechCapabilities: () =>
+    request<SpeechCapabilities>("GET", "/api/speech/capabilities"),
+  /**
+   * 录音 → 文本。走中心 request()，所以体积/格式/积分不足都能拿到带 code 的
+   * 中文信封（见 `@/lib/voice` 的 code → 文案表）。返回的文本由调用方写进
+   * 输入框，**不自动发送**。
+   */
+  transcribeAudio: (audio: Blob, filename = "voice.webm", signal?: AbortSignal) => {
+    const fd = new FormData();
+    // 第三个参数决定 multipart 里的 filename：后端在浏览器把 Blob.type 报成
+    // 空串时靠扩展名回落判定格式，所以文件名不能省。
+    fd.append("file", audio, filename);
+    return request<SpeechTranscribeResult>("POST", "/api/speech/transcribe", fd, {
+      signal,
+    });
+  },
+  /**
+   * 文本 → 音频（后端分块下发，这里汇成一个 Blob 交给 <audio>）。
+   * 用 raw + blob() 而不是让 request() 解析 JSON：这是唯一一个「成功响应不是
+   * JSON」的语音端点，失败仍是干净的 JSON 信封。
+   */
+  synthesizeSpeech: async (text: string, signal?: AbortSignal): Promise<Blob> => {
+    const res = await request<Response>(
+      "POST",
+      "/api/speech/synthesize",
+      { text },
+      { raw: true, signal }
+    );
+    return res.blob();
+  },
+
+  // ---- 提示词库（条目 34）----
+  /** 一页模板：预置在前（后端按 sort_order），其余按最近更新。 */
+  listPrompts: (opts?: {
+    q?: string;
+    category?: string;
+    scope?: PromptScope;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const params = new URLSearchParams();
+    if (opts?.q) params.set("q", opts.q);
+    if (opts?.category) params.set("category", opts.category);
+    if (opts?.scope && opts.scope !== "all") params.set("scope", opts.scope);
+    if (opts?.limit != null) params.set("limit", String(opts.limit));
+    if (opts?.offset != null) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return request<PromptTemplate[]>(
+      "GET",
+      `/api/prompts${qs ? `?${qs}` : ""}`
+    );
+  },
+  /** 已有分类名（按用量排序）——筛选标签的数据源，不是前端常量表。 */
+  listPromptCategories: (scope?: PromptScope) =>
+    request<string[]>(
+      "GET",
+      `/api/prompts/categories${scope && scope !== "all" ? `?scope=${scope}` : ""}`
+    ),
+  getPrompt: (id: string) => request<PromptTemplate>("GET", `/api/prompts/${id}`),
+  createPrompt: (body: PromptTemplateInput) =>
+    request<PromptTemplate>("POST", "/api/prompts", body),
+  /** PATCH：省略的字段不动（与 knowledge-bases 同一套语义）。 */
+  updatePrompt: (id: string, body: Partial<PromptTemplateInput>) =>
+    request<PromptTemplate>("PATCH", `/api/prompts/${id}`, body),
+  deletePrompt: (id: string) => request("DELETE", `/api/prompts/${id}`),
+
+  // ---- 消息编辑 / 截断 / 历史版本（条目 30、31、33）----
+  /** 改正文；被改掉的原文由服务端先存成一版。**不**顺带截断后续轮次。 */
+  updateMessageContent: (messageId: string, content: string) =>
+    request<Message>("PATCH", `/api/messages/${messageId}`, { content }),
+  /** 删掉这条消息之后的所有消息（每条删除前先存档）。不可逆，界面须显式确认。 */
+  truncateMessagesAfter: (messageId: string) =>
+    request<MessageTruncateResult>("DELETE", `/api/messages/${messageId}/after`),
+  /**
+   * 一段会话的历史版本，新的在前。按会话而不是按消息取：重新生成会换掉消息行
+   * 的 id，只按 message_id 查恰好漏掉「回答被换掉」那批版本。
+   */
+  listConversationVersions: (conversationId: string, messageId?: string) =>
+    request<MessageVersionDTO[]>(
+      "GET",
+      `/api/conversations/${conversationId}/versions${
+        messageId ? `?message_id=${messageId}` : ""
+      }`
+    ),
+  activateMessageVersion: (
+    conversationId: string,
+    messageId: string,
+    versionId: string
+  ) =>
+    request<VersionActivateResult>(
+      "POST",
+      `/api/conversations/${conversationId}/messages/${messageId}/versions/${versionId}/activate`
+    ),
+
   // ---- Tools ----
   listTools: () => request<ToolInfo[]>("GET", "/api/tools"),
 
@@ -453,18 +597,73 @@ export const api = {
     request<User>("PATCH", `/api/admin/users/${id}`, body),
   adminStats: () =>
     request<{ usage: unknown[]; status: unknown }>("GET", "/api/admin/stats"),
-  /** Most recent audit events (tool calls, approvals, auth). */
-  adminAuditLog: (limit = 200) =>
-    request<
-      Array<{
-        id: string;
-        actor_id: string | null;
-        action: string;
-        target: string | null;
-        detail: Record<string, unknown> | null;
-        created_at: string | null;
-      }>
-    >("GET", `/api/admin/audit?limit=${limit}`),
+
+  /**
+   * 运营开关的**生效结论**（条目 34④）。只读，且回的是算过的结论不是环境变量原文：
+   * 引擎要总开关与灰度名单同时成立，`python_exec` 在生产要显式放行 **且** 真有隔离
+   * 后端。把 `.env` 抄给运营等于让他们自己重推一遍判定式，而推错的方向永远是
+   * 「以为已经开了」。
+   */
+  adminFeatureFlags: () =>
+    request<FeatureFlagPage>("GET", "/api/admin/feature-flags"),
+
+  /**
+   * 后台工具目录：**含已被停用的那些**（与 ``listTools`` 的关键差别）。
+   *
+   * 用户侧那份把停用的工具直接藏掉，这一份不能藏 —— 界面上看不见一个工具，就没有
+   * 第二个地方能把它重新打开。
+   */
+  adminListTools: () => request<ToolInfo[]>("GET", "/api/admin/tools"),
+
+  /**
+   * 启用 / 停用一个工具。``note`` 允许留空，但界面上停用时会追问一次：一周后没人
+   * 记得当初为什么关，"重新打开"就成了一次无人负责的赌博。
+   *
+   * 生效是异步的（各进程最长 ``SNAPSHOT_TTL_SECONDS`` = 15s 内跟上），所以返回值只
+   * 代表这一行的新状态，不代表"此刻所有 run 都已停手"—— 文案别写成"已生效"。
+   */
+  adminSetToolEnabled: (name: string, enabled: boolean, note?: string) =>
+    request<ToolInfo>("POST", `/api/admin/tools/${encodeURIComponent(name)}/toggle`, {
+      enabled,
+      note: note?.trim() || null,
+    }),
+
+  /**
+   * 用量报表（按天 / 按模型 / 按用户）。聚合、分组、分页都在 SQL 里做：
+   * `messages` 表会一直长，把行拉到浏览器再累加等于把报表变成一次全表下载。
+   *
+   * `start` / `end` 是 UTC 日历日且**两端都含当天**；都不传时后端给最近 30 天
+   * （`backend/app/services/admin_service.py:34`），响应里的 `start`/`end` 是
+   * 实际生效的区间，前端拿它回显与导出，不自己算「今天」。
+   */
+  adminUsageReport: (query: AdminUsageQuery = {}) => {
+    const qs = new URLSearchParams();
+    if (query.start) qs.set("start", query.start);
+    if (query.end) qs.set("end", query.end);
+    if (query.groupBy) qs.set("group_by", query.groupBy);
+    if (query.limit != null) qs.set("limit", String(query.limit));
+    if (query.offset) qs.set("offset", String(query.offset));
+    const q = qs.toString();
+    return request<AdminUsagePage>("GET", `/api/admin/usage${q ? `?${q}` : ""}`);
+  },
+
+  /**
+   * 审计事件列表：action / 操作人 / 目标关键字 / 日期区间都在服务端筛。
+   * 一旦分页，前端手上只有这一页，在浏览器里过滤等于「只在这一页里找」。
+   */
+  adminAuditLog: (query: AdminAuditQuery = {}) => {
+    const qs = new URLSearchParams();
+    if (query.action) qs.set("action", query.action);
+    if (query.actionPrefix) qs.set("action_prefix", query.actionPrefix);
+    if (query.actor) qs.set("actor", query.actor);
+    if (query.q) qs.set("q", query.q);
+    if (query.start) qs.set("start", query.start);
+    if (query.end) qs.set("end", query.end);
+    if (query.limit != null) qs.set("limit", String(query.limit));
+    if (query.offset) qs.set("offset", String(query.offset));
+    const q = qs.toString();
+    return request<AdminAuditPage>("GET", `/api/admin/audit${q ? `?${q}` : ""}`);
+  },
 
   // ---- Credits（积分） ----
   fetchCredits: () => request<CreditAccountInfo>("GET", "/api/credits/me"),
@@ -479,8 +678,21 @@ export const api = {
   },
 
   // ---- Credits（管理端） ----
-  adminListRedeemBatches: () =>
-    request<RedeemBatchProgress[]>("GET", "/api/admin/redeem-batches"),
+  /**
+   * 批次分页 + 筛选都在服务端（`lib/redeem-batch.ts` 的 `redeemBatchQuery` 是
+   * 唯一的条件来源）。后端没有总数端点，所以「装满一页」就是还有下一页的信号。
+   */
+  adminListRedeemBatches: (query: RedeemBatchQuery) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(query.limit));
+    params.set("offset", String(query.offset));
+    if (query.search) params.set("search", query.search);
+    if (query.status) params.set("status", query.status);
+    return request<RedeemBatchProgress[]>(
+      "GET",
+      `/api/admin/redeem-batches?${params.toString()}`
+    );
+  },
 
   adminCreateRedeemBatch: (body: {
     name: string;
@@ -490,11 +702,35 @@ export const api = {
     note?: string | null;
   }) => request<RedeemBatchCreateResult>("POST", "/api/admin/redeem-batches", body),
 
-  adminListRedeemCodes: (batchId: string, limit = 200, offset = 0) =>
-    request<RedeemCodeInfo[]>(
+  /**
+   * 单码列表（可按批次 / 状态过滤，含核销人）。返回的是「前缀 + 掩码」，
+   * 系统里从生成响应之后就不存在明文 —— 后端只存 HMAC 哈希。
+   */
+  adminQueryRedeemCodes: (opts: {
+    batchId?: string | null;
+    status?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.batchId) qs.set("batch_id", opts.batchId);
+    if (opts.status) qs.set("status", opts.status);
+    if (opts.limit != null) qs.set("limit", String(opts.limit));
+    if (opts.offset != null) qs.set("offset", String(opts.offset));
+    const q = qs.toString();
+    return request<RedeemCodePage>(
       "GET",
-      `/api/admin/redeem-batches/${batchId}/codes?limit=${limit}&offset=${offset}`
-    ),
+      `/api/admin/redeem-codes${q ? `?${q}` : ""}`
+    );
+  },
+
+  /** 作废单张未使用的码（已兑换 → 409）。 */
+  adminVoidRedeemCode: (codeId: string) =>
+    request<RedeemCodeActionResult>("POST", `/api/admin/redeem-codes/${codeId}/void`),
+
+  /** 删除单张未使用的码（已兑换 → 409；误生成时的清理手段）。 */
+  adminDeleteRedeemCode: (codeId: string) =>
+    request<RedeemCodeActionResult>("DELETE", `/api/admin/redeem-codes/${codeId}`),
 
   adminVoidRedeemBatch: (batchId: string) =>
     request<{ voided: number }>(
@@ -513,6 +749,51 @@ export const api = {
 
   adminAdjustCredits: (body: { user_id: string; delta: number; note?: string | null }) =>
     request<CreditAccountRow>("POST", "/api/admin/credits/adjust", body),
+
+  // ---- 管理端：Agent 运行时观测（跨用户，服务端分页） ----
+  /**
+   * 跨用户的运行列表。用户侧的 ``/api/agent-runs`` 为实时轮询优化（一次带回
+   * 全量 steps/graph），管理侧要的是翻页 + 过滤 + 账，所以走这个独立端点。
+   * ``status`` 只接受后端白名单里的取值，传错会得到 400。
+   */
+  adminListAgentRuns: (opts: {
+    status?: string | null;
+    flowName?: string | null;
+    runtime?: string | null;
+    q?: string | null;
+    conversationId?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.status) qs.set("status", opts.status);
+    if (opts.flowName) qs.set("flow_name", opts.flowName);
+    if (opts.runtime) qs.set("runtime", opts.runtime);
+    if (opts.q) qs.set("q", opts.q);
+    if (opts.conversationId) qs.set("conversation_id", opts.conversationId);
+    if (opts.limit != null) qs.set("limit", String(opts.limit));
+    if (opts.offset != null) qs.set("offset", String(opts.offset));
+    const q = qs.toString();
+    return request<AdminAgentRunPage>("GET", `/api/admin/agent-runs${q ? `?${q}` : ""}`);
+  },
+
+  /** 观测面板的汇总卡（默认近 24 小时）。 */
+  adminAgentRunsSummary: () =>
+    request<AdminRunSummary>("GET", "/api/admin/agent-runs/summary"),
+
+  /** 一个运行收下的持久控制命令（含计划门上闸/撤闸、审批、取消）。 */
+  adminListRunCommands: (runId: string, limit = 100) =>
+    request<AdminRunCommandRow[]>(
+      "GET",
+      `/api/admin/agent-runs/${runId}/commands?limit=${limit}`
+    ),
+
+  /** ``run_events`` 的分页审计视图（实时跟随仍用 /events SSE）。 */
+  adminListRunEvents: (runId: string, limit = 200, offset = 0) =>
+    request<AdminRunEventPage>(
+      "GET",
+      `/api/admin/agent-runs/${runId}/events?limit=${limit}&offset=${offset}`
+    ),
 
   // ---- Agent runs (Phase 3) ----
   getAgentRun: (runId: string) => request<AgentRun>("GET", `/api/agent-runs/${runId}`),
@@ -545,6 +826,14 @@ export const api = {
     }),
   confirmPlan: (runId: string) =>
     request<RunActionResult>("POST", `/api/agent-runs/${runId}/plan/confirm`),
+  /**
+   * 计划门（B8）：上闸让运行在下一个计划边界停下等人工确认，撤闸放回默认的
+   * 「计划先行但不阻塞」。终态运行会被后端拒绝（``ok:false`` + 原状态），
+   * 这是唯一的冲突面 —— 后端没有版本/If-Match 乐观锁，命令队列按 created_at
+   * 追加，所以调用方拿到 ok:false 时必须重新拉取运行详情再决定重试。
+   */
+  setPlanGate: (runId: string, enabled: boolean) =>
+    request<RunActionResult>("POST", `/api/agent-runs/${runId}/gate`, { enabled }),
   updatePlan: (
     runId: string,
     body: {
@@ -560,6 +849,11 @@ export const api = {
 export const projectsApi = {
   list: () => request<Project[]>("GET", "/api/projects"),
   create: (body: ProjectInput) => request<Project>("POST", "/api/projects", body),
+  /** 改名 / 改描述 / 改颜色：只发送显式给出的字段（omit = 不动）。 */
+  update: (id: string, body: ProjectPatch) =>
+    request<Project>("PATCH", `/api/projects/${id}`, body),
+  /** 删除前向服务端要一次真实的影响范围（会话数 / 消息数）。 */
+  impact: (id: string) => request<ProjectImpact>("GET", `/api/projects/${id}/impact`),
   delete: (id: string) => request("DELETE", `/api/projects/${id}`),
   assignConversation: (projectId: string, conversationId: string) =>
     request<Conversation>("POST", `/api/projects/${projectId}/conversations/${conversationId}`),
@@ -652,434 +946,3 @@ export const connectorsApi = {
     request<Connector>("POST", `/api/connectors/${id}/deactivate`),
   delete: (id: string) => request("DELETE", `/api/connectors/${id}`),
 };
-
-// ===========================================================================
-// SSE chat streaming
-// ===========================================================================
-export interface ChatStreamHandlers {
-  onMeta?: (conversationId: string, messageId: string) => void;
-  onRunStarted?: (e: { runId: string; runtime: string; conversationId: string; messageId: string }) => void;
-  onRuntimeSelected?: (e: {
-    runId: string;
-    requestedMode: string;
-    effectiveMode: string;
-    requestedRuntime: string;
-    effectiveRuntime: string;
-    agentProfile: string;
-    multiAgentRequested: boolean;
-    multiAgentExecuted: boolean;
-    fallbackReason: string | null;
-    isDemo: boolean;
-  }) => void;
-  onPlanCreated?: (e: { summary: string; steps: { id: string; title: string }[] }) => void;
-  onStepStarted?: (e: { stepId: string; title: string; type: string; agent?: string }) => void;
-  onStepCompleted?: (e: { stepId: string; status: string }) => void;
-  onAgentGraph?: (e: { runId: string; graph: unknown }) => void;
-  onAgentStatus?: (e: {
-    runId: string; agentId: string; status: string; taskTitle?: string;
-    startedAt?: string; finishedAt?: string; durationMs?: number;
-    outputSummary?: string; error?: string;
-    usage?: Record<string, number>; costUsd?: number;
-    retrying?: { attempt: number; error: string };
-  }) => void;
-  onStepOutput?: (e: {
-    runId: string; agentId: string; text: string; truncated: boolean; chars: number;
-  }) => void;
-  onStepProgress?: (e: {
-    runId: string; agentId: string; elapsedS: number; note?: string;
-  }) => void;
-  onAgentEdge?: (e: { runId: string; edgeId: string; status: string; label?: string }) => void;
-  onRunStatus?: (e: { runId: string; status: string; currentAgentIds?: string[] }) => void;
-  onToken?: (delta: string) => void;
-  onCitations?: (citations: Citation[]) => void;
-  onToolCall?: (e: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string; agent_id?: string; task_id?: string }) => void;
-  onToolResult?: (e: { id: string; name: string; ok: boolean; result: unknown; error: string | null; agent_id?: string; task_id?: string }) => void;
-  onApprovalRequired?: (e: PendingApproval) => void;
-  onResearchPlan?: (e: {
-    runId: string;
-    status: string;
-    summary: string;
-    steps: ResearchPlanStep[];
-    requiresConfirmation: boolean;
-    updated: boolean;
-  }) => void;
-  onRunInstructionReceived?: (e: { runId: string; instruction: string; acknowledged: boolean }) => void;
-  onRunPaused?: (e: { runId: string; reason: string; pausedAt?: string }) => void;
-  onRunResumed?: (e: { runId: string; resumedAt?: string }) => void;
-  onDone?: (e: { messageId: string; finishReason: FinishReason }) => void;
-  onError?: (e: { code: string; message: string }) => void;
-}
-
-/**
- * Dispatch one chat SSE event to the handlers. Returns true when the event is
- * terminal (done/error) so the caller can stop consuming the stream.
- *
- * Exported (not private to streamChat) so the durable reattach path can feed
- * events from the agent-runs event log through the EXACT same mapping — the
- * worker persists AgentEvent.kind, which IS the SSE event name.
- */
-export function dispatchChatStreamEvent(
-  handlers: ChatStreamHandlers,
-  eventName: string,
-  dataStr: string
-): boolean {
-  if (!dataStr) return false;
-  let data: any;
-  try {
-    data = JSON.parse(dataStr);
-  } catch {
-    return false; // malformed JSON payload — drop this one event only
-  }
-  try {
-    switch (eventName) {
-        case "meta":
-          handlers.onMeta?.(data.conversation_id, data.message_id);
-          break;
-        case "run_started":
-          handlers.onRunStarted?.({
-            runId: data.run_id,
-            runtime: data.runtime,
-            conversationId: data.conversation_id,
-            messageId: data.message_id,
-          });
-          break;
-        case "runtime_selected":
-          handlers.onRuntimeSelected?.({
-            runId: data.run_id,
-            requestedMode: data.requested_mode,
-            effectiveMode: data.effective_mode,
-            requestedRuntime: data.requested_runtime,
-            effectiveRuntime: data.effective_runtime,
-            agentProfile: data.agent_profile,
-            multiAgentRequested: !!data.multi_agent_requested,
-            multiAgentExecuted: !!data.multi_agent_executed,
-            fallbackReason: data.fallback_reason ?? null,
-            isDemo: !!data.is_demo,
-          });
-          break;
-        case "plan_created":
-          handlers.onPlanCreated?.({ summary: data.summary, steps: data.steps ?? [] });
-          break;
-        case "step_started":
-          handlers.onStepStarted?.({
-            stepId: data.step_id,
-            title: data.title,
-            type: data.type,
-            agent: data.agent,
-          });
-          break;
-        case "step_completed":
-          handlers.onStepCompleted?.({ stepId: data.step_id, status: data.status });
-          break;
-        case "agent_graph":
-          handlers.onAgentGraph?.({ runId: data.run_id, graph: data.graph });
-          break;
-        case "agent_status":
-          handlers.onAgentStatus?.({
-            runId: data.run_id,
-            agentId: data.agent_id,
-            status: data.status,
-            taskTitle: data.task_title,
-            startedAt: data.started_at,
-            finishedAt: data.finished_at,
-            durationMs: data.duration_ms,
-            outputSummary: data.output_summary,
-            error: data.error,
-            usage: data.usage,
-            costUsd: data.cost_usd,
-            retrying: data.retrying,
-          });
-          break;
-        case "step_output":
-          handlers.onStepOutput?.({
-            runId: data.run_id,
-            agentId: data.agent_id,
-            text: data.text,
-            truncated: data.truncated,
-            chars: data.chars,
-          });
-          break;
-        case "step_progress":
-          handlers.onStepProgress?.({
-            runId: data.run_id,
-            agentId: data.agent_id,
-            elapsedS: data.elapsed_s,
-            note: data.note,
-          });
-          break;
-        case "agent_edge":
-          handlers.onAgentEdge?.({ runId: data.run_id, edgeId: data.edge_id, status: data.status, label: data.label });
-          break;
-        case "run_status":
-          handlers.onRunStatus?.({ runId: data.run_id, status: data.status, currentAgentIds: data.current_agent_ids });
-          break;
-        case "token":
-          handlers.onToken?.(data.delta ?? "");
-          break;
-        case "citations":
-          handlers.onCitations?.(data.citations);
-          break;
-        case "tool_call":
-          handlers.onToolCall?.(data);
-          break;
-        case "tool_result":
-          handlers.onToolResult?.(data);
-          break;
-        case "approval_required":
-          handlers.onApprovalRequired?.({
-            runId: data.run_id,
-            approvalId: data.approval_id,
-            toolName: data.tool_name,
-            summary: data.summary,
-            riskLevel: data.risk_level,
-            argumentsPreview: data.arguments_preview ?? {},
-          });
-          break;
-        case "research_plan":
-          handlers.onResearchPlan?.({
-            runId: data.run_id,
-            status: data.status,
-            summary: data.summary,
-            steps: data.steps ?? [],
-            requiresConfirmation: data.requires_confirmation,
-            updated: false,
-          });
-          break;
-        case "research_plan_updated":
-          handlers.onResearchPlan?.({
-            runId: data.run_id,
-            status: data.status,
-            summary: data.summary,
-            steps: data.steps ?? [],
-            requiresConfirmation: data.requires_confirmation,
-            updated: true,
-          });
-          break;
-        case "run_instruction_received":
-          handlers.onRunInstructionReceived?.({
-            runId: data.run_id,
-            instruction: data.instruction,
-            acknowledged: data.acknowledged,
-          });
-          break;
-        case "run_paused":
-          handlers.onRunPaused?.({
-            runId: data.run_id,
-            reason: data.reason,
-            pausedAt: data.paused_at,
-          });
-          break;
-        case "run_resumed":
-          handlers.onRunResumed?.({ runId: data.run_id, resumedAt: data.resumed_at });
-          break;
-        case "done":
-          handlers.onDone?.({ messageId: data.message_id, finishReason: data.finish_reason });
-          break;
-        case "error":
-          handlers.onError?.(data);
-          break;
-      }
-  } catch (err) {
-    // Surface handler bugs to the console instead of silently masking them as
-    // a "malformed chunk"; the stream continues past a single bad event.
-    console.error("[streamChat] handler error for event", eventName, err);
-  }
-  return eventName === "done" || eventName === "error";
-}
-
-export interface ActiveConversationRun {
-  runId: string;
-  messageId: string | null;
-  status: string;
-}
-
-/**
- * Latest non-terminal (pending/running) durable run for a conversation — the
- * reattach probe on conversation open / browser refresh. Runs survive client
- * disconnects when BACKGROUND_WORKER is enabled server-side.
- */
-export async function findActiveConversationRun(
-  conversationId: string
-): Promise<ActiveConversationRun | null> {
-  try {
-    const runs = await request<
-      Array<{ id: string; message_id: string | null; status: string }>
-    >("GET", `/api/agent-runs?conversation_id=${encodeURIComponent(conversationId)}`);
-    const active = runs.find((r) => r.status === "running" || r.status === "pending");
-    if (!active) return null;
-    return { runId: active.id, messageId: active.message_id, status: active.status };
-  } catch {
-    return null;
-  }
-}
-
-export async function streamChat(
-  req: ChatRequest,
-  handlers: ChatStreamHandlers,
-  signal?: AbortSignal,
-  /** internal: bounds the 401 → refresh → retry path to a single attempt. */
-  _attempt = 0
-): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/chat/stream`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(getAccessToken() ? { Authorization: `Bearer ${getAccessToken()}` } : {}),
-    },
-    credentials: "include",
-    body: JSON.stringify(req),
-    signal,
-  });
-
-  if (!res.ok || !res.body) {
-    let message = res.statusText;
-    try {
-      const d = await res.json();
-      message = d.message || d.detail || message;
-    } catch { /* ignore */ }
-    // Retry once after a refresh; never recurse unbounded (a refresh that
-    // returns ok while the endpoint still 401s would otherwise stack-overflow).
-    if (res.status === 401 && _attempt < 1) {
-      const ok = await refreshAccessToken();
-      if (ok) return streamChat(req, handlers, signal, _attempt + 1);
-    }
-    handlers.onError?.({ code: "http_error", message });
-    return;
-  }
-
-  let terminated = false;
-  const dispatch = (eventName: string, dataStr: string) => {
-    if (dispatchChatStreamEvent(handlers, eventName, dataStr)) terminated = true;
-  };
-
-  // Robust SSE framing: the parser keeps its buffer/event/data accumulators
-  // ACROSS network chunks (the old code re-declared `dataLines` inside the read
-  // loop, so any event split across two chunks was silently dropped — the cause
-  // of random missing tokens / lost `done`). Abort returns cleanly (not a throw).
-  for await (const frame of parseSSEStream(res.body, signal)) {
-    dispatch(frame.event || "message", frame.data);
-    if (terminated) break;
-  }
-  // If the socket closed without a terminal done/error frame (and the user did
-  // NOT abort), surface a disconnect — otherwise the caller's finally would
-  // silently erase the partial reply with no error shown.
-  if (!terminated && !signal?.aborted) {
-    handlers.onError?.({ code: "stream_disconnected", message: "连接已中断，请重试" });
-  }
-}
-
-// ===========================================================================
-// Durable run-event SSE (Task 12)
-//   GET /api/agent-runs/{run_id}/events — cursor-replay SSE.
-//   READ-ONLY: never executes or cancels the run. A client disconnect closes
-//   only this subscription; the run keeps running on the worker. The frame's
-//   `id:` line carries the event sequence, echoed back as `Last-Event-ID` on
-//   reconnect so replay resumes exactly where it left off.
-// ===========================================================================
-export interface RunEventStreamHandlers {
-  /**
-   * Called for each durable event frame. `sequence` comes from the SSE `id:`
-   * line (falls back to `data.sequence` when the line is absent). `event_type`
-   * is the `event:` field; `data` is the parsed JSON payload.
-   */
-  onEvent?: (e: {
-    runId: string;
-    sequence: number;
-    event_type: string;
-    data: Record<string, unknown>;
-    id?: string;
-  }) => void;
-  /** Called whenever the cursor advances (the highest sequence seen so far). */
-  onCursor?: (cursor: number) => void;
-  /** Network drop (not a user abort) — the caller decides whether to reconnect. */
-  onDisconnect?: () => void;
-  /** Non-recoverable HTTP error (after the single 401 refresh retry). */
-  onError?: (e: { code: string; message: string }) => void;
-}
-
-export async function streamRunEvents(
-  runId: string,
-  handlers: RunEventStreamHandlers,
-  opts: { signal?: AbortSignal; lastEventId?: number } = {},
-  /** internal: bounds the 401 → refresh → retry path to a single attempt. */
-  _attempt = 0,
-): Promise<void> {
-  const headers: Record<string, string> = {};
-  if (getAccessToken()) headers["Authorization"] = `Bearer ${getAccessToken()}`;
-  // Last-Event-ID seeds the cursor so the server replays only events past it.
-  if (opts.lastEventId && opts.lastEventId > 0) {
-    headers["Last-Event-ID"] = String(opts.lastEventId);
-  }
-
-  try {
-    const res = await fetch(`${API_BASE}/api/agent-runs/${runId}/events`, {
-      method: "GET",
-      headers,
-      credentials: "include",
-      signal: opts.signal,
-    });
-
-    if (!res.ok || !res.body) {
-      let message = res.statusText;
-      try {
-        const d = await res.json();
-        message = d.message || d.detail || message;
-      } catch {
-        /* ignore */
-      }
-      if (res.status === 401 && _attempt < 1) {
-        const ok = await refreshAccessToken();
-        if (ok) return streamRunEvents(runId, handlers, opts, _attempt + 1);
-      }
-      handlers.onError?.({ code: "http_error", message });
-      return;
-    }
-
-    let cursor = opts.lastEventId ?? 0;
-    for await (const frame of parseSSEStream(res.body, opts.signal)) {
-      if (!frame.data) continue;
-      let data: Record<string, unknown>;
-      try {
-        data = JSON.parse(frame.data);
-      } catch {
-        continue; // malformed JSON — drop this one frame only
-      }
-      // Prefer the SSE `id:` line (the durable sequence); fall back to a
-      // `sequence` field in the payload for streams that don't stamp `id:`.
-      let sequence = -1;
-      if (frame.id !== undefined && /^\d+$/.test(frame.id)) {
-        sequence = parseInt(frame.id, 10);
-      } else if (typeof data.sequence === "number") {
-        sequence = data.sequence;
-      }
-      if (sequence > cursor) cursor = sequence;
-      handlers.onEvent?.({
-        runId,
-        sequence,
-        event_type: frame.event || "message",
-        data,
-        ...(frame.id !== undefined ? { id: frame.id } : {}),
-      });
-      handlers.onCursor?.(cursor);
-    }
-    // Socket ended without an abort → network drop / server-side close. Signal
-    // the caller so it can decide to reconnect from the persisted cursor.
-    if (!opts.signal?.aborted) {
-      handlers.onDisconnect?.();
-    }
-  } catch (err) {
-    // Intentional cancellation: the caller aborted the AbortController
-    // (component unmount / runId switch / explicit clear). fetch() and the
-    // stream iterator then reject with an AbortError — that's not a real
-    // error, so swallow it silently (no onError, no onDisconnect). Anything
-    // else is a genuine network failure: surface it so the caller reconnects.
-    const aborted =
-      opts.signal?.aborted === true ||
-      (err instanceof DOMException && err.name === "AbortError");
-    if (aborted) return;
-    handlers.onError?.({
-      code: "network_error",
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-}

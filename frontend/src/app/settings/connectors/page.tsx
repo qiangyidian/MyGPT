@@ -5,7 +5,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Plus, Pencil, Plug, Trash2, RefreshCw, Power, PowerOff } from "lucide-react";
 
-import { connectorsApi, ApiError } from "@/lib/api";
+import { connectorsApi } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { cn } from "@/lib/utils";
 import type {
   Connector,
@@ -80,7 +81,7 @@ export default function ConnectorsPage() {
       invalidate();
       setOpen(false);
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const updateMut = useMutation({
@@ -90,7 +91,7 @@ export default function ConnectorsPage() {
       toast.success("已保存");
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const toggleMut = useMutation({
@@ -99,7 +100,7 @@ export default function ConnectorsPage() {
     onSuccess: () => {
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const deleteMut = useMutation({
@@ -108,7 +109,7 @@ export default function ConnectorsPage() {
       toast.success("已删除");
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   // Credential rotation (B: rotate API now wired): prompts for a new JSON
@@ -120,7 +121,7 @@ export default function ConnectorsPage() {
       toast.success("凭证已轮换");
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   function rotateCredentials(c: Connector) {

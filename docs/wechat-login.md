@@ -85,6 +85,25 @@ journalctl -u mychat-backend -f | grep wechat
 - 登录页没有二维码、只有文字 → 正常（关键词模式）。看 `login-info` 的 `mode`
 - 扫码后公众号没反应 → 公众号后台的服务器配置 URL / Token 不对，或微信消息没到 wxauth
 
+## 自动建号与「没设置过密码」
+
+扫码自动注册要合成 `users` 的三个 NOT NULL 列，其中 `password_hash` 写的不是随机哈希，
+而是 `PASSWORD_NOT_SET` 哨兵（`app/core/security.py`）。原因是随机哈希与「本人设过密码」
+在字段上**完全不可区分**，那批人会永久卡在改密之外：改密端点要求填原密码，而原密码是
+一串谁都不知道的随机值。
+
+- 判断「这个账号有没有可校验的密码」只有一处：`auth_service.password_is_set()`。
+  改密端点、后台文案都从它出发，不要在其他地方另写一套 `password_hash` 判断。
+- 哨兵方案上线**之前**自动注册的行仍是随机哈希。迁移 `0020_wechat_password_sentinel_backfill`
+  做回填，四个条件同时成立才动一行：合成邮箱形如 `wx_%@wechat.local`、`password_hash`
+  像一个可解析散列、**有** `wechat_identities` 行、**没有** `auth:password_changed` /
+  `auth:password_reset` 审计事件。
+- 回填的判据刻意不是「有微信身份行」：老账号是**主动绑定**微信的，它有自己的密码，
+  那条判据会把人家的密码清掉。
+- 0020 的 `downgrade()` 是**空操作**，不是漏写：旧值无人所知、既没备份也不可还原，
+  写回随机值等于把缺陷重新造一遍。上线后看部署日志里的 `[0020] ... 回填为哨兵：N 行`，
+  那是唯一能知道改了多少行的地方。
+
 ## 历史
 
 2026-09-17 之前这里跑的是「两个后端各自发码 + HMAC 派生 + nginx mirror」那一套，

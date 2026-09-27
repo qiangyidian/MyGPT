@@ -214,6 +214,33 @@ export interface ProjectInput {
   color?: string | null;
 }
 
+/**
+ * PATCH body for a project. Omitted keys are left untouched server-side;
+ * `color: null` restores the platform default while `name: null` is a 400.
+ */
+export interface ProjectPatch {
+  name?: string | null;
+  description?: string | null;
+  color?: string | null;
+}
+
+/**
+ * What deleting a project actually costs, counted by the server
+ * (`GET /api/projects/{id}/impact`) instead of guessed in the dialog.
+ * `deletes_conversations` is false today: `Conversation.project_id` is a soft
+ * reference with no FK, so the delete un-files conversations rather than
+ * removing them.
+ */
+export interface ProjectImpact {
+  project_id: string;
+  name: string;
+  conversation_count: number;
+  archived_conversation_count: number;
+  message_count: number;
+  knowledge_base_count: number;
+  deletes_conversations: boolean;
+}
+
 export interface ConversationDetail extends Conversation {
   messages: Message[];
 }
@@ -371,6 +398,13 @@ export interface ToolInfo {
   description: string;
   category: string;
   dangerous: boolean;
+  /**
+   * 运营启停（条目 34③）。可选是因为 ``GET /api/tools``（用户侧目录）根本不含被停用
+   * 的工具，那份响应里这个字段没有意义；后台目录才拿它渲染开关。缺省按"可用"处理。
+   */
+  enabled?: boolean;
+  /** 上次停用/启用时留下的理由，界面上要显示出来：没有理由的开关没人敢动。 */
+  toggle_note?: string | null;
   parameters: Array<{
     name: string;
     type: string;
@@ -379,6 +413,25 @@ export interface ToolInfo {
     default?: unknown;
     enum?: string[] | null;
   }>;
+}
+
+// ---- 运营开关的生效结论（条目 34④）----
+// 注意 `enabled` 是**算出来的**结论，不是环境变量的原文：引擎要总开关与灰度名单同时
+// 成立，python_exec 在生产要显式放行且真有隔离后端。
+export interface FeatureFlag {
+  key: string;
+  label: string;
+  group: string;
+  enabled: boolean;
+  value: string;
+  source: string;
+  note: string;
+}
+
+export interface FeatureFlagPage {
+  generated_at: string;
+  env: string;
+  flags: FeatureFlag[];
 }
 
 // ---- SSE stream events from /api/chat/stream ----
@@ -421,6 +474,35 @@ export type ChatStreamEvent =
   | { event: "done"; data: { message_id: string; finish_reason: FinishReason } }
   | { event: "error"; data: { code: string; message: string } };
 
+/** One ``@`` reference as it goes on the wire: the stable pair the composer
+ *  decoded out of the message text (never a label — a rename cannot change what
+ *  a turn retrieves). Mirrors backend ``app/schemas/chat.py::ChatMention``. */
+export interface ChatMention {
+  kind: "kb" | "doc" | "file";
+  id: string;
+}
+
+/** One type-ahead candidate from ``GET /api/mentions``. */
+export interface MentionTarget {
+  kind: ChatMention["kind"];
+  id: string;
+  /** ``kind:id`` — what ``inline-refs.encodeRef`` puts in the token. */
+  token: string;
+  label: string;
+  sublabel?: string;
+  knowledge_base_id?: string | null;
+  /** False for a target that exists but cannot be retrieved yet (indexing). */
+  selectable?: boolean;
+}
+
+/** ``GET /api/mentions`` response: a capped page + the caps the server enforces. */
+export interface MentionList {
+  items: MentionTarget[];
+  truncated: boolean;
+  max_knowledge_bases: number;
+  max_mentions: number;
+}
+
 export interface ResearchPlanStep {
   id: string;
   title: string;
@@ -434,6 +516,10 @@ export interface ChatRequest {
   knowledge_base_id?: string | null;
   /** Per-turn multi-KB selection (Phase 1+). */
   knowledge_base_ids?: string[];
+  /** ``@``-references typed in the composer (see lib/inline-refs.ts). They
+   *  EXTEND the toolbar selection for this turn; the server folds them into the
+   *  retrieval scope and rejects any the caller may not read. */
+  mentions?: ChatMention[];
   content: string;
   regenerate?: boolean;
   /** User-facing capability mode (Phase 1). The backend derives the route. */
@@ -551,10 +637,12 @@ export interface AgentRun {
   plan_status: string | null;
   user_instructions: Record<string, unknown> | null;
   paused_at: string | null;
+  /** 计划门是否上着闸（最后一条持久 gate 命令 + plan_status 收口后的结果）。 */
+  gate_armed: boolean;
 }
 
 // ---- Context panel ----
-export type ContextTab = "execution" | "sources" | "files" | "artifact";
+export type ContextTab = "execution" | "sources" | "files";
 
 // ===========================================================================
 // Task 12: durable runs, artifacts, user memories, connectors, typed parts.
@@ -779,4 +867,212 @@ export interface CreditAccountRow {
   balance: number;
   lifetime_granted: number;
   lifetime_consumed: number;
+}
+
+// ===========================================================================
+// 管理端：兑换码单码运营面（GET /api/admin/redeem-codes 等）
+// ===========================================================================
+
+/**
+ * 一行兑换码。后端只存哈希，所以这里**永远没有明文** —— ``masked_code`` 是
+ * 「6 位前缀 + 固定掩码」，够运营辨认，不够还原凭证。
+ */
+export interface RedeemCodeRow {
+  id: string;
+  batch_id: string;
+  batch_name: string;
+  credits_per_code: number;
+  code_prefix: string;
+  masked_code: string;
+  status: "active" | "redeemed" | "void" | string;
+  expires_at: string | null;
+  redeemed_by: string | null;
+  redeemer_email: string | null;
+  redeemer_username: string | null;
+  redeemed_at: string | null;
+  created_at: string;
+}
+
+export interface RedeemCodePage {
+  items: RedeemCodeRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** 单码作废 / 删除的结果：``changed=false`` 表示状态本来就是那样。 */
+export interface RedeemCodeActionResult {
+  id: string;
+  status: string;
+  changed: boolean;
+  message: string;
+}
+
+// ===========================================================================
+// 管理端：Agent 运行时观测（GET /api/admin/agent-runs …）
+// ===========================================================================
+
+/** 运行列表的一行（跨用户，含账与门状态）。 */
+export interface AdminAgentRunRow {
+  id: string;
+  conversation_id: string;
+  conversation_title: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  user_username: string | null;
+  runtime: string;
+  flow_name: string;
+  status: string;
+  current_step: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  error_message: string | null;
+  plan_status: string;
+  plan_present: boolean;
+  paused_at: string | null;
+  gate_armed: boolean;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number | null;
+  credits_consumed: number;
+  step_count: number;
+  pending_approvals: number;
+}
+
+export interface AdminAgentRunPage {
+  items: AdminAgentRunRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** 观测面板顶部的汇总卡（默认近 24 小时窗口）。 */
+export interface AdminRunSummary {
+  total_runs: number;
+  running: number;
+  waiting_approval: number;
+  failed: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+  avg_duration_ms: number | null;
+}
+
+/** 一条持久控制命令（pause/resume/cancel/gate/approve/instruction）。 */
+export interface AdminRunCommandRow {
+  id: string;
+  command_type: string;
+  payload: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  applied_at: string | null;
+  error: string | null;
+}
+
+/** ``run_events`` 表的一行（分页审计视图；实时跟随仍走 SSE）。 */
+export interface AdminRunEventRow {
+  id: string;
+  sequence: number;
+  event_type: string;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface AdminRunEventPage {
+  items: AdminRunEventRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * 语音能力探测（`GET /api/speech/capabilities`）—— 服务端把「实际会接受什么」
+ * 一次讲清楚：按钮是否可点、体积/时长/字数上限、可录容器。前端**不抄常量**，
+ * 全部以此为准（与 `UploadCapabilities` 同定位）。后端事实来源：
+ * `app/services/speech_service.capabilities`。
+ */
+export interface SpeechCapabilities {
+  /** 总开关（SPEECH_ENABLED）。关闭时两个端点都会返回中文 503。 */
+  enabled: boolean;
+  asr_enabled: boolean;
+  tts_enabled: boolean;
+  /** 不可用的原因："disabled" | "model_unconfigured" | null（一切就绪）。 */
+  reason: string | null;
+  max_audio_mb: number;
+  max_audio_bytes: number;
+  /** 录音硬上限（秒）；到点前端自动停止。 */
+  max_duration_seconds: number;
+  /** 单次播报的字符上限（中文一个字算一个）。 */
+  max_text_chars: number;
+  /** 服务端白名单，例如 ["audio/flac", "audio/mpeg", ...]。 */
+  audio_mime_types: string[];
+  tts_response_format: string;
+  /** 合成响应 MIME（浏览器可直接播），如 "audio/mpeg"。 */
+  tts_mime_type: string;
+  tts_voice: string;
+  /** 关闭时的官方中文说明，直接展示给用户。 */
+  disabled_message: string;
+}
+
+/** `POST /api/speech/transcribe` 的响应：识别文本 + 本次请求的元信息。 */
+export interface SpeechTranscribeResult {
+  text: string;
+  media_type: string;
+  audio_bytes: number;
+  model_name: string;
+}
+
+/** 提示词库模板（条目 34）。`user_id` 为 null 表示平台预置。 */
+export interface PromptTemplate {
+  id: string;
+  user_id: string | null;
+  title: string;
+  content: string;
+  category: string;
+  tags: string[];
+  description: string | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PromptTemplateInput {
+  title: string;
+  content: string;
+  category?: string;
+  tags?: string[];
+  description?: string | null;
+}
+
+/** 提示词库列表的可见范围（与后端 `scope` 查询参数同义）。 */
+export type PromptScope = "all" | "mine" | "preset";
+
+/** 消息的历史版本（条目 31），与后端 MessageVersionOut 同形。 */
+export interface MessageVersionDTO {
+  id: string;
+  message_id: string;
+  conversation_id: string;
+  role: string;
+  content: string;
+  metadata: Record<string, unknown>;
+  model_name: string | null;
+  total_tokens: number | null;
+  cost_usd: number | null;
+  origin: string;
+  created_at: string;
+}
+
+export interface VersionActivateResult {
+  message_id: string;
+  activated_version_id: string;
+  changed: boolean;
+}
+
+export interface MessageTruncateResult {
+  conversation_id: string;
+  deleted: number;
+  last_message_preview: string | null;
 }

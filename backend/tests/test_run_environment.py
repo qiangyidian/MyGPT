@@ -1,6 +1,6 @@
 """RunEnvironment：一次 run 的共享执行环境。
 
-装配断言 —— for_turn 必须填好 CrewAI 多 Agent 路径所需的全部字段，
+装配断言 —— for_call 必须填好 CrewAI 多 Agent 路径所需的全部字段，
 否则 StreamingWriterExecutor（依赖 provider/assistant_msg）与审批桥
 （依赖 stage_ctx.loop）会在运行期静默失效。
 """
@@ -49,9 +49,9 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
     return ctx
 
 
-async def test_for_turn_populates_stage_context(db_session):
+async def test_for_call_populates_stage_context(db_session):
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
 
     assert env.run_id == ctx.run_id
     assert env.stage_ctx.run_id == ctx.run_id
@@ -68,22 +68,22 @@ async def test_for_turn_populates_stage_context(db_session):
     assert env.guard is not None
 
 
-async def test_for_turn_installs_continuation_checkpoint(db_session):
+async def test_for_call_installs_continuation_checkpoint(db_session):
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     # 未注入时必须装好回退实现（否则长回答续写检查点静默不落库）。
     assert env.stage_ctx.persist_continuation_checkpoint is not None
     assert callable(env.stage_ctx.persist_continuation_checkpoint)
 
 
-async def test_for_turn_prefers_injected_checkpoint(db_session):
+async def test_for_call_prefers_injected_checkpoint(db_session):
     ctx = await _seed_ctx(db_session)
 
     async def _fake(checkpoint: dict) -> None:
         return None
 
     ctx.extra["persist_continuation_checkpoint"] = _fake
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     assert env.stage_ctx.persist_continuation_checkpoint is _fake
 
 
@@ -123,7 +123,7 @@ async def _drain_events(env) -> list:
 
 async def _env_with_graph(db_session):
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     env.attach_graph(build_deep_research_graph("q"))
     return env
 
@@ -146,7 +146,7 @@ async def test_attach_graph_builds_approval_bridge(db_session):
 
 async def test_emitter_before_attach_raises(db_session):
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     with pytest.raises(RuntimeError):
         _ = env.emitter
 

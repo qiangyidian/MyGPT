@@ -374,7 +374,7 @@ async def test_aux_usage_reaches_the_final_usage_snapshot(db_session, monkeypatc
 
     _patch_flag(monkeypatch, engine="1", crewai=True)
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     env.stage_ctx.record_usage("aux:planner:1", {"total_tokens": 700})
     env.stage_ctx.record_usage("aux:verifier:1", {"total_tokens": 300})
 
@@ -578,7 +578,7 @@ async def test_durable_gate_command_flips_the_control(db_session):
 
     run = await _create_run_row(db_session)
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     env.run_id = run.id  # type: ignore[attr-defined]
     ctl = RunControl(run_id=str(uuid.uuid4()))
 
@@ -602,7 +602,7 @@ async def test_await_plan_confirmation_never_blocks_an_unarmed_run(db_session, m
 
     _patch_flag(monkeypatch, engine="1", crewai=True)
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     ctl = RunControl(run_id=str(uuid.uuid4()))
     ctx.extra["run_control"] = ctl
     assert ctl.gate_requested is False
@@ -619,7 +619,7 @@ async def test_armed_run_waits_until_the_plan_is_confirmed(db_session, monkeypat
 
     _patch_flag(monkeypatch, engine="1", crewai=True)
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     ctl = RunControl(run_id=str(uuid.uuid4()))
     ctl.request_gate()
     ctx.extra["run_control"] = ctl
@@ -646,7 +646,7 @@ async def test_armed_run_proceeds_after_the_bounded_wait(db_session, monkeypatch
     _patch_flag(monkeypatch, engine="1", crewai=True)
     monkeypatch.setattr(get_settings(), "PLAN_CONFIRM_TIMEOUT_S", 0, raising=False)
     ctx = await _seed_ctx(db_session)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
     ctl = RunControl(run_id=str(uuid.uuid4()))
     ctl.request_gate()
     ctx.extra["run_control"] = ctl

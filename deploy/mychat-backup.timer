@@ -1,9 +1,25 @@
 [Unit]
-Description=MyGPT nightly backup (Postgres + Qdrant + uploads)
+Description=MyGPT nightly backup (Postgres + Qdrant + uploads + offsite rclone push)
 
 [Timer]
 # Nightly at 03:00 local time; catch up shortly after boot if the window was
 # missed (e.g. the server was down — backups are the last thing to skip).
+#
+# THE REAL CADENCE, because docs/backup-restore.md derives RPO from it and not
+# from what we wish it were:
+#   * interval            : 24h (one run per day)
+#   * AccuracySec=5min    : systemd may fire up to 5 min late, so a scheduled
+#                           window is 03:00-03:05 local, not 03:00 sharp
+#   * Persistent=true     : a missed window is replayed at next boot — but only
+#                           if the machine comes back. Total host loss + no
+#                           offsite copy = everything since 03:00 yesterday.
+#   * TimeoutStartSec=2h  : a job that hangs is killed, it does not overlap the
+#                           next one; OnFailure=mychat-backup-alert.service fires.
+# Worst-case data loss is therefore ~24h of Postgres/Qdrant/uploads. To tighten
+# it, add more OnCalendar= lines (systemd ORs them) rather than editing this one,
+# and remember each run re-pushes a full batch offsite:
+#   OnCalendar=*-*-* 03:00:00
+#   OnCalendar=*-*-* 09:00/6:00:00
 OnCalendar=*-*-* 03:00:00
 Persistent=true
 AccuracySec=5min

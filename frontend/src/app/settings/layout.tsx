@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useSearchParams, useRouter } from "next/navigation";
 import { Suspense, useEffect, useState, type ReactNode } from "react";
-import { Boxes, Brain, Coins, Cpu, Plug, ShieldCheck } from "lucide-react";
+import { BookOpen, Boxes, Brain, Coins, Cpu, Plug, ShieldCheck } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { buildLoginUrl, buildReturnTo, resolveChatHome, withReturnTo } from "@/lib/navigation";
@@ -37,6 +37,12 @@ const NAV = [
     href: "/settings/knowledge-bases",
     icon: Boxes,
     description: "管理向量知识库与文档",
+  },
+  {
+    label: "提示词库",
+    href: "/settings/prompts",
+    icon: BookOpen,
+    description: "管理常用提示词与占位符模板",
   },
   {
     label: "积分",

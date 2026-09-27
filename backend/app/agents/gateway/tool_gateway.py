@@ -19,6 +19,10 @@ through :class:`ToolGateway`. It enforces, in order:
   5. **Execution** — ``tool.run`` runs under a hard timeout backstop.
   6. **Audit** — a ``ToolCall`` row + an ``AgentStep`` row are persisted.
   7. **Truncation** — oversized output is capped before reaching the model.
+  7b. **Untrusted-content fence** — the model-facing observation is wrapped by
+     :func:`app.security.prompt_boundary.apply_untrusted_boundary` (paired
+     delimiters + a Chinese "this is data, not instructions" notice, with any
+     delimiter forged inside the payload neutralized) within the same cap.
 
 The returned :class:`~app.agents.schemas.ToolExecution` carries the *real*
 ``ok`` (fixing the old always-``ok=True`` bug) so the SSE ``tool_result``
@@ -58,6 +62,7 @@ from app.models import AgentStep, ToolApproval, ToolCall
 from app.models.user import User
 from app.observability import observe_counter, observe_histogram, observe_span
 from app.quotas import QuotaExceeded, get_quota_service
+from app.security.prompt_boundary import apply_untrusted_boundary
 from app.tools.base import BaseTool, ToolError, ToolRegistry
 from app.tools.context import bind_tool_context, make_tool_context, reset_tool_context
 from app.tools.registry_init import get_default_registry
@@ -395,6 +400,14 @@ class ToolGateway:
         )
         full_text, content, truncated = _stringify_and_truncate(
             rendered_result, self._max_result_chars
+        )
+        # 7b. Untrusted-content fence. 工具返回值一律是外部数据（web_search /
+        # http_get / MCP connector 的正文尤其如此），进模型上下文前包上成对定界标记，
+        # 并中和正文里伪造的标记。预算沿用同一个 max_result_chars：截断只发生在内容
+        # 上，围栏永远闭合，所以「模型看到的工具输出 ≤ max_result_chars」这条不变式
+        # 仍然成立。full_result（给 UI 的未截断原文）不加围栏——它不进模型。
+        content = apply_untrusted_boundary(
+            f"tool:{tool_name}", content, max_chars=self._max_result_chars
         )
 
         # 6b. Oversized tool output → real Artifact (Task-10 spill wiring).

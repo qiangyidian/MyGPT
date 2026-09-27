@@ -22,6 +22,7 @@ from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import User
 from app.schemas import (
+    BatchStatusFilter,
     CreditAccountOut,
     CreditAccountRowOut,
     CreditAdjustRequest,
@@ -140,10 +141,20 @@ async def create_redeem_batch(
 @admin_router.get("/redeem-batches", response_model=list[RedeemBatchProgressOut])
 async def list_redeem_batches(
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    search: str | None = Query(default=None, max_length=128),
+    status: BatchStatusFilter = Query(default="all"),
     admin: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[RedeemBatchProgressOut]:
-    rows = await redeem_service.list_batches(db, limit=limit)
+    rows = await redeem_service.list_batches(
+        db,
+        limit=limit,
+        offset=offset,
+        search=search,
+        # "all" 只是前端「全部批次」这个选项，不是 SQL 条件。
+        status=None if status == "all" else status,
+    )
     return [
         RedeemBatchProgressOut(
             batch=RedeemBatchOut.model_validate(row.batch),

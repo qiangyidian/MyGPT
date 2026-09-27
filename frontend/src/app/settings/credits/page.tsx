@@ -5,7 +5,8 @@ import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-q
 import { toast } from "sonner";
 import { Coins, Info } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { toUserError } from "@/lib/api-error";
 import { formatCredits, normalizeRedeemCodeInput, redeemErrorMessage } from "@/lib/credits";
 import { useCredits } from "@/hooks/useCredits";
 import { Button } from "@/components/ui/button";
@@ -50,8 +51,9 @@ export default function CreditsSettingsPage() {
       qc.invalidateQueries({ queryKey: ["credits"] });
     },
     onError: (err) => {
-      const apiErr = err as ApiError;
-      setError(redeemErrorMessage(apiErr.code, apiErr.message));
+      // 兑换码特有的错误码用专表，其余（网络/401/422…）用统一映射的中文。
+      const mapped = toUserError(err);
+      setError(redeemErrorMessage(mapped.code ?? "", mapped.message));
     },
   });
 

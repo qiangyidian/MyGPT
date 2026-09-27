@@ -52,7 +52,6 @@ export function WechatLoginPanel({
         <div className="flex flex-col items-center gap-3" data-testid="wechat-login-guide">
           {/* Served from the deployment's own public/ dir: same-origin, so no
               hotlink or referer problem. */}
-          {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={qrUrl}
             alt="微信公众号二维码"

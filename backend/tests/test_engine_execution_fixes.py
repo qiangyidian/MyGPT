@@ -72,7 +72,7 @@ async def test_engine_stages_get_the_same_tools_as_the_walker(db_session):
     ctx = await _seed_ctx(db_session)
     orch = ChatOrchestrator()
     run = await orch._create_run(ctx)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
 
     adapter = await orch._build_stage_adapter(ctx, run, env)
     engine_tool_sets = {
@@ -106,7 +106,7 @@ async def test_engine_tools_are_run_scoped_and_share_the_env_stage_ctx(db_sessio
     ctx = await _seed_ctx(db_session)
     orch = ChatOrchestrator()
     run = await orch._create_run(ctx)
-    env = RunEnvironment.for_turn(ctx)
+    env = RunEnvironment.for_call(ctx)
 
     adapter = await orch._build_stage_adapter(ctx, run, env)
     spec = adapter._stages["researcher"]

@@ -28,10 +28,11 @@ if settings.DATABASE_URL.startswith("sqlite"):
         return "JSON"
 
 
-# Pool sizing: a streaming chat turn holds its request session for the whole
-# stream (agent runs can run up to the Hermes budget of 900s), so the asyncpg
-# defaults (pool_size=5, max_overflow=10) are starved by ~15 concurrent turns.
-# Explicit headroom keeps short API calls from queueing behind streams.
+# Every API, worker and recovery process owns an independent engine. Keep pool
+# sizing explicit and configurable so the sum across replicas stays within the
+# PostgreSQL connection budget. Long-running streams can hold request sessions;
+# see DB_POOL_SIZE / DB_MAX_OVERFLOW in the deployment environment and budget
+# (replicas × (pool_size + max_overflow)) before scaling.
 # SQLite (dev/tests) uses a single connection — pass pool args only for server DBs.
 _engine_kwargs: dict = {
     "echo": False,
@@ -40,8 +41,8 @@ _engine_kwargs: dict = {
 }
 if not settings.DATABASE_URL.startswith("sqlite"):
     _engine_kwargs.update(
-        pool_size=max(10, int(getattr(settings, "DB_POOL_SIZE", 20))),
-        max_overflow=int(getattr(settings, "DB_MAX_OVERFLOW", 20)),
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
         pool_recycle=1800,  # recycle before DB-side idle timeouts kill conns
     )
 

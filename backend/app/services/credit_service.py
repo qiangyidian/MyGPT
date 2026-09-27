@@ -14,19 +14,28 @@
 
 本模块所有函数只 **flush，从不 commit** —— 事务边界归调用方所有：
 聊天扣费必须与消息写入同事务原子提交，因此这层一旦提交就会破坏该保证。
+
+唯一例外是轮次准入 :func:`admit_turn` / :func:`release_turn_hold`：预留的整个
+意义就是"在别人开始之前已经落库"，跟着一个要到整轮结束才 commit 的长事务走
+等于没有预留。所以它们自己开会话、自己 commit，并且不碰调用方的事务。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import case, func, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.credits import compute_charge, get_credit_policy
+from app.credits import CreditPolicy, compute_charge, get_credit_policy
+from app.core.like import LIKE_ESCAPE, like_pattern
 from app.models import CreditAccount, CreditLedger, Message, User
+from app.observability import observe_counter
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +124,17 @@ async def _write_entry(
     ref_id: str | None,
     actor_id: uuid.UUID | None,
     note: str | None,
+    count_toward_lifetime: bool = True,
 ) -> CreditLedger | None:
     """写流水 + 更新余额。唯一约束冲突时返回 None（幂等命中）。
 
     调用方必须已经持有账户行锁（见 :func:`_locked_account`），否则并发下
     ``balance_after`` 会算错。
+
+    ``count_toward_lifetime=False`` 给"临时占位"类流水（轮次预留 / 退还）用：
+    ``lifetime_granted`` 与 ``lifetime_consumed`` 是对账 SQL 的口径，预留既不
+    是发放也不是消耗 —— 计入的话一次充值前的普通对话就会把两个累计量各抬高
+    ``turn_reserve``，而预留与退还在余额上互相抵零、看不出来。
     """
     new_balance = int(account.balance) + int(delta)
     entry = CreditLedger(
@@ -142,10 +157,11 @@ async def _write_entry(
         return None
 
     account.balance = new_balance
-    if delta > 0:
-        account.lifetime_granted = int(account.lifetime_granted) + int(delta)
-    elif delta < 0:
-        account.lifetime_consumed = int(account.lifetime_consumed) + (-int(delta))
+    if count_toward_lifetime:
+        if delta > 0:
+            account.lifetime_granted = int(account.lifetime_granted) + int(delta)
+        elif delta < 0:
+            account.lifetime_consumed = int(account.lifetime_consumed) + (-int(delta))
     await db.flush()
     return entry
 
@@ -243,6 +259,210 @@ async def adjust(
 
 
 # --------------------------------------------------------------------------- #
+# 轮次准入（finding 40）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class TurnHold:
+    """一次准入留下的预留句柄。轮次结束时必须交给 :func:`release_turn_hold`。"""
+
+    user_id: uuid.UUID
+    turn_key: str
+    amount: int
+
+
+async def admit_turn(
+    user_id: uuid.UUID,
+    *,
+    turn_key: str | None = None,
+    policy: CreditPolicy | None = None,
+    session_factory: Any | None = None,
+) -> TurnHold | None:
+    """预留一轮的额度；余额不足抛 :class:`CreditError`（402）。
+
+    为什么必须是"锁行 + 写一条预留流水"，而不是读一下余额：准入检查原本用
+    :func:`read_account`（无锁快照读），N 个并发轮次读到同一个 ``balance=1``
+    会全部放行 —— 单进程里 ``asyncio`` 的交错点正好落在 ``await`` 上，所以这
+    不是理论问题，是必然发生的。这里走 :func:`_locked_account`（Postgres 上是
+    真 ``SELECT ... FOR UPDATE``），预留额以 ``reason='turn_hold'`` 的负向流水
+    **落库**，所以第二个轮次拿到锁时读到的已经是扣掉预留后的余额。
+
+    三条边界：
+
+    * ``ref_type='turn_hold'`` + 同一 ``turn_key`` 撞唯一部分索引 —— 重复准入
+      按幂等处理（不再扣一次预留）。
+    * 预留额是 ``policy.turn_reserve``，与 ``max_credits_per_turn`` 无关：前者
+      是"见底就挡"的下界，后者是单轮扣费上界（见 :func:`app.credits.compute_charge`）。
+    * 观察模式（``enforced=False``）直接返回 ``None``，不锁行、不写流水 ——
+      与扣费侧同一套语义，免得准入偷偷变成拦截。
+
+    进程在预留之后、结算之前崩溃：这条预留留在账上（余额被压低 ``turn_reserve``），
+    由 :func:`release_stale_turn_holds` 回收 —— 见该函数的说明。
+    """
+    p = policy or get_credit_policy()
+    if not p.enforced:
+        return None
+    reserve = int(p.turn_reserve)
+    if reserve <= 0:
+        # 预留额配成 0 = 只做"余额>0"的检查，但那是无锁读，等于回到 race。
+        # 明确拒绝这种配法，而不是假装它安全。
+        reserve = 1
+    key = turn_key or str(uuid.uuid4())
+    factory = session_factory or _default_session_factory()
+    # 预留必须**独立提交**才算预留：跟着调用方的事务一起 flush，就等于在
+    # "整轮结束才提交"的事务里锁了个只有自己看得到的余额。所以这里刻意开一
+    # 个自己的会话，而不是复用聊天请求那个长事务的 session —— 后者此时还没
+    # 有任何待写入的行，提前 commit 也不会连带提交别人的工作。
+    async with factory() as session:
+        account = await _locked_account(session, user_id)
+        balance = int(account.balance)
+        if balance < reserve:
+            # 告警口径（见 deploy/monitoring/rules/mygpt.yml）：拒绝率是"用户已经
+            # 见底"最直接信号，所以计数必须发生在这里而不是 API 层 —— 观察模式
+            # 与配额层挡掉的原因不同，混在一个标签里就没法定位。
+            observe_counter("credit.admission_rejected", 1, outcome="insufficient")
+            raise CreditError(
+                "insufficient_credits",
+                "积分不足，请先兑换后再继续对话",
+                status_code=402,
+            )
+        entry = await _write_entry(
+            session,
+            account,
+            delta=-reserve,
+            reason="turn_hold",
+            ref_type="turn_hold",
+            ref_id=key,
+            actor_id=None,
+            note=None,
+            count_toward_lifetime=False,
+        )
+        await session.commit()
+    if entry is None:
+        # 幂等命中：这一轮已经预留过了（重试/重放）。按已放行处理，不再扣一次。
+        logger.debug("admit_turn: duplicate hold for %s ignored", key)
+    return TurnHold(user_id=user_id, turn_key=key, amount=reserve)
+
+
+async def release_turn_hold(
+    hold: TurnHold | None, *, session_factory: Any | None = None
+) -> CreditLedger | None:
+    """退还预留（轮次结束，无论成功/失败/取消都要调用）。
+
+    实际扣分由 :func:`charge_message_credits` 独立成账，所以这里只把预留原额
+    加回去 —— 两条流水（hold / hold_release）互相抵零，对账时能一眼看出哪些
+    轮次只留了 hold 没留 release（进程被杀的那批）。幂等：同一
+    ``(turn_hold_release, turn_key)`` 撞唯一索引时返回 None。
+    """
+    if hold is None:
+        return None
+    factory = session_factory or _default_session_factory()
+    async with factory() as session:
+        account = await _locked_account(session, hold.user_id)
+        entry = await _write_entry(
+            session,
+            account,
+            delta=hold.amount,
+            reason="turn_hold_release",
+            ref_type="turn_hold_release",
+            ref_id=hold.turn_key,
+            actor_id=None,
+            note=None,
+            count_toward_lifetime=False,
+        )
+        await session.commit()
+        return entry
+
+
+async def release_stale_turn_holds(
+    db: AsyncSession, *, older_than_seconds: int = 6 * 3600
+) -> int:
+    """回收没有配对 release 的历史预留（被杀进程留下的悬挂 hold）。
+
+    准入的预留是"这一轮会跑完并结算"的承诺，进程被 OOMKill 时承诺兑现不了，
+    余额就长期被压住。这里找出 ``turn_hold`` 有、对应 ``turn_hold_release`` 无、
+    且已经老于单轮最长可能时长（默认 6 小时，与 retention 的周期同量级）的行，
+    补一条 release。由 retention 清扫循环调用 —— 同一把 leader 锁下只会跑一个
+    进程，所以不会和别的进程抢同一张 hold。
+
+    时间截断在 Python 侧算，不用 ``now() - interval``：方言差异（SQLite 测试库
+    没有 ``make_interval``）不该让这个回收路径分成两条代码。数据库里的
+    ``created_at`` 是 UTC 带时区的，所以这里也用带时区的 UTC。
+    """
+    cutoff = datetime.now(UTC) - timedelta(
+        seconds=max(int(older_than_seconds), 60)
+    )
+    released_keys = {
+        str(row[0])
+        for row in (
+            await db.execute(
+                select(CreditLedger.ref_id).where(
+                    CreditLedger.reason == "turn_hold_release",
+                    CreditLedger.ref_id.isnot(None),
+                )
+            )
+        ).all()
+    }
+    holds = list(
+        (
+            await db.execute(
+                select(CreditLedger)
+                .where(
+                    CreditLedger.reason == "turn_hold",
+                    CreditLedger.created_at < cutoff,
+                )
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    released = 0
+    for entry in holds:
+        if entry.ref_id is None or str(entry.ref_id) in released_keys:
+            continue
+        # delta 是负数（准入时扣掉的预留），退还时取反。
+        if await _release_hold_in(
+            db,
+            TurnHold(
+                user_id=entry.user_id,
+                turn_key=str(entry.ref_id),
+                amount=-int(entry.delta),
+            ),
+        ):
+            released += 1
+    return released
+
+
+def _default_session_factory() -> Any:
+    """懒取进程级 session factory（避免 import 期就建连接池）。"""
+    from app.db import AsyncSessionLocal
+
+    return AsyncSessionLocal
+
+
+async def _release_hold_in(
+    db: AsyncSession, hold: TurnHold
+) -> CreditLedger | None:
+    """在**给定会话**里退还预留 —— 供悬挂 hold 回收这种批处理场景用。
+
+    :func:`release_turn_hold` 自己开事务并 commit，而回收循环是一个大 sweep
+    事务的一部分，逐条 commit 会让它失去可重入性（中途失败就留下半批）。
+    """
+    account = await _locked_account(db, hold.user_id)
+    return await _write_entry(
+        db,
+        account,
+        delta=hold.amount,
+        reason="turn_hold_release",
+        ref_type="turn_hold_release",
+        ref_id=hold.turn_key,
+        actor_id=None,
+        note=None,
+        count_toward_lifetime=False,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 挂到聊天轮次上的扣费
 # --------------------------------------------------------------------------- #
 async def charge_message_credits(
@@ -334,7 +554,79 @@ async def list_accounts(
         .limit(max(1, min(int(limit), 500)))
         .offset(max(0, int(offset)))
     )
-    if search:
-        needle = f"%{search.strip()}%"
-        stmt = stmt.where(User.email.ilike(needle) | User.username.ilike(needle))
+    if term := (search or "").strip():
+        pattern = like_pattern(term)
+        stmt = stmt.where(
+            User.email.ilike(pattern, escape=LIKE_ESCAPE)
+            | User.username.ilike(pattern, escape=LIKE_ESCAPE)
+        )
     return [(row[0], row[1]) for row in (await db.execute(stmt)).all()]
+
+
+# --------------------------------------------------------------------------- #
+# 池子水位（finding 38 的 credit-depletion 口径）
+# --------------------------------------------------------------------------- #
+async def read_pool_watermarks(
+    db: AsyncSession,
+) -> tuple[int, int, int, int]:
+    """全表聚合：``(累计发放, 累计消耗, 余额<=0 的账户数, 余额<0 的账户数)``。
+
+    一次查询而不是按用户循环：账户数是有上限的（每个用户一行），但分钟级重复
+    扫全表仍然值得省掉。``balance<0`` 单独计数，因为余额为负是本设计的正常状态
+    （超扣后再由兑换补回），它**突增**才是信号，绝对值不是。
+    """
+    stmt = select(
+        func.coalesce(func.sum(CreditAccount.lifetime_granted), 0),
+        func.coalesce(func.sum(CreditAccount.lifetime_consumed), 0),
+        func.sum(case((CreditAccount.balance <= 0, 1), else_=0)),
+        func.sum(case((CreditAccount.balance < 0, 1), else_=0)),
+    )
+    granted, consumed, at_zero, negative = (await db.execute(stmt)).one()
+    return (
+        int(granted or 0),
+        int(consumed or 0),
+        int(at_zero or 0),
+        int(negative or 0),
+    )
+
+
+async def run_credit_pool_poller(
+    stop: asyncio.Event | None = None,
+    *,
+    interval: float = 300.0,
+    session_factory: Any | None = None,
+) -> None:
+    """把池子水位导出为 gauge：``credit_pool_*``。
+
+    放在 API 进程而不是 worker，理由与
+    :func:`app.agents.workflow.queue.run_queue_depth_poller` 相同：只有 API 暴露
+    ``/metrics``，worker 观测到的值 Alertmanager 永远抓不到。
+
+    默认 5 分钟一次（队列水位是 15 秒）：这是一次聚合扫描，而"现在有人见底了"
+    的实时信号本来就该由 ``credit_admission_rejected_total`` 的速率提供 —— 那是
+    计数、不扫表。扫描失败时跳过样本而不是写 0：把"聚合超时"报成"池子空了"会
+    制造一条假的高优先级告警，比晚 5 分钟知道更糟。
+    """
+    from app.observability import observe_gauge
+
+    poll = max(float(interval), 30.0)
+    factory = session_factory
+    while stop is None or not stop.is_set():
+        try:
+            async with (factory or _default_session_factory())() as session:
+                granted, consumed, at_zero, negative = await read_pool_watermarks(session)
+            observe_gauge("credit.pool_granted", float(granted))
+            observe_gauge("credit.pool_consumed", float(consumed))
+            observe_gauge("credit.pool_accounts_at_zero", float(at_zero))
+            observe_gauge("credit.pool_accounts_negative", float(negative))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("credit pool watermark poll failed", exc_info=True)
+        if stop is None:
+            await asyncio.sleep(poll)
+            continue
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll)
+        except TimeoutError:
+            pass

@@ -126,6 +126,11 @@ class Step(BaseModel):
     cost_estimate: float = 0.0
     # Carried over (already done) in a revised plan -> do not re-execute.
     skip: bool = False
+    # 第几轮返修重跑过这一步（0 = 原始轮次，未被返修触及）。
+    revision_round: int = 0
+    # 触发这次返修的审阅意见。必须随步骤一起走：返修的提示词若不带上一轮的
+    # 结论，「审 → 改」就断在中间，改出来的东西和第一遍没有区别（B13）。
+    review_findings: list[str] = Field(default_factory=list)
 
 
 class StepObservation(BaseModel):
@@ -198,6 +203,9 @@ class WorkflowResult(BaseModel):
     observations: dict[str, StepObservation] = Field(default_factory=dict)
     findings: list[str] = Field(default_factory=list)
     verifier_results: list[VerifierResult] = Field(default_factory=list)
+    # 审阅台账：每条 verdict + 由它做出的决定（B13）。终态事件与 run.output
+    # 都带这份账，事后才答得出「为什么改了/没改这两轮」。
+    review_log: list[dict[str, Any]] = Field(default_factory=list)
     # 跨进程 resume 时从检查点复用（未重跑）的步骤 id。空 = 本轮全部真跑。
     reused_steps: list[str] = Field(default_factory=list)
     error: str | None = None

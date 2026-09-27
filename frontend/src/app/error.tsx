@@ -20,7 +20,6 @@ export default function Error({
 }) {
   useEffect(() => {
     // Full detail for developers only.
-    // eslint-disable-next-line no-console
     console.error(error);
   }, [error]);
 

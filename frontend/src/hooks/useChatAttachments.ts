@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { attachmentRejectionMessage } from "@/lib/attachment-types";
 import { useAttachmentStore, EMPTY_DRAFTS, type AttachmentDraft } from "@/stores/attachment-store";
 
@@ -94,8 +95,7 @@ export function useChatAttachments(
                 uploading: false,
               });
             } catch (err) {
-              const message =
-                err instanceof ApiError ? err.message : "上传失败";
+              const message = userErrorMessage(err);
               updateDraft(convId!, tempId, {
                 status: "failed",
                 uploading: false,

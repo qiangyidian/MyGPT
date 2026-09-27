@@ -60,24 +60,41 @@ echo "$OLD_HEAD" > /var/lib/mychat-deploy/rollback_commit
 git reset --hard "origin/$BRANCH" --quiet
 log "checked out origin/$BRANCH"
 
-# ---- 3. 后端依赖：requirements.txt 变了才重装（hash 比对，幂等） ----
-REQ_HASH_FILE=/var/lib/mychat-deploy/requirements.sha256
-NEW_REQ_HASH=$(sha256sum backend/requirements.txt | awk '{print $1}')
-OLD_REQ_HASH=$(cat "$REQ_HASH_FILE" 2>/dev/null || echo "none")
-if [ "$NEW_REQ_HASH" != "$OLD_REQ_HASH" ]; then
-    log "requirements.txt changed — reinstalling venv deps"
-    "$VENV/bin/pip" install -r backend/requirements.txt -q
-    echo "$NEW_REQ_HASH" > "$REQ_HASH_FILE"
-else
-    log "requirements unchanged — skip pip install"
-fi
+install_backend_deps() {
+    local hash_file=/var/lib/mychat-deploy/requirements-lock.sha256
+    local new_hash old_hash
+    new_hash=$(sha256sum backend/requirements.lock.txt | awk '{print $1}')
+    old_hash=$(cat "$hash_file" 2>/dev/null || echo "none")
+    if [ "$new_hash" != "$old_hash" ]; then
+        log "requirements.lock.txt changed — installing hash-verified venv deps"
+        "$VENV/bin/pip" install --require-hashes -r backend/requirements.lock.txt -q
+        echo "$new_hash" > "$hash_file"
+    else
+        log "backend lock unchanged — skip pip install"
+    fi
+}
+
+install_frontend_deps() {
+    local hash_file=/var/lib/mychat-deploy/frontend-lock.sha256
+    local new_hash old_hash
+    new_hash=$(sha256sum frontend/package-lock.json | awk '{print $1}')
+    old_hash=$(cat "$hash_file" 2>/dev/null || echo "none")
+    if [ ! -d frontend/node_modules ] || [ "$new_hash" != "$old_hash" ]; then
+        log "frontend package lock changed — running npm ci"
+        (cd frontend && npm ci --no-audit --no-fund --silent)
+        echo "$new_hash" > "$hash_file"
+    else
+        log "frontend lock unchanged — skip npm ci"
+    fi
+}
+
+# ---- 3. Install exact backend/frontend dependency locks (hash-aware) ----
+install_backend_deps
+install_frontend_deps
 
 # ---- 4. 前端构建（总是构建——NEXT_PUBLIC_* 在构建时内联，必须重建） ----
 log "building frontend..."
 cd frontend
-if [ ! -d node_modules ]; then
-    npm ci --no-audit --no-fund --silent
-fi
 NEXT_PUBLIC_API_BASE_URL=https://mychat.qiangi.top \
 NEXT_TELEMETRY_DISABLED=1 \
     npm run build --silent
@@ -92,6 +109,8 @@ if ! MIG_OUT=$("$VENV/bin/alembic" upgrade head 2>&1); then
     echo "$MIG_OUT" | tail -10 | while read -r line; do log "alembic: $line"; done
     cd "$REPO"
     git reset --hard "$OLD_HEAD" --quiet
+    install_backend_deps
+    install_frontend_deps
     exit 1
 fi
 log "alembic: $(echo "$MIG_OUT" | tail -1)"
@@ -125,6 +144,8 @@ if [ "$healthy" != "1" ]; then
     log "UNHEALTHY after deploy — rolling back to $OLD_HEAD"
     ROLLBACK_TO=$(cat /var/lib/mychat-deploy/rollback_commit 2>/dev/null || echo "$OLD_HEAD")
     git reset --hard "$ROLLBACK_TO" --quiet
+    install_backend_deps
+    install_frontend_deps
     cd frontend && NEXT_PUBLIC_API_BASE_URL=https://mychat.qiangi.top NEXT_TELEMETRY_DISABLED=1 npm run build --silent && cd "$REPO"
     systemctl restart mychat-backend mychat-frontend
     sleep 6

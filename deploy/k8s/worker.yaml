@@ -45,6 +45,11 @@ spec:
                 name: mygpt-config
             - secretRef:
                 name: mygpt-secrets
+          env:
+            - name: DB_POOL_SIZE
+              value: "3"
+            - name: DB_MAX_OVERFLOW
+              value: "1"
           command: ["python", "-m", "app.worker"]
           # No HTTP endpoint -> no httpGet probe. Pod readiness = container
           # started; real worker health is observed via run-queue depth, lease

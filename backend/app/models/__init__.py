@@ -17,8 +17,10 @@ from app.models.document_chunk import DocumentChunk
 from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
 from app.models.message_feedback import MessageFeedback
+from app.models.message_version import MessageVersion
 from app.models.model_config import ModelConfig
 from app.models.project import Project
+from app.models.prompt_template import PromptTemplate
 from app.models.redeem_code import RedeemCode
 from app.models.redeem_code_batch import RedeemCodeBatch
 from app.models.run_command import RunCommand
@@ -26,6 +28,7 @@ from app.models.run_event import RunEvent
 from app.models.run_lease import RunLease
 from app.models.tool_approval import ToolApproval
 from app.models.tool_call import ToolCall
+from app.models.tool_toggle import ToolToggle
 from app.models.user import User
 from app.models.user_memory import UserMemory
 from app.models.wechat_identity import WechatIdentity
@@ -45,11 +48,13 @@ __all__ = [
     "AgentStep",
     "ConversationMemory",
     "ToolApproval",
+    "ToolToggle",
     # ---- Task 7: opt-in semantic long-term user memory ----
     "UserMemory",
     # ---- Phase 1: product upgrade ----
     "ChatAttachment",
     "MessageFeedback",
+    "MessageVersion",
     # ---- Phase 3: projects + background tasks ----
     "Project",
     # ---- Task 4: durable workflow (events, commands, leases, attempts) ----
@@ -68,4 +73,6 @@ __all__ = [
     "CreditLedger",
     "RedeemCodeBatch",
     "RedeemCode",
+    # ---- 提示词库（个人模板 + 系统预置） ----
+    "PromptTemplate",
 ]

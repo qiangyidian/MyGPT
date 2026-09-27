@@ -8,17 +8,21 @@ import { redirect } from "next/navigation";
  * The old paths were reachable from bookmarks / browser history, so they
  * redirect, preserving the query string (returnTo etc.).
  */
-export default function LegacyKnowledgeBasesRedirect({
+export default async function LegacyKnowledgeBasesRedirect({
   params,
   searchParams,
 }: {
-  params: { slug?: string[] };
-  searchParams?: Record<string, string | string[] | undefined>;
+  params: Promise<{ slug?: string[] }>;
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const slug = params.slug?.length ? `/${params.slug.join("/")}` : "";
-  const qs = searchParams
+  const [{ slug: routeSlug }, resolvedSearchParams] = await Promise.all([
+    params,
+    searchParams ?? Promise.resolve({}),
+  ]);
+  const slug = routeSlug?.length ? `/${routeSlug.join("/")}` : "";
+  const qs = Object.keys(resolvedSearchParams).length
     ? `?${new URLSearchParams(
-        Object.entries(searchParams).flatMap(([k, v]) =>
+        Object.entries(resolvedSearchParams).flatMap(([k, v]) =>
           Array.isArray(v) ? v.map((vv) => [k, vv] as [string, string]) : v != null ? [[k, v] as [string, string]] : []
         )
       ).toString()}`

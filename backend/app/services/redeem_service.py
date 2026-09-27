@@ -29,6 +29,7 @@ from app.credits import (
     hash_code,
     normalize_code,
 )
+from app.core.like import LIKE_ESCAPE, like_pattern
 from app.models import RedeemCode, RedeemCodeBatch
 from app.services import credit_service
 from app.services.credit_service import CreditError
@@ -185,8 +186,28 @@ async def redeem(db: AsyncSession, *, user_id: uuid.UUID, raw_code: str) -> Rede
     )
 
 
-async def list_batches(db: AsyncSession, *, limit: int = 100) -> list[BatchProgress]:
-    """批次列表含核销进度。一次聚合查询，不是每批一条 count。"""
+async def list_batches(
+    db: AsyncSession,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    search: str | None = None,
+    status: str | None = None,
+) -> list[BatchProgress]:
+    """批次列表含核销进度。一次聚合查询，不是每批一条 count。
+
+    ``offset`` 是给运营页翻页用的：批次没有「总数」端点，所以前端按「这一页是否装满」
+    判断还有没有下一页 —— 少了这个参数它永远只能看见最近 500 批。
+
+    ``search`` / ``status`` 必须在 SQL 里做而不是在前端做：一旦分页，前端手上的
+    只有当前这 50 行，在浏览器里 filter 等于「只在这一页里找」，搜老批次会假装
+    不存在。``status`` 取值与 ``frontend/src/lib/redeem-batch.ts`` 的筛选项、
+    ``app/schemas/credit.py`` 的 ``BatchStatusFilter`` 三处必须同步：
+
+    - ``operable``：还有未兑换码
+    - ``expired``：有效期已过（``expires_at`` 为空 = 永久，不算过期）
+    - ``settled``：没有未兑换码了（兑完 / 全部作废）
+    """
     progress = (
         select(
             RedeemCode.batch_id.label("batch_id"),
@@ -198,11 +219,41 @@ async def list_batches(db: AsyncSession, *, limit: int = 100) -> list[BatchProgr
         .group_by(RedeemCode.batch_id)
         .subquery()
     )
+    stmt = select(
+        RedeemCodeBatch,
+        progress.c.total,
+        progress.c.redeemed,
+        progress.c.void,
+        progress.c.active,
+    ).outerjoin(progress, progress.c.batch_id == RedeemCodeBatch.id)
+
+    term = (search or "").strip()
+    if term:
+        pattern = like_pattern(term)
+        stmt = stmt.where(
+            RedeemCodeBatch.name.ilike(pattern, escape=LIKE_ESCAPE)
+            | RedeemCodeBatch.note.ilike(pattern, escape=LIKE_ESCAPE)
+        )
+    # 没有聚合行的批次（码被删干净）在 SQL 里是 NULL，按 0 处理才符合
+    # 「没有未兑换码 = 已了结」的直觉。
+    active_count = func.coalesce(progress.c.active, 0)
+    if status == "operable":
+        stmt = stmt.where(active_count > 0)
+    elif status == "settled":
+        stmt = stmt.where(active_count == 0)
+    elif status == "expired":
+        stmt = stmt.where(
+            RedeemCodeBatch.expires_at.is_not(None),
+            RedeemCodeBatch.expires_at <= datetime.now(UTC),
+        )
+
     rows = (
         await db.execute(
-            select(RedeemCodeBatch, progress.c.total, progress.c.redeemed, progress.c.void, progress.c.active)
-            .outerjoin(progress, progress.c.batch_id == RedeemCodeBatch.id)
-            .order_by(RedeemCodeBatch.created_at.desc())
+            stmt
+            # `id` 只是并列时的定序键：同一瞬间建的两个批次若没有它，翻页会看见
+            # 重复行或漏行（OFFSET 分页要求全序）。
+            .order_by(RedeemCodeBatch.created_at.desc(), RedeemCodeBatch.id)
+            .offset(max(0, int(offset)))
             .limit(max(1, min(int(limit), 500)))
         )
     ).all()

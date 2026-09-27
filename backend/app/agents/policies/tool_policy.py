@@ -104,7 +104,18 @@ def is_tool_allowed(tool_name: str, user: User | None, *, strict: bool | None = 
     cross-tenant read primitive whether reached via /api/tools/test or via
     their own agent's approval flow, so in production it is admin-only.
     Dev/test keeps it open for development and the test-suite.
+
+    Operator kill-switch first and absolute: a tool the admin disabled in
+    /admin (``tool_toggles``) is refused here no matter who asks, how it is
+    routed, or whether an approval row exists. This is the execution gate the
+    advertise-side filter (``ToolRegistry.list``) mirrors — the mirror is UX,
+    this is the guarantee.
     """
+    from app.services.tool_toggles import is_disabled
+
+    if is_disabled(tool_name):
+        return False
+
     settings = get_settings()
     if strict is None:
         strict = not settings.is_dev

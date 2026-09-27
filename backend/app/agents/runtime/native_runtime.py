@@ -41,7 +41,8 @@ from app.agents.gateway.tool_gateway import ToolGateway
 from app.agents.graph import build_single_agent_graph
 from app.agents.output_spill import production_spill_writer
 from app.agents.planning import build_plan, classify_intent, summarize_prefix
-from app.agents.policies import BudgetExceeded, BudgetGuard, BudgetLimits
+from app.agents.policies import BudgetExceeded, BudgetGuard, guard_for_context
+from app.agents.run_environment import resolve_session_factory
 from app.agents.runtime.stage_executor import safe_positive_int
 from app.agents.schemas import (
     AgentEvent,
@@ -66,7 +67,6 @@ from app.agents.schemas import (
 from app.agents.token_budget import PromptAdmissionError, calculate_prompt_budget
 from app.core.config import get_settings
 from app.core.pricing import usage_cost
-from app.db import AsyncSessionLocal
 from app.model_capabilities import capabilities_from_config
 from app.models import AgentRun
 from app.providers.base import (
@@ -169,18 +169,11 @@ class NativeChatRuntime:
                     except Exception:
                         pass
         settings = get_settings()
-        guard = ctx.budget_guard
-        if guard is None:
-            guard = BudgetGuard(
-                BudgetLimits.from_settings(
-                    settings,
-                    ctx.extra.get("budget_overrides"),
-                    allow_increase=bool(
-                        ctx.extra.get("budget_policy_authorized", False)
-                    ),
-                )
-            )
-            ctx.budget_guard = guard
+        # Single resolution point for the run guard: the native runtime, the
+        # CrewAI walker and RunEnvironment all go through ``guard_for_context``
+        # so ``budget_overrides`` / ``budget_policy_authorized`` are read once
+        # and in one way (B12).
+        guard = guard_for_context(ctx)
         gateway = ToolGateway(
             db,
             conversation_id=conversation_id,
@@ -319,7 +312,9 @@ class NativeChatRuntime:
                 return
             from app.services.chat_service import _persist_continuation_checkpoint
 
-            session_factory = ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
+            session_factory = resolve_session_factory(
+                ctx.extra.get("persistence_session_factory")
+            )
             async with db_mutation_scope(ctx.extra.get("persistence_lock")):
                 await _persist_continuation_checkpoint(
                     session_factory, assistant_msg, ctx.run_id, checkpoint

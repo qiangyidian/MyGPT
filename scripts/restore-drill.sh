@@ -3,13 +3,20 @@
 #
 # Restores a backup produced by scripts/backup.sh into ISOLATED throwaway
 # Postgres + Qdrant containers (never the dev/prod data stores) and verifies:
+#   0. Artifact set: SHA256SUMS.txt (written by backup.sh over the top-level
+#      artifacts) verifies BEFORE any container is started, and the downloaded
+#      qdrant-*.snapshot count matches qdrant-collections.txt.
 #   1. Postgres: the dump restores cleanly AND alembic current == repo head
-#      (0014_credits_redeem) — i.e. the migration revision survives backup/restore.
+#      (resolved dynamically from backend/migrations — a pinned head here once
+#      said 0014_credits_redeem while the chain had moved on) — i.e. the
+#      migration revision survives backup/restore.
 #   2. Qdrant:   every collection snapshot uploads and the collection is listed.
 #   3. Object    storage: uploads.tar extracts without error and the per-file
 #      sha256 of the extracted tree matches a re-extraction (tar round-trip
 #      integrity). If the backup dir carries a MANIFEST.sha256, it is verified
-#      against it instead.
+#      against it instead. (MANIFEST.sha256 = per-file uploads tree, produced by
+#      whatever packs uploads; SHA256SUMS.txt = one line per top-level artifact.
+#      They are different files with different scopes — do not merge them.)
 #
 # Requires: docker, the backend venv (psycopg2 + alembic), curl, sha256sum.
 # Usage:
@@ -58,6 +65,27 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[drill] source: $SRC"
+
+# --- 0. Artifact-set preflight (before a single container is started) ---------
+# Cheap, and it is the check that catches "the job exited 0 but the batch is not
+# a backup": a truncated dump, a swallowed Qdrant outage, a missing manifest.
+if [ -f "$SRC/SHA256SUMS.txt" ]; then
+  ( cd "$SRC" && sha256sum -c --quiet SHA256SUMS.txt ) \
+    || { echo "[drill] FAIL: SHA256SUMS.txt 校验不过 —— 本地产物已损坏，演练不再需要起容器" >&2; exit 1; }
+  echo "[drill] SHA256SUMS.txt verified ($(grep -c . "$SRC/SHA256SUMS.txt") artifact(s))"
+else
+  echo "[drill] WARN: 无 SHA256SUMS.txt（backup.sh 旧版产物），跳过产物级校验" >&2
+fi
+if [ -f "$SRC/UPLOADS_SKIPPED" ]; then
+  echo "[drill] WARN: 这批备份被 backup.sh 标记为「未包含附件」—— 它不是完整备份" >&2
+fi
+if [ -f "$SRC/qdrant-collections.txt" ]; then
+  want="$(grep -c . "$SRC/qdrant-collections.txt" || true)"; want="${want:-0}"
+  have="$(find "$SRC" -maxdepth 1 -type f -name 'qdrant-*.snapshot' | wc -l | tr -d ' ')"
+  [ "$have" -eq "$want" ] \
+    || { echo "[drill] FAIL: qdrant 快照数 $have != collection 数 $want —— 快照不全" >&2; exit 1; }
+  echo "[drill] qdrant snapshot count == collection count ($have)"
+fi
 
 # --- isolated targets --------------------------------------------------------
 echo "[drill] starting isolated postgres on 127.0.0.1:$PG_PORT"

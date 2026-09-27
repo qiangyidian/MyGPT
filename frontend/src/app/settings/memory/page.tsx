@@ -5,7 +5,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Brain, Pencil, Plus, Trash2 } from "lucide-react";
 
-import { memoriesApi, ApiError } from "@/lib/api";
+import { memoriesApi } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { DEFAULT_USER_MEMORY_PROPOSE, userMemoryIsActive } from "@/lib/memories";
 import type { UserMemory, UserMemoryProposeInput } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -58,7 +59,7 @@ export default function MemoryPage() {
       invalidate();
       setOpen(false);
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const editMut = useMutation({
@@ -69,14 +70,14 @@ export default function MemoryPage() {
       invalidate();
       setOpen(false);
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const toggleMut = useMutation({
     mutationFn: ({ id, active }: { id: string; active: boolean }) =>
       active ? memoriesApi.activate(id) : memoriesApi.deactivate(id),
     onSuccess: () => invalidate(),
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const deleteMut = useMutation({
@@ -85,7 +86,7 @@ export default function MemoryPage() {
       toast.success("已删除");
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   const disableAllMut = useMutation({
@@ -94,7 +95,7 @@ export default function MemoryPage() {
       toast.success(`已停用 ${res.deactivated ?? 0} 条记忆`);
       invalidate();
     },
-    onError: (e: ApiError) => toast.error(e.message),
+    onError: (e: unknown) => toast.error(userErrorMessage(e)),
   });
 
   function openCreate() {

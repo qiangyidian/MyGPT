@@ -69,7 +69,6 @@ from app.agents.schemas import (
     ev_runtime_selected,
 )
 from app.core.config import get_settings
-from app.db import AsyncSessionLocal
 from app.models import AgentRun
 from app.observability import observe_counter
 
@@ -404,7 +403,7 @@ class ChatOrchestrator:
         selection = ctx.extra.get("runtime_selection")
         profile = getattr(selection, "agent_profile", None) or "deep_research"
 
-        env = RunEnvironment.for_turn(ctx)
+        env = RunEnvironment.for_call(ctx)
 
         # LLM 规划器（flag 开时）：永远返回可用 plan（失败即回退模板）。
         _used_llm_planner = bool(getattr(get_settings(), "AGENT_LLM_PLANNER", False))
@@ -431,11 +430,11 @@ class ChatOrchestrator:
         # 「打算做什么」并修改它。默认不阻塞；只有用户主动上闸才进门禁。
         _plan_gate = bool(getattr(get_settings(), "PLAN_REQUIRE_CONFIRMATION", False))
         ui_plan = plan_to_ui_payload(plan, requires_confirmation=_plan_gate)
-        factory = (
-            ctx.extra.get("persistence_session_factory") or AsyncSessionLocal
-        )
+        # session 工厂 / 持久锁一律走 RunEnvironment 的取值点（B12）：这里
+        # 以前自己重读一遍 ctx.extra，改默认值就会漏。
+        factory = env.persistence_session_factory
         try:
-            async with db_mutation_scope(ctx.extra.get("persistence_lock")):
+            async with db_mutation_scope(env.persistence_lock):
                 await persist_research_plan(
                     factory, run_id=run.id, plan=ui_plan
                 )
@@ -459,7 +458,7 @@ class ChatOrchestrator:
             async def _plan_status() -> str | None:
                 from sqlalchemy import select
 
-                async with db_mutation_scope(ctx.extra.get("persistence_lock")):
+                async with db_mutation_scope(env.persistence_lock):
                     async with factory() as session:
                         row = await session.execute(
                             select(AgentRun.plan_status).where(AgentRun.id == run.id)
@@ -502,6 +501,24 @@ class ChatOrchestrator:
             # guard 为 None（无预算的注入执行器/测试）时返回 None = 不限时。
             return None if env.guard is None else env.guard.remaining_seconds
 
+        # ---- 返修预算（B13）------------------------------------------------ #
+        # ``BudgetGuard.enter_replan()`` 是全仓声明的 replan 闸门，但引擎从没调
+        # 过它 —— 于是 AGENT_MAX_REPLAN_COUNT 对引擎路径完全无效，只有 plan 自带
+        # 的 max_replans 在管。这里接上读数与落账两个口子；引擎依旧不认识
+        # BudgetGuard 本身，与上面的 budget_remaining_seconds 同构。
+        def _replan_units_left() -> int | None:
+            if env.guard is None:
+                return None
+            return max(
+                0,
+                int(env.guard.limits.max_replan_count) - int(env.guard.replans),
+            )
+
+        def _spend_replan_unit(_decision: dict) -> None:
+            # **同步**调用：BudgetGuard 的临界区是 threading.RLock，中间不得 await。
+            if env.guard is not None:
+                env.guard.enter_replan()
+
         engine = WorkflowEngine(
             executor=_EnvExecutor(),
             verifier=self._engine_verifier(
@@ -514,6 +531,8 @@ class ChatOrchestrator:
             session_factory=ctx.extra.get("persistence_session_factory"),
             before_step=lambda step_id: env.respect_controls(),
             budget_remaining_seconds=_budget_remaining,
+            replan_units_remaining=_replan_units_left,
+            on_replan=_spend_replan_unit,
             on_step_start=env.step_started,
             on_step_end=lambda step_id, output, usage: env.step_completed(
                 step_id,
@@ -661,15 +680,9 @@ class ChatOrchestrator:
         the SAME CrewAIStageExecutor the live CrewAI path uses.
         """
         from app.agents.adapters.llm_adapter import CrewAILLMFactory
-        from app.agents.crews import (
-            build_debate_stages,
-            build_parallel_research_stages,
-            build_research_stages,
-            build_task_decomposition_stages,
-            build_write_review_stages,
-        )
         from app.agents.runtime.crewai_runtime import build_runtime_tools
         from app.agents.workflow.executor import StageAdapterExecutor
+        from app.agents.workflow.topology import build_stage_specs, topology_for
 
         # stage_ctx / 预算守卫来自共享的 RunEnvironment —— 与 walker 路径同一实例。
         guard = env.guard
@@ -681,35 +694,45 @@ class ChatOrchestrator:
         # 内部是 tools=tools or None —— 名单内 profile 一上引擎就静默地不检索、
         # 不调工具。
         tools = await build_runtime_tools(ctx, stage_ctx=stage_ctx)
-        builders = {
-            "parallel_research": build_parallel_research_stages,
-            "debate": build_debate_stages,
-            "task_decomposition": build_task_decomposition_stages,
-            "write_review": build_write_review_stages,
-        }
-        # 与 plan 用同一个 profile 来源（见上）—— 两处必须一致，否则 plan 里
-        # 的 step id 与这里取出的 stage 对不上，直接 KeyError。
+        # 与 plan / graph 同一个 profile 来源（见上）—— 三处必须一致，否则 plan
+        # 里的 step id 与这里取出的 stage 对不上，直接 KeyError。
         selection = ctx.extra.get("runtime_selection")
         profile = getattr(selection, "agent_profile", None) or "deep_research"
-        builder = builders.get(profile, build_research_stages)
-        _, stages = builder(llm=llm, tools=tools, question=ctx.user_content or "")
-        stages_by_id = {spec.agent_id: spec for spec in stages}
+        # stage 表由拓扑声明给出（B15）：以前这里是第四份手写的 profile 清单，
+        # 漏一个 profile 就是「路由选得到、引擎跑不了」。
+        spec = topology_for(profile)
+        _, stages = build_stage_specs(
+            spec, llm=llm, tools=tools, question=ctx.user_content or ""
+        )
+        stages_by_id = {stage.agent_id: stage for stage in stages}
 
         stage_factory = None
+        revise_factory = None
         if allow_dynamic_stages:
             # 规划器的职责就是提出模板里没有的步骤；那些 step id 在这里查不到
             # stage，旧行为是 execute 时 KeyError 当成永久失败 —— 开规划器等于
             # 让多 Agent 轮次随机全挂。按 Step 自带文案现场建 agent+task 才让
             # 「模型提议的计划」真的可执行。模板 plan 不用这条路（id 必然命中），
             # 所以只在 flag 开时挂上，保留 builder 与模板漂移时的 fail-loud。
-            from app.agents.crews.dynamic_stage import build_dynamic_stage
+            from app.agents.crews.dynamic_stage import (
+                build_dynamic_stage,
+                build_revise_stage,
+            )
 
             def stage_factory(step: Any) -> Any:
                 return build_dynamic_stage(
                     step=step, llm=llm, tools=tools, question=ctx.user_content or ""
                 )
 
-        return StageAdapterExecutor(stages_by_id, stage_ctx, stage_factory)
+            # 返修轮用同一个动态 builder，只是把上一轮的审阅结论并进任务描述
+            # （B13）：不并进去，「审 → 改」就断在「改」这一头。
+            def revise_factory(step: Any) -> Any:
+                return build_revise_stage(
+                    step=step, llm=llm, tools=tools, question=ctx.user_content or ""
+                )
+
+        return StageAdapterExecutor(stages_by_id, stage_ctx, stage_factory,
+                                    revise_factory)
 
     def _crewai_status(self) -> tuple[bool, str | None]:
         """Return (available, fallback_reason). Cached after the first check."""

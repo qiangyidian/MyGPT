@@ -5,7 +5,8 @@ import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { buildLoginUrl } from "@/lib/navigation";
 import {
   clearOnboardingSkipped,
@@ -65,7 +66,8 @@ export default function OnboardingPage() {
       const test = await api.testModel(created.id);
       if (!test.ok) {
         toast.error("连接测试失败", {
-          description: `${test.error ?? "未知错误"}。模型配置已保存，可稍后在「设置 → 模型配置」中修正。`,
+          // test.error 是上游异常原文（含类名），必须过统一映射。
+          description: `${userErrorMessage(test.error)}。模型配置已保存，可稍后在「设置 → 模型配置」中修正。`,
           duration: 8000,
         });
       } else {
@@ -89,7 +91,7 @@ export default function OnboardingPage() {
       toast.success("模型已配置，正在进入对话…");
       router.replace("/");
     } catch (e) {
-      toast.error("保存失败", { description: e instanceof ApiError ? e.message : undefined });
+      toast.error("保存失败", { description: userErrorMessage(e) });
     } finally {
       setBusy(false);
     }

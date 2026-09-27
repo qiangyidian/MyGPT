@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from app.schemas.common import ORMModel
+
+# 批次列表的筛选项。分页之后筛选必须由 SQL 完成（前端手上只有一页数据），所以
+# 这四值是 ``redeem_service.list_batches`` 的入参而不是显示逻辑；前端
+# ``lib/redeem-batch.ts`` 的 ``REDEEM_BATCH_FILTERS`` 必须与它一字不差。
+BatchStatusFilter = Literal["all", "operable", "expired", "settled"]
 
 
 class CreditAccountOut(BaseModel):

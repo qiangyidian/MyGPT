@@ -33,7 +33,6 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
 
-import tiktoken
 from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -60,19 +59,13 @@ from app.agents.schemas import (
     ExecutionMode,
 )
 from app.agents.state_store import load_state, save_summary, upsert_goal
-from app.agents.token_budget import (
-    PROMPT_TOO_LARGE,
-    PromptAdmissionError,
-    admit_latest_turn,
-    calculate_prompt_budget,
-)
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.db import AsyncSessionLocal
-from app.model_capabilities import capabilities_from_config
 from app.models import (
     AgentRun,
     Conversation,
+    Document,
     KnowledgeBase,
     Message,
     ModelConfig,
@@ -80,12 +73,26 @@ from app.models import (
     User,
 )
 from app.providers.registry import get_provider_for_config
-from app.credits import get_credit_policy
 from app.quotas import QuotaExceeded, get_quota_service
-from app.services import credit_service
+from app.services.chat_context import (
+    _CHARS_PER_TOKEN,
+    _DEFAULT_MAX_CONTEXT_TOKENS,
+    _admit_and_trim_history,
+    _estimate_available_tool_schema_tokens,
+    _estimate_tokens,
+)
+from app.services.chat_accounting import (
+    _finish_for_error_code,
+    _status_for_finish,
+    settle_turn_usage,
+)
+from app.services import credit_service, tool_toggles
+from app.services.message_versions import snapshot_message
 from app.rag.citations import sanitize_unbacked_source_markers
 from app.rag.rag_service import rag_service
+from app.security.prompt_boundary import apply_untrusted_boundary
 from app.schemas import ChatRequest, Citation
+from app.schemas.chat import MAX_KB_PER_REQUEST
 from app.services.title_service import (
     is_default_title,
     maybe_autotitle,
@@ -132,134 +139,6 @@ logger = logging.getLogger(__name__)
 # Strong references to fire-and-forget tasks: asyncio keeps only weak refs, so
 # an unreferenced created task can be garbage-collected before it completes.
 _BG_TASKS: set[asyncio.Task[None]] = set()
-
-# Fallback context budget when a config has no usable token limit configured.
-_DEFAULT_MAX_CONTEXT_TOKENS = 8192
-
-# Rough chars-per-token used for naive fallback counting when tiktoken has no
-# encoding for a model (e.g. obscure model names). Keeps trimming conservative.
-_CHARS_PER_TOKEN = 4
-
-# Conservative accounting for image inputs. Provider-side image tokenization
-# depends on dimensions/detail and cannot be derived from the base64 byte size;
-# reserve fixed prompt headroom per image while counting text parts normally.
-_IMAGE_INPUT_TOKEN_RESERVE = 1024
-
-# finish_reason → consumer-facing generation status, persisted in message
-# metadata so the UI can tell a real completion apart from a truncation,
-# timeout, cancel, or failure. The old code collapsed everything non-cancelled
-# to "complete", hiding length/timeout truncations.
-_FINISH_STATUS: dict[str, str] = {
-    "stop": "complete",
-    "tool_calls": "complete",
-    "length": "truncated",
-    "budget": "truncated",
-    "cancelled": "cancelled",
-    "timeout": "error",
-    "content_filter": "error",
-    "provider_error": "error",
-    "stream_disconnected": "interrupted",
-    "error": "error",
-}
-
-# ev_error `code` → finish_reason, so a provider timeout is recorded as
-# finish_reason="timeout" instead of a generic "error".
-_ERROR_FINISH: dict[str, str] = {
-    "agent_budget_exceeded": "budget",
-    "provider_timeout": "timeout",
-    "provider_error": "provider_error",
-    "stream_disconnected": "stream_disconnected",
-}
-
-
-def _status_for_finish(finish_reason: str) -> str:
-    if not finish_reason:
-        return "complete"
-    return _FINISH_STATUS.get(finish_reason, "error")
-
-
-def _finish_for_error_code(code: str | None) -> str:
-    if not code:
-        return "error"
-    return _ERROR_FINISH.get(code, "error")
-
-
-def _apply_usage_accounting(
-    message: Message,
-    model_name: str | None,
-    usage: dict[str, Any] | None,
-) -> None:
-    """Persist one already-aggregated turn usage payload and its total cost."""
-    from app.core.pricing import normalize_usage, usage_cost
-
-    normalized = normalize_usage(usage)
-    if normalized is None:
-        return
-    message.prompt_tokens = normalized["prompt_tokens"]
-    message.completion_tokens = normalized["completion_tokens"]
-    message.total_tokens = normalized["total_tokens"]
-    message.cost_usd = usage_cost(model_name, usage)
-    message.metadata_ = {
-        **(message.metadata_ or {}),
-        "usage": dict(usage or {}),
-    }
-
-
-async def _charge_quota_if_enabled(tenant_id: str, message: Message) -> None:
-    """Charge the tenant's quota counters from the just-persisted message usage.
-
-    Reads the authoritative ``Message`` token/cost fields written by
-    :func:`_apply_usage_accounting` (server-computed; never client-supplied) and
-    forwards them to the quota service. No-op when quotas are disabled (the
-    default + test env), so this call site is inert unless an operator opts in
-    via ``QUOTAS_ENABLED=true``.
-    """
-    svc = get_quota_service()
-    if not svc.enabled:
-        return
-    prompt = int(message.prompt_tokens or 0)
-    completion = int(message.completion_tokens or 0)
-    if prompt == 0 and completion == 0:
-        return  # nothing to charge (e.g. a no-usage mock turn)
-    try:
-        await svc.charge_usage(
-            tenant_id,
-            prompt_tokens=prompt,
-            completion_tokens=completion,
-            cost_usd=float(message.cost_usd or 0.0),
-        )
-    except QuotaExceeded:
-        # Post-usage overage (tenant crossed the cap mid-period). Surface the
-        # admin-visible reason via the turn's metadata so the operator sees it;
-        # we do not fail the turn that already produced this output.
-        logger.warning(
-            "quota overage for tenant %s after turn usage charge", tenant_id
-        )
-
-
-async def settle_turn_usage(
-    db: AsyncSession,
-    user_id: uuid.UUID,
-    message: Message,
-    model_name: str | None,
-    usage: dict[str, Any] | None,
-) -> None:
-    """一轮对话的统一结算入口：记账 + 配额计费 + 积分扣减。
-
-    五个调用点全部走这里，不再各自成对调用 ``_apply_usage_accounting`` 与
-    ``_charge_quota_if_enabled``。原因是一个真实的漏洞：``_finalize_error``
-    与 ``_finalize_interrupted`` 过去只记账不计费，于是"故意让请求报错"就能
-    烧 token 而不付账。合并成单一入口后，结构上不可能只记账不计费。
-
-    原子性边界：记账与积分扣减在**同一 DB 事务**内（由调用方提交），幂等由
-    ``credit_ledger`` 上 ``ref_type='message'`` 的唯一部分索引保证。配额计费
-    走 Redis，是 best-effort（与 :mod:`app.quotas` 既有语义一致），失败不影响
-    积分账本 —— 积分是钱，配额是限流，可靠性要求不同，不该捆成一个事务。
-    """
-    _apply_usage_accounting(message, model_name, usage)
-    await _charge_quota_if_enabled(str(user_id), message)
-    await credit_service.charge_message_credits(db, user_id, message)
-
 
 def _log_turn_outcome(
     label: str,
@@ -525,175 +404,6 @@ async def _load_history(
     return rows
 
 
-# Resolved tiktoken encodings by model name. encoding_for_model is registry-
-# cached internally, but the miss path (unknown model -> fallback chain) was
-# re-walked per MESSAGE on every trim; memoize the final encoding per model.
-_encoding_cache: dict[str, tiktoken.Encoding | None] = {}
-
-
-def _resolve_encoding(model_name: str) -> tiktoken.Encoding | None:
-    if model_name in _encoding_cache:
-        return _encoding_cache[model_name]
-    enc: tiktoken.Encoding | None
-    try:
-        enc = tiktoken.encoding_for_model(model_name)
-    except Exception:
-        try:
-            enc = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            enc = None
-    _encoding_cache[model_name] = enc
-    return enc
-
-
-def _estimate_tokens(text: str, model_name: str) -> int:
-    """Best-effort token count.
-
-    Tries the tiktoken encoding matching ``model_name``; on any failure falls
-    back to cl100k_base, then to a character heuristic — we never hard-fail on
-    trimming, we just get less precise.
-    """
-    if not text:
-        return 0
-    enc = _resolve_encoding(model_name)
-    if enc is not None:
-        return len(enc.encode(text))
-    return max(1, len(text) // _CHARS_PER_TOKEN)
-
-
-def _trim_history(
-    messages: list[dict[str, Any]], max_tokens: int, model_name: str
-) -> list[dict[str, Any]]:
-    """Drop oldest messages until the whole list fits the token budget.
-
-    The very first message (the system prompt) is always preserved. Trimming
-    starts from the oldest non-system entry and walks forward — we keep the
-    most recent context, mirroring how a human would summarize.
-    """
-    if not messages or len(messages) <= 1:
-        return messages
-
-    # Precompute each message's token cost ONCE. The old loop recomputed the
-    # whole-list total on every deletion (re-serializing every message each
-    # time) — O(n^2). Here we keep a running total and subtract in O(1).
-    costs = [_estimate_message_tokens(message, model_name) for message in messages]
-    total = sum(costs)
-    if total <= max_tokens:
-        return messages
-
-    latest_user_index = next(
-        (
-            index
-            for index in range(len(messages) - 1, 0, -1)
-            if messages[index].get("role") == "user"
-        ),
-        1,
-    )
-    while latest_user_index > 1 and total > max_tokens:
-        # Remove a complete oldest turn where possible, rather than leaving an
-        # orphaned assistant/tool response after its user prompt was trimmed.
-        cutoff = 2
-        if messages[1].get("role") == "user":
-            while (
-                cutoff < latest_user_index
-                and messages[cutoff].get("role") != "user"
-            ):
-                cutoff += 1
-        total -= sum(costs[1:cutoff])
-        del messages[1:cutoff]
-        del costs[1:cutoff]
-        latest_user_index -= cutoff - 1
-    return messages
-
-
-def _estimate_message_tokens(message: dict[str, Any], model_name: str) -> int:
-    """Count serialized message text plus conservative multimodal reserves."""
-    import json
-
-    content = message.get("content")
-    if not isinstance(content, list):
-        return _estimate_tokens(
-            json.dumps(message, ensure_ascii=False, default=str), model_name
-        )
-
-    image_count = 0
-    serialized_parts: list[dict[str, Any]] = []
-    for part in content:
-        if isinstance(part, dict) and part.get("type") == "image_url":
-            image_count += 1
-            serialized_parts.append({"type": "image_url"})
-        elif isinstance(part, dict):
-            serialized_parts.append(part)
-    text_message = {**message, "content": serialized_parts}
-    return _estimate_tokens(
-        json.dumps(text_message, ensure_ascii=False, default=str), model_name
-    ) + image_count * _IMAGE_INPUT_TOKEN_RESERVE
-
-
-def _latest_user_turn_tokens(messages: list[dict[str, Any]], model_name: str) -> int:
-    """Return the serialized cost of the newest user turn only."""
-    for message in reversed(messages):
-        if message.get("role") == "user":
-            return _estimate_message_tokens(message, model_name)
-    return 0
-
-
-def _admit_and_trim_history(
-    messages: list[dict[str, Any]],
-    cfg: ModelConfig,
-    *,
-    model_name: str | None = None,
-    tool_schema_tokens: int = 0,
-) -> list[dict[str, Any]]:
-    """Apply capability-aware admission, then trim only older history."""
-
-    caps = capabilities_from_config(cfg)
-    budget = calculate_prompt_budget(
-        caps,
-        requested_output=caps.max_output_tokens,
-        tool_schema_tokens=tool_schema_tokens,
-    )
-    effective_model = model_name or getattr(cfg, "model_name", "")
-    admit_latest_turn(
-        _latest_user_turn_tokens(messages, effective_model), budget.input_tokens
-    )
-    admitted = _trim_history(list(messages), budget.input_tokens, effective_model)
-    admitted_total = sum(
-        _estimate_message_tokens(message, effective_model) for message in admitted
-    )
-    if admitted_total > budget.input_tokens:
-        raise PromptAdmissionError(
-            PROMPT_TOO_LARGE,
-            "The protected system prompt and latest message exceed the prompt budget",
-        )
-    return admitted
-
-
-def _estimate_available_tool_schema_tokens(
-    cfg: ModelConfig, *, enable_tools: bool, route: Any, model_name: str
-) -> int:
-    """Estimate advertised tool schemas when this turn can expose them."""
-    caps = capabilities_from_config(cfg)
-    if not enable_tools or not caps.supports_tools:
-        return 0
-    try:
-        import json
-
-        from app.agents.intent_router import filter_tool_names
-        from app.tools.registry_init import get_default_registry
-
-        registry = get_default_registry()
-        names = [tool.name for tool in registry.list()]
-        names = list(filter_tool_names(names, route))
-        schemas = registry.openai_schemas(only=names)
-        return _estimate_tokens(
-            json.dumps(schemas, ensure_ascii=False, default=str), model_name
-        )
-    except Exception:
-        logger.warning("tool schema token estimation failed", exc_info=True)
-        return 0
-
-
 def _finalize_prompt_messages(
     messages: list[dict[str, Any]],
     cfg: ModelConfig,
@@ -796,6 +506,96 @@ def _resolve_turn_route(
             use_multi_agent=True,
         )
     return route
+
+
+def _split_mentions(request: ChatRequest) -> tuple[list[uuid.UUID], ...]:
+    """(@引用) 按目标类型拆成 (知识库 id, 文档 id, 本对话附件 id)。"""
+    kb_ids: list[uuid.UUID] = []
+    doc_ids: list[uuid.UUID] = []
+    file_ids: list[uuid.UUID] = []
+    for mention in request.mentions or []:
+        if mention.kind == "kb":
+            kb_ids.append(mention.id)
+        elif mention.kind == "doc":
+            doc_ids.append(mention.id)
+        elif mention.kind == "file":
+            file_ids.append(mention.id)
+    return kb_ids, doc_ids, file_ids
+
+
+async def _apply_mentions(
+    db: AsyncSession,
+    user: User,
+    request: ChatRequest,
+    kb_ids: list[uuid.UUID],
+) -> list[uuid.UUID]:
+    """Fold the turn's ``@`` references into its retrieval scope.
+
+    Mutates the (request-scoped) DTO so every downstream consumer — route
+    resolution, attachment binding, the persisted run input — sees one merged
+    answer instead of re-deriving it:
+
+      * ``@知识库`` joins ``kb_ids`` (the ownership loop that already follows the
+        call site rejects a foreign one with a 404, same as the toolbar set);
+      * ``@文档`` pulls in its own KB too — chunks live in that KB's collection —
+        and is returned as the document scope the retriever filters on;
+      * ``@文件`` joins ``request.attachment_ids``, which is exactly what already
+        injects the file's text / multimodal parts into the prompt.
+
+    A target the caller cannot read is reported as a 404 with the same wording as
+    "does not exist": an existence probe and a wrong guess get identical answers.
+    """
+    mention_kb_ids, mention_doc_ids, mention_file_ids = _split_mentions(request)
+
+    for doc_id in mention_doc_ids:
+        doc = await db.get(Document, doc_id)
+        kb = None
+        if doc is not None:
+            kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
+        if doc is None or kb is None or (kb.user_id != user.id and user.role != "admin"):
+            raise AppException(404, "document_not_found", "Document not found")
+        if doc.knowledge_base_id not in kb_ids:
+            kb_ids.append(doc.knowledge_base_id)
+
+    for kb_id in mention_kb_ids:
+        if kb_id not in kb_ids:
+            kb_ids.append(kb_id)
+
+    # The merged set is what actually fans out, so the request-wide cap applies
+    # to it (toolbar picks + @-references together), not to either half alone.
+    if len(kb_ids) > MAX_KB_PER_REQUEST:
+        raise AppException(
+            400,
+            "too_many_knowledge_bases",
+            f"一次最多引用 {MAX_KB_PER_REQUEST} 个知识库",
+        )
+
+    if (mention_kb_ids or mention_doc_ids) and kb_ids != request.knowledge_base_ids:
+        request.knowledge_base_ids = list(kb_ids)
+
+    for att_id in mention_file_ids:
+        if att_id not in request.attachment_ids:
+            request.attachment_ids.append(att_id)
+
+    return mention_doc_ids
+
+
+def _mentions_on_wire(request: ChatRequest) -> list[dict[str, str]]:
+    """The mention list in the shape both the message metadata and run.input use."""
+    return [{"kind": m.kind, "id": str(m.id)} for m in (request.mentions or [])]
+
+
+def _mention_document_ids(raw: Any) -> list[uuid.UUID]:
+    """``run.input["mentions"]`` → the document ids that scope the turn."""
+    out: list[uuid.UUID] = []
+    for item in raw or []:
+        if not isinstance(item, dict) or item.get("kind") != "doc":
+            continue
+        try:
+            out.append(uuid.UUID(str(item.get("id"))))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _build_system_prompt(conversation: Conversation | None, rag_context: str) -> str:
@@ -916,6 +716,9 @@ def _augment_with_attachments(
     a bounded inline snippet so it never blows the context budget.
     ``max_chars=None`` means the caller already bounded the text (the
     history-rehydration path caps per message) — do not truncate again.
+
+    这里是附件文本进模型上下文的**最后一个**拼接点（当前轮与跨轮记忆两条路径都走
+    它），所以围栏只加一次：文件正文属外部数据，包进不可信内容围栏后再拼上去。
     """
     snippet = (attachment_text or "").strip()
     if not snippet:
@@ -923,7 +726,29 @@ def _augment_with_attachments(
     # Bound the inline injection; full text stays on the attachment row.
     if max_chars is not None and len(snippet) > max_chars:
         snippet = snippet[:max_chars] + "\n…（内容已截断，完整内容见附件）"
-    return f"{user_content}\n\n[附件内容]\n{snippet}"
+    fenced = apply_untrusted_boundary("attachment", snippet)
+    if not fenced:
+        return user_content
+    return f"{user_content}\n\n[附件内容]\n{fenced}"
+
+
+def _context_enrichment_block(stable_block: str, skill_block: str) -> str:
+    """把本轮变化的上下文富化片段合成**一块**并整体过不可信内容围栏。
+
+    这些片段的正文不是平台写的：``project instructions`` 是从磁盘上逐级读回的
+    ``AGENTS.md``（内容随仓库走，谁改了文件谁就能改这一段），``$skill`` 片段来自
+    ``SKILLS_ROOTS`` 下安装的 ``SKILL.md``——按提示注入的威胁模型它们和 RAG chunk
+    同级，过去却被裸拼到 system prompt 末尾，文件里一行「忽略以上规则」就是顶
+    层指令。
+
+    围栏只在这一层加、且只加一次：先逐片段包再包整段会把内层的闭合标记全角化（等于
+    剥掉内层围栏），模型读到两套互相矛盾的标记；顺序上必须是「拼成一块 → 包一次 →
+    整体追加」，因为声明只跟着自己那层 header，header 与正文之间一旦被别的内容隔开，
+    中间那段就没有任何声明保护。返回空串表示本轮没有变化的片段，调用点据此什么都不
+    追加。
+    """
+    joined = "\n\n".join(b for b in (stable_block, skill_block) if b)
+    return apply_untrusted_boundary("enrichment", joined)
 
 
 def _attach_image_parts(messages: list[dict[str, Any]], image_parts: list[dict[str, Any]]) -> None:
@@ -993,6 +818,10 @@ async def _delete_last_assistant_message(
             raise AppException(
                 409, "turn_in_progress", "上一条回复还在生成中，请先停止再重新生成"
             )
+        # 删之前先存一版（条目 31）：重新生成不该把上一个答案销毁——用户要能切回去
+        # 对比，评测集要能取到，成本也已经真实发生过。版本行不带 messages 外键，
+        # 所以它活得比这一行长。
+        await snapshot_message(db, last, origin="regenerate")
         # Cascade should handle ToolCall rows, but be explicit to be safe.
         await db.execute(delete(ToolCall).where(ToolCall.message_id == last.id))
         await db.delete(last)
@@ -1101,6 +930,7 @@ class ChatService:
         tenant = str(user.id)
         quota_svc = get_quota_service()
         quota_ticket = None
+        credit_hold: credit_service.TurnHold | None = None
         try:
             if quota_svc.enabled:
                 try:
@@ -1115,21 +945,30 @@ class ChatService:
                         },
                     )
                     return
-            # 积分准入：余额 <= 0 时在调用模型之前拒绝，避免已产生成本。
-            # CREDITS_ENFORCED 关闭时只记账不拦截（观察模式）。
-            credit_policy = get_credit_policy()
-            if credit_policy.enforced:
+            # 工具启停快照要在**这一侧**也刷：durable 路径由 execute_run 刷，但网页
+            # 上的普通对话根本不走 worker，只有 API 进程自己认账，运营在后台按下的
+            # "停用 python_exec"才会对网页生效。TTL 挡着，所以是每进程每 15 秒一条
+            # SELECT，不是每条消息一条。
+            await tool_toggles.refresh_with(db)
+            # 积分准入（finding 40）：调用模型之前预留一轮的额度。
+            # 这里刻意不再"读一下余额"—— 无锁快照读下，N 个并发轮次会读到
+            # 同一个余额然后全部放行，而 await 交错点保证了这必然发生。
+            # admit_turn 在账户行锁（Postgres 上是 SELECT ... FOR UPDATE）下写
+            # 一条独立提交的预留流水，所以第二个轮次看到的是扣过预留的余额。
+            # CREDITS_ENFORCED 关闭时它直接返回 None（观察模式，不锁行）。
+            try:
+                credit_hold = await credit_service.admit_turn(user.id)
+            except credit_service.CreditError as exc:
                 account = await credit_service.read_account(db, user.id)
-                if account is None or int(account.balance) <= 0:
-                    yield _event(
-                        "error",
-                        {
-                            "code": "insufficient_credits",
-                            "message": "积分不足，请先兑换后再继续对话",
-                            "balance": int(account.balance) if account else 0,
-                        },
-                    )
-                    return
+                yield _event(
+                    "error",
+                    {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "balance": int(account.balance) if account else 0,
+                    },
+                )
+                return
             async for evt in self._run(db, user, request):
                 yield evt
         except asyncio.CancelledError:
@@ -1149,6 +988,14 @@ class ChatService:
                     await quota_svc.release_run(tenant, quota_ticket)
                 except Exception:
                     pass
+            # 预留必须在任何出口都退还：正常结束、模型报错、客户端断开
+            # （CancelledError）都走到这里。漏退还 = 用户余额被永久压住
+            # turn_reserve，只能靠悬挂回收兜底（默认 6 小时）。
+            if credit_hold is not None:
+                try:
+                    await credit_service.release_turn_hold(credit_hold)
+                except Exception:
+                    logger.warning("turn hold release failed", exc_info=True)
 
     async def _run(
         self, db: AsyncSession, user: User, request: ChatRequest
@@ -1224,6 +1071,11 @@ class ChatService:
         elif not kb_ids and conversation.knowledge_base_id is not None:
             kb_ids = [conversation.knowledge_base_id]
             kb_explicit = False
+        # @-references extend the scope (and are ownership-checked here, because
+        # a mention is attacker-controlled text from the composer).
+        mention_doc_ids = await _apply_mentions(db, user, request, kb_ids)
+        if request.mentions:
+            kb_explicit = True
         # Ownership: a user may only run against their own (or system-wide) model
         # config and their own knowledge bases — never another user's.
         if cfg.user_id is not None and cfg.user_id != user.id:
@@ -1282,6 +1134,10 @@ class ChatService:
                             "mode": request.mode or "speed",
                             "model_id": str(request.model_id) if request.model_id else None,
                             "knowledge_base_ids": [str(k) for k in (kb_ids or [])],
+                            # The @-references as sent (the readable tokens are in
+                            # the content; this is what the bubble renders as
+                            # 引用来源 and what a replay re-sends verbatim).
+                            "mentions": _mentions_on_wire(request),
                             "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
                         }
                     },
@@ -1376,8 +1232,16 @@ class ChatService:
         else:
             rag_requested = True
             try:
+                # No request-wide top_k: each knowledge base contributes its OWN
+                # recall window (``kb.top_k``, NULL = the platform default), and
+                # the merged list is cut globally (RRF order → per-KB cap → the
+                # RAG_CONTEXT_TOKENS budget). Hard-coding a single k here — as this
+                # call used to — silently overrode every per-KB tuning.
                 rag_context, citations = await rag_service.retrieve(
-                    db, user_content, kb_ids, top_k=5
+                    db,
+                    user_content,
+                    kb_ids,
+                    document_ids=mention_doc_ids or None,
                 )
             except Exception as exc:
                 # RAG is best-effort: a retrieval failure must not kill the chat.
@@ -1607,7 +1471,9 @@ class ChatService:
 
             _changed = differ_for(str(conversation.id)).diff(_stable)
             _stable_block = render_fragments(_changed)
-            _enrich = "\n\n".join(b for b in (_stable_block, _skill_block) if b)
+            # 6b'. 富化片段来自磁盘（AGENTS.md / SKILL.md），整块过一次不可信围栏再
+            # 追加：一次 ``+=`` 追加一整块，header 与正文不会被后续内容隔开。
+            _enrich = _context_enrichment_block(_stable_block, _skill_block)
             if _enrich:
                 system_prompt = system_prompt + "\n\n" + _enrich
                 if messages and messages[0].get("role") == "system":
@@ -2041,21 +1907,21 @@ class ChatService:
         the worker invokes — it is NOT duplicated here.
         """
 
-        # 积分准入：与内联路径同款规则，但不走 SSE —— 这个端点返回 run_id，
-        # 所以用 HTTP 状态码拒绝。必须放在最前面：_get_or_create_conversation
-        # 会真的建一个会话行，拦在它后面就"已经产生了副作用"。
-        credit_policy = get_credit_policy()
-        if credit_policy.enforced:
+        # 积分准入（finding 40）：与内联路径同款规则，但不走 SSE —— 这个端点
+        # 返回 run_id，所以用 HTTP 状态码拒绝。必须放在最前面：
+        # _get_or_create_conversation 会真的建一个会话行，拦在它后面就"已经产生
+        # 了副作用"。预留在这里独立 commit：从这一刻到 run 行落库之间是最容易
+        # 并发的窗口，两个并发提交必须看到同一份已经被压低过的余额。
+        try:
+            credit_hold = await credit_service.admit_turn(user.id)
+        except credit_service.CreditError as exc:
             account = await credit_service.read_account(db, user.id)
-            if account is None or int(account.balance) <= 0:
-                from app.core.exceptions import AppException as _AppException
-
-                raise _AppException(
-                    402,
-                    "insufficient_credits",
-                    "积分不足，请先兑换后再继续对话",
-                    {"balance": int(account.balance) if account else 0},
-                )
+            raise AppException(
+                402,
+                exc.code,
+                exc.message,
+                {"balance": int(account.balance) if account else 0},
+            ) from exc
 
         # 1. Resolve conversation + model (same helpers as _run).
         conversation = await _get_or_create_conversation(db, user, request)
@@ -2086,6 +1952,13 @@ class ChatService:
         if cfg.user_id is not None and cfg.user_id != user.id:
             raise AppException(404, "model_not_found", "Model config not found")
 
+        # @-references: validate + fold into the request BEFORE anything is
+        # persisted, so the run input the worker later executes already carries
+        # the merged KB / attachment set (and a foreign mention never writes a
+        # row). Same helper the inline turn uses — the two dispatch paths must
+        # scope retrieval identically.
+        await _apply_mentions(db, user, request, list(request.knowledge_base_ids or []))
+
         # 2. Persist the user message (same shape as _run; no regenerate support
         #    in durable dispatch for now — regenerate is an inline-only path).
         user_content = request.content or ""
@@ -2099,6 +1972,7 @@ class ChatService:
                         "mode": request.mode or "speed",
                         "model_id": str(request.model_id) if request.model_id else None,
                         "knowledge_base_ids": [str(k) for k in (request.knowledge_base_ids or [])],
+                        "mentions": _mentions_on_wire(request),
                         "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
                     }
                 },
@@ -2176,6 +2050,9 @@ class ChatService:
                 # Per-turn KB selection (multi-KB) so the worker-side turn can
                 # run RAG — without this the durable path always saw no KB.
                 "knowledge_base_ids": [str(k) for k in (request.knowledge_base_ids or [])],
+                # The @-references, so the worker can rebuild the document scope
+                # (the KB / attachment parts already rode the merged lists above).
+                "mentions": _mentions_on_wire(request),
                 # Bound attachment ids so the worker-side turn re-hydrates the
                 # file context (text injection + vision/audio parts + routing).
                 "attachment_ids": [str(a) for a in (request.attachment_ids or [])],
@@ -2224,6 +2101,14 @@ class ChatService:
                 message="服务繁忙，请求已排队稍后自动执行",
                 status_code=503,
             ) from exc
+        # 预留的使命到此结束：run 行已经 commit 成 pending，排队/执行的并发
+        # 控制交接给 quota（admit_run）与单轮扣分上限，所以这里立刻退还 ——
+        # 留在账上等 worker 去还会把余额压低到下次悬挂回收（默认 6h）。
+        if credit_hold is not None:
+            try:
+                await credit_service.release_turn_hold(credit_hold)
+            except Exception:
+                logger.warning("turn hold release failed", exc_info=True)
         logger.info(
             "durable dispatch: enqueued run %s for conversation %s (user %s)",
             run.id, conversation.id, user.id,
@@ -2369,6 +2254,14 @@ async def run_durable_turn(
             if kb.user_id == user.id or user.role == "admin"
         }
         kb_ids = [kb_id for kb_id in kb_ids if kb_id in owned]
+    # Dedupe + re-apply the request-wide fan-out cap: run.input is server-written,
+    # but a row persisted before the cap existed (or a hand-edited one) must not
+    # buy extra per-turn cost on the worker's behalf.
+    kb_ids = list(dict.fromkeys(kb_ids))[:MAX_KB_PER_REQUEST]
+    # @文档 narrows retrieval to those documents. No ownership re-check here: the
+    # filter can only REMOVE context, and the KB set above is already owner-
+    # filtered, so a foreign document id can never pull its chunks in.
+    mention_doc_ids = _mention_document_ids(run_input.get("mentions"))
     # Bind the selection to the conversation (single-KB semantics) so the
     # client's detail refetch restores the picker state after the turn.
     if kb_ids and conversation.knowledge_base_id != kb_ids[0]:
@@ -2426,8 +2319,14 @@ async def run_durable_turn(
     else:
         rag_skipped_reason = None
         try:
+            # Same rule as the inline path: no request-wide top_k, so every
+            # knowledge base keeps its own recall window and the merge is cut
+            # globally; ``mention_doc_ids`` scopes it to the @-referenced files.
             rag_context, citations = await rag_service.retrieve(
-                db, user_content, kb_ids, top_k=5
+                db,
+                user_content,
+                kb_ids,
+                document_ids=mention_doc_ids or None,
             )
         except Exception as exc:
             logger.warning("durable RAG retrieval failed, continuing without context: %s", exc)

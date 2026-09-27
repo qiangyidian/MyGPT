@@ -32,7 +32,8 @@ class Document(Base, TimestampMixin):
     # 没有这几列时，索引跑在「谁收到上传谁执行」的进程内后台任务里：一次发版
     # 或崩溃就把任务销毁，文档永远停在 pending/parsing，而且坏文档会被无限重试。
     # lease + claimed_by 让「接管」与「误接管」可以区分：租约到期前别人不能碰，
-    # 到期后任何进程都能接手，而接手之后旧进程再写回会被 claimed_by 挡掉。
+    # 到期后任何进程都能接手，而接手之后旧进程再写回会被 ingest_claim_version
+    # 挡掉（见下面那列）。
     ingest_attempts: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
@@ -43,6 +44,13 @@ class Document(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     ingest_claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 每次领取 +1，且永不归零 —— 它是「这是不是我领的那一次」的唯一凭据。
+    # claimed_by 不足以回答这个问题：worker 名可以重复（同一进程重启后同名），
+    # 而 attempts 会被 enqueue 重置，两者都能被 ABA 绕过：僵尸拿回旧名字/旧计数
+    # 就能覆盖接管者已经落库的状态。单调递增的整数没有这个洞。
+    ingest_claim_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     knowledge_base = relationship("KnowledgeBase", back_populates="documents")
     chunks = relationship(

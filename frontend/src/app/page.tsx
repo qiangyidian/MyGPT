@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { NavSuspense } from "@/components/navigation/page-loading";
 import { MessageList } from "@/components/message-list";
-import { Composer } from "@/components/composer";
+import { Composer, type ComposerSendOpts } from "@/components/composer";
 import { AttachmentDropzone } from "@/components/attachments/attachment-dropzone";
 import { ApprovalCard } from "@/components/approval-card";
 import { ContextPanel } from "@/components/context/context-panel";
@@ -20,10 +20,12 @@ import { restoreAgentGraph } from "@/hooks/useAgentRunGraph";
 import { useBranchConversation } from "@/hooks/useMessageActions";
 import { useModels } from "@/hooks/useModels";
 import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import { useChatUiStore } from "@/stores/chat-ui-store";
 import { useContextPanelStore } from "@/stores/context-panel-store";
 import { useAgentRunStore } from "@/stores/agent-run-store";
 import { BranchHistory } from "@/components/branch-history";
+import { ExportConversation } from "@/components/chat/export-conversation";
 import type { Citation, KnowledgeBase } from "@/lib/types";
 
 export default function HomePage() {
@@ -122,6 +124,7 @@ function ChatPanel({
   }, [detail.data?.id, detail.data?.knowledge_base_id]);
 
   const chat = useChatStream();
+  const rebuildLastSend = chat.rebuildLastSend;
   const lastRestoredRunRef = useRef<string | null>(null);
 
   // Bumped on every send so MessageList force-scrolls to the newest message
@@ -172,8 +175,10 @@ function ChatPanel({
   // conversation detail has loaded (covers the post-refresh case where the
   // in-memory lastSendRef was lost and regenerate/continue went silent).
   useEffect(() => {
-    if (detail.data && !chat.isStreaming) chat.rebuildLastSend(activeConversationId);
-  }, [detail.data, chat.isStreaming, activeConversationId]);
+    if (detail.data && !chat.isStreaming) {
+      rebuildLastSend(activeConversationId);
+    }
+  }, [detail.data, chat.isStreaming, rebuildLastSend, activeConversationId]);
 
   // Durable runs: on conversation open / browser refresh, adopt a run that is
   // still executing server-side and resume its live view (no-op otherwise).
@@ -247,12 +252,14 @@ function ChatPanel({
     (chat.currentConversationId === activeConversationId ||
       activeConversationId == null);
 
-  const handleSend = (content: string, opts: { mode: typeof mode; attachmentIds: string[] }) => {
+  const handleSend = (content: string, opts: ComposerSendOpts) => {
     bumpScrollSignal();
     void chat.send(content, {
       conversationId: activeConversationId,
       modelId,
       knowledgeBaseIds: kbIds,
+      // 正文里 @ 出来的引用：服务端把它们并入本轮检索范围（条目 26）。
+      mentions: opts.mentions,
       mode: opts.mode,
       attachmentIds: opts.attachmentIds,
     });
@@ -272,7 +279,7 @@ function ChatPanel({
         attachmentIds: [],
       });
     } catch (err) {
-      toast.error("编辑分支失败", { description: err instanceof Error ? err.message : undefined });
+      toast.error("编辑分支失败", { description: userErrorMessage(err) });
     }
   };
 
@@ -304,12 +311,18 @@ function ChatPanel({
             (top-right, absolute) so they no longer claim a header row. */}
         <div className="absolute right-4 top-2 z-10 flex items-center gap-2">
           {activeConversationId && (
-            <BranchHistory
-              conversationId={activeConversationId}
-              activeConversationId={activeConversationId}
-              onNavigate={setActiveConversationId}
-              className="h-8 gap-1 text-xs text-muted-foreground"
-            />
+            <>
+              <BranchHistory
+                conversationId={activeConversationId}
+                activeConversationId={activeConversationId}
+                onNavigate={setActiveConversationId}
+                className="h-8 gap-1 text-xs text-muted-foreground"
+              />
+              <ExportConversation
+                conversationId={activeConversationId}
+                className="h-8 text-xs text-muted-foreground"
+              />
+            </>
           )}
           <AgentPanelTrigger />
           <ContextPanelTrigger

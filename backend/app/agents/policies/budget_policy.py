@@ -110,6 +110,37 @@ class BudgetLimits:
 DEFAULT_LIMITS = BudgetLimits()
 
 
+# --------------------------------------------------------------------------- #
+# 唯一的「一次 run 的 guard 从哪来」取值点。
+#
+# 三条执行路径（native runtime、CrewAI walker、workflow engine）过去各自
+# 从 Settings 现拼一份 limits：``budget_overrides`` / ``budget_policy_authorized``
+# 的读法在 native_runtime 与 crewai_runtime 里逐字重复了两遍，第三遍则在
+# RunEnvironment 里绕回来。默认值散落三处 = 改一处漏两处。
+# --------------------------------------------------------------------------- #
+def guard_for_context(ctx: Any) -> BudgetGuard:
+    """Resolve the run guard on ``ctx``, building (and attaching) it once.
+
+    Tolerates the lightweight protocol fakes tests inject: they may carry no
+    ``budget_guard`` slot at all (``getattr``) but always expose ``extra``.
+    """
+    guard = getattr(ctx, "budget_guard", None)
+    if guard is not None:
+        return guard
+    from app.core.config import get_settings
+
+    extra = getattr(ctx, "extra", {}) or {}
+    guard = BudgetGuard(
+        BudgetLimits.from_settings(
+            get_settings(),
+            extra.get("budget_overrides"),
+            allow_increase=bool(extra.get("budget_policy_authorized", False)),
+        )
+    )
+    ctx.budget_guard = guard
+    return guard
+
+
 class BudgetGuard:
     """Tracks usage against :class:`BudgetLimits` and raises when crossed."""
 

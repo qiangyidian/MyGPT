@@ -1,0 +1,84 @@
+# Alertmanager routing for MyGPT (finding 38).
+#
+# Mounted read-only at /etc/alertmanager/alertmanager.yml in
+# docker-compose.prod.yml; rules live in rules/mygpt.yml.
+#
+# Unlike prometheus.yml, Alertmanager does NOT expand $VAR inside its config, so
+# the receiver endpoints below are literal placeholders. The repo carries no
+# secrets: fill them in on the server (chmod 600) or mount a per-environment
+# override file instead of committing a real webhook token here.
+#
+# China-market note: Alertmanager has no native DingTalk/Talkfire webhook, and
+# `wechat_configs` needs corp/agent credentials. The default receiver is a plain
+# `webhooks` entry so any of 企业微信机器人 / 钉钉机器人 / Server酱 / PagerDuty
+# events can be reached through a tiny forwarding endpoint; the `email` receiver
+# is left as the fallback because it needs no intermediate service.
+
+global:
+  resolve_timeout: 5m
+  # Only used by the email receiver below; keep the placeholder obvious so a
+  # half-configured deploy fails loudly at first send instead of silently.
+  smtp_smarthost: "smtp.example.invalid:465"
+  smtp_from: "alertmanager@mychat.qiangi.invalid"
+  smtp_auth_username: "REPLACE-ME"
+  smtp_auth_password: "REPLACE-ME"
+  smtp_require_tls: true
+
+# Grouping: one page per alert name per component, so a 500-generating bad
+# release is one notification rather than hundreds.
+route:
+  receiver: ops-ticket
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  # Warning-level noise stays on the 30m cadence; only the critical sub-route
+  # below is re-paged quickly.
+  group_interval: 30m
+  repeat_interval: 12h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: ops-critical
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 1h
+      continue: true
+    - matchers:
+        - severity = "info"
+      receiver: "null"
+
+receivers:
+  - name: "null"
+
+  # Paging path: 企业微信/钉钉机器人 webhook, or an external pager.
+  - name: ops-critical
+    webhook_configs:
+      - url: "https://REPLACE-ME/critical-webhook"
+        send_resolved: true
+    # Email also receives criticals so a dead bot webhook cannot swallow a page.
+    email_configs:
+      - to: "ops-replace-me@example.invalid"
+        send_resolved: true
+        headers:
+          subject: '[MyGPT CRITICAL] {{ .GroupLabels.alertname }}'
+
+  - name: ops-ticket
+    email_configs:
+      - to: "ops-replace-me@example.invalid"
+        send_resolved: true
+        headers:
+          subject: '[MyGPT] {{ .GroupLabels.alertname }}'
+
+inhibit_rules:
+  # A dead scrape target explains every "no progress / no samples" rule firing
+  # behind it — page once for the target, not for each derived symptom.
+  - source_matchers:
+      - alertname = "MyGPTApiTargetDown"
+    target_matchers:
+      - alertname =~ "MyGPTQueueNoProgress|MyGPTQueueMetricsAbsent|MyGPTAPIHighErrorRate|MyGPTScrapeExpositionEmpty"
+    equal: ["instance"]
+  # info-level restart notices are noise while the service is actually down.
+  - source_matchers:
+      - alertname = "MyGPTApiTargetDown"
+    target_matchers:
+      - severity = "info"
+    equal: ["instance"]

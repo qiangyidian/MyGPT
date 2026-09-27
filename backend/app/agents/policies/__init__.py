@@ -13,6 +13,7 @@ from app.agents.policies.budget_policy import (
     BudgetExceeded,
     BudgetGuard,
     BudgetLimits,
+    guard_for_context,
 )
 from app.agents.policies.tool_policy import (
     UnsafeSQLError,
@@ -33,6 +34,7 @@ __all__ = [
     "UnsafeSQLError",
     "arguments_hash",
     "expiry_from_now",
+    "guard_for_context",
     "is_expired",
     "isolated_sandbox_configured",
     "is_tool_allowed",

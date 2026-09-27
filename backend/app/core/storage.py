@@ -181,9 +181,12 @@ def get_storage(backend: str | None = None) -> StorageBackend:
 
     settings = get_settings()
     chosen = (backend or settings.STORAGE_BACKEND).lower().strip()
-    if chosen == "minio":
+    if chosen != "local":
+        # 正常配置走不到这里：``STORAGE_BACKEND`` 的启动校验已经把非 local 的值挡在
+        # 进程外了。留这条 raise 是给显式传 ``backend=`` 的调用方与未来接手的同事看
+        # 的 —— 别误会成"后端在别处实现好了"。
         raise NotImplementedError(
-            "MinIO/S3 storage backend is not implemented; set STORAGE_BACKEND=local"
+            f"存储后端 {chosen!r} 未实现，只有 local（请把 STORAGE_BACKEND 设回 local）"
         )
     instance: StorageBackend = LocalStorage()
     if backend is None:

@@ -45,6 +45,14 @@ class CreditPolicy:
     signup_bonus: int = 0
     max_adjust: int = 10_000_000
     max_codes_per_batch: int = 5000
+    # 单轮扣分硬上限（finding 40）。余额可以在轮末结算时被扣成负数是刻意设计
+    # （见 :class:`app.models.CreditAccount` 的注释），但"一轮"必须有上界：
+    # 一个 200 步的任务、或一个把工具输出塞满上下文的循环，能在一次准入通过
+    # 之后把余额拖到任意深的负值 —— 那时拦截已经来不及了。
+    max_credits_per_turn: int = 200_000
+    # 轮次准入预留额：开启拦截时，账户余额至少要能覆盖它才放行一轮。
+    # 刻意远小于 max_credits_per_turn —— 它的职责是"见底就挡"，不是预付整轮。
+    turn_reserve: int = 50
 
     @classmethod
     def from_settings(cls, settings: Any | None = None) -> CreditPolicy:
@@ -63,6 +71,12 @@ class CreditPolicy:
             max_codes_per_batch=max(
                 1, int(getattr(s, "REDEEM_MAX_CODES_PER_BATCH", 5000))
             ),
+            # 上限至少 1：配成 0 等于"所有轮次免费"，那是一次静默的计费关闭，
+            # 而不是一种合法的取值。
+            max_credits_per_turn=max(
+                1, int(getattr(s, "CREDITS_MAX_CHARGE_PER_TURN", 200_000))
+            ),
+            turn_reserve=max(0, int(getattr(s, "CREDITS_TURN_RESERVE", 50))),
         )
 
 
@@ -72,7 +86,7 @@ class CreditPolicy:
 def compute_charge(
     cost_usd: float | None, total_tokens: int | None, policy: CreditPolicy
 ) -> int:
-    """一轮对话该扣多少积分。
+    """一轮对话该扣多少积分（已按单轮上限截断）。
 
     优先用服务端实测成本换算。**成本未知或为 0 时必须回落到 token 计价** ——
     :func:`app.core.pricing.usage_cost` 对未配置定价的模型返回 ``None``
@@ -81,13 +95,21 @@ def compute_charge(
 
     两个分支都 ``ceil`` 且下限为 1：真实产生过消耗的一轮，积分至少为 1。
     零消耗（mock 响应、无 usage 的失败轮）返回 0。
+
+    最后统一被 ``policy.max_credits_per_turn`` 截断（finding 40）：一轮扣费的
+    上界必须是常量，不能取决于这一轮跑了多少步。截断发生在纯函数里，所以
+    流式路径、持久 worker 路径、评测路径拿到的是同一个数字。
     """
     if cost_usd is not None and cost_usd > 0:
-        return max(1, ceil(cost_usd * policy.credits_per_usd))
-    tokens = int(total_tokens or 0)
-    if tokens > 0:
-        return max(1, ceil(tokens / 1000.0 * policy.credits_per_1k_tokens))
-    return 0
+        charge = max(1, ceil(cost_usd * policy.credits_per_usd))
+    else:
+        tokens = int(total_tokens or 0)
+        charge = (
+            max(1, ceil(tokens / 1000.0 * policy.credits_per_1k_tokens))
+            if tokens > 0
+            else 0
+        )
+    return min(charge, policy.max_credits_per_turn)
 
 
 # --------------------------------------------------------------------------- #

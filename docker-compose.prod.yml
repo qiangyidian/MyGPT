@@ -12,10 +12,16 @@
 #   * A one-shot `migrate` service runs `alembic upgrade head` BEFORE the API,
 #     worker, and recovery start (depends_on: service_completed_successfully).
 #     The runtime readiness gate (/ready, see app/core/health.py) additionally
-#     returns 503 if the DB revision != repo head (0014_credits_redeem) — so a stale
+#     returns 503 if the DB revision != repo head (read it from
+#     `backend/migrations/versions`, never from a comment) — so a stale
 #     image that skipped a migration can never receive traffic.
 #   * Non-root containers (backend Dockerfile runs as uid 1001).
 #   * Resource limits + reservations on every service.
+#   * Real container healthchecks on worker + recovery (python -m
+#     app.healthcheck …): a process-level pulse check would have missed the
+#     wedged-worker incident this deploy actually had.
+#   * Optional monitoring stack behind the `monitoring` compose profile
+#     (Prometheus + Alertmanager, configs in deploy/monitoring/).
 #   * External secret file: the operator supplies .env.prod (never committed);
 #     it must set ENV=prod, a stable FERNET_KEY, BACKGROUND_WORKER=durable,
 #     QUOTAS_ENABLED=true, AUTO_CREATE_TABLES=false, and a changed
@@ -53,7 +59,29 @@ services:
     # requirepass: a reachable-but-unauthenticated Redis previously let anyone
     # on the network read/overwrite rate-limit keys, refresh blacklists and
     # quota counters. The app's REDIS_URL must include the same password.
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-changeme-redis}"]
+    #
+    # noeviction is not a tunable: this Redis is a queue, not a cache. The
+    # durable run queue and KB ingest live in Streams, and any LRU/volatile
+    # policy would delete queued runs under memory pressure — silent loss of
+    # work the user was billed for. With noeviction a full keyspace makes XADD
+    # fail loudly and the run row stays ``pending`` for the recovery scheduler.
+    # maxmemory stays below the container limit so Redis can still fork for
+    # AOF/RDB rewrites; the stream itself is bounded by XADD maxlen
+    # (RUN_STREAM_MAXLEN, see app/agents/workflow/queue.py).
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-changeme-redis}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    environment:
+      # Same compose variable as --requirepass above; only the healthcheck reads
+      # it (see below), so there is no second source of truth.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-changeme-redis}
     logging: &default_logging
       # json-file default never rotates — a busy backend fills the disk.
       driver: json-file
@@ -63,7 +91,15 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # 必须带密码并核对字面 PONG：`requirepass` 下 `redis-cli ping` 拿到的是
+      # -NOAUTH 错误回复，而 redis-cli 对错误回复仍然退出 0 —— 旧探针因此是一盏
+      # 常亮的绿灯，与此同时所有应用连接都被拒。`depends_on: service_healthy`
+      # 建立在这上面，等于把「Redis 起了」误判成「Redis 能用」。
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG",
+        ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -71,9 +107,12 @@ services:
       resources:
         limits:
           cpus: '1.0'
-          memory: 512M
+          # > --maxmemory 512mb: the cgroup has to cover Redis' own overhead +
+          # the COW spike of an AOF/RDB rewrite, or Docker OOM-kills it before
+          # maxmemory ever engages.
+          memory: 768M
         reservations:
-          memory: 64M
+          memory: 128M
 
   # ------------------------------------------------------------------ qdrant
   qdrant:
@@ -98,7 +137,9 @@ services:
           memory: 512M
 
   # ------------------------------------------------------- migration one-shot
-  # Runs `alembic upgrade head` to the repo head (0014_credits_redeem) before any app
+  # Runs `alembic upgrade head` to whatever head the image carries (do NOT pin
+  # the revision number here — this comment once said 0014_credits_redeem while
+  # the chain had moved on) before any app
   # service starts. This is the DEPLOY-TIME migration gate; the API/worker
   # additionally refuse readiness (/ready → 503) if the DB revision drifts.
   migrate:
@@ -112,6 +153,13 @@ services:
         condition: service_healthy
     # No source mount — migrations are baked into the image.
     command: ["alembic", "upgrade", "head"]
+    # A one-shot still needs a ceiling: an unbounded `alembic upgrade` that
+    # deadlocks would otherwise sit and page the host while it retries.
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
 
   # ----------------------------------------------------------------- backend
   backend:
@@ -167,6 +215,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env.prod
+    environment:
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -180,11 +231,18 @@ services:
     init: true
     stop_grace_period: 30s
     healthcheck:
-      # No HTTP endpoint on the worker; assert the process is alive. Real
-      # worker health is monitored via run-queue depth / lease metrics.
-      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1, 0)'"]
+      # Real probe (finding 39), not a pulse check: it asserts the worker's two
+      # hard dependencies answer (Postgres SELECT 1 + Redis PING/XREADGROUP
+      # surface) AND that the in-process self-check is still beating
+      # (app/worker.py:_self_check stops beating when the event loop wedges).
+      # The previous `os.kill(1, 0)` was always green — it proved only that PID 1
+      # exists, which is exactly the case that already failed in production
+      # (wedged worker, runs unclaimed, "healthy").
+      # budget: self-check beats every 20s, probe allows 3x60s of staleness.
+      test: ["CMD", "python", "-m", "app.healthcheck", "worker"]
       interval: 30s
-      timeout: 10s
+      timeout: 20s
+      start_period: 90s
       retries: 3
     deploy:
       resources:
@@ -202,6 +260,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env.prod
+    environment:
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -213,10 +274,16 @@ services:
     init: true
     stop_grace_period: 10s
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import os,signal; os.kill(1, 0)'"]
+      # Leader-gated loop: the probe passes on a *fresh heartbeat* (written by
+      # app/recovery.py after each completed scan) or, legitimately, on a
+      # standby that has never held the advisory lock — see
+      # app/healthcheck.py:_was_leader for why failing a standby would remove
+      # the failover target. RECOVERY_SCAN_INTERVAL_SECONDS * 3 is the budget.
+      test: ["CMD", "python", "-m", "app.healthcheck", "recovery"]
       interval: 30s
-      timeout: 10s
-      retries: 3
+      timeout: 20s
+      start_period: 120s
+      retries: 4
     deploy:
       resources:
         limits:
@@ -224,6 +291,84 @@ services:
           memory: 512M
         reservations:
           memory: 128M
+
+  # ------------------------------------------------------------- monitoring (38)
+  # Prometheus + Alertmanager are behind a compose PROFILE so enabling
+  # monitoring is an explicit act and an existing `up -d` is untouched:
+  #   docker compose -f docker-compose.prod.yml --env-file .env.prod \
+  #     --profile monitoring up -d
+  # Scraping model (see deploy/monitoring/prometheus.yml for the full
+  # justification): the API's /metrics is bearer-authenticated and Prometheus
+  # reaches it over the private compose network; the backend publishes on
+  # loopback only, so nothing here is exposed outside this host.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 15d of 15s-scrape RED metrics is enough to answer "was last Tuesday like
+      # this?" without letting a slow disk fill (this deployment has no remote write).
+      - --storage.tsdb.retention.time=15d
+      - --web.listen-address=0.0.0.0:9090
+    environment:
+      # prometheus.yml interpolates $METRICS_TOKEN at config load (Prometheus
+      # expands env vars in its config). No default and no secret here: an unset
+      # token means every scrape gets 404, which MyGPTScrapeExpositionEmpty /
+      # MyGPTApiTargetDown report instead of silently alerting on nothing.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      # No secrets are committed: the receiver URLs in this file are
+      # placeholders the operator replaces on the server (Alertmanager does not
+      # expand $VAR inside its config, unlike Prometheus).
+      - ./deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          memory: 64M
 
   # ---------------------------------------------------------------- frontend
   # Production Next.js standalone server (Dockerfile `prod` stage). No source
@@ -234,12 +379,13 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       target: prod
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?Set NEXT_PUBLIC_API_BASE_URL to the browser-reachable API origin}
     restart: unless-stopped
     environment:
       NODE_ENV: production
       HOSTNAME: 0.0.0.0
       PORT: "3000"
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
       NEXT_TELEMETRY_DISABLED: "1"
     depends_on:
       backend:
@@ -267,3 +413,5 @@ volumes:
   redis_data:
   qdrant_data:
   uploads_data:
+  prometheus_data:
+  alertmanager_data:

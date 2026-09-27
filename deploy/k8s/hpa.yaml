@@ -1,0 +1,213 @@
+# HorizontalPodAutoscaler for the api Deployment.
+#
+# HOW TO USE THIS IN AN INCIDENT
+# ------------------------------
+#   * "Why is api at 1 replica / why isn't it scaling?" — the HPA tells you:
+#         kubectl -n mygpt describe hpa api
+#     Read the Conditions first. `ScalingActive=False` = it cannot compute a
+#     target; its reason says which half broke — `FailedGetResourceMetric` /
+#     `FailedGetExternalMetric` = the metric source is gone (metrics-server
+#     missing, so `kubectl top pods -n mygpt` fails too; or the adapter series in
+#     the OPTIONAL block below was never registered), `FailedComputeReplicas` =
+#     numbers arrived but the math refused. `AbleToScale=False` with
+#     `FailedRescale` = it wants a different count but cannot write
+#     `spec.replicas` (something else owns the field: a kustomize `replicas:`
+#     overlay, a CD tool pruning the drift, or a Deployment restored to a
+#     hand-written count). Event `ScaleDownLimited` = behavior.scaleDown's policy
+#     is the binding constraint, not the metric.
+#   * "It scaled out and we are still saturated" — you are queue-bound, not
+#     CPU-bound. That is expected and is exactly the blind spot documented below:
+#     the enabled metric here is CPU only. Read the real depth instead —
+#     `queue_stream_length` / `queue_pending_entries` in Prometheus, or the
+#     alerts MyGPTQueueBacklogGrowing / MyGPTQueueNoProgress
+#     (deploy/monitoring/rules/mygpt.yml). Then scale the WORKER by hand
+#     (`kubectl -n mygpt scale deploy/worker --replicas=N`); the run queue is the
+#     unit of parallelism there (see worker.yaml).
+#   * "It scaled down and every chat stream died" — see the SSE note below; widen
+#     `behavior.scaleDown.stabilizationWindowSeconds`, and remember the API
+#     Deployment has no preStop drain, so scale-down is abrupt by design.
+#   * Rollback of autoscaling entirely: `kubectl -n mygpt delete hpa api` and put
+#     `replicas: 2` back into api.yaml (it is deliberately absent — see below).
+#
+# WHAT THIS HPA CANNOT SEE (read this before trusting it)
+# -------------------------------------------------------
+# Chat is SSE: one request holds a connection open for the whole completion, and
+# the work happens while the api process is *parked* on the provider socket.
+# Such a pod is idle-but-heavy — it uses memory and file descriptors for buffers,
+# almost no CPU — so CPU utilization is close to uncorrelated with "how many
+# concurrent conversations can this fleet still accept". `http_request_duration_
+# seconds` does not fix the picture either: app/core/middleware.py records when
+# the response *starts* (BaseHTTPMiddleware returns at response-start), so a
+# 10-minute stream contributes one request and ~0s of latency.
+#
+# Therefore: this HPA is a CPU-shape backstop (prompt formatting, RAG result
+# post-processing, JSON serialisation, token accounting, attachment parsing — the
+# things that actually burn cycles). It is NOT the queue-pressure control. For
+# that, the honest signals are the two queue gauges below, and they need a
+# metrics adapter, not more CPU math.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: mygpt
+  labels:
+    app.kubernetes.io/name: mygpt
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  # Floor = 2, so the PDB in api.yaml (minAvailable: 1) still means "one pod
+  # survives a node drain" at the smallest legal size. If you drop this to 1, a
+  # single replica + minAvailable 1 blocks every voluntary eviction instead.
+  minReplicas: 2
+  # Ceiling is a cost/DB-connections guard, not a capacity claim: every api
+  # replica opens its own SQLAlchemy pool against Postgres and its own queue-depth
+  # poller, so raise this together with the DB's max_connections.
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Utilization is a fraction of REQUESTS (500m in api.yaml), not of the
+          # 2000m limit -> the trigger is ~300m per pod. Keeping the limit 4x the
+          # request means the pod can burst past the target while the HPA is only
+          # at 60%; that is intentional, the HPA reacts a scrape-interval late.
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      # Fast in, slowly out. A latency spike is user-visible immediately, and
+      # adding a replica is cheap and reversible.
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      # The expensive knob in this repo. SSE conversations outlive a single
+      # token-by-token burst, so a scale-down that lands between two users'
+      # messages severs live streams that nothing can resume: the *run* is safe
+      # (BACKGROUND_WORKER=durable — the api only enqueues, the worker holds the
+      # lease, recovery requeues it: see config.yaml + worker.yaml +
+      # recovery.yaml), but the *browser stream* is not, and the user sees a
+      # truncated answer. 5 minutes of sustained spare capacity before we cut.
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+  # ===========================================================================
+  # OPTIONAL: scale on real queue pressure instead of CPU
+  # ===========================================================================
+  # These are list items for `metrics:` above (append them under it). Turn them
+  # on ONLY after installing metrics-server (the CPU Resource metric needs it)
+  # AND prometheus-adapter (custom/external metrics) — an HPA cannot read PromQL.
+  #
+  # The names below are the ones the code actually exports; nothing here is
+  # aspirational. Call sites use dotted names and
+  # `backend/app/observability.py:_prom_name` rewrites dots to underscores at
+  # registration, so the scraped `# TYPE` lines are:
+  #
+  #   queue_stream_length    gauge  XLEN of the run-queue stream
+  #   queue_pending_entries  gauge  delivered to a worker, not yet XACKed
+  #
+  # Both are set in `backend/app/agents/workflow/queue.py:490-491`
+  # (observe_gauge("queue.stream_length") / ("queue.pending_entries")) by
+  # `run_queue_depth_poller` (queue.py:470), which `app/main.py:160-168` starts in
+  # the API process only when PROMETHEUS_ENABLED. Per stream_depth()'s own
+  # docstring the two answer different questions: big length + small pending =
+  # work arrives faster than it drains (capacity); growing pending = entries
+  # delivered and never acked (workers dying or wedged). They carry the fixed
+  # label set (observability.py:_METRIC_LABEL_KEYS) with every value empty, so
+  # don't try to select on a label.
+  #
+  # WHY THIS IS NOT ENABLED BY DEFAULT — read before you wire it to the api:
+  # under BACKGROUND_WORKER=durable the api only ENQUEUES (config.yaml), so
+  # queue_stream_length is primarily a WORKER shortfall signal and adding api
+  # replicas does not drain it. It is a legitimate api signal only as a proxy
+  # for held streams: an unconsumed run keeps its client's SSE open longer, so
+  # depth rising -> concurrent streams per api replica rising -> api memory
+  # rising while CPU stays flat. The first responder to this metric is
+  # `kubectl -n mygpt scale deploy/worker --replicas=N` (worker.yaml: the queue is
+  # the unit of parallelism there, and QUOTA_MAX_CONCURRENT_RUNS caps useful
+  # replicas); a worker HPA reading the same gauge is the honest follow-up to
+  # this file, and it has an odd dependency to design around — the metric that
+  # describes the worker is scraped from the api.
+  #
+  # Two traps from "every api replica samples the same Redis and writes the same
+  # absolute value":
+  #   1. Aggregate with max(), never sum() or count(): summing N replicas
+  #      multiplies one true depth by the replica count and the HPA then scales
+  #      on its own denominator — a runaway loop.
+  #   2. target.type: Value (a cluster-wide absolute number), NOT AverageValue:
+  #      AverageValue divides by current replicas, which is meaningless for a
+  #      gauge that already describes the whole queue.
+  #
+  # prometheus-adapter series (config fragment, reference only):
+  #   - seriesQuery: 'queue_stream_length{}'
+  #     resources: {}
+  #     name: {as: mygpt_queue_stream_length}
+  #     metricsQuery: 'max(queue_stream_length)'
+  #
+  # Threshold: sit BELOW the paging alert so the scaler acts first.
+  # MyGPTQueueBacklogGrowing fires on `delta(queue_stream_length[10m]) > 0 and
+  # queue_stream_length > 20` (deploy/monitoring/rules/mygpt.yml), so 10 has
+  # headroom — and remember MyGPTQueueNoProgress (pending not falling) is the
+  # alert that means scaling is the wrong answer.
+  #
+  #   - type: External
+  #     external:
+  #       metric:
+  #         name: mygpt_queue_stream_length
+  #       target:
+  #         type: Value
+  #         value: "10"
+  #
+  # The scrape is bearer-authenticated: GET /metrics requires METRICS_TOKEN
+  # (app/core/config.py:941 in _guard_default_secrets; scrape job `mygpt-api` in
+  # deploy/monitoring/prometheus.yml), so the adapter must send that header or it
+  # sees 404s. If the series vanishes, the HPA silently stops acting on it while
+  # CPU keeps working — which is why MyGPTQueueMetricsAbsent exists. This knob is
+  # therefore purely additive.
+  #
+  # Cheaper middle ground, no adapter: because the SSE load shape is
+  # buffer-bound rather than CPU-bound, a memory target is a better proxy for
+  # concurrent streams than CPU is, and metrics-server is all it needs:
+  #
+  #   - type: Resource
+  #     resource:
+  #       name: memory
+  #       target:
+  #         type: Utilization
+  #         averageUtilization: 75   # of the 512Mi *request* in api.yaml
+# =================================================================================
+# WHO OWNS spec.replicas — and why api.yaml no longer declares it
+# =================================================================================
+# The HPA writes `Deployment.spec.replicas` and is the only controller that should.
+# If api.yaml kept `replicas: 2`, then every
+#     kubectl apply -n mygpt -f deploy/k8s/          # the documented flow, config.yaml
+# would yank the count back to 2 mid-incident. That reset is a direct scale-down,
+# not an Eviction API call, so the PodDisruptionBudget in api.yaml does NOT gate
+# it: surplus pods disappear immediately and every SSE stream on them dies while
+# the operator is busy doing something else. Repeated, silent, worst-time-of-
+# occurrence.
+#
+# The trade we accepted by omitting the field: a fresh cluster brings the
+# Deployment up at the API-server default (1 replica) and the HPA raises it to
+# minReplicas on its first sync (~15s), and if metrics-server is missing the HPA
+# sets ScalingActive=False and changes NOTHING — leaving one api pod and a PDB
+# that then blocks every drain. So before applying this directory to a new
+# cluster, confirm the scaler exists:
+#     kubectl top pods -n mygpt          # must succeed
+#     kubectl -n mygpt describe hpa api  # after apply: no ScalingActive=False
+# and if you deploy without autoscaling at all, put `replicas: 2` back in
+# api.yaml and delete this file.

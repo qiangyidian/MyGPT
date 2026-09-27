@@ -1,0 +1,62 @@
+# 入口（条目 40 补齐）：这套清单原先只能让集群内部跑得起来 —— api 是一个
+# ClusterIP Service，外面没有任何东西把流量带进来，"部署完成"其实还不等于"能访问"。
+#
+# **只暴露 /api**。这套 k8s 清单里没有前端的 Deployment（浏览器侧的 Next.js 目前只
+# 在 docker-compose.prod.yml 里有 `frontend` 一个服务），所以这里把 `/` 指到 api:8000
+# 只会得到一个"域名能打开、但除了接口什么都不是"的入口 —— 那是假装自己把站点发出去了。
+# 要把整站发出去：补一个 web Deployment + Service（3000），再把下面的 `/` 规则加上。
+# 同理 `/ready` 与 `/metrics` 不在这里暴露：前者是给集群内探针用的，后者只应留给
+# Prometheus（带 Bearer，见 deploy/monitoring）。
+#
+# 用 ingress-nginx 的注解写（`deploy/k8s/*.yaml` 里没有别的入口约定）。换 Ingress
+# 类时下面几条注解都要重新对照各家语法确认 —— 它们不是装饰，每一条都对应一个这个
+# 应用特有的失败方式，见各自注释。
+#
+# 需要先做的一件事：把 host 换成真实域名，并同步改 config.yaml 的
+# `BACKEND_CORS_ORIGINS`。两者不一致的症状是页面能打开、POST 全部被浏览器拦成 CORS
+# 错误 —— 一个看起来像后端坏了的前端问题。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mygpt
+  namespace: mygpt
+  annotations:
+    # ---- SSE 必须关掉代理缓冲 ----
+    # 对话是 /api/chat/stream 与 /api/agent-runs/{id}/events 上的一条条流式响应。
+    # nginx 默认会把上游响应攒在一个缓冲块里再发，于是"每个 token 都要等缓冲填满
+    # 才出现"：界面看上去卡住，超时之后整条回复一起吐出来。这不是性能调优，是这条
+    # 功能能不能用的开关。
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # ---- 长连接超时 ----
+    # 默认 60s 会掐断一次还在生成的深度研究（一轮可以跑很久，且空闲期本来就没字节
+    # 流出）。read-timeout 要大于「一次工具调用的最长耗时」，否则用户看到的是一次
+    # 无由来的断流；这里给 1 小时，真正的上限仍由后端的 run 超时决定。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # ---- 上传体积 ----
+    # 必须 ≥ MAX_UPLOAD_MB（config.yaml 里是 20）。小于它时上传在入口层就被拒成
+    # 413，而后端日志里干干净净什么都没有 —— 排查方向会被整个带偏。
+    nginx.ingress.kubernetes.io/proxy-body-size: "21m"
+    # 明文 HTTP 一律跳到 TLS：这是个有登录态与 API key 的站点。
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - chat.example.com
+      # 证书由 issuer 签发后写进这个 Secret 名（清单里没有 issuer：各家集群不同，
+      # 装完 cert-manager 再按自己的 issuer 补一条 Certificate）。
+      secretName: mygpt-tls
+  rules:
+    - host: chat.example.com
+      http:
+        paths:
+          # 后端的路由本来就带 /api 前缀，所以这里不需要 rewrite-target：越少一层
+          # 重写，"本地好、线上 404" 的那类差异就少一处。
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000

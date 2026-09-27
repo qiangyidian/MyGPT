@@ -7,7 +7,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { FileText, Layers, Plus, Trash2, Search } from "lucide-react";
 
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { userErrorMessage } from "@/lib/api-error";
 import type { KnowledgeBase } from "@/lib/types";
 import { cn, relativeTime } from "@/lib/utils";
 import { resolveChatHome, withReturnTo } from "@/lib/navigation";
@@ -99,7 +100,7 @@ function KnowledgeBasesContent() {
       const next = await api.listKnowledgeBases({ limit: KB_PAGE_SIZE, offset: fetchedRows });
       setMorePages((pages) => [...pages, next]);
     } catch (err: unknown) {
-      toast.error(err instanceof ApiError ? err.message : "加载失败");
+      toast.error("加载失败", { description: userErrorMessage(err) });
     } finally {
       setLoadingMore(false);
     }
@@ -128,7 +129,7 @@ function KnowledgeBasesContent() {
       setOpen(false);
     },
     onError: (err: unknown) => {
-      toast.error(err instanceof ApiError ? err.message : "创建失败");
+      toast.error("创建失败", { description: userErrorMessage(err) });
     },
   });
 
@@ -146,7 +147,7 @@ function KnowledgeBasesContent() {
     },
     onError: (err: unknown, _id, ctx) => {
       if (ctx?.prev) qc.setQueryData(["knowledge-bases"], ctx.prev);
-      toast.error(err instanceof ApiError ? err.message : "删除失败");
+      toast.error("删除失败", { description: userErrorMessage(err) });
     },
     onSuccess: () => toast.success("知识库已删除"),
   });

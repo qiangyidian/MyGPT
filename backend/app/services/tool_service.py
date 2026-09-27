@@ -15,8 +15,11 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.agents.policies.tool_policy import is_tool_allowed
 from app.schemas import ToolInfo, ToolTestResult
+from app.services import tool_toggles
 from app.tools.base import ToolError
 from app.tools.context import bind_tool_context, make_tool_context, reset_tool_context
 from app.tools.registry_init import get_default_registry
@@ -25,28 +28,60 @@ if TYPE_CHECKING:  # pragma: no cover
     from app.models.user import User
 
 
+def _describe(
+    tool, *, enabled: bool = True, note: str | None = None
+) -> ToolInfo:
+    return ToolInfo(
+        name=tool.name,
+        description=tool.description,
+        category=getattr(tool, "category", "general"),
+        dangerous=getattr(tool, "dangerous", False),
+        enabled=enabled,
+        toggle_note=note,
+        parameters=[
+            {
+                "name": p.name,
+                "type": p.type,
+                "description": p.description,
+                "required": p.required,
+                **({"default": p.default} if p.default is not None else {}),
+                **({"enum": p.enum} if p.enum else {}),
+            }
+            for p in tool.parameters
+        ],
+    )
+
+
 def list_tools() -> list[ToolInfo]:
-    """Expose every registered tool with its OpenAI-style parameter list."""
+    """用户侧目录：每个**当前可用**的工具 + 它的 OpenAI 风格参数表。
+
+    已被运营停用的工具不在这一份里（:meth:`app.tools.base.ToolRegistry.list` 的默认
+    口径就是过滤）—— 用户看得见一个点上去必然失败的工具，比看不见它更糟。
+    """
+    registry = get_default_registry()
+    return [_describe(tool) for tool in registry.list()]
+
+
+async def catalog_for_admin(db: AsyncSession) -> list[ToolInfo]:
+    """后台目录：**全量** + 每个工具的启停状态与理由。
+
+    与 :func:`list_tools` 的差别是这里必须包含被关掉的那些 —— 界面上看不见的东西没有
+    第二个地方能把它重新打开。
+
+    只覆盖注册表里的工具（builtin + workspace）。MCP / connector 的工具是按 run 临时
+    合进某个 registry 的、不进 ``get_default_registry()``，所以这里列不出来；按名字
+    停用它们仍然有效，因为执行侧那道闸 :func:`is_tool_allowed` 问的就是名字。
+    """
+    states = {row.tool_name: row for row in await tool_toggles.list_overrides(db)}
     registry = get_default_registry()
     out: list[ToolInfo] = []
-    for tool in registry.list():
+    for tool in registry.list(include_disabled=True):
+        row = states.get(tool.name)
         out.append(
-            ToolInfo(
-                name=tool.name,
-                description=tool.description,
-                category=getattr(tool, "category", "general"),
-                dangerous=getattr(tool, "dangerous", False),
-                parameters=[
-                    {
-                        "name": p.name,
-                        "type": p.type,
-                        "description": p.description,
-                        "required": p.required,
-                        **({"default": p.default} if p.default is not None else {}),
-                        **({"enum": p.enum} if p.enum else {}),
-                    }
-                    for p in tool.parameters
-                ],
+            _describe(
+                tool,
+                enabled=True if row is None else row.enabled,
+                note=None if row is None else row.note,
             )
         )
     return out
