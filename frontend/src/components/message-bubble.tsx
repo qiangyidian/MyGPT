@@ -59,6 +59,7 @@ import type {
 import { getMessageStatus } from "@/lib/types";
 import { sanitizeSourceMarkers } from "@/lib/citations";
 import { collectArtifactIds } from "@/lib/artifacts";
+import { MemoryUsage } from "@/components/memory/memory-entry-point";
 
 /** Hermes-mode assistant header: ⚡ badge + live status dot + memory chip.
  *  Rendered for the live stream (mode === "hermes") and for reloaded
@@ -116,6 +117,7 @@ interface MessageBubbleProps {
   onSourceClick?: (index: number, citations: Citation[]) => void;
   /** Open the Files tab focused on an attachment id. */
   onOpenAttachment?: (attachmentId: string) => void;
+  onOpenMemoryManager?: () => void;
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -308,6 +310,7 @@ export const MessageBubble = memo(function MessageBubble({
   onBranch,
   onSourceClick,
   onOpenAttachment,
+  onOpenMemoryManager,
 }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const [editing, setEditing] = useState(false);
@@ -581,6 +584,13 @@ export const MessageBubble = memo(function MessageBubble({
               onSourceClick={(i) => onSourceClick?.(i, resolvedCitations)}
             />
           </div>
+        )}
+
+        {!isUser && (
+          <MemoryUsage
+            value={message.metadata?.user_memories}
+            onManage={() => onOpenMemoryManager?.()}
+          />
         )}
 
         {/* Termination status banner (truncated / interrupted / cancelled / error). */}

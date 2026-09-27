@@ -26,6 +26,7 @@ import { useContextPanelStore } from "@/stores/context-panel-store";
 import { useAgentRunStore } from "@/stores/agent-run-store";
 import { BranchHistory } from "@/components/branch-history";
 import { ExportConversation } from "@/components/chat/export-conversation";
+import { MemoryEntryPoint } from "@/components/memory/memory-entry-point";
 import type { Citation, KnowledgeBase } from "@/lib/types";
 
 export default function HomePage() {
@@ -71,6 +72,7 @@ function ChatPanel({
 
   const [modelId, setModelId] = useState<string | null>(null);
   const [kbIds, setKbIds] = useState<string[]>([]);
+  const [memoryDialogOpen, setMemoryDialogOpen] = useState(false);
 
   // Default the selector to the conversation's model, else the first chat
   // model. A null modelId ("默认模型") lets the backend choose.
@@ -344,6 +346,11 @@ function ChatPanel({
             </>
           )}
           <AgentPanelTrigger />
+          <MemoryEntryPoint
+            open={memoryDialogOpen}
+            onOpenChange={setMemoryDialogOpen}
+            conversationId={activeConversationId}
+          />
           <ContextPanelTrigger
             conversationId={activeConversationId}
             hasPendingApproval={chat.pendingApprovals.length > 0}
@@ -376,6 +383,7 @@ function ChatPanel({
           onBranch={(id, content) => void handleBranch(id, content)}
           onSourceClick={handleSourceClick}
           onOpenAttachment={handleOpenAttachment}
+          onOpenMemoryManager={() => setMemoryDialogOpen(true)}
           onPickSuggestion={handlePickSuggestion}
           conversationId={activeConversationId}
           scrollToBottomSignal={scrollToBottomSignal}

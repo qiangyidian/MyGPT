@@ -9,6 +9,8 @@
 
 import type { UserMemory, UserMemoryProposeInput } from "./types";
 
+export const USER_MEMORIES_QUERY_KEY = ["user-memories"] as const;
+
 /**
  * The default propose body. `active` is always false — activation is a
  * separate, explicit user action (`POST /api/memories/{id}/activate`).

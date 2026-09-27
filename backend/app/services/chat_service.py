@@ -71,6 +71,7 @@ from app.models import (
     ModelConfig,
     ToolCall,
     User,
+    UserMemory,
 )
 from app.providers.registry import get_provider_for_config
 from app.quotas import QuotaExceeded, get_quota_service
@@ -260,10 +261,10 @@ _CONTEXT_MANAGER = ContextManager(
 )
 
 
-async def _load_active_user_memories(
+async def _load_active_user_memory_rows(
     db: AsyncSession, user_id: uuid.UUID, *, query: str | None = None, top_k: int = 12
-) -> list[str]:
-    """Return the user's active, non-expired USER-level memory contents.
+) -> list[UserMemory]:
+    """Return active, non-expired user memories in the order used for context.
 
     These are the opt-in semantic memories (Task 7) folded into the effective
     system prompt each turn. Tenant-scoped by user_id; never crosses users.
@@ -278,8 +279,6 @@ async def _load_active_user_memories(
     from datetime import datetime
 
     from app.core.datetime_utils import is_expired as _is_expired
-    from app.models import UserMemory
-
     if query:
         try:
             from app.api.memories import get_memory_service
@@ -287,7 +286,7 @@ async def _load_active_user_memories(
             svc = await get_memory_service(db)
             rows = await svc.retrieve_for_prompt(db, user_id, query, top_k=top_k)
             if rows:
-                return [r.content for r in rows]
+                return rows
         except Exception:
             logger.debug("semantic memory retrieval failed; using recency fallback", exc_info=True)
 
@@ -303,7 +302,19 @@ async def _load_active_user_memories(
         )
     ).scalars().all()
     now = datetime.now(UTC)
-    return [r.content for r in rows if not _is_expired(r.expires_at, now)]
+    return [r for r in rows if not _is_expired(r.expires_at, now)]
+
+
+def _memory_usage_metadata(memories: list[UserMemory]) -> list[dict[str, str]]:
+    """Persist the exact user-memory snapshot injected into this answer.
+
+    Keeping both the id and the text lets the UI explain old answers accurately
+    even after the user edits or deletes the current version of a memory.
+    """
+    return [
+        {"id": str(memory.id), "content": memory.content, "memory_type": memory.memory_type}
+        for memory in memories
+    ]
 
 
 def _event(name: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1271,7 +1282,7 @@ class ChatService:
         # process-local mutable world state). The tool-use preamble, rolling
         # summary, ongoing goal, and the user's opt-in semantic memories are
         # all folded in here; the single-model honesty backstop closes it.
-        active_user_memories = await _load_active_user_memories(
+        active_user_memory_rows = await _load_active_user_memory_rows(
             db, user.id, query=request.content or None
         )
         behavior_blocks: list[str] = []
@@ -1283,7 +1294,7 @@ class ChatService:
             rag_context="",  # already folded into base by _build_system_prompt
             summary=flow_state.conversation_summary or "",
             goal=flow_state.user_goal or "",
-            memories=active_user_memories,
+            memories=[memory.content for memory in active_user_memory_rows],
             intent_block=None,
             behavior_blocks=behavior_blocks,
         )
@@ -1501,7 +1512,10 @@ class ChatService:
             role="assistant",
             content="",
             model_name=cfg.model_name,
-            metadata_={"status": "pending"},
+            metadata_={
+                "status": "pending",
+                "user_memories": _memory_usage_metadata(active_user_memory_rows),
+            },
         )
         db.add(assistant_msg)
         await db.flush()
@@ -2344,16 +2358,20 @@ async def run_durable_turn(
     # (M-2). Summary / goal remain deferred on the durable path (no flow-state
     # re-hydration), matching the prior behavior.
     history = await _load_history(db, conversation.id)
-    _active_user_memories = await _load_active_user_memories(
+    _active_user_memory_rows = await _load_active_user_memory_rows(
         db, user.id, query=run_input.get("content") or None
     )
+    assistant_msg.metadata_ = {
+        **(assistant_msg.metadata_ or {}),
+        "user_memories": _memory_usage_metadata(_active_user_memory_rows),
+    }
     system_prompt = _build_system_prompt(conversation, rag_context=rag_context)
     system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
         base=system_prompt,
         rag_context="",  # already folded into base by _build_system_prompt
         summary="",
         goal="",
-        memories=_active_user_memories,
+        memories=[memory.content for memory in _active_user_memory_rows],
         intent_block=None,
         behavior_blocks=[_MULTI_AGENT_HONESTY],
     )

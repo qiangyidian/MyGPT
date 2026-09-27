@@ -34,6 +34,7 @@ interface MessageListProps {
   onBranch?: (messageId: string, newContent: string) => void;
   onSourceClick?: (index: number, citations: Citation[]) => void;
   onOpenAttachment?: (attachmentId: string) => void;
+  onOpenMemoryManager?: () => void;
   onPickSuggestion?: (prompt: string) => void;
   /** Owner conversation — switching resets follow mode and parks at the latest message. */
   conversationId?: string | null;
@@ -62,6 +63,7 @@ export function MessageList({
   onBranch,
   onSourceClick,
   onOpenAttachment,
+  onOpenMemoryManager,
   onPickSuggestion,
   conversationId,
   scrollToBottomSignal,
@@ -296,6 +298,7 @@ export function MessageList({
               onBranch={onBranch}
               onSourceClick={onSourceClick}
               onOpenAttachment={onOpenAttachment}
+              onOpenMemoryManager={onOpenMemoryManager}
             />
           ))}
 
@@ -315,6 +318,7 @@ export function MessageList({
               isStreaming
               isLast
               onSourceClick={onSourceClick}
+              onOpenMemoryManager={onOpenMemoryManager}
             />
           )}
 

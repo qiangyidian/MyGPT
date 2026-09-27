@@ -12,6 +12,7 @@ import {
   type ChatStreamHandlers,
 } from "@/lib/api";
 import { buildChatBody } from "@/lib/chat-request";
+import { USER_MEMORIES_QUERY_KEY } from "@/lib/memories";
 import { userErrorMessage } from "@/lib/api-error";
 import {
   initialStreamState,
@@ -284,6 +285,9 @@ export function useChatStream(): ChatStreamState {
       queryClient.invalidateQueries({
         queryKey: CONVERSATIONS_QUERY_KEY,
       });
+      // Auto-proposed memory candidates are written at the end of the turn.
+      // Refresh the chat affordance so they appear without a page reload.
+      queryClient.invalidateQueries({ queryKey: USER_MEMORIES_QUERY_KEY });
       // 这一轮可能已经扣了积分。侧边栏余额与 /settings/credits 都从
       // ["credits"] 缓存读取（staleTime 30s），不主动失效就会在连续对话时
       // 一直显示轮前余额 —— 用户被挡时余额数字毫无变化，恰是体验最差的 surprises。
