@@ -20,6 +20,9 @@ const NEAR_BOTTOM_PX = 120;
 
 interface MessageListProps {
   messages: Message[];
+  isLoading?: boolean;
+  loadError?: string | null;
+  onRetryLoad?: () => void;
   streamingText?: string;
   isStreaming?: boolean;
   streamingCitations?: Citation[];
@@ -46,6 +49,9 @@ interface MessageListProps {
 
 export function MessageList({
   messages,
+  isLoading = false,
+  loadError,
+  onRetryLoad,
   streamingText,
   isStreaming,
   streamingCitations,
@@ -93,7 +99,8 @@ export function MessageList({
     setStuck(on);
   }, []);
 
-  const isEmpty = messages.length === 0 && !streamingText && !isStreaming;
+  const isEmpty =
+    messages.length === 0 && !streamingText && !isStreaming && !isLoading && !loadError;
 
   // User scroll intent: leaving the bottom region cancels follow for THIS
   // run; returning to it re-enables follow. (ChatGPT/豆包-style: 手动上滑
@@ -163,6 +170,57 @@ export function MessageList({
   }, [conversationId]);
   const hiddenCount = Math.max(0, visibleAll.length - renderCount);
   const shownMessages = hiddenCount > 0 ? visibleAll.slice(hiddenCount) : visibleAll;
+
+  if (messages.length === 0 && !streamingText && !isStreaming && isLoading) {
+    return (
+      <div
+        className={cn("flex flex-1 flex-col gap-5 overflow-hidden px-4 py-8", className)}
+        role="status"
+        aria-live="polite"
+        aria-label="正在加载对话"
+      >
+        <span className="sr-only">正在加载对话……</span>
+        {["w-2/3", "w-5/6", "w-1/2"].map((width, index) => (
+          <div
+            key={index}
+            className={cn(
+              "mx-auto flex w-full max-w-3xl animate-pulse",
+              index === 1 ? "justify-end" : "justify-start",
+            )}
+          >
+            <div className={cn("space-y-2 rounded-2xl bg-muted/70 p-4", width)}>
+              <div className="h-3 w-24 rounded bg-muted-foreground/15" />
+              <div className="h-3 w-full rounded bg-muted-foreground/10" />
+              <div className="h-3 w-4/5 rounded bg-muted-foreground/10" />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (messages.length === 0 && !streamingText && !isStreaming && loadError) {
+    return (
+      <div
+        className={cn("flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center", className)}
+        role="alert"
+      >
+        <div className="space-y-1">
+          <h2 className="text-base font-semibold">这段对话暂时无法加载</h2>
+          <p className="max-w-md text-sm text-muted-foreground">{loadError}</p>
+        </div>
+        {onRetryLoad && (
+          <button
+            type="button"
+            onClick={onRetryLoad}
+            className="rounded-md border border-border bg-background px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            重试加载
+          </button>
+        )}
+      </div>
+    );
+  }
 
   if (isEmpty) {
     return (

@@ -1,6 +1,6 @@
 "use client";
 
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Send, Square } from "lucide-react";
 
@@ -93,7 +93,23 @@ export function Composer({
   className,
   onUploadReady,
 }: ComposerProps) {
-  const [value, setValue] = useState("");
+  const [draftsByConversation, setDraftsByConversation] = useState<Record<string, string>>({});
+  const draftKey = conversationId ?? "new";
+  const value = draftsByConversation[draftKey] ?? "";
+  const setValue = (next: string) => {
+    setDraftsByConversation((current) => {
+      if (next) return { ...current, [draftKey]: next };
+      const remaining = { ...current };
+      delete remaining[draftKey];
+      return remaining;
+    });
+    try {
+      if (next) window.sessionStorage.setItem(`mygpt.chat.draft.v1:${draftKey}`, next);
+      else window.sessionStorage.removeItem(`mygpt.chat.draft.v1:${draftKey}`);
+    } catch {
+      // Drafts stay available in memory if browser storage is disabled.
+    }
+  };
   /** 服务端随候选下发的上限；没拿到之前用 inline-refs 的同源兜底。 */
   const [limits, setLimits] = useState<MentionLimits>(FALLBACK_LIMITS);
   /** 输入框里的选区：「把选中文字存为模板」要用，别再去读一遍 DOM。 */
@@ -104,6 +120,22 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** 输入法合成中：这段时间的按键与文本变化都不参与 ``@`` 判定。 */
   const composingRef = useRef(false);
+
+  // Keep a separate draft for each conversation and restore it on navigation
+  // or refresh. sessionStorage scopes this convenience to the current tab.
+  useEffect(() => {
+    let saved: string | null = null;
+    try {
+      saved = window.sessionStorage.getItem(`mygpt.chat.draft.v1:${draftKey}`);
+    } catch {
+      // Continue with the in-memory draft when storage is unavailable.
+    }
+    setDraftsByConversation((current) => {
+      const draft = saved ?? current[draftKey];
+      if (!draft) return current;
+      return { ...current, [draftKey]: draft };
+    });
+  }, [draftKey]);
 
   // Re-focus the composer when the user switches/creates a conversation —
   // previously the input stayed blurred and typing went nowhere.
@@ -265,12 +297,17 @@ export function Composer({
   };
 
   // Auto-grow textarea up to 200px.
-  const handleInput = () => {
+  const handleInput = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  };
+  }, []);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(handleInput);
+    return () => window.cancelAnimationFrame(frame);
+  }, [handleInput, value]);
 
   const canSend =
     !!value.trim() && !isStreaming && allReady && !modalityBlocked;
@@ -279,7 +316,7 @@ export function Composer({
    *  与已有内容之间补一个空格（打字打到一半录音不该把两段黏成一个词）。 */
   const insertRecognizedText = (text: string) => {
     if (!text) return;
-    setValue((prev) => (prev.trim() ? `${prev.replace(/\s+$/, "")} ${text}` : text));
+    setValue(value.trim() ? `${value.replace(/\s+$/, "")} ${text}` : text);
     // 自适应高度读的是 DOM，等内容落到 textarea 之后再量一次。
     if (typeof requestAnimationFrame === "function") {
       requestAnimationFrame(handleInput);

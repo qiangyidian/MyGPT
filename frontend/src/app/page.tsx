@@ -52,6 +52,13 @@ function ChatPanel({
 }) {
   const { chatModels } = useModels();
   const detail = useConversationDetail(activeConversationId);
+  const hasActiveConversationDetail = Boolean(
+    activeConversationId && detail.data?.id === activeConversationId,
+  );
+  const messages = useMemo(
+    () => (hasActiveConversationDetail ? detail.data?.messages ?? [] : []),
+    [hasActiveConversationDetail, detail.data?.messages],
+  );
   const { create: createConversation } = useConversations();
   const branchConversation = useBranchConversation();
 
@@ -68,10 +75,11 @@ function ChatPanel({
   // Default the selector to the conversation's model, else the first chat
   // model. A null modelId ("默认模型") lets the backend choose.
   useEffect(() => {
+    if (activeConversationId && !hasActiveConversationDetail) return;
     if (detail.data?.model_id) setModelId(detail.data.model_id);
     else if (modelId === null && chatModels.length > 0) setModelId(chatModels[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail.data?.model_id, chatModels]);
+  }, [detail.data?.model_id, chatModels, activeConversationId, hasActiveConversationDetail]);
 
   // Hermes 模式：模型选择器已隐藏，自动锁定 hermes provider 的模型；知识库
   // 同步清空（平台 RAG 不注入 Hermes）。切回其他模式时恢复用户原先的选择。
@@ -112,6 +120,7 @@ function ChatPanel({
   // brand-new conversation created by the first send keeps the selection.)
   const kbSyncPrevConvRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
+    if (activeConversationId && !hasActiveConversationDetail) return;
     const convId = detail.data?.id ?? null;
     const prev = kbSyncPrevConvRef.current;
     kbSyncPrevConvRef.current = convId;
@@ -121,7 +130,12 @@ function ChatPanel({
     // selection applies; don't clobber it with the fresh binding.
     if (prev === null && convId !== null) return;
     setKbIds(detail.data?.knowledge_base_id ? [detail.data.knowledge_base_id] : []);
-  }, [detail.data?.id, detail.data?.knowledge_base_id]);
+  }, [
+    detail.data?.id,
+    detail.data?.knowledge_base_id,
+    activeConversationId,
+    hasActiveConversationDetail,
+  ]);
 
   const chat = useChatStream();
   const rebuildLastSend = chat.rebuildLastSend;
@@ -159,9 +173,9 @@ function ChatPanel({
 
   // Restore the multi-agent graph after refresh.
   useEffect(() => {
+    if (activeConversationId && !hasActiveConversationDetail) return;
     if (chat.isStreaming) return;
-    const msgs = detail.data?.messages ?? [];
-    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
     const runId = (lastAssistant?.metadata as { run_id?: string } | undefined)?.run_id;
     if (runId && runId !== lastRestoredRunRef.current) {
       lastRestoredRunRef.current = runId;
@@ -169,16 +183,22 @@ function ChatPanel({
     } else if (!runId) {
       lastRestoredRunRef.current = null;
     }
-  }, [detail.data?.messages, chat.isStreaming]);
+  }, [messages, chat.isStreaming, activeConversationId, hasActiveConversationDetail]);
 
   // Rebuild the replayable last-send from persisted send_params once the
   // conversation detail has loaded (covers the post-refresh case where the
   // in-memory lastSendRef was lost and regenerate/continue went silent).
   useEffect(() => {
-    if (detail.data && !chat.isStreaming) {
+    if (hasActiveConversationDetail && detail.data && !chat.isStreaming) {
       rebuildLastSend(activeConversationId);
     }
-  }, [detail.data, chat.isStreaming, rebuildLastSend, activeConversationId]);
+  }, [
+    detail.data,
+    chat.isStreaming,
+    rebuildLastSend,
+    activeConversationId,
+    hasActiveConversationDetail,
+  ]);
 
   // Durable runs: on conversation open / browser refresh, adopt a run that is
   // still executing server-side and resume its live view (no-op otherwise).
@@ -240,7 +260,6 @@ function ChatPanel({
     return conv.id;
   }, [createConversation, setActiveConversationId]);
 
-  const messages = detail.data?.messages ?? [];
   // Only render the live stream for the conversation it belongs to — otherwise
   // switching conversations mid-stream paints the other conversation's reply.
   // The `activeConversationId == null` clause covers a brand-new chat whose
@@ -334,6 +353,15 @@ function ChatPanel({
 
         <MessageList
           messages={messages}
+          isLoading={Boolean(
+            activeConversationId &&
+              !hasActiveConversationDetail &&
+              (detail.isLoading || detail.isFetching),
+          )}
+          loadError={
+            detail.isError && detail.error ? userErrorMessage(detail.error) : null
+          }
+          onRetryLoad={() => void detail.refetch()}
           streamingText={isThisConvStreaming ? chat.streamingText : undefined}
           isStreaming={isThisConvStreaming}
           streamingCitations={isThisConvStreaming ? chat.citations : undefined}
