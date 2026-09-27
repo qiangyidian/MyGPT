@@ -20,11 +20,8 @@ from app.agents.schemas import ev_done, ev_tool_result
 from app.core.config import Settings
 from app.core.pricing import reset_pricing_cache
 from app.models import AgentRun, Conversation, Message
-from app.services.chat_service import (
-    ChatService,
-    _apply_usage_accounting,
-    _persist_continuation_checkpoint,
-)
+from app.services.chat_service import ChatService, _persist_continuation_checkpoint
+from app.services.chat_accounting import _apply_usage_accounting
 from tests.conftest import TestSessionLocal
 
 

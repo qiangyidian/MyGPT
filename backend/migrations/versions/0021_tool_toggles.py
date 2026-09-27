@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0021_tool_toggles"
@@ -38,6 +38,10 @@ _TABLE = "tool_toggles"
 
 
 def _has_table(table: str) -> bool:
+    # Offline mode has a mock connection with no reflection support. Its input
+    # is explicitly the prior revision, so emit this revision's DDL directly.
+    if context.is_offline_mode():
+        return False
     return table in sa.inspect(op.get_bind()).get_table_names()
 
 

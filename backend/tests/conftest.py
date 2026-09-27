@@ -219,6 +219,21 @@ async def seeded_db() -> AsyncSession:
     yield None  # tables + seed persist for the whole session (StaticPool)
 
 
+@pytest.fixture(autouse=True)
+def _credit_hold_uses_test_database(monkeypatch):
+    """Route independently committed credit holds through the shared test DB.
+
+    ``admit_turn`` deliberately opens its own session so a hold is committed
+    before model execution. In tests, that factory must target the in-memory
+    schema created by ``seeded_db`` instead of the production engine.
+    """
+    from app.services import credit_service
+
+    monkeypatch.setattr(
+        credit_service, "_default_session_factory", lambda: TestSessionLocal
+    )
+
+
 @pytest_asyncio.fixture
 async def db_session(seeded_db) -> AsyncIterator[AsyncSession]:
     """Per-test session sharing the seeded in-memory database."""

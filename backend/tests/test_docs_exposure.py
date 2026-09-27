@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from cryptography.fernet import Fernet
 
-from app.core import main as main_module
+from app import main as main_module
 from app.core.config import Settings
 
 
