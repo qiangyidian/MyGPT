@@ -79,6 +79,7 @@ from app.services.chat_context import (
     _DEFAULT_MAX_CONTEXT_TOKENS,
     _admit_and_trim_history,
     _estimate_available_tool_schema_tokens,
+    _estimate_message_tokens as _estimate_message_tokens,  # noqa: PLC0414
     _estimate_tokens,
 )
 from app.services.chat_accounting import (

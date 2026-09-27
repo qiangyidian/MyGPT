@@ -57,11 +57,15 @@ async def test_regenerate_snapshot_survives_the_deleted_message(client, db_sessi
     assert prompt == "问题"
 
     # 消息行没了，版本还在——这正是 message_versions 不建 messages 外键的原因。
-    assert (
-        await db_session.execute(
-            Message.__table__.select().where(Message.__table__.c.role == "assistant")
+    remaining_assistants = await db_session.execute(
+        Message.__table__
+        .select()
+        .where(
+            Message.__table__.c.conversation_id == conv_id,
+            Message.__table__.c.role == "assistant",
         )
-    ).rowcount == 0
+    )
+    assert remaining_assistants.scalars().all() == []
     rows = list(await latest_versions(db_session, conv_id))
     assert [r.origin for r in rows] == ["regenerate"]
     assert rows[0].content == "旧答案"

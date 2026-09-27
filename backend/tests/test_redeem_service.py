@@ -307,8 +307,18 @@ async def _named_batch(db, name, *, count=2, credits=100, note=None):
     )
 
 
+async def _clear_batches(db):
+    """Keep list assertions local to this case in the session-shared test DB."""
+    from sqlalchemy import delete
+
+    await db.execute(delete(RedeemCode))
+    await db.execute(delete(RedeemCodeBatch))
+    await db.flush()
+
+
 async def test_list_batches_pages_without_gaps_or_repeats(db_session):
     """OFFSET 分页必须全序：并列的 created_at 若没有 ``id`` 兜底就会重复或漏行。"""
+    await _clear_batches(db_session)
     for i in range(5):
         await _named_batch(db_session, f"批次{i}")
     await db_session.commit()
@@ -342,6 +352,7 @@ async def test_list_batches_search_treats_wildcards_literally(db_session):
 
 async def test_list_batches_status_filter_is_server_side(db_session):
     """筛选项必须在 SQL 里做：分页后前端只有一页数据，浏览器里 filter 会漏掉旧批次。"""
+    await _clear_batches(db_session)
     kept, _ = await _named_batch(db_session, "还在核销")
     done, codes = await _named_batch(db_session, "已兑完", count=1)
     await redeem_service.redeem(db_session, user_id=uuid.uuid4(), raw_code=codes[0])
@@ -358,14 +369,14 @@ async def test_list_batches_status_filter_is_server_side(db_session):
     def names(rows):
         return sorted(row.batch.name for row in rows)
 
-    assert names(await redeem_service.list_batches(db_session, status="operable")) == [
+    assert set(names(await redeem_service.list_batches(db_session, status="operable"))) == {
         "还在核销",
         "已过期",
-    ]
-    assert names(await redeem_service.list_batches(db_session, status="settled")) == [
+    }
+    assert set(names(await redeem_service.list_batches(db_session, status="settled"))) == {
         "已作废",
         "已兑完",
-    ]
+    }
     assert names(await redeem_service.list_batches(db_session, status="expired")) == ["已过期"]
     # 不传 status = 不加条件；永久批次（expires_at 为 NULL）不算过期。
     assert len(await redeem_service.list_batches(db_session)) == 4

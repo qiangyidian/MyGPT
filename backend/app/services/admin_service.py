@@ -192,7 +192,7 @@ async def usage_report(
     group_exprs = [key_expr]
 
     def base(cols):
-        stmt = select(*cols)
+        stmt = select(*cols).select_from(Message)
         if group_by == "user":
             # 用户维度要落到人：messages 没有 user_id，得经 conversations 一跳。
             stmt = stmt.join(

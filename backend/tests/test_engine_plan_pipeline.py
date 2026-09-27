@@ -446,9 +446,9 @@ async def test_llm_planner_on_arms_the_dynamic_factory(db_session, monkeypatch):
     seen: dict = {}
     original = StageAdapterExecutor.__init__
 
-    def spy(self, stages, stage_ctx, stage_factory=None):
+    def spy(self, stages, stage_ctx, stage_factory=None, revise_factory=None):
         seen["factory"] = stage_factory
-        original(self, stages, stage_ctx, stage_factory)
+        original(self, stages, stage_ctx, stage_factory, revise_factory)
 
     monkeypatch.setattr(StageAdapterExecutor, "__init__", spy)
     _patch_flag(monkeypatch, engine="1", crewai=True)
@@ -470,9 +470,9 @@ async def test_llm_planner_off_leaves_no_dynamic_factory(db_session, monkeypatch
     seen: dict = {}
     original = StageAdapterExecutor.__init__
 
-    def spy(self, stages, stage_ctx, stage_factory=None):
+    def spy(self, stages, stage_ctx, stage_factory=None, revise_factory=None):
         seen["factory"] = stage_factory
-        original(self, stages, stage_ctx, stage_factory)
+        original(self, stages, stage_ctx, stage_factory, revise_factory)
 
     monkeypatch.setattr(StageAdapterExecutor, "__init__", spy)
     _patch_flag(monkeypatch, engine="1", crewai=True)

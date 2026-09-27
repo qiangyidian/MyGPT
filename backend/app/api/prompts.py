@@ -35,7 +35,7 @@ FORBID = status.HTTP_403_FORBIDDEN
 # 分页上限与 knowledge_bases 同一思路：默认值宽松（个人模板量级有限），但绝不
 # 允许无上限拉表。搜索走 ILIKE，一页的行数就是序列化成本的天花板。
 DEFAULT_PAGE_SIZE = 50
-MAX_PAGE_SIZE = 200
+MAX_PAGE_SIZE = 1000
 
 # PATCH 可写的字段。user_id / sort_order 不在其中：归属和预置排序是服务端（以及
 # 迁移）的事，客户端能写就等于任何人都能把自己的模板伪装成系统预置。

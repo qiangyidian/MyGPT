@@ -64,7 +64,11 @@ async def get_speech_capabilities(
 
 @router.post(
     "/transcribe",
-    dependencies=[Depends(_gate_enabled), Depends(rate_limit_user(20, 60, "speech-asr"))],
+    dependencies=[
+        Depends(get_current_user),
+        Depends(_gate_enabled),
+        Depends(rate_limit_user(20, 60, "speech-asr")),
+    ],
 )
 async def transcribe(
     file: UploadFile = File(...),
@@ -77,7 +81,11 @@ async def transcribe(
 
 @router.post(
     "/synthesize",
-    dependencies=[Depends(_gate_enabled), Depends(rate_limit_user(10, 60, "speech-tts"))],
+    dependencies=[
+        Depends(get_current_user),
+        Depends(_gate_enabled),
+        Depends(rate_limit_user(10, 60, "speech-tts")),
+    ],
 )
 async def synthesize(
     payload: SynthesizeRequest,

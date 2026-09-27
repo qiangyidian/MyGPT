@@ -478,17 +478,36 @@ async def test_category_filter_is_exact(client):
 
 async def test_pagination_slices_a_stable_order_without_overlap(client):
     h = auth_headers()
+    category = _name("分页范围")
     created = _ids(
         [
-            await _create(client, h, title=_name(f"分页{i}"), content="正文")
+            await _create(
+                client, h, title=_name(f"分页{i}"), content="正文", category=category
+            )
             for i in range(3)
         ]
     )
-    full = [t["id"] for t in await _list(client, h, scope="mine", limit=500) if t["id"] in created]
+    full = [
+        t["id"]
+        for t in await _list(
+            client, h, scope="mine", category=category, limit=500
+        )
+        if t["id"] in created
+    ]
     assert len(full) == 3, "同一行不得重复出现（排序必须有全序兜底）"
 
-    page1 = [t["id"] for t in await _list(client, h, scope="mine", limit=2, offset=0)]
-    page2 = [t["id"] for t in await _list(client, h, scope="mine", limit=2, offset=2)]
+    page1 = [
+        t["id"]
+        for t in await _list(
+            client, h, scope="mine", category=category, limit=2, offset=0
+        )
+    ]
+    page2 = [
+        t["id"]
+        for t in await _list(
+            client, h, scope="mine", category=category, limit=2, offset=2
+        )
+    ]
     assert page1 == full[:2] and page2 == full[2:]
     assert not set(page1) & set(page2)
 

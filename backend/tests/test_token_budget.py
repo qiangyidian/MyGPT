@@ -110,9 +110,9 @@ def test_chat_history_admission_never_silently_truncates_current_turn():
 
 
 def test_protected_system_and_latest_turn_must_fit_together(monkeypatch):
-    from app.services import chat_service as module
+    from app.services import chat_context
 
-    monkeypatch.setattr(module, "_estimate_tokens", lambda text, _model: len(text))
+    monkeypatch.setattr(chat_context, "_estimate_tokens", lambda text, _model: len(text))
     messages = [
         {"role": "system", "content": "s" * 600},
         {"role": "user", "content": "current"},

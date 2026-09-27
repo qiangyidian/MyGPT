@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
@@ -46,10 +46,15 @@ async def list_for_user(
     ).options(noload(Conversation.messages))  # sidebar list must not pull messages
     term = (q or "").strip()
     if term:
+        # SQLAlchemy's ILIKE compiles to lower(column) LIKE lower(pattern) on
+        # SQLite, but SQLite's LIKE behavior can vary with connection PRAGMAs.
+        # Normalize both sides explicitly so search stays case-insensitive on
+        # development/test SQLite and production PostgreSQL.
+        pattern = like_pattern(term).lower()
         stmt = stmt.where(
-            Conversation.title.ilike(like_pattern(term), escape=LIKE_ESCAPE)
-            | Conversation.last_message_preview.ilike(
-                like_pattern(term), escape=LIKE_ESCAPE
+            func.lower(Conversation.title).like(pattern, escape=LIKE_ESCAPE)
+            | func.lower(Conversation.last_message_preview).like(
+                pattern, escape=LIKE_ESCAPE
             )
         )
     stmt = stmt.order_by(

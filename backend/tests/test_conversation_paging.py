@@ -116,7 +116,7 @@ async def test_search_is_case_insensitive(client, db_session):
     h = auth_headers()
     token = uuid.uuid4().hex[:10]
     (row,) = await _seed(db_session, ["Quarterly Report"], token=token)
-    for probe in ("quarterly report", "QUARTERLY", "QuArErLy RepORt"):
+    for probe in ("quarterly report", "QUARTERLY REPORT", "QuArTeRlY RepORt"):
         res = await client.get(
             "/api/conversations", params={"q": f"{probe} {token}"}, headers=h
         )
