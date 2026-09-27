@@ -1,6 +1,6 @@
 """把哨兵方案上线前的微信账号回填成「未设置密码」.
 
-Revision ID: 0020_wechat_password_sentinel_backfill
+Revision ID: 0020_wechat_pw_sentinel
 Revises: 0019_ingest_claim_version
 Create Date: 2026-09-20
 
@@ -35,7 +35,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0020_wechat_password_sentinel_backfill"
+revision: str = "0020_wechat_pw_sentinel"
 down_revision: Union[str, None] = "0019_ingest_claim_version"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

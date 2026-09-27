@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from app.models import Message, MessageVersion
+from app.models import Message
 from app.services.chat_service import _delete_last_assistant_message
 from app.services.message_versions import (
     MAX_VERSIONS_PER_MESSAGE,

@@ -271,7 +271,13 @@ def _seed_presets(tables: set[str]) -> None:
             continue
         rows.append(
             {
-                "id": _preset_id(str(item["slug"])),
+                # PostgreSQL's native UUID bind requires uuid.UUID, while the
+                # SQLite fallback column is CHAR(36) and only accepts strings.
+                "id": (
+                    _preset_id(str(item["slug"]))
+                    if _is_postgres()
+                    else str(_preset_id(str(item["slug"])))
+                ),
                 "user_id": None,  # NULL = 系统预置
                 "title": item["title"],
                 "content": item["content"],

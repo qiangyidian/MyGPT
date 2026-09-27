@@ -55,7 +55,7 @@ def _insert_user(
         "INSERT INTO users (id, email, username, password_hash, role, is_active,"
         " token_version, created_at, updated_at)"
         " VALUES (?, ?, ?, ?, 'user', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        (user_id, email, username or email.split("@")[0], password_hash),
+        (user_id, email, username or email.split("@", maxsplit=1)[0], password_hash),
     )
     return user_id
 
@@ -77,12 +77,9 @@ def _audit(conn: sqlite3.Connection, user_id: str, action: str) -> None:
 
 
 def _hashes(conn: sqlite3.Connection) -> dict[str, str]:
-    return {
-        email: password_hash
-        for email, password_hash in conn.execute(
-            "SELECT email, password_hash FROM users"
-        ).fetchall()
-    }
+    return dict(
+        conn.execute("SELECT email, password_hash FROM users").fetchall()
+    )
 
 
 def test_backfill_hits_only_pre_sentinel_wechat_rows(tmp_path: Path) -> None:

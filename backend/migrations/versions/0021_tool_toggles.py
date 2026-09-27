@@ -1,7 +1,7 @@
 """工具目录启停：tool_toggles 建表.
 
 Revision ID: 0021_tool_toggles
-Revises: 0020_wechat_password_sentinel_backfill
+Revises: 0020_wechat_pw_sentinel
 Create Date: 2026-09-20
 
 后台的「工具」页原来只是一份**只读目录**：运营看得见某个工具有多危险（``python_exec``
@@ -30,7 +30,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0021_tool_toggles"
-down_revision: Union[str, None] = "0020_wechat_password_sentinel_backfill"
+down_revision: Union[str, None] = "0020_wechat_pw_sentinel"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
