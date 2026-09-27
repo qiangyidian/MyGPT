@@ -193,7 +193,7 @@ export function parseBackendInstant(value: string | null | undefined): number | 
   const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed);
   const normalized = hasZone ? trimmed : `${trimmed}Z`;
   const time = new Date(normalized).getTime();
-  return Number.isFinite(time) ? time : null;
+  return Number.isFinite(time) ? Math.floor(time / 1000) : null;
 }
 
 export function isBatchExpired(
@@ -202,7 +202,7 @@ export function isBatchExpired(
 ): boolean {
   const time = parseBackendInstant(expiresAt);
   if (time === null) return false;
-  return time <= now.getTime();
+  return time <= Math.floor(now.getTime() / 1000);
 }
 
 /** 展示用日期（解析失败时退回原串，绝不显示 `Invalid Date`）。 */
@@ -213,14 +213,14 @@ export function formatDateText(
   if (!value) return fallback;
   const time = parseBackendInstant(value);
   if (time === null) return value;
-  return new Date(time).toLocaleDateString();
+  return new Date(time * 1000).toLocaleDateString();
 }
 
 export function formatDateTimeText(value: string | null | undefined): string {
   if (!value) return "—";
   const time = parseBackendInstant(value);
   if (time === null) return value;
-  return new Date(time).toLocaleString();
+  return new Date(time * 1000).toLocaleString();
 }
 
 // --------------------------------------------------------------------------- //

@@ -50,10 +50,10 @@ export const SERVER_AUDIO_MIME_FALLBACK: readonly string[] = [
  * 而不是录一段后端必然 415 的音频。 */
 export const RECORDER_MIME_CANDIDATES: readonly string[] = [
   "audio/webm;codecs=opus",
-  "audio/webm",
   "audio/ogg;codecs=opus",
   "audio/ogg",
   "audio/mp4",
+  "audio/webm",
   "audio/aac",
   "audio/mpeg",
 ];
@@ -476,7 +476,8 @@ export const MIC_ERROR_CODE_BY_NAME: Record<string, string> = {
   NotAllowedError: "mic_denied",
   PermissionDeniedError: "mic_denied",
   // 非安全上下文（http 访问）下 Chrome 抛的也是 SecurityError，表现就是「不给权限」。
-  SecurityError: "mic_denied",
+  SecurityError: "mic_insecure_origin",
+  AbortError: "recorder_failed",
   NotFoundError: "mic_unavailable",
   DevicesNotFoundError: "mic_unavailable",
   NotReadableError: "mic_unavailable",

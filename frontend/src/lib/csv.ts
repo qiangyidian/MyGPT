@@ -19,7 +19,7 @@ export type CsvValue = string | number | boolean | null | undefined;
  * 只在值**是字符串**时加前缀单引号：数字（成本、token 数）以 ``-`` 开头是负数，加
  * 引号会把 ``-0.5`` 变成文本，报表里那一列就不再能求和了。
  */
-const FORMULA_LEAD = /^[=+\-@\t\r]/;
+const FORMULA_LEAD = /^(?:[=+@\t\r]|-(?![=]))/;
 
 export function csvSafeValue(value: CsvValue): string {
   if (value === null || value === undefined) return "";

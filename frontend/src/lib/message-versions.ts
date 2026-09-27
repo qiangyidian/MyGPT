@@ -102,7 +102,8 @@ export function isSameContent(
 ): boolean {
   return (
     (version.content ?? "") === (current.content ?? "") &&
-    (version.model_name ?? "") === (current.model_name ?? "")
+    (current.model_name === undefined ||
+      (version.model_name ?? "") === (current.model_name ?? ""))
   );
 }
 
