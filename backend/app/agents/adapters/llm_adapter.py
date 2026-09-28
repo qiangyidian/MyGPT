@@ -25,6 +25,7 @@ from app.core.pricing import usage_cost
 from app.core.security import decrypt_secret
 from app.model_capabilities import capabilities_from_config
 from app.models import ModelConfig
+from app.providers.openai_compatible import opencode_request_headers
 
 _USAGE_LOCK_POLL_SECONDS = 0.005
 
@@ -262,7 +263,9 @@ class CrewAILLMFactory:
     """Turn a ModelConfig row into a CrewAI LLM instance."""
 
     @staticmethod
-    def from_model_config(cfg: ModelConfig, *, budget_guard: Any = None) -> Any:
+    def from_model_config(
+        cfg: ModelConfig, *, budget_guard: Any = None, session_id: str = ""
+    ) -> Any:
         from crewai import LLM  # lazy: crewai is optional
 
         api_key = decrypt_secret(cfg.api_key_encrypted or "") or "dummy"
@@ -284,6 +287,12 @@ class CrewAILLMFactory:
             # The workflow owns retries so each attempt crosses the run budget.
             max_retries=0,
         )
+        # CrewAI delegates through LiteLLM, so it does not use the native
+        # OpenAICompatibleProvider transport. Forward OpenCode Go's required
+        # headers through CrewAI's additional_params for every agent stage.
+        opencode_headers = opencode_request_headers(cfg.api_base_url or "", session_id)
+        if opencode_headers:
+            kwargs["additional_params"] = {"extra_headers": opencode_headers}
         output_parameter = capabilities_from_config(cfg).output_token_parameter
         kwargs[output_parameter] = cfg.max_tokens
         if cfg.top_p is not None:

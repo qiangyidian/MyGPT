@@ -308,7 +308,9 @@ class CrewAIRuntime:
         # 1. LLM from the existing ModelConfig.
         try:
             llm = CrewAILLMFactory.from_model_config(
-                ctx.model_config, budget_guard=guard
+                ctx.model_config,
+                budget_guard=guard,
+                session_id=str(ctx.conversation.id),
             )
         except Exception as exc:
             logger.exception("crewai LLM build failed: %s", exc)

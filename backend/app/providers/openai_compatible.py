@@ -59,12 +59,23 @@ _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 # so unrelated OpenAI-compatible endpoints never see a vendor-specific header.
 _OPENCODE_HOST = "opencode.ai"
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
+_OPENCODE_USER_AGENT = "MyGPT/1.0"
 
 
 def _is_opencode_host(base_url: str) -> bool:
     """True when ``base_url``'s host is opencode.ai or a subdomain of it."""
     host = (urlsplit(base_url).hostname or "").lower()
     return host == _OPENCODE_HOST or host.endswith("." + _OPENCODE_HOST)
+
+
+def opencode_request_headers(base_url: str, session_id: str) -> dict[str, str]:
+    """Return the gateway-specific headers required by OpenCode Go."""
+    if not _is_opencode_host(base_url):
+        return {}
+    return {
+        _OPENCODE_SESSION_HEADER: session_id,
+        "User-Agent": _OPENCODE_USER_AGENT,
+    }
 
 
 def _is_retryable_response(resp: httpx.Response) -> bool:
@@ -130,8 +141,7 @@ class OpenAICompatibleProvider(ModelProvider):
         h: dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
-        if _is_opencode_host(self.base_url):
-            h[_OPENCODE_SESSION_HEADER] = self.session_id
+        h.update(opencode_request_headers(self.base_url, self.session_id))
         return h
 
     def _chat_url(self) -> str:

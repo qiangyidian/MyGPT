@@ -686,7 +686,11 @@ class ChatOrchestrator:
 
         # stage_ctx / 预算守卫来自共享的 RunEnvironment —— 与 walker 路径同一实例。
         guard = env.guard
-        llm = CrewAILLMFactory.from_model_config(ctx.model_config, budget_guard=guard)
+        llm = CrewAILLMFactory.from_model_config(
+            ctx.model_config,
+            budget_guard=guard,
+            session_id=str(ctx.conversation.id),
+        )
         stage_ctx = env.stage_ctx
         # 工具与 walker **同一构造函数、同一份代码**（app.agents.runtime.
         # crewai_runtime.build_runtime_tools）：route 白名单、MCP/connector 合并、
