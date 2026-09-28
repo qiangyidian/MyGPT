@@ -26,7 +26,28 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      - name: Detect dependency lock inputs
+        id: lock-inputs
+        working-directory: .
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            BASE_SHA="${{ github.event.before }}"
+          else
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          fi
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            changed=true
+          else
+            git fetch --no-tags origin "$BASE_SHA" --depth=1
+            if git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- backend/requirements.txt backend/requirements.lock.txt; then
+              changed=false
+            else
+              changed=true
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
       - name: Verify dependency lock is current
+        if: steps.lock-inputs.outputs.changed == 'true'
         run: |
           python -m pip install "uv==0.11.33"
           uv pip compile requirements.txt --python-version 3.13 --universal \
