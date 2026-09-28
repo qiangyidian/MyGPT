@@ -689,7 +689,9 @@ class ChatOrchestrator:
         llm = CrewAILLMFactory.from_model_config(
             ctx.model_config,
             budget_guard=guard,
-            session_id=str(ctx.conversation.id),
+            session_id=str(
+                getattr(getattr(ctx, "conversation", None), "id", "") or ""
+            ),
         )
         stage_ctx = env.stage_ctx
         # 工具与 walker **同一构造函数、同一份代码**（app.agents.runtime.

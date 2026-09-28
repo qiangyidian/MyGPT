@@ -73,7 +73,9 @@ def opencode_request_headers(base_url: str, session_id: str) -> dict[str, str]:
     if not _is_opencode_host(base_url):
         return {}
     return {
-        _OPENCODE_SESSION_HEADER: session_id,
+        # Real chat paths pass the conversation id; one-off callers still need
+        # a non-empty value for OpenCode Go's request validation.
+        _OPENCODE_SESSION_HEADER: session_id or uuid.uuid4().hex,
         "User-Agent": _OPENCODE_USER_AGENT,
     }
 
