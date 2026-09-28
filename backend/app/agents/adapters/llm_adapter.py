@@ -28,6 +28,10 @@ from app.models import ModelConfig
 from app.providers.openai_compatible import opencode_request_headers
 
 _USAGE_LOCK_POLL_SECONDS = 0.005
+# CrewAI agents need short handoff artifacts, not a full chat-length answer at
+# every stage. Large per-model limits (for example 8192) can make a single
+# Researcher generation consume the entire run budget before later agents start.
+_CREWAI_STAGE_OUTPUT_TOKEN_CAP = 2048
 
 
 def _final_payload_parts(
@@ -294,7 +298,10 @@ class CrewAILLMFactory:
         if opencode_headers:
             kwargs["additional_params"] = {"extra_headers": opencode_headers}
         output_parameter = capabilities_from_config(cfg).output_token_parameter
-        kwargs[output_parameter] = cfg.max_tokens
+        configured_max_tokens = max(1, int(getattr(cfg, "max_tokens", 1) or 1))
+        kwargs[output_parameter] = min(
+            configured_max_tokens, _CREWAI_STAGE_OUTPUT_TOKEN_CAP
+        )
         if cfg.top_p is not None:
             kwargs["top_p"] = cfg.top_p
 
