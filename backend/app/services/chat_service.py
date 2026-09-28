@@ -2023,6 +2023,7 @@ class ChatService:
 
         # 4. Create the AgentRun (status=pending; the worker flips it to running).
         snapshot = {
+            "model_config_id": str(cfg.id),
             "provider": cfg.provider,
             "model_name": cfg.model_name,
             "api_base_url": cfg.api_base_url,
@@ -2056,6 +2057,7 @@ class ChatService:
             current_step="",
             input={
                 "content": user_content,
+                "model_config_id": str(cfg.id),
                 "enable_tools": bool(route.enable_tools or request.enable_tools),
                 "execution_mode": route.execution_mode.value,
                 "agent_profile": route.agent_profile,
@@ -2132,25 +2134,77 @@ class ChatService:
 
 
 async def _resolve_model_for_durable_run(
-    db: AsyncSession, conversation: Conversation, user: User | None = None
+    db: AsyncSession,
+    conversation: Conversation,
+    user: User | None = None,
+    run: AgentRun | None = None,
 ) -> ModelConfig | None:
     """Resolve the ModelConfig for a durable run.
 
-    Prefers the conversation's bound model; falls back to the first available
-    chat config so a durable run never dead-ends on model resolution. The
-    fallback honors the same visibility rule as the inline path (system-wide
-    configs, or the user's own) — never another user's private config.
+    Preserve the exact model selected when the user sent this turn. The request
+    may specify ``model_id`` without binding it to the conversation, so the
+    durable queue must not silently replace it with the oldest available model.
+    Older queued rows are resolved from their model snapshot before using the
+    legacy conversation/default fallback. Every lookup honors model visibility.
     """
-    cfg_id = getattr(conversation, "model_id", None)
-    if cfg_id is not None:
-        cfg = await db.get(ModelConfig, cfg_id)
-        if cfg is not None:
-            return cfg
     visibility = (
         or_(ModelConfig.user_id.is_(None), ModelConfig.user_id == user.id)
         if user is not None
         else ModelConfig.user_id.is_(None)
     )
+
+    async def visible_config(cfg_id: uuid.UUID | str | None) -> ModelConfig | None:
+        if cfg_id is None:
+            return None
+        try:
+            parsed_id = uuid.UUID(str(cfg_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        result = await db.execute(
+            select(ModelConfig).where(ModelConfig.id == parsed_id, visibility)
+        )
+        return result.scalar_one_or_none()
+
+    run_input = (run.input or {}) if run is not None else {}
+    snapshot = (run.model_config_snapshot or {}) if run is not None else {}
+    selected_id = run_input.get("model_config_id") or snapshot.get("model_config_id")
+    if selected_id:
+        # A turn with an explicit selection must never silently run against a
+        # different provider if that config was deleted or is no longer visible.
+        return await visible_config(selected_id)
+
+    conversation_cfg = await visible_config(getattr(conversation, "model_id", None))
+    if conversation_cfg is not None:
+        return conversation_cfg
+
+    # Compatibility for runs enqueued before model_config_id was persisted.
+    # The snapshot was captured from the selected row at enqueue time, whereas
+    # conversation.model_id can legitimately be NULL for per-turn selections.
+    provider = snapshot.get("provider")
+    model_name = snapshot.get("model_name")
+    api_base_url = snapshot.get("api_base_url")
+    if provider and model_name and api_base_url:
+        result = await db.execute(
+            select(ModelConfig)
+            .where(
+                ModelConfig.provider == provider,
+                ModelConfig.model_name == model_name,
+                ModelConfig.api_base_url == api_base_url,
+                ModelConfig.is_embedding.is_(False),
+                visibility,
+            )
+            .order_by(ModelConfig.updated_at.desc(), ModelConfig.created_at.desc())
+        )
+        matching = list(result.scalars().all())
+        if user is not None:
+            own = next((cfg for cfg in matching if cfg.user_id == user.id), None)
+            if own is not None:
+                return own
+        if matching:
+            return matching[0]
+
+    # Legacy rows without an explicit id or useful snapshot retain the former
+    # default behavior, still restricted to system/shared and current-user rows.
     result = await db.execute(
         select(ModelConfig)
         .where(ModelConfig.is_embedding.is_(False), visibility)
@@ -2223,7 +2277,7 @@ async def run_durable_turn(
         )
         return
 
-    cfg = await _resolve_model_for_durable_run(db, conversation, user=user)
+    cfg = await _resolve_model_for_durable_run(db, conversation, user=user, run=run)
     if cfg is None:
         yield AgentEvent(
             kind="error", data={"code": "model_config_not_found", "run_id": str(run_id)}
