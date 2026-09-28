@@ -1,20 +1,13 @@
 name: Deploy Signal
 
-# CI (ci.yml) 全绿后才允许部署。这个工作流提供两个触发方式：
-#
-#   1. push 一个「部署信号」到 deploy 分支 —— 服务器上的 systemd timer
-#      每 2 分钟轮询 origin/main 与 deploy 信号，检测到新信号即自动执行
-#      部署脚本（拉代码 → 构建 → 迁移 → 重启 → 健康检查 → 失败回滚）。
-#      适合服务器无公网入站（无法接 webhook）的场景 —— 本项目正是如此。
-#
-#   2. workflow_dispatch 手动触发（跳过 CI 门禁，紧急修复用）。
+# CI (ci.yml) 全绿且不可变镜像已经推送到 GHCR 后，才发部署信号。
+# 服务器 systemd timer 轮询 deploy 分支，拉取对应 SHA 镜像后部署。
 #
 # 服务器侧组件（已在本机部署）：
 #   /usr/local/bin/mychat-deploy.sh          部署+回滚脚本
 #   mychat-deploy.timer / .service           systemd 轮询单元
 
 on:
-  workflow_dispatch:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -23,35 +16,46 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: mychat-production-deploy-signal
+  cancel-in-progress: false
+
 jobs:
   signal:
-    # 只有 CI 成功才发部署信号
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # CI 通过后才发部署信号；手动绕过 CI 不再受支持。
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Push deploy signal
         run: |
-          # deploy 分支只是一个信号载体：内容为时间戳 + 触发 commit。
-          # 服务器轮询脚本用 git fetch 检测 main 的新 commit（信号分支
-          # 只作为「CI 已通过」的门禁标志）。
-          #
-          # ⚠ 必须基于远端 deploy 的最新信号提交（fetch + reset），否则
-          # push 是 non-fast-forward 被拒 —— 这正是 v1 的 bug：浅 clone 只有
-          # main 历史，checkout -b deploy 与远端 deploy 无共同祖先，第二次
-          # 运行起每次 push 都 rejected，部署信号永远发不出去。
+          TARGET_SHA="${{ github.event.workflow_run.head_sha }}"
           SIGNAL="deploy-requested-$(date -u +%Y%m%dT%H%M%SZ)"
           REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git clone --depth 1 "$REPO_URL" repo
           cd repo
+          # Full main history is used only to prevent an older CI run that
+          # finishes late from replacing a newer deploy signal.
+          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+            git fetch --unshallow origin main
+          else
+            git fetch origin main
+          fi
+          git fetch origin deploy --depth 1
+          CURRENT_SIGNAL_SHA=$(git show FETCH_HEAD:SIGNAL 2>/dev/null | awk '$1 == "commit:" {print $2; exit}' || true)
+          if [[ "$CURRENT_SIGNAL_SHA" =~ ^[0-9a-f]{40}$ ]] && \
+             git merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_SIGNAL_SHA"; then
+            echo "A newer commit already has a deploy signal: $CURRENT_SIGNAL_SHA"
+            exit 0
+          fi
           git fetch origin deploy --depth 1
           git checkout -B deploy FETCH_HEAD
           echo "${SIGNAL}" > SIGNAL
-          echo "commit: ${{ github.event.workflow_run.head_sha || github.sha }}" >> SIGNAL
+          echo "commit: ${TARGET_SHA}" >> SIGNAL
           echo "actor:  ${{ github.actor }}" >> SIGNAL
           git config user.name "deploy-bot"
           git config user.email "deploy-bot@users.noreply.github.com"
           git add SIGNAL
-          git commit -m "deploy: ${{ github.event.workflow_run.head_sha || github.sha }}" --allow-empty
+          git commit -m "deploy: ${TARGET_SHA}" --allow-empty
           # force-with-lease：信号分支是单向追加，远端若在我们 fetch 后又
           # 更新（并发信号），以远端为准放弃本次（下一个 commit 会再触发）。
           git push --force-with-lease=deploy:FETCH_HEAD origin deploy

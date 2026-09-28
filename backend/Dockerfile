@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+FROM docker:29.1.3-cli AS docker-cli
+
+FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -11,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# The app calls a separately configured sandbox Docker daemon. Ship only the
+# client; never run a Docker daemon or mount the application host's socket here.
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY requirements.lock.txt .
 RUN pip install --require-hashes -r requirements.lock.txt

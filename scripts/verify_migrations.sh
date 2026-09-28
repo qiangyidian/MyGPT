@@ -12,10 +12,12 @@
 #                    then to head, proving an existing deployment at the
 #                    previous head upgrades cleanly (the real deploy path).
 #
-# Requires: docker (for the isolated postgres) + the backend venv (psycopg2).
+# Requires: Docker for local isolated runs; CI may set PG_EXTERNAL=1 to reuse its
+# Postgres service. Both modes need the backend Python environment with asyncpg.
 # Usage:
 #   ./scripts/verify_migrations.sh
 #   PG_PORT=55432 REPO_HEAD=0010_artifacts ./scripts/verify_migrations.sh
+#   PG_EXTERNAL=1 PG_PORT=5432 PG_ADMIN_URL=... (GitHub Actions only)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +40,20 @@ resolve_prior_rev() {
 PG_PORT="${PG_PORT:-55432}"
 PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
 CTR="mygpt-verify-pg-$$"
+PG_EXTERNAL="${PG_EXTERNAL:-0}"
+if [ "$PG_EXTERNAL" = "1" ] && [ "${GITHUB_ACTIONS:-false}" != "true" ]; then
+  echo "[verify] PG_EXTERNAL=1 is reserved for the isolated GitHub Actions service" >&2
+  exit 1
+fi
+PG_ADMIN_URL="${PG_ADMIN_URL:-postgresql://postgres:postgres@127.0.0.1:${PG_PORT}/postgres}"
+if [ "$PG_EXTERNAL" = "1" ]; then
+  DB_SUFFIX="${GITHUB_RUN_ID:-$$}_${GITHUB_RUN_ATTEMPT:-1}"
+  VERIFY_EMPTY_DB="mygpt_verify_empty_${DB_SUFFIX}"
+  VERIFY_INC_DB="mygpt_verify_inc_${DB_SUFFIX}"
+else
+  VERIFY_EMPTY_DB="verify_empty"
+  VERIFY_INC_DB="verify_inc"
+fi
 
 # Locate alembic via the backend venv's `python -m alembic` (cross-platform:
 # Windows venv is .venv/Scripts/python.exe, Linux is .venv/bin/python). Falls
@@ -64,27 +80,70 @@ fi
 PRIOR_REV="${PRIOR_REV:-$(resolve_prior_rev)}"
 
 cleanup() {
-  echo "[verify] tearing down $CTR"
-  docker rm -f "$CTR" >/dev/null 2>&1 || true
+  if [ "$PG_EXTERNAL" = "1" ]; then
+    echo "[verify] dropping temporary databases from external Postgres"
+    PG_ADMIN_URL="$PG_ADMIN_URL" VERIFY_EMPTY_DB="$VERIFY_EMPTY_DB" VERIFY_INC_DB="$VERIFY_INC_DB" python - <<'PY' || true
+import asyncio
+import os
+import re
+import asyncpg
+
+async def main():
+    conn = await asyncpg.connect(os.environ["PG_ADMIN_URL"])
+    for name in (os.environ["VERIFY_INC_DB"], os.environ["VERIFY_EMPTY_DB"]):
+        if not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+            raise ValueError("unsafe temporary database name")
+        await conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+            name,
+        )
+        await conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    await conn.close()
+
+asyncio.run(main())
+PY
+  else
+    echo "[verify] tearing down $CTR"
+    docker rm -f "$CTR" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
-echo "[verify] starting isolated postgres ($PG_IMAGE) on 127.0.0.1:$PG_PORT"
-docker run -d --name "$CTR" \
-  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-  -p 127.0.0.1:${PG_PORT}:5432 "$PG_IMAGE" >/dev/null
+if [ "$PG_EXTERNAL" = "1" ]; then
+  echo "[verify] using the CI Postgres service on 127.0.0.1:$PG_PORT"
+else
+  echo "[verify] starting isolated postgres ($PG_IMAGE) on 127.0.0.1:$PG_PORT"
+  docker run -d --name "$CTR" \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+    -p 127.0.0.1:${PG_PORT}:5432 "$PG_IMAGE" >/dev/null
+fi
 
 # Wait for the postgres container to accept connections.
 echo -n "[verify] waiting for postgres"
 for _ in $(seq 1 30); do
-  if docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1; then
+  if [ "$PG_EXTERNAL" = "1" ]; then
+    PG_ADMIN_URL="$PG_ADMIN_URL" python - <<'PY' >/dev/null 2>&1 && ready=1 || ready=0
+import asyncio, os, asyncpg
+async def main():
+    conn = await asyncpg.connect(os.environ["PG_ADMIN_URL"])
+    await conn.close()
+asyncio.run(main())
+PY
+  else
+    docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1 && ready=1 || ready=0
+  fi
+  if [ "${ready:-0}" = "1" ]; then
     echo " up"
     break
   fi
   echo -n "."
   sleep 1
 done
-docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1 || { echo "postgres never came up" >&2; exit 1; }
+if [ "$PG_EXTERNAL" = "1" ]; then
+  [ "${ready:-0}" = "1" ] || { echo "postgres service never became available" >&2; exit 1; }
+else
+  docker exec "$CTR" pg_isready -U postgres >/dev/null 2>&1 || { echo "postgres never came up" >&2; exit 1; }
+fi
 
 # Assert the repo has exactly one alembic head (no branching) == REPO_HEAD.
 echo "[verify] alembic heads (expect single head $REPO_HEAD)"
@@ -112,10 +171,23 @@ assert_head() {  # $1 = label, $2 = db name
 }
 
 # --- Path 1: empty DB -> head ------------------------------------------------
-docker exec "$CTR" createdb -U postgres verify_empty
+if [ "$PG_EXTERNAL" = "1" ]; then
+  PG_ADMIN_URL="$PG_ADMIN_URL" python - "$VERIFY_EMPTY_DB" <<'PY'
+import asyncio, os, sys, re, asyncpg
+async def main():
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", sys.argv[1]):
+        raise ValueError("unsafe temporary database name")
+    conn = await asyncpg.connect(os.environ["PG_ADMIN_URL"])
+    await conn.execute(f'CREATE DATABASE "{sys.argv[1]}"')
+    await conn.close()
+asyncio.run(main())
+PY
+else
+  docker exec "$CTR" createdb -U postgres "$VERIFY_EMPTY_DB"
+fi
 echo "[verify] path 1: empty DB -> upgrade head"
-run_alembic verify_empty head
-assert_head "empty" verify_empty
+run_alembic "$VERIFY_EMPTY_DB" head
+assert_head "empty" "$VERIFY_EMPTY_DB"
 
 # --- Path 2: incremental (prior revision -> head) ----------------------------
 if [ -z "$PRIOR_REV" ]; then
@@ -123,13 +195,26 @@ if [ -z "$PRIOR_REV" ]; then
   echo "[verify] PASS: empty path at head $REPO_HEAD"
   exit 0
 fi
-docker exec "$CTR" createdb -U postgres verify_inc
+if [ "$PG_EXTERNAL" = "1" ]; then
+  PG_ADMIN_URL="$PG_ADMIN_URL" python - "$VERIFY_INC_DB" <<'PY'
+import asyncio, os, sys, re, asyncpg
+async def main():
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", sys.argv[1]):
+        raise ValueError("unsafe temporary database name")
+    conn = await asyncpg.connect(os.environ["PG_ADMIN_URL"])
+    await conn.execute(f'CREATE DATABASE "{sys.argv[1]}"')
+    await conn.close()
+asyncio.run(main())
+PY
+else
+  docker exec "$CTR" createdb -U postgres "$VERIFY_INC_DB"
+fi
 echo "[verify] path 2: incremental DB -> upgrade $PRIOR_REV then head"
-run_alembic verify_inc "$PRIOR_REV"
-mid="$(current_rev verify_inc)"
+run_alembic "$VERIFY_INC_DB" "$PRIOR_REV"
+mid="$(current_rev "$VERIFY_INC_DB")"
 echo "[verify] incremental intermediate = ${mid:-<none>} (expect $PRIOR_REV)"
 [ "$mid" = "$PRIOR_REV" ] || { echo "[verify] FAIL: incremental did not stop at $PRIOR_REV" >&2; exit 1; }
-run_alembic verify_inc head
-assert_head "incremental" verify_inc
+run_alembic "$VERIFY_INC_DB" head
+assert_head "incremental" "$VERIFY_INC_DB"
 
 echo "[verify] PASS: empty + incremental paths both at head $REPO_HEAD"

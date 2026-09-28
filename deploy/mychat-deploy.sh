@@ -1,163 +1,157 @@
 #!/usr/bin/env bash
-# =============================================================================
-# MyChat 自动部署脚本 — 由 mychat-poll-deploy.service/timer 或手动调用。
-# 流程：安全上下文检查 → 拉取 main → 依赖变更检测 → 前端构建 →
-#       数据库迁移 → 服务重启 → 健康验证（失败自动回滚到部署前 commit）。
-# =============================================================================
-set -euo pipefail
+# Deploy only CI-published, immutable GHCR images. The server does not build code.
+set -Eeuo pipefail
 
-REPO=/root/MyGPT
-BRANCH=main
-VENV=/opt/mychat-venv
-LOG_TAG="mychat-deploy"
-BACKEND_READY_URL="http://127.0.0.1:8003/ready"
-STATE_FILE=/var/lib/mychat-deploy/last_deployed_commit
-HEALTH_RETRIES=15
-# 敏感配置（DATABASE_URL 等）从已 chmod 600 的 .env 读取，绝不入库
-ENV_FILE="$REPO/.env"
+REPO=${MYCHAT_REPO:-/root/MyGPT}
+ENV_FILE=${MYCHAT_ENV_FILE:-/root/MyGPT/.env}
+STATE_DIR=/var/lib/mychat-deploy
+STATE_FILE=$STATE_DIR/last_deployed_commit
+RELEASES_DIR=/opt/mychat-deploy/releases
+BACKEND_READY_URL=http://127.0.0.1:8003/ready
+FRONTEND_READY_URL=http://127.0.0.1:5003/
+LOG_TAG=mychat-deploy
+HEALTH_RETRIES=90
 
-log() { echo "[$(date '+%F %T')] $*" | logger -t "$LOG_TAG" -s 2>/dev/null || echo "[$(date '+%F %T')] $*"; }
+log() { logger -t "$LOG_TAG" -- "$*" 2>/dev/null || echo "[$(date '+%F %T')] $*"; }
+fatal() { log "ERROR: $*"; exit 1; }
 
-mkdir -p /var/lib/mychat-deploy
+mkdir -p "$STATE_DIR" "$RELEASES_DIR"
+install -d -m 1777 /opt/mychat-data/sandbox
+[[ -d "$REPO/.git" ]] || fatal "repository not found: $REPO"
+[[ -r "$ENV_FILE" ]] || fatal "production env file is missing or unreadable: $ENV_FILE"
+command -v docker >/dev/null || fatal "docker is not installed"
+docker compose version >/dev/null 2>&1 || fatal "Docker Compose plugin is required (docker compose)"
+command -v curl >/dev/null || fatal "curl is not installed"
+command -v flock >/dev/null || fatal "flock is not installed"
+exec 9>/run/lock/mychat-deploy.lock
+flock -n 9 || fatal "another deployment is already running"
 
-cd "$REPO"
-
-# ---- 1. 安全上下文：绝不在脏工作区上部署（本地实验改动会被吞掉） ----
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    log "REFUSE: 工作区有未提交改动，跳过部署（避免吞掉本地修改）"
-    exit 1
+# Refuse to deploy on top of operator edits, and never reset or clean the tree.
+if ! git -C "$REPO" diff --quiet || ! git -C "$REPO" diff --cached --quiet; then
+    fatal "repository has tracked local changes; refusing deployment"
 fi
 
-# ---- 2. 拉取远端 ----
-OLD_HEAD=$(git rev-parse HEAD)
-git fetch origin "$BRANCH" --quiet
-git fetch origin deploy --quiet 2>/dev/null || true
-NEW_HEAD=$(git rev-parse "origin/$BRANCH")
+# Production settings are trusted operator input. Loading them here allows
+# Compose to interpolate paths, while values are never printed to the journal.
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
 
-if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
-    log "up-to-date: $NEW_HEAD"
+[[ -n "${REDEEM_CODE_PEPPER:-}" ]] || fatal "REDEEM_CODE_PEPPER is missing in the production env file"
+[[ ${#REDEEM_CODE_PEPPER} -ge 32 ]] || fatal "REDEEM_CODE_PEPPER must be at least 32 characters"
+if [[ "${REDEEM_CODE_PEPPER,,}" =~ (changeme|please-change|example|placeholder|your[-_]) ]]; then
+    fatal "REDEEM_CODE_PEPPER still looks like a placeholder"
+fi
+[[ -n "${STORAGE_DIR:-}" && "$STORAGE_DIR" == /* ]] || fatal "STORAGE_DIR must be an absolute path"
+[[ -d "$STORAGE_DIR" && -w "$STORAGE_DIR" ]] || fatal "STORAGE_DIR is missing or not writable"
+[[ "${SANDBOX_MODE:-}" != docker || -n "${DOCKER_HOST:-}" ]] || \
+    fatal "SANDBOX_MODE=docker requires DOCKER_HOST for the separate sandbox daemon"
+
+git -C "$REPO" fetch --quiet origin main deploy || fatal "cannot fetch origin main/deploy"
+SIGNAL=$(git -C "$REPO" show origin/deploy:SIGNAL 2>/dev/null || true)
+TARGET_SHA=$(printf '%s\n' "$SIGNAL" | awk '$1 == "commit:" {print $2; exit}')
+[[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fatal "deploy signal is missing a valid commit SHA"
+git -C "$REPO" cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null || \
+    fatal "deploy signal commit is not available locally: $TARGET_SHA"
+git -C "$REPO" merge-base --is-ancestor "$TARGET_SHA" origin/main || \
+    fatal "deploy signal is not an ancestor of origin/main"
+
+PREVIOUS_SHA=$(cat "$STATE_FILE" 2>/dev/null || true)
+if [[ "$PREVIOUS_SHA" == "$TARGET_SHA" ]]; then
+    log "up-to-date: $TARGET_SHA"
     exit 0
 fi
-
-# CI 门禁：main 有新 commit 时，必须存在比该 commit 更新的 deploy 信号
-# （GitHub Actions 在 CI 全绿后推送）。无信号 = CI 未通过或未跑，不部署。
-SIGNAL_COMMIT=$(git log origin/deploy -1 --format=%H 2>/dev/null || echo "")
-if [ -z "$SIGNAL_COMMIT" ]; then
-    log "HOLD: main updated but no deploy signal (CI not green yet) — skipping"
-    exit 0
+if [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    git -C "$REPO" merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET_SHA" || \
+        fatal "refusing stale or non-fast-forward deployment: $PREVIOUS_SHA -> $TARGET_SHA"
 fi
-# 信号分支最新 SIGNAL 文件里记录的 commit 是否覆盖当前 main 头
-SIGNAL_TARGET=$(git show origin/deploy:SIGNAL 2>/dev/null | grep '^commit:' | awk '{print $2}')
-if [ "$SIGNAL_TARGET" != "$NEW_HEAD" ]; then
-    log "HOLD: deploy signal targets ${SIGNAL_TARGET:-?} != main HEAD $NEW_HEAD (CI pending) — skipping"
-    exit 0
-fi
-log "deploying: $OLD_HEAD → $NEW_HEAD (CI green ✓)"
 
-# 记住部署前状态用于回滚
-echo "$OLD_HEAD" > /var/lib/mychat-deploy/rollback_commit
+COMPOSE_FILE="$RELEASES_DIR/$TARGET_SHA/docker-compose.server.yml"
+mkdir -p "$(dirname "$COMPOSE_FILE")"
+git -C "$REPO" show "$TARGET_SHA:deploy/docker-compose.server.yml" > "$COMPOSE_FILE" || \
+    fatal "commit $TARGET_SHA does not contain deploy/docker-compose.server.yml"
+chmod 0644 "$COMPOSE_FILE"
+export ENV_FILE IMAGE_TAG="sha-$TARGET_SHA"
 
-git reset --hard "origin/$BRANCH" --quiet
-log "checked out origin/$BRANCH"
-
-install_backend_deps() {
-    local hash_file=/var/lib/mychat-deploy/requirements-lock.sha256
-    local new_hash old_hash
-    new_hash=$(sha256sum backend/requirements.lock.txt | awk '{print $1}')
-    old_hash=$(cat "$hash_file" 2>/dev/null || echo "none")
-    if [ "$new_hash" != "$old_hash" ]; then
-        log "requirements.lock.txt changed — installing hash-verified venv deps"
-        "$VENV/bin/pip" install --require-hashes -r backend/requirements.lock.txt -q
-        echo "$new_hash" > "$hash_file"
-    else
-        log "backend lock unchanged — skip pip install"
-    fi
+compose() {
+    docker compose --project-name mychat --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
 
-install_frontend_deps() {
-    local hash_file=/var/lib/mychat-deploy/frontend-lock.sha256
-    local new_hash old_hash
-    new_hash=$(sha256sum frontend/package-lock.json | awk '{print $1}')
-    old_hash=$(cat "$hash_file" 2>/dev/null || echo "none")
-    if [ ! -d frontend/node_modules ] || [ "$new_hash" != "$old_hash" ]; then
-        log "frontend package lock changed — running npm ci"
-        (cd frontend && npm ci --no-audit --no-fund --silent)
-        echo "$new_hash" > "$hash_file"
-    else
-        log "frontend lock unchanged — skip npm ci"
-    fi
+log "pulling immutable images for $TARGET_SHA"
+compose pull backend frontend worker recovery || fatal "image pull failed; running services were not stopped"
+
+# Apply schema changes while the existing app is still available. Migrations
+# must follow the expand/contract rule so the currently serving version remains
+# compatible with the new schema until the container health gate passes.
+compose run --rm migrate || fatal "database migration failed; existing services were not stopped"
+
+stop_native() {
+    local unit
+    for unit in mychat-backend.service mychat-frontend.service mychat-worker.service mychat-recovery.service; do
+        if systemctl cat "$unit" >/dev/null 2>&1; then
+            systemctl stop "$unit" || return 1
+            systemctl disable "$unit" || return 1
+        fi
+    done
 }
 
-# ---- 3. Install exact backend/frontend dependency locks (hash-aware) ----
-install_backend_deps
-install_frontend_deps
+start_native() {
+    local unit
+    for unit in mychat-backend.service mychat-frontend.service mychat-worker.service mychat-recovery.service; do
+        if systemctl cat "$unit" >/dev/null 2>&1; then
+            systemctl enable --now "$unit" || return 1
+        fi
+    done
+}
 
-# ---- 4. 前端构建（总是构建——NEXT_PUBLIC_* 在构建时内联，必须重建） ----
-log "building frontend..."
-cd frontend
-NEXT_PUBLIC_API_BASE_URL=https://mychat.qiangi.top \
-NEXT_TELEMETRY_DISABLED=1 \
-    npm run build --silent
-cd "$REPO"
+wait_healthy() {
+    local i service container_id health
+    for ((i=1; i<=HEALTH_RETRIES; i++)); do
+        if curl -fsS --max-time 5 "$BACKEND_READY_URL" >/dev/null 2>&1 && \
+           curl -fsS --max-time 5 "$FRONTEND_READY_URL" >/dev/null 2>&1; then
+            for service in backend frontend worker recovery; do
+                container_id=$(compose ps -q "$service")
+                health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || true)
+                [[ "$health" == healthy ]] || break
+            done
+            [[ "$service" == recovery && "$health" == healthy ]] && return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
 
-# ---- 5. 数据库迁移（迁移失败必须中止部署：带缺口 schema 上线必然不可用） ----
-log "applying alembic migrations (if any)..."
-cd backend
-set -a; . "$ENV_FILE"; set +a
-if ! MIG_OUT=$("$VENV/bin/alembic" upgrade head 2>&1); then
-    log "FATAL: alembic upgrade failed — services NOT restarted, aborting deploy:"
-    echo "$MIG_OUT" | tail -10 | while read -r line; do log "alembic: $line"; done
-    cd "$REPO"
-    git reset --hard "$OLD_HEAD" --quiet
-    install_backend_deps
-    install_frontend_deps
-    exit 1
+rollback() {
+    log "deployment health check failed; rolling back"
+    if [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+        export IMAGE_TAG="sha-$PREVIOUS_SHA"
+        if compose pull backend frontend worker recovery && \
+           compose up -d backend frontend worker recovery && wait_healthy; then
+            log "rollback successful: $PREVIOUS_SHA"
+            return 0
+        fi
+        log "container rollback failed; trying the previous systemd services"
+    fi
+    compose down || true
+    if start_native; then
+        log "native systemd services restarted"
+        return 0
+    fi
+    log "rollback failed; manual intervention required"
+    return 1
+}
+
+if ! stop_native; then
+    start_native || log "could not restore every native service after stopping them"
+    fatal "could not stop and disable all native services; refusing container cutover"
 fi
-log "alembic: $(echo "$MIG_OUT" | tail -1)"
-cd "$REPO"
-
-# ---- 6. 重启服务 ----
-log "restarting services..."
-systemctl restart mychat-backend mychat-frontend
-# Best-effort: restart the durable worker/recovery units too when present.
-# A worker skipped here keeps executing runs with OLD code (durable turns run
-# in the worker process, not in the backend) — restarting the backend alone
-# is not enough on stacks with BACKGROUND_WORKER=durable.
-systemctl restart mychat-worker 2>/dev/null || log "no mychat-worker unit (skipped)"
-systemctl restart mychat-recovery 2>/dev/null || log "no mychat-recovery unit (skipped)"
-
-# ---- 7. 健康验证（失败回滚） ----
-healthy=0
-for i in $(seq 1 $HEALTH_RETRIES); do
-    sleep 2
-    if curl -sf --max-time 5 "$BACKEND_READY_URL" >/dev/null 2>&1; then
-        healthy=1
-        break
-    fi
-done
-
-if [ "$healthy" != "1" ]; then
-    # 回滚只回退代码，数据库保持在新 revision（expand-contract 约定：迁移只
-    # 做 additive 变更）。/ready 的迁移检查允许 DB 领先于代码 head，因此回滚
-    # 后健康检查可以通过；禁止在迁移里写破坏性 contract 变更（删列/删表必须
-    # 推迟到下一个版本）。
-    log "UNHEALTHY after deploy — rolling back to $OLD_HEAD"
-    ROLLBACK_TO=$(cat /var/lib/mychat-deploy/rollback_commit 2>/dev/null || echo "$OLD_HEAD")
-    git reset --hard "$ROLLBACK_TO" --quiet
-    install_backend_deps
-    install_frontend_deps
-    cd frontend && NEXT_PUBLIC_API_BASE_URL=https://mychat.qiangi.top NEXT_TELEMETRY_DISABLED=1 npm run build --silent && cd "$REPO"
-    systemctl restart mychat-backend mychat-frontend
-    sleep 6
-    if curl -sf --max-time 5 "$BACKEND_READY_URL" >/dev/null 2>&1; then
-        log "ROLLBACK OK — serving $ROLLBACK_TO"
-    else
-        log "ROLLBACK ALSO UNHEALTHY — manual intervention required"
-        exit 2
-    fi
+if ! compose up -d backend frontend worker recovery || ! wait_healthy; then
+    rollback || exit 2
     exit 1
 fi
 
-echo "$NEW_HEAD" > "$STATE_FILE"
-FRONT_OK=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:5003/ || echo 000)
-log "DEPLOYED $NEW_HEAD (frontend http=$FRONT_OK)"
+printf '%s\n' "$TARGET_SHA" > "$STATE_FILE.tmp"
+chmod 0644 "$STATE_FILE.tmp"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+log "deployment successful: $TARGET_SHA"

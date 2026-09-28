@@ -1,0 +1,103 @@
+# App-only production stack for the current server.
+# PostgreSQL, Redis, and Qdrant remain host services and existing data stays put.
+# `network_mode: host` lets the containers use the same localhost URLs that the
+# current systemd deployment uses. No source tree is mounted into app containers.
+services:
+  migrate:
+    image: ghcr.io/qiangyidian/mygpt-backend:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit>}
+    env_file:
+      - ${ENV_FILE:?set ENV_FILE to the private production env file}
+    environment:
+      STORAGE_DIR: ${STORAGE_DIR:?set STORAGE_DIR to the existing upload directory}
+      SANDBOX_SCRATCH_ROOT: /opt/mychat-data/sandbox
+    network_mode: host
+    user: "0:0"
+    volumes:
+      - ${STORAGE_DIR:?set STORAGE_DIR}:${STORAGE_DIR:?set STORAGE_DIR}
+      - /opt/mychat-data/sandbox:/opt/mychat-data/sandbox
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  backend:
+    image: ghcr.io/qiangyidian/mygpt-backend:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit>}
+    env_file:
+      - ${ENV_FILE:?set ENV_FILE to the private production env file}
+    environment:
+      STORAGE_DIR: ${STORAGE_DIR:?set STORAGE_DIR to the existing upload directory}
+      SANDBOX_SCRATCH_ROOT: /opt/mychat-data/sandbox
+    network_mode: host
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ${STORAGE_DIR:?set STORAGE_DIR}:${STORAGE_DIR:?set STORAGE_DIR}
+      - /opt/mychat-data/sandbox:/opt/mychat-data/sandbox
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=4).status == 200 else 1)"]
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 4
+
+  worker:
+    image: ghcr.io/qiangyidian/mygpt-backend:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit>}
+    env_file:
+      - ${ENV_FILE:?set ENV_FILE to the private production env file}
+    environment:
+      STORAGE_DIR: ${STORAGE_DIR:?set STORAGE_DIR to the existing upload directory}
+      SANDBOX_SCRATCH_ROOT: /opt/mychat-data/sandbox
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
+    network_mode: host
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 300s
+    volumes:
+      - ${STORAGE_DIR:?set STORAGE_DIR}:${STORAGE_DIR:?set STORAGE_DIR}
+      - /opt/mychat-data/sandbox:/opt/mychat-data/sandbox
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "worker"]
+      interval: 30s
+      timeout: 20s
+      start_period: 90s
+      retries: 3
+
+  recovery:
+    image: ghcr.io/qiangyidian/mygpt-backend:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit>}
+    env_file:
+      - ${ENV_FILE:?set ENV_FILE to the private production env file}
+    environment:
+      DB_POOL_SIZE: ${DB_BACKGROUND_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${DB_BACKGROUND_MAX_OVERFLOW:-1}
+    network_mode: host
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: ["python", "-m", "app.recovery"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "recovery"]
+      interval: 30s
+      timeout: 20s
+      start_period: 120s
+      retries: 4
+
+  frontend:
+    image: ghcr.io/qiangyidian/mygpt-frontend:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit>}
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 127.0.0.1
+      PORT: "5003"
+      NEXT_TELEMETRY_DISABLED: "1"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:5003/"]
+      interval: 20s
+      timeout: 5s
+      start_period: 20s
+      retries: 4
