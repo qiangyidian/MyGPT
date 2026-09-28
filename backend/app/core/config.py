@@ -392,7 +392,10 @@ class Settings(BaseSettings):
     AGENT_MAX_STEPS: int = Field(default=8, gt=0)
     AGENT_MAX_TOOL_CALLS: int = Field(default=12, gt=0)
     AGENT_MAX_REPLAN_COUNT: int = Field(default=2, ge=0)
-    AGENT_MAX_RUNTIME_SECONDS: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+    # Deep-research turns run multiple model stages sequentially. A 120s total
+    # cap can terminate a slow but active Researcher before Analyst/Writer start;
+    # keep the hard stop while allowing a realistic multi-agent round trip.
+    AGENT_MAX_RUNTIME_SECONDS: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     AGENT_MAX_TOOL_OUTPUT_CHARS: int = Field(default=8_000, ge=16)
     AGENT_MAX_TOTAL_TOKENS: int = Field(default=40_000, gt=0)
     AGENT_MAX_COST_USD: float = Field(default=5.0, gt=0, allow_inf_nan=False)

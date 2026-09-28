@@ -26,7 +26,7 @@ class BudgetLimits:
     max_agent_steps: int = 8       # model<->tool round trips
     max_tool_calls: int = 12       # individual tool invocations
     max_replan_count: int = 2      # how many times the plan may be revised
-    max_runtime_seconds: float = 120.0
+    max_runtime_seconds: float = 300.0
     max_tool_output_chars: int = 8000
     max_total_tokens: int = 40000
     max_cost_usd: float = 5.0
