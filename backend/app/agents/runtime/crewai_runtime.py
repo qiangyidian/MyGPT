@@ -319,9 +319,13 @@ class CrewAIRuntime:
         ctx.extra["intent"] = intent
         profile = ctx.agent_profile
 
-        # Decide single- vs multi-agent.
-        use_multi = ctx.enable_tools and (
-            profile in _MULTI_AGENT_PROFILES or intent == "deep_research"
+        # Decide single- vs multi-agent. Tool availability is independent of
+        # the crew topology: profiles such as debate coordinate multiple
+        # agents without calling tools. Keep intent-based deep-research
+        # detection gated on tools because intent is classified as "chat"
+        # when tools are disabled above.
+        use_multi = profile in _MULTI_AGENT_PROFILES or (
+            ctx.enable_tools and intent == "deep_research"
         )
 
         if not use_multi:
