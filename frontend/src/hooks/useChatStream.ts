@@ -76,6 +76,9 @@ export interface ChatStreamState {
   stepsSinceTextFrom: number;
   /** Pending human-approval requests for dangerous tools in the live run. */
   pendingApprovals: PendingApproval[];
+  /** User message held locally when its conversation cache is not ready yet. */
+  optimisticUserMessage: Message | null;
+  clearOptimisticUserMessage: () => void;
   currentConversationId: string | null;
   currentRunId: string | null;
   error: string | null;
@@ -155,6 +158,12 @@ export function useChatStream(): ChatStreamState {
   // the last text token (see ChatStreamState.stepsSinceTextFrom).
   const [stepsSinceTextFrom, setStepsSinceTextFrom] = useState(0);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
+  const [optimisticUserMessage, setOptimisticUserMessage] =
+    useState<Message | null>(null);
+  const clearOptimisticUserMessage = useCallback(
+    () => setOptimisticUserMessage(null),
+    [],
+  );
   const [currentConversationId, setCurrentConversationId] = useState<
     string | null
   >(null);
@@ -228,14 +237,17 @@ export function useChatStream(): ChatStreamState {
    */
   const appendMessage = useCallback(
     (conversationId: string, msg: Message) => {
+      let appended = false;
       queryClient.setQueryData(
         CONVERSATION_DETAIL_QUERY_KEY(conversationId),
         (old: unknown) => {
           if (!old || typeof old !== "object") return old;
           const detail = old as { messages?: Message[] };
+          appended = true;
           return { ...detail, messages: [...(detail.messages ?? []), msg] };
         }
       );
+      return appended;
     },
     [queryClient]
   );
@@ -348,6 +360,17 @@ export function useChatStream(): ChatStreamState {
     const handlers: ChatStreamHandlers = {
       onMeta: (convId, msgId) => {
         apply({ kind: "meta", conversationId: convId, messageId: msgId });
+        // A new conversation has no detail cache yet, so its optimistic user
+        // message lives in local hook state until this persisted conversation
+        // can be fetched. Attach the server id now and refresh any stale detail.
+        setOptimisticUserMessage((message) =>
+          message && message.conversation_id === ""
+            ? { ...message, conversation_id: convId }
+            : message
+        );
+        void queryClient.invalidateQueries({
+          queryKey: CONVERSATION_DETAIL_QUERY_KEY(convId),
+        });
         // Bump the conversation list so a new conversation appears.
         queryClient.invalidateQueries({ queryKey: CONVERSATIONS_QUERY_KEY });
       },
@@ -577,6 +600,7 @@ export function useChatStream(): ChatStreamState {
     setCurrentRunId,
     setError,
     setFinishReason,
+    setOptimisticUserMessage,
     setPendingApprovals,
     setStatus,
     setSteps,
@@ -603,6 +627,7 @@ export function useChatStream(): ChatStreamState {
       if (!isRegenerate) {
         lastSendRef.current = { content, opts };
       }
+      setOptimisticUserMessage(null);
 
       const initialConversationId =
         opts.conversationId ?? currentConversationId ?? null;
@@ -633,16 +658,24 @@ export function useChatStream(): ChatStreamState {
           }));
         const optimisticUser: Message = {
           id: `optimistic-user-${Date.now()}`,
-          conversation_id: initialConversationId,
+          conversation_id: initialConversationId ?? "",
           role: "user",
           content,
           metadata: draftAttachments.length ? { attachments: draftAttachments } : {},
           model_name: null,
           created_at: new Date().toISOString(),
         };
-        appendMessage(initialConversationId, optimisticUser);
+        const cached = initialConversationId
+          ? appendMessage(initialConversationId, optimisticUser)
+          : false;
+        // If the conversation detail has not loaded (or this is the first
+        // message and the server has not minted its id), render from local
+        // state instead of waiting for the next detail refetch.
+        if (!cached) setOptimisticUserMessage(optimisticUser);
         // Drafts are now bound to the outgoing message — clear the composer tray.
-        useAttachmentStore.getState().clearDrafts(initialConversationId);
+        if (initialConversationId) {
+          useAttachmentStore.getState().clearDrafts(initialConversationId);
+        }
       }
 
 
@@ -697,6 +730,7 @@ export function useChatStream(): ChatStreamState {
         // 卸载式 abort 什么都不做：后端 durable run 继续跑，半截正文不入账，回到
         // 会话时由 reattach 整段重放补回视图。
         setIsStreaming(false);
+        if (!turn.state.assistantMessageId) setOptimisticUserMessage(null);
         abortRef.current = null;
         userStopRef.current = false;
         syncStreamingText("");
@@ -707,6 +741,7 @@ export function useChatStream(): ChatStreamState {
       currentConversationId,
       appendMessage,
       createTurn,
+      setOptimisticUserMessage,
       syncStreamingText,
     ]
   );
@@ -859,6 +894,8 @@ export function useChatStream(): ChatStreamState {
     steps,
     stepsSinceTextFrom,
     pendingApprovals,
+    optimisticUserMessage,
+    clearOptimisticUserMessage,
     currentConversationId,
     currentRunId,
     error,

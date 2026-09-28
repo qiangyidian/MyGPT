@@ -56,7 +56,7 @@ function ChatPanel({
   const hasActiveConversationDetail = Boolean(
     activeConversationId && detail.data?.id === activeConversationId,
   );
-  const messages = useMemo(
+  const persistedMessages = useMemo(
     () => (hasActiveConversationDetail ? detail.data?.messages ?? [] : []),
     [hasActiveConversationDetail, detail.data?.messages],
   );
@@ -140,6 +140,54 @@ function ChatPanel({
   ]);
 
   const chat = useChatStream();
+  const messages = useMemo(() => {
+    const pending = chat.optimisticUserMessage;
+    if (!pending) return persistedMessages;
+
+    const belongsToActiveConversation = activeConversationId
+      ? pending.conversation_id === activeConversationId ||
+        (!pending.conversation_id && chat.currentConversationId === activeConversationId)
+      : !pending.conversation_id ||
+        pending.conversation_id === chat.currentConversationId;
+    if (!belongsToActiveConversation) return persistedMessages;
+
+    // Once the detail fetch for the server-assigned conversation completes,
+    // the user's message has already been persisted and is in that response.
+    // Let the canonical row replace the temporary bubble without a duplicate.
+    const hasFreshDetail = Boolean(
+      pending.conversation_id &&
+      detail.data?.id === pending.conversation_id &&
+      !detail.isFetching,
+    );
+    return hasFreshDetail
+      ? persistedMessages
+      : [...persistedMessages, pending];
+  }, [
+    activeConversationId,
+    chat.currentConversationId,
+    chat.optimisticUserMessage,
+    detail.data?.id,
+    detail.isFetching,
+    persistedMessages,
+  ]);
+
+  useEffect(() => {
+    const pending = chat.optimisticUserMessage;
+    if (
+      pending?.conversation_id &&
+      pending.conversation_id === activeConversationId &&
+      detail.data?.id === pending.conversation_id &&
+      !detail.isFetching
+    ) {
+      chat.clearOptimisticUserMessage();
+    }
+  }, [
+    activeConversationId,
+    chat.clearOptimisticUserMessage,
+    chat.optimisticUserMessage,
+    detail.data?.id,
+    detail.isFetching,
+  ]);
   const rebuildLastSend = chat.rebuildLastSend;
   const lastRestoredRunRef = useRef<string | null>(null);
 
