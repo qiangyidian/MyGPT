@@ -21,6 +21,9 @@ PyJWT[crypto]>=2.10,<3
 passlib[argon2]>=1.7.4
 bcrypt>=4.1,<4.2        # pin for passlib bcrypt backend compatibility
 cryptography>=42.0
+# Security floor for the kubernetes -> requests-oauthlib transitive dependency
+# (PYSEC-2026-4114 / CVE-2026-49265 is fixed in OAuthLib 4.0.0).
+oauthlib>=4.0.0,<5
 
 # ---- Redis ----
 redis>=5.0

@@ -1,4 +1,16 @@
-# Dependency audit exceptions
+# Dependency security
+
+## Resolved advisories
+
+On 2026-10-10, OAuthLib was upgraded from 3.3.1 to 4.0.0 to resolve
+[`PYSEC-2026-4114` / `CVE-2026-49265`](https://github.com/oauthlib/oauthlib/security/advisories/GHSA-xpv3-w29h-x7cv),
+the PKCE verifier timing comparison vulnerability. `requirements.txt` now
+enforces `oauthlib>=4.0.0,<5` for the transitive
+`chromadb -> kubernetes -> requests-oauthlib -> oauthlib` dependency, and the
+hashed lock file pins the patched release. The vulnerability is fixed by an
+upgrade and is not added to the audit exception list.
+
+## Audit exceptions
 
 The locked backend dependency audit remains strict except for the four current
 ChromaDB advisories listed below. `crewai==1.15.22` requires `chromadb~=1.1.0`,
