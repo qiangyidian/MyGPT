@@ -31,6 +31,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -201,6 +202,7 @@ class StageContext:
     # Coalesce: track active tool_call ids per agent so a duplicate TOOL_STARTED
     # for the same (agent, call) is a no-op (defensive against adapter retries).
     _seen_tool_calls: set = field(default_factory=set)
+    _tool_call_lock: Lock = field(default_factory=Lock, repr=False, compare=False)
     # Counted drops (logged once per run when non-zero, not per drop).
     _dropped: int = 0
     _drop_warned: bool = False
@@ -244,9 +246,23 @@ class StageContext:
         return self._current_slot().task_id
 
     def emit(self, event: AgentEvent) -> None:
-        """Thread-safe forward to the main-loop queue. Never blocks."""
-        if getattr(event, "kind", None) == "tool_call" and self.budget_guard is not None:
-            self.budget_guard.enter_tool_call()
+        """Forward thread-safely without waiting for queue capacity."""
+        if getattr(event, "kind", None) == "tool_call":
+            # Count unique invocations only. Some adapters may replay the same
+            # start event after a retry; deduplicate before charging the run
+            # budget so an event replay cannot exhaust the tool-call cap.
+            call_id = event.data.get("id")
+            key = (event.data.get("agent_id"), call_id) if call_id else None
+            # Adapters can emit from several worker threads at once. Admit
+            # and remember a call atomically, only after the budget permits
+            # it; a rejected start must remain rejected if it is replayed.
+            with self._tool_call_lock:
+                if key is not None and key in self._seen_tool_calls:
+                    return
+                if self.budget_guard is not None:
+                    self.budget_guard.enter_tool_call()
+                if key is not None:
+                    self._seen_tool_calls.add(key)
         if getattr(event, "kind", None) == "tool_result":
             usage = event.data.get("usage")
             if isinstance(usage, dict) and usage:
@@ -255,12 +271,6 @@ class StageContext:
                 )
             if self.budget_guard is not None:
                 self.budget_guard.check()
-        # Coalesce duplicate tool_call events for the same (agent, call_id).
-        if getattr(event, "kind", None) == "tool_call":
-            key = (event.data.get("agent_id"), event.data.get("id"))
-            if key in self._seen_tool_calls:
-                return  # already announced this exact tool call
-            self._seen_tool_calls.add(key)
         try:
             self.loop.call_soon_threadsafe(self._put_nowait, event)
         except RuntimeError:

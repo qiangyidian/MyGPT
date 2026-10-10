@@ -359,6 +359,14 @@ _CASUAL_PHRASES = (
     # Short affirmations
     "好的", "好的呀", "好", "嗯", "嗯嗯", "ok", "okay", "收到", "明白了", "知道了",
 )
+# A greeting can be directly concatenated with another casual phrase in CJK
+# text (for example, "你好你都能干什么"). Treat just the greeting prefix as a
+# removable politeness marker before checking the remainder against the same
+# conservative phrase list below.
+_CASUAL_GREETING_PREFIXES = (
+    "你好", "您好", "嗨", "哈喽", "hey", "hi", "hello",
+    "早上好", "早安", "早", "下午好", "晚上好", "晚安",
+)
 # Particles / punctuation tolerated around a casual phrase (so "你能做什么呢？"
 # still counts). Stripped from the head/tail when comparing.
 _CASUAL_FILLER = "呢啊呀哦吧嘛呐嘿啦哟咯哈!！?？。.,，、~～、 "
@@ -388,11 +396,9 @@ def should_recognize_intent(text: str) -> bool:
 def is_casual_question(text: str) -> bool:
     """True when ``text`` is social/capability chit-chat, not a real query.
 
-    Conservative: returns True only if, after collapsing whitespace and
-    stripping filler/leading polite verbs, the message EQUALS a casual phrase
-    or STARTS WITH one with at most a tiny non-casual remainder. Also True for
-    very short (≤2 meaningful chars) pure chit-chat. A real request that merely
-    opens with a greeting is NOT casual.
+    Conservative: after removing an optional greeting/polite prefix, the
+    message must equal a casual phrase with only filler or punctuation around
+    it. Short business queries and tasks opening with a greeting are not casual.
     """
     if not text:
         return False
@@ -400,37 +406,36 @@ def is_casual_question(text: str) -> bool:
     if not raw:
         return False
     s = re.sub(r"\s+", "", raw).lower()
-    core = _casual_core(s)
-    if not core:
+    if not _casual_core(s):
         return False
 
-    # Strip a single leading polite verb (请/帮我/你能…) so "请介绍一下自己"
-    # matches the bare phrase. We test BOTH the original core and the
-    # prefix-stripped variant, because "你能做什么" is itself a phrase (matched
-    # by the original) while "请介绍一下自己" only matches after the prefix is
-    # removed.
-    candidates = [core]
-    for lead in _CASUAL_LEAD:
-        if core.startswith(lead):
-            trimmed = _casual_core(core[len(lead):])
-            if trimmed and trimmed != core:
-                candidates.append(trimmed)
-            break
+    # Keep the unstripped candidate too: 哈 is both a filler particle and
+    # the first character of 哈喽. Strip a greeting before the polite prefix
+    # so "你好，请介绍一下自己" follows the same rules as the bare question.
+    candidates = [s, _casual_core(s)]
+    for cand in tuple(candidates):
+        for greeting in _CASUAL_GREETING_PREFIXES:
+            if cand.startswith(greeting):
+                remainder = _casual_core(cand[len(greeting):])
+                if remainder:
+                    candidates.append(remainder)
+                break
+    for cand in tuple(candidates):
+        for lead in _CASUAL_LEAD:
+            if cand.startswith(lead):
+                trimmed = _casual_core(cand[len(lead):])
+                if trimmed:
+                    candidates.append(trimmed)
+                break
 
     for cand in candidates:
         for phrase in _CASUAL_PHRASES:
-            if cand == phrase:
-                return True
+            phrase = phrase.replace(" ", "")  # same normalization as the input
             if cand.startswith(phrase):
                 remainder = _casual_core(cand[len(phrase):])
-                # Casual only if nothing substantive follows the phrase.
-                if len(remainder) <= 2:
+                if not remainder:
                     return True
 
-    # Very short pure chit-chat (≤2 meaningful chars), e.g. "嗯", "ok".
-    meaningful = re.sub(rf"[{re.escape(_CASUAL_FILLER)}]", "", s)
-    if 0 < len(meaningful) <= 2:
-        return True
     return False
 
 

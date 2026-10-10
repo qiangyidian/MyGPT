@@ -1,6 +1,8 @@
 """Intent router: user-facing mode -> execution route mapping (pure unit tests)."""
 from __future__ import annotations
 
+import pytest
+
 from app.agents.intent_router import (
     VALID_MODES,
     decide_route,
@@ -89,6 +91,40 @@ def test_expert_mode_with_kb_uses_parallel_crew():
     r = decide_route("expert", has_knowledge_base=True)
     assert r.use_multi_agent is True
     assert r.agent_profile == "parallel_research"
+
+
+@pytest.mark.parametrize("mode", ["expert", "deep_research"])
+@pytest.mark.parametrize("has_kb", [False, True])
+@pytest.mark.parametrize("content", ["你好", "你好你都能干什么", "你好，请介绍一下自己"])
+def test_research_modes_answer_casual_turns_directly(mode, has_kb, content):
+    r = decide_route(mode, has_knowledge_base=has_kb, user_content=content)
+    assert r.execution_mode == ExecutionMode.auto
+    assert r.agent_profile == "general"
+    assert r.use_multi_agent is False
+    assert r.enable_tools is False
+    assert r.mode == "auto"
+    assert r.requested_mode == mode
+
+
+@pytest.mark.parametrize("mode", ["expert", "deep_research"])
+@pytest.mark.parametrize("content", ["你好，天气", "汇率", "你好，请深入调研大模型微调"])
+def test_research_modes_keep_real_questions_on_the_crew(mode, content):
+    r = decide_route(mode, has_knowledge_base=True, user_content=content)
+    assert r.execution_mode == ExecutionMode.agent
+    assert r.agent_profile == "parallel_research"
+    assert r.use_multi_agent is True
+    assert r.enable_tools is True
+    assert r.requested_mode == mode
+
+
+@pytest.mark.parametrize("mode", ["expert", "deep_research"])
+def test_research_modes_keep_code_requests_native(mode):
+    r = decide_route(mode, user_content="你好，请用 Python 写一个贪吃蛇游戏")
+    assert r.execution_mode == ExecutionMode.auto
+    assert r.use_multi_agent is False
+    assert r.disable_web is True
+    assert r.mode == "create"
+    assert r.requested_mode == mode
 
 
 def test_speed_ignores_intent_judgment():

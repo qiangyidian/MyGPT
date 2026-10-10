@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,7 @@ from pydantic import ValidationError
 
 from app.agents.policies.budget_policy import BudgetGuard, BudgetLimits
 from app.agents.runtime.stage_executor import CrewAIStageExecutor
-from app.agents.schemas import BudgetExceeded
+from app.agents.schemas import AgentEvent, BudgetExceeded, ev_tool_call
 from app.agents.stage_context import make_stage_context
 from app.core.config import Settings
 from app.core.pricing import usage_cost
@@ -58,6 +60,82 @@ def test_budget_limits_are_built_from_validated_settings(monkeypatch):
     )
     with pytest.raises(FrozenInstanceError):
         limits.max_agent_steps = 99  # type: ignore[misc]
+
+
+def test_default_tool_cap_is_consistent(monkeypatch):
+    monkeypatch.delenv("AGENT_MAX_TOOL_CALLS", raising=False)
+    assert Settings(_env_file=None).AGENT_MAX_TOOL_CALLS == 40
+    assert BudgetGuard().limits.max_tool_calls == 40
+
+
+async def test_duplicate_tool_start_uses_one_budget_slot_and_one_event():
+    guard = BudgetGuard(_limits(max_tool_calls=1))
+    ctx = make_stage_context("dedup", budget_guard=guard)
+    event = ev_tool_call(id="call-1", name="web_search", arguments={}, agent_id="researcher")
+    ctx.emit(event)
+    ctx.emit(event)
+    await asyncio.sleep(0)
+    assert guard.tool_calls == 1
+    assert ctx.queue.qsize() == 1
+
+
+async def test_same_tool_call_id_from_different_agents_is_counted_separately():
+    guard = BudgetGuard(_limits(max_tool_calls=2))
+    ctx = make_stage_context("agents", budget_guard=guard)
+    for agent in ("web-researcher", "kb-researcher"):
+        ctx.emit(ev_tool_call(id="call-1", name="search", arguments={}, agent_id=agent))
+    await asyncio.sleep(0)
+    assert guard.tool_calls == 2
+    assert ctx.queue.qsize() == 2
+
+
+async def test_rejected_tool_start_cannot_bypass_budget_on_replay():
+    guard = BudgetGuard(_limits(max_tool_calls=1))
+    ctx = make_stage_context("rejected", budget_guard=guard)
+    ctx.emit(ev_tool_call(id="allowed", name="search", arguments={}, agent_id="researcher"))
+    rejected = ev_tool_call(id="rejected", name="search", arguments={}, agent_id="researcher")
+    for _ in range(2):
+        with pytest.raises(BudgetExceeded, match="max tool calls"):
+            ctx.emit(rejected)
+    await asyncio.sleep(0)
+    assert ctx.queue.qsize() == 1
+
+
+async def test_tool_starts_without_ids_are_not_coalesced():
+    guard = BudgetGuard(_limits(max_tool_calls=2))
+    ctx = make_stage_context("missing-ids", budget_guard=guard)
+    for _ in range(2):
+        ctx.emit(AgentEvent(kind="tool_call", data={"agent_id": "researcher", "name": "search"}))
+    await asyncio.sleep(0)
+    assert guard.tool_calls == 2
+    assert ctx.queue.qsize() == 2
+
+
+async def test_concurrent_duplicate_tool_starts_are_admitted_once():
+    class SlowMembershipSet(set):
+        def __contains__(self, key):
+            seen = super().__contains__(key)
+            time.sleep(0.005)  # force overlapping membership checks without a lock
+            return seen
+
+    guard = BudgetGuard(_limits(max_tool_calls=1))
+    ctx = make_stage_context("concurrent-dedup", budget_guard=guard)
+    ctx._seen_tool_calls = SlowMembershipSet()
+    event = ev_tool_call(id="shared", name="search", arguments={}, agent_id="researcher")
+    ready = Barrier(8)
+
+    def emit(_):
+        ready.wait(timeout=5)
+        ctx.emit(event)
+
+    def run_threads():
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(emit, range(8)))
+
+    await asyncio.to_thread(run_threads)
+    await asyncio.sleep(0)
+    assert guard.tool_calls == 1
+    assert ctx.queue.qsize() == 1
 
 
 @pytest.mark.parametrize(

@@ -390,7 +390,9 @@ class Settings(BaseSettings):
     NETWORK_POLICY_FILE: str = ""
     # Agent hard-stop budgets (see app.agents.policies.budget_policy).
     AGENT_MAX_STEPS: int = Field(default=8, gt=0)
-    AGENT_MAX_TOOL_CALLS: int = Field(default=12, gt=0)
+    # One research run can span three agents; align the shared run-wide cap
+    # with the default per-run tool quota so Researcher has room to finish.
+    AGENT_MAX_TOOL_CALLS: int = Field(default=40, gt=0)
     AGENT_MAX_REPLAN_COUNT: int = Field(default=2, ge=0)
     # Deep-research turns run multiple model stages sequentially. A 120s total
     # cap can terminate a slow but active Researcher before Analyst/Writer start;

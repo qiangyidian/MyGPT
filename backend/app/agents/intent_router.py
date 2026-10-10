@@ -101,7 +101,19 @@ def decide_route(
     if m == "expert":
         # 专家模式：默认使用多 Agent 协作（研究 crew；绑了知识库走并行 research）。
         # 代码请求例外 —— 研究 Writer 会截断代码，所以代码仍走原生（与 deep_research 一致）。
-        from app.agents.planning import looks_like_code_request
+        from app.agents.planning import is_casual_question, looks_like_code_request
+
+        # Social / capability questions do not need a research crew. Keep the
+        # selected mode observable while routing this turn to a direct answer.
+        if is_casual_question(user_content):
+            return RouteDecision(
+                execution_mode=ExecutionMode.auto,
+                agent_profile="general",
+                enable_tools=False,
+                use_multi_agent=False,
+                mode="auto",
+                requested_mode="expert",
+            )
 
         if looks_like_code_request(user_content):
             return RouteDecision(
@@ -140,7 +152,17 @@ def decide_route(
         # (the research Writer caps output and writes prose, truncating code).
         # Reroute it to native create — observable via requested_mode != mode.
         # "research then code" requests (looks_like_research_then_code) stay.
-        from app.agents.planning import looks_like_code_request
+        from app.agents.planning import is_casual_question, looks_like_code_request
+
+        if is_casual_question(user_content):
+            return RouteDecision(
+                execution_mode=ExecutionMode.auto,
+                agent_profile="general",
+                enable_tools=False,
+                use_multi_agent=False,
+                mode="auto",
+                requested_mode="deep_research",
+            )
 
         if looks_like_code_request(user_content):
             return RouteDecision(
