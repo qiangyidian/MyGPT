@@ -30,9 +30,18 @@ def test_inventory_stays_native_even_with_research_intent(mode):
 
 @pytest.mark.parametrize("question", [
     "对比这些文档中有哪些差异", "研究这些文档涉及的技术并联网查找资料", "总结这份文档",
+    "这些文档中有哪些算法？", "这个文件有哪些函数？",
+    "What topics are in these documents?", "Which documents mention retry?",
 ])
 def test_content_research_is_not_mistaken_for_a_catalog(question):
     assert not is_document_inventory_question(question)
+
+
+@pytest.mark.parametrize("question", [
+    QUESTION, "列出我的文档", "我的文件清单", "List my documents", "Which files do I have?",
+])
+def test_catalog_phrasings_use_inventory(question):
+    assert is_document_inventory_question(question)
 
 
 async def test_inventory_includes_unindexed_documents_and_stays_in_selected_kbs(db_session):

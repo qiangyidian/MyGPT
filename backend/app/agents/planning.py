@@ -51,9 +51,19 @@ def is_document_inventory_question(text: str) -> bool:
         "compare", "research", "difference", "web", "internet",
     )):
         return False
-    return any(term in value for term in (
-        "哪些", "清单", "列表", "目录", "list", "which documents", "what documents",
-        "which files", "what files",
+    if any(term in value for term in (
+        "文档清单", "文件清单", "文档列表", "文件列表", "文档目录", "文件目录",
+    )):
+        return True
+    # A topic after "哪些" is a content question (e.g. 文档中有哪些算法),
+    # not a request for file names. Keep those on normal semantic retrieval.
+    return bool(re.search(
+        r"有哪些(?:文档|文件)|(?:文档|文件)(?:中|里|内)?都?(?:有)?哪些[？?。！!\s]*$"
+        r"|(?:列出|罗列|列举|展示).*(?:文档|文件)[？?。！!\s]*$"
+        r"|\b(?:list|which|what)\s+(?:(?:all|my|our|the|these|uploaded|available|stored)\s+)*"
+        r"(?:documents|files)(?:\s+(?:do\s+(?:i|we)\s+have|(?:i|we)\s+(?:have|uploaded)"
+        r"|are\s+(?:available|there)))?[?.!\s]*$",
+        value,
     ))
 
 
