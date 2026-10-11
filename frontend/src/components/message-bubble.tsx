@@ -58,7 +58,7 @@ import type {
 } from "@/lib/types";
 import { getMessageStatus } from "@/lib/types";
 import { getMessageTerminationNotice } from "@/lib/message-termination";
-import { sanitizeSourceMarkers } from "@/lib/citations";
+import { sanitizeSourceMarkers, citedCitations } from "@/lib/citations";
 import { collectArtifactIds } from "@/lib/artifacts";
 import { MemoryUsage } from "@/components/memory/memory-entry-point";
 
@@ -381,6 +381,15 @@ export const MessageBubble = memo(function MessageBubble({
     : message.content;
   const citationFlagged = !isUser && meta.citation_validation_failed === true;
 
+  // Real-citation chips: the retrieval candidates arrive BEFORE the first
+  // token; only sources the answer actually marked ([source N]) get a chip,
+  // and never while the answer is still streaming (mid-answer there is no
+  // honest citation set yet — the chips would just be the raw candidates).
+  const visibleCitations =
+    !isUser && !isStreaming
+      ? citedCitations(message.content, resolvedCitations)
+      : undefined;
+
   // Artifact references — from the assistant text (`artifact:<id>` handles)
   // AND the persisted metadata list (written when a tool result spilled).
   // Both render as inline artifact cards with an authenticated download link.
@@ -572,11 +581,11 @@ export const MessageBubble = memo(function MessageBubble({
           <ResearchSteps steps={resolvedSteps} live={Boolean(isStreaming)} />
         )}
 
-        {!isUser && resolvedCitations && resolvedCitations.length > 0 && (
+        {!isUser && visibleCitations && visibleCitations.length > 0 && (
           <div className="w-full">
             <Citations
-              citations={resolvedCitations}
-              onSourceClick={(i) => onSourceClick?.(i, resolvedCitations)}
+              citations={visibleCitations}
+              onSourceClick={(i) => onSourceClick?.(i, resolvedCitations ?? [])}
             />
           </div>
         )}
