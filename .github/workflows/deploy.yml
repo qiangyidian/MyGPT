@@ -1,54 +1,85 @@
-name: Deploy Signal
+name: Deploy
 
-# CI (ci.yml) 全绿且不可变镜像已经推送到 GHCR 后，才发部署信号。
-# 服务器 systemd timer 轮询 deploy 分支，拉取对应 SHA 镜像后部署。
-#
-# 服务器侧组件（已在本机部署）：
-#   /usr/local/bin/mychat-deploy.sh          部署+回滚脚本
-#   mychat-deploy.timer / .service           systemd 轮询单元
+# push 到 main = 一次生产部署（独立开发者的约定）。
+# 本 workflow 取代原 ci.yml + deploy.yml 两段式：
+#   1. 按当前 SHA 构建并推送 backend / frontend 两份不可变镜像到 GHCR；
+#   2. 向 deploy 分支追加部署信号。
+# 服务器 systemd timer 轮询 deploy 分支，拉取对应 sha-TARGET_SHA 镜像部署。
+#（质量门禁——ruff/pytest/eval/迁移链——已按「单人阶段不需要」移除。）
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+  push:
     branches: [main]
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: mychat-production-deploy-signal
   cancel-in-progress: false
 
 jobs:
-  signal:
-    # CI 通过后才发部署信号；手动绕过 CI 不再受支持。
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+  build-and-signal:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 —— full clone 避免 Deploy Signal 时代那次
+      # "shallow file has changed"（浅克隆竞态）的偶发失败；信号合并
+      # 基线判断也需要完整 main 历史。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set image names
+        id: image
+        run: |
+          echo "backend=ghcr.io/qiangyidian/mygpt-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=ghcr.io/qiangyidian/mygpt-frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.image.outputs.backend }}:sha-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and publish frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          target: prod
+          build-args: NEXT_PUBLIC_API_BASE_URL=https://mychat.qiangi.top
+          push: true
+          tags: ${{ steps.image.outputs.frontend }}:sha-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
       - name: Push deploy signal
         run: |
-          TARGET_SHA="${{ github.event.workflow_run.head_sha }}"
+          TARGET_SHA="${{ github.sha }}"
           SIGNAL="deploy-requested-$(date -u +%Y%m%dT%H%M%SZ)"
-          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git clone --depth 1 "$REPO_URL" repo
-          cd repo
-          # Full main history is used only to prevent an older CI run that
-          # finishes late from replacing a newer deploy signal.
-          if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
-            git fetch --unshallow origin main
-          else
-            git fetch origin main
-          fi
-          git fetch origin deploy --depth 1
-          CURRENT_SIGNAL_SHA=$(git show FETCH_HEAD:SIGNAL 2>/dev/null | awk '$1 == "commit:" {print $2; exit}' || true)
+          CURRENT_SIGNAL_SHA=$(git show origin/deploy:SIGNAL 2>/dev/null | awk '$1 == "commit:" {print $2; exit}' || true)
           if [[ "$CURRENT_SIGNAL_SHA" =~ ^[0-9a-f]{40}$ ]] && \
              git merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_SIGNAL_SHA"; then
             echo "A newer commit already has a deploy signal: $CURRENT_SIGNAL_SHA"
             exit 0
           fi
-          git fetch origin deploy --depth 1
-          git checkout -B deploy FETCH_HEAD
+          git fetch origin deploy
+          git checkout -B deploy origin/deploy
           echo "${SIGNAL}" > SIGNAL
           echo "commit: ${TARGET_SHA}" >> SIGNAL
           echo "actor:  ${{ github.actor }}" >> SIGNAL
@@ -56,6 +87,6 @@ jobs:
           git config user.email "deploy-bot@users.noreply.github.com"
           git add SIGNAL
           git commit -m "deploy: ${TARGET_SHA}" --allow-empty
-          # force-with-lease：信号分支是单向追加，远端若在我们 fetch 后又
-          # 更新（并发信号），以远端为准放弃本次（下一个 commit 会再触发）。
-          git push --force-with-lease=deploy:FETCH_HEAD origin deploy
+          # force-with-lease：信号分支是单向追加，远端若又更新（并发信号），
+          # 以远端为准放弃本次；被拒绝的信号由下一个 commit 补上。
+          git push --force-with-lease=deploy:origin/deploy origin deploy
