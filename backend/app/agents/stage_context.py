@@ -179,6 +179,7 @@ class StageContext:
     model_config: Any = None
     assistant_msg: Any = None
     user_content: str = ""
+    source_context: str = ""
     cancel_event: Any = None
     db: Any = None
     persistence_session_factory: Any = None
@@ -219,7 +220,8 @@ class StageContext:
           * **CrewAI 自己的工作线程**（不继承上下文，读不到 contextvar）：
             回落到单槽，行为与修前一致，不会更差。
         """
-        slot = _StageSlot(agent_id=agent_id, task_id=task_id)
+        # CrewAI Task.id is a UUID; audit columns and SSE attribution are text.
+        slot = _StageSlot(agent_id=str(agent_id or ""), task_id=str(task_id or ""))
         self._legacy_slot = slot
         return _CURRENT_STAGE.set(slot)
 

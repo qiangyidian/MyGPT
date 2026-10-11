@@ -141,6 +141,9 @@ class CrewAIStageExecutor:
         context: str | None,
         stage_ctx: StageContext,
     ) -> StageResult:
+        source_context = getattr(stage_ctx, "source_context", "")
+        if source_context:
+            context = f"{source_context}\n\n{context}" if context else source_context
         admitted_context = admit_stage_dispatch(
             agent=agent, task=task, context=context, stage_ctx=stage_ctx
         )

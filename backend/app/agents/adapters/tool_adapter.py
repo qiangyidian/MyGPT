@@ -54,20 +54,23 @@ def _build_args_schema(source: AppBaseTool):
     return create_model(f"{source.name}Args", **fields)
 
 
-def _bridge_async(coro):
-    """Run a coroutine from sync ``_run`` whether or not an event loop is running.
-
-    CrewAI may call ``_run`` from inside ``aexecute_task`` (a running loop) or
-    from a sync ``kickoff``. The former is handled by running the coro in a
-    worker thread with its own loop, so we never recurse into a running loop.
-    """
+def _bridge_async(coro, owner_loop: asyncio.AbstractEventLoop | None = None):
+    """Dispatch worker-thread tools on the loop that owns the async DB pool."""
     try:
-        asyncio.get_running_loop()
-        running = True
+        current_loop = asyncio.get_running_loop()
     except RuntimeError:
-        running = False
+        current_loop = None
 
-    if not running:
+    if owner_loop is not None:
+        if current_loop is owner_loop:
+            coro.close()
+            raise RuntimeError("Use arun() when calling an agent tool on its owning loop")
+        if not owner_loop.is_running():
+            coro.close()
+            raise RuntimeError("The agent tool's owning loop is no longer running")
+        return asyncio.run_coroutine_threadsafe(coro, owner_loop).result()
+
+    if current_loop is None:
         return asyncio.run(coro)
 
     import concurrent.futures
@@ -211,6 +214,12 @@ def build_crewai_tool(
     ctx = stage_ctx
     guard = budget_guard or (ctx.budget_guard if ctx is not None else None)
     output_limit = max_result_chars
+    owner_loop = getattr(ctx, "loop", None)
+    if owner_loop is None:
+        try:
+            owner_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
 
     class _Adapter(BaseTool):
         name: str = source.name
@@ -242,7 +251,8 @@ def build_crewai_tool(
                     self._run_id, self._user_id,
                     agent_id, task_id,
                     call_id, guard, output_limit,
-                )
+                ),
+                owner_loop,
             )
 
             # Dangerous tool awaiting approval: pause for a human decision if a
@@ -265,7 +275,8 @@ def build_crewai_tool(
                             self._run_id, self._user_id,
                             agent_id, task_id,
                             call_id, guard, output_limit,
-                        )
+                        ),
+                        owner_loop,
                     )
                 else:
                     exec_ = _blocked_execution(exec_, reason or f"approval {decision}")
@@ -284,5 +295,10 @@ def build_crewai_tool(
                 guard.check()
 
             return _format_for_crewai(exec_, output_limit)
+
+        async def _arun(self, **kwargs: Any) -> str:
+            # Keep the sync approval bridge off-loop; DB work is submitted back
+            # to owner_loop by _run, sharing the pool's original async context.
+            return await asyncio.to_thread(self._run, **kwargs)
 
     return _Adapter()

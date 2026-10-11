@@ -20,6 +20,20 @@ class RecordingAgent:
         return SimpleNamespace(raw="ok")
 
 
+async def test_research_stage_receives_retrieved_sources_before_dispatch():
+    agent = RecordingAgent()
+    stage_ctx = _stage_context()
+    stage_ctx.source_context = "[source 1] document evidence; id=known-document"
+    await CrewAIStageExecutor().execute(
+        agent_id="researcher", agent=agent,
+        task=SimpleNamespace(id="task", description="review user documents"),
+        context="upstream instructions", stage_ctx=stage_ctx,
+    )
+    assert "document evidence" in agent.contexts[0]
+    assert "known-document" in agent.contexts[0]
+    assert "upstream instructions" in agent.contexts[0]
+
+
 def _stage_context(*, context_window: int = 2_000, max_tokens: int = 200):
     stage_ctx = make_stage_context("stage-admission")
     stage_ctx.model_config = SimpleNamespace(

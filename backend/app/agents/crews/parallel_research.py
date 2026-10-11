@@ -117,7 +117,9 @@ def build_parallel_research_stages(
     web_task = Task(
         description=(
             "Using the coordinator's web research line in context, gather "
-            "external evidence with web_search / http_get. Report sources + snippets."
+            "external evidence with web_search / http_get. Report sources + snippets. "
+            "If the question only asks about the supplied internal documents, "
+            "report that external research is unnecessary and make no web calls."
         ),
         expected_output="A list of {source, snippet} evidence items from the web.",
         agent=web_researcher,
@@ -125,7 +127,10 @@ def build_parallel_research_stages(
     kb_task = Task(
         description=(
             "Using the coordinator's KB research line in context, retrieve "
-            "internal documents with file_analyze. Report sources + snippets."
+            "internal documents with file_analyze. Use the supplied knowledge-base "
+            "evidence first; call file_analyze only with a supplied document UUID "
+            "when more detail is needed. Never guess IDs or use db_query to discover "
+            "documents. Report sources + snippets, and state any evidence gaps."
         ),
         expected_output="A list of {source, snippet} evidence items from the KB.",
         agent=kb_researcher,

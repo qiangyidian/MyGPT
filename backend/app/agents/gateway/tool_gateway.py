@@ -130,8 +130,8 @@ class ToolGateway:
 
     def set_attribution(self, *, agent_id: str = "", task_id: str = "") -> None:
         """Set the agent/task id for subsequent tool executions in this run."""
-        self._agent_id = agent_id or ""
-        self._task_id = task_id or ""
+        self._agent_id = str(agent_id or "")
+        self._task_id = str(task_id or "")
 
     def drain_spilled_handles(self) -> list[str]:
         """Return and clear the artifact handles spilled during this run."""

@@ -200,7 +200,7 @@ async def test_crewai_tool_adapter_run_bridges_to_gateway(db_session, monkeypatc
         run_id=run.id,
         user_id=_SEEDED_USER,
     )
-    out = adapter._run()  # sync; bridges async gateway internally
+    out = await adapter.arun()  # async caller stays on the database's owning loop
     assert isinstance(out, str)
     assert "utc_iso" in out  # datetime_now payload stringified
 

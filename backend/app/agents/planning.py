@@ -41,6 +41,22 @@ _KNOWLEDGE_HINTS = (
 Intent = str  # "chat" | "knowledge" | "deep_research" | "action"
 
 
+def is_document_inventory_question(text: str) -> bool:
+    """A request for the user's file catalog, rather than content research."""
+    value = (text or "").strip().lower()
+    if not any(term in value for term in ("文档", "文件", "documents", "files")):
+        return False
+    if any(term in value for term in (
+        "对比", "比较", "差异", "差别", "研究", "调研", "联网", "网上", "互联网",
+        "compare", "research", "difference", "web", "internet",
+    )):
+        return False
+    return any(term in value for term in (
+        "哪些", "清单", "列表", "目录", "list", "which documents", "what documents",
+        "which files", "what files",
+    ))
+
+
 # --------------------------------------------------------------------------- #
 # Research-signal confidence
 # --------------------------------------------------------------------------- #

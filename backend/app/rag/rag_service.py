@@ -12,14 +12,15 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.models import KnowledgeBase, ModelConfig
+from app.models import Document, DocumentChunk, KnowledgeBase, ModelConfig
 from app.observability import observe_histogram, observe_span
 from app.providers.registry import get_provider_for_config
 from app.rag.embedder import ProviderEmbedder
+from app.rag.base import SearchHit
 from app.rag.fusion import compress_context, rrf_fuse
 from app.rag.keyword import KeywordRetriever
 from app.rag.prompts import build_rag_context, fit_context, format_context_block
@@ -166,6 +167,10 @@ class RagService:
     ) -> tuple[str, list[Citation]]:
         if not question or not str(question).strip() or not kb_ids:
             return "", []
+        from app.agents.planning import is_document_inventory_question
+
+        if is_document_inventory_question(question):
+            return await self._document_inventory(db, kb_ids, document_ids)
         settings = get_settings()
         # A caller-supplied top_k (the retrieval API's explicit parameter) beats
         # every per-KB column; otherwise each KB contributes its own recall
@@ -286,6 +291,46 @@ class RagService:
         citations = [self._hit_to_citation(h, i) for i, h in enumerate(hits, start=1)]
         context_block = format_context_block(hits)
         return build_rag_context(context_block), citations
+
+    async def _document_inventory(
+        self, db: AsyncSession, kb_ids: list[uuid.UUID | str],
+        document_ids: list[uuid.UUID | str] | None,
+    ) -> tuple[str, list[Citation]]:
+        # Ownership of these KB IDs is checked by the calling chat/RAG API.
+        # Inventory is metadata, not a similarity search: unindexed files must
+        # still appear, and no embedding endpoint or vector collection is needed.
+        scope = [Document.knowledge_base_id.in_([uuid.UUID(str(k)) for k in kb_ids])]
+        if document_ids:
+            scope.append(Document.id.in_([uuid.UUID(str(d)) for d in document_ids]))
+        total = await db.scalar(select(func.count(Document.id)).where(*scope)) or 0
+        rows = (await db.execute(
+            select(Document, KnowledgeBase.name, DocumentChunk.id,
+                   func.substr(DocumentChunk.content, 1, 400))
+            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+            .outerjoin(DocumentChunk, (DocumentChunk.document_id == Document.id)
+                       & (DocumentChunk.chunk_index == 0))
+            .where(*scope)
+            .order_by(Document.created_at, Document.id)
+            .limit(50)
+        )).all()
+        hits = [SearchHit(
+            id=str(chunk_id) if chunk_id else "", score=1.0,
+            payload={
+                "document_id": str(doc.id), "document_name": doc.filename,
+                "kb_id": str(doc.knowledge_base_id), "kb_name": kb_name,
+                "chunk_id": str(chunk_id) if chunk_id else None, "chunk_index": 0,
+                "retriever": "document_inventory",
+                "text": (f"文件名：{doc.filename}\n知识库：{kb_name}\n"
+                         f"类型：{doc.file_type}；索引状态：{doc.status}\n"
+                         f"开头预览：{preview or '暂无已解析正文'}"),
+            },
+        ) for doc, kb_name, chunk_id, preview in rows]
+        hits = fit_context(hits, get_settings().RAG_CONTEXT_TOKENS or None)
+        citations = [self._hit_to_citation(hit, i) for i, hit in enumerate(hits, start=1)]
+        header = f"所选知识库共 {total} 份文档，本次展示 {len(hits)} 份。"
+        if len(hits) < total:
+            header += "这里只是部分清单，不要声称已展示全部文件。"
+        return header + "\n" + format_context_block(hits), citations
 
     @staticmethod
     def _hit_to_citation(hit: Any, index: int) -> Citation:

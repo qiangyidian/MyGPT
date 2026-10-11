@@ -70,6 +70,19 @@ def decide_route(
     if m not in VALID_MODES:
         m = "speed"
 
+    from app.agents.planning import is_document_inventory_question
+
+    if (
+        m in {"speed", "expert", "deep_research", "auto"}
+        and has_knowledge_base
+        and is_document_inventory_question(user_content)
+    ):
+        return RouteDecision(
+            execution_mode=ExecutionMode.auto, agent_profile="general",
+            enable_tools=False, use_multi_agent=False, disable_web=True,
+            mode="auto", requested_mode=m,
+        )
+
     if m == "speed":
         # 极速模式：单 Agent 原生直答，不启动多 Agent、不跑意图分类（首 token 最快）。
         # 允许联网搜索（web_search / http_get）——这样极速提问也能有「来源」，
@@ -303,9 +316,15 @@ def decide_route_with_intent(
     ``speed`` is special: it ALWAYS stays native single-agent (the user picked
     极速 on purpose) — any intent judgment is ignored.
     """
-    if (mode or "").strip().lower() == "speed":
+    from app.agents.planning import is_document_inventory_question
+
+    if (mode or "").strip().lower() == "speed" or (
+        (mode or "auto").strip().lower() in {"expert", "deep_research", "auto"}
+        and has_knowledge_base
+        and is_document_inventory_question(user_content)
+    ):
         return decide_route(
-            "speed",
+            mode,
             has_knowledge_base=has_knowledge_base,
             has_attachment=has_attachment,
             user_content=user_content,

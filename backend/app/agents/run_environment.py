@@ -19,6 +19,7 @@ StageContext，从而缺失审批桥、流式字段、工具归属与 usage 归�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -129,6 +130,23 @@ class RunEnvironment:
         stage_ctx.model_config = ctx.model_config
         stage_ctx.assistant_msg = ctx.assistant_msg
         stage_ctx.user_content = ctx.user_content
+        # Research stages must see the same retrieved evidence as native chat.
+        # Without it they guess document IDs or try unrelated database queries.
+        from app.rag.prompts import build_rag_context
+        from app.security.prompt_boundary import apply_untrusted_boundary
+
+        if ctx.rag_context:
+            refs = [
+                {"source": index, "document_id": str(citation.document_id)}
+                for index, citation in enumerate(ctx.citations or [], start=1)
+                if getattr(citation, "document_id", None)
+            ]
+            source_context = build_rag_context(ctx.rag_context)
+            if refs:
+                source_context += "\nDocument IDs for file_analyze:\n" + apply_untrusted_boundary(
+                    "rag", json.dumps(refs, ensure_ascii=False)
+                )
+            stage_ctx.source_context = source_context
         stage_ctx.cancel_event = asyncio.Event()
         stage_ctx.db = ctx.db
         stage_ctx.persistence_session_factory = cls.session_factory_for(ctx)

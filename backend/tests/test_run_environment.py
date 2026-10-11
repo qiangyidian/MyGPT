@@ -51,6 +51,11 @@ async def _seed_ctx(db_session) -> AgentTurnContext:
 
 async def test_for_call_populates_stage_context(db_session):
     ctx = await _seed_ctx(db_session)
+    from app.schemas.chat import Citation
+
+    doc_id = uuid.uuid4()
+    ctx.rag_context = "[source 1] example.pdf\nDocument evidence"
+    ctx.citations = [Citation(document_id=str(doc_id), document_name="example.pdf")]
     env = RunEnvironment.for_call(ctx)
 
     assert env.run_id == ctx.run_id
@@ -58,6 +63,8 @@ async def test_for_call_populates_stage_context(db_session):
     assert env.stage_ctx.model_config is ctx.model_config
     assert env.stage_ctx.assistant_msg is ctx.assistant_msg
     assert env.stage_ctx.user_content == "compare A and B"
+    assert "Document evidence" in env.stage_ctx.source_context
+    assert str(doc_id) in env.stage_ctx.source_context
     assert env.stage_ctx.db is ctx.db
     assert env.stage_ctx.persistence_session_factory is TestSessionLocal
     assert env.stage_ctx.persistence_lock is ctx.extra["persistence_lock"]
