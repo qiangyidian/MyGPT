@@ -61,7 +61,9 @@ async def test_inventory_includes_unindexed_documents_and_stays_in_selected_kbs(
     assert "A real document introduction" in context
     assert "x" * 401 not in context
     assert {c.document_id for c in citations} == {doc.id for doc in documents[:2]}
-    assert citations[0].chunk_id == chunk_id
+    by_document = {citation.document_id: citation for citation in citations}
+    assert by_document[documents[0].id].chunk_id == chunk_id
+    assert by_document[documents[1].id].chunk_id is None
 
     narrowed, narrowed_citations = await RagService().retrieve(
         db_session, QUESTION, [selected.id], document_ids=[documents[1].id]
