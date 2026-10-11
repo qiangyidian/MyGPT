@@ -28,7 +28,7 @@ class BudgetLimits:
     max_replan_count: int = 2      # how many times the plan may be revised
     max_runtime_seconds: float = 300.0
     max_tool_output_chars: int = 8000
-    max_total_tokens: int = 40000
+    max_total_tokens: int = 160000
     max_cost_usd: float = 5.0
 
     def __post_init__(self) -> None:

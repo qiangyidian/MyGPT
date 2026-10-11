@@ -402,7 +402,11 @@ class Settings(BaseSettings):
     # keep the hard stop while allowing a realistic multi-agent round trip.
     AGENT_MAX_RUNTIME_SECONDS: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     AGENT_MAX_TOOL_OUTPUT_CHARS: int = Field(default=8_000, ge=16)
-    AGENT_MAX_TOTAL_TOKENS: int = Field(default=40_000, gt=0)
+    # 多 Agent 检索的实测地板：CrewAI 每次模型调用重发整个累积上下文，一次
+    # 8 请求的研究轮 prompt 就能到 ~45k（缓存除外），40k 会在 Writer 开跑前
+    # 撞墙（生产事故 2026-10-11）。160k 容下几次正常的全文检索 + 分析 + 撰写；
+    # 真正的失控仍由步数/时间/费用上限兜住。
+    AGENT_MAX_TOTAL_TOKENS: int = Field(default=160_000, gt=0)
     AGENT_MAX_COST_USD: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     # Intent classifier (runs on the chat hot path before the first token).
     # Master switch: when False, intent recognition is skipped entirely and the

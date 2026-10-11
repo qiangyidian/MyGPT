@@ -20,6 +20,7 @@ All run() methods are async and return JSON-serialisable values.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import ipaddress
 import json
 import logging
@@ -28,6 +29,7 @@ import shutil
 import socket
 import tempfile
 import uuid
+import zlib
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
@@ -201,6 +203,54 @@ async def _bounded_request(
         return resp.status_code, b"".join(chunks), resp.headers.get("content-type", ""), str(resp.url)
 
 
+def _decode_http_body(raw: bytes, content_type: str, max_bytes: int) -> str | None:
+    """Decode a response body to text, or None when it is not text.
+
+    httpx's ``aiter_raw`` skips automatic content decoding, so gzip/deflate
+    responses arrive as raw compressed bytes. Decoding those with
+    ``errors="replace"`` used to flood the agent context with binary garbage
+    — a few thousand tokens of noise per fetch that blew the run's token
+    budget. Also refuse obviously-non-text payloads by declared type.
+    """
+    encoding = (content_type.split(";", maxsplit=1)[0] or "").strip().lower()
+    if encoding in ("application/gzip", "application/x-gzip") or raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, EOFError):
+            return None
+    elif raw[:1] == b"\x78":
+        # zlib stream magic — the declared deflate content-type (or a
+        # mislabeled one) still gets one inflation attempt.
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            try:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+            except zlib.error:
+                return None
+    if encoding.startswith("image/") or encoding.startswith("audio/") or (
+        encoding.startswith("application/")
+        and encoding not in ("application/deflate",)
+        and not any(
+            k in encoding
+            for k in ("json", "xml", "javascript", "xhtml", "yaml", "toml", "csv")
+        )
+    ):
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("utf-8-sig", errors="replace")
+        except Exception:
+            return None
+        # A body that is mostly replacement chars after coercion is binary, not
+        # "weird-but-text" — enough garbage saturated a past run's budget.
+        if text.count("�") * 8 > len(text):
+            return None
+    return text[:max_bytes]
+
+
 class DateTimeNowTool(BaseTool):
     """Return the current UTC timestamp as an ISO-8601 string."""
 
@@ -308,15 +358,28 @@ class HttpGetTool(BaseTool):
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"http error: {exc}", "status_code": None, "body": ""}
 
-        body = raw.decode("utf-8", errors="replace")
-        truncated = len(body) > max_chars
+        text = _decode_http_body(raw, content_type, max_chars)
+        if text is None:
+            # 二进制 / 压缩体（gzip 未解压、图片等）不给模型 —— 上千 token 的
+            # 乱码会烧穿整轮 run 的 token 预算（生产事故：一次 http_get 把
+            # prompt 推到 45k，多 Agent 检索因此在预算墙前失败）。
+            return {
+                "ok": True,
+                "status_code": status_code,
+                "url": final_url,
+                "content_type": content_type,
+                "truncated": False,
+                "body": "",
+                "note": "响应不是可读文本（可能是二进制/压缩内容），未返回正文",
+            }
+        truncated = len(text) > max_chars
         return {
             "ok": True,
             "status_code": status_code,
             "url": final_url,
             "content_type": content_type,
             "truncated": truncated,
-            "body": body[:max_chars],
+            "body": text[:max_chars],
         }
 
 

@@ -34,7 +34,10 @@ _COORDINATOR_BACKSTORY = (
 )
 _WEB_RESEARCHER_BACKSTORY = (
     "You are a web researcher. You gather external evidence using web_search / "
-    "http_get. Never fabricate sources."
+    "http_get. Never fabricate sources. A search that returns no results is a "
+    "finding — report 'no external evidence found' after at most TWO different "
+    "queries; never keep retrying variations, those empty rounds only burn the "
+    "shared run token budget."
 )
 _KB_RESEARCHER_BACKSTORY = (
     "You are a knowledge-base researcher. You retrieve internal documents using "
@@ -119,7 +122,10 @@ def build_parallel_research_stages(
             "Using the coordinator's web research line in context, gather "
             "external evidence with web_search / http_get. Report sources + snippets. "
             "If the question only asks about the supplied internal documents, "
-            "report that external research is unnecessary and make no web calls."
+            "report that external research is unnecessary and make no web calls. "
+            "Hard limit: at most two web_search queries. If both come back empty, "
+            "stop and report 'no external evidence found' — do not keep trying "
+            "query variations."
         ),
         expected_output="A list of {source, snippet} evidence items from the web.",
         agent=web_researcher,
