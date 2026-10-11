@@ -23,7 +23,7 @@ from app.agents.schemas import BudgetExceeded
 class BudgetLimits:
     """Validated immutable hard caps for one run."""
 
-    max_agent_steps: int = 8       # model<->tool round trips
+    max_agent_steps: int = 24      # model<->tool round trips across all agents
     max_tool_calls: int = 40       # shared across all agents in one run
     max_replan_count: int = 2      # how many times the plan may be revised
     max_runtime_seconds: float = 300.0

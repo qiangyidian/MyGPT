@@ -121,6 +121,7 @@ export function initialStreamState(conversationId: string | null = null): Stream
 
 /** 后端 error 帧的 code → 终态 finish_reason（其余一律按 `error` 收口）。 */
 const ERROR_CODE_FINISH: Record<string, FinishReason> = {
+  agent_budget_exceeded: "budget",
   provider_timeout: "timeout",
   stream_disconnected: "stream_disconnected",
   provider_error: "provider_error",

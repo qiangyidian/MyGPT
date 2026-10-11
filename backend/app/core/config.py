@@ -389,7 +389,10 @@ class Settings(BaseSettings):
     # without code changes.
     NETWORK_POLICY_FILE: str = ""
     # Agent hard-stop budgets (see app.agents.policies.budget_policy).
-    AGENT_MAX_STEPS: int = Field(default=8, gt=0)
+    # All agents share model-call steps, including internal research/tool rounds
+    # and the final Writer. Eight can stop ordinary document research before
+    # any user-visible answer; allow several rounds per stage, still bounded.
+    AGENT_MAX_STEPS: int = Field(default=24, gt=0)
     # One research run can span three agents; align the shared run-wide cap
     # with the default per-run tool quota so Researcher has room to finish.
     AGENT_MAX_TOOL_CALLS: int = Field(default=40, gt=0)

@@ -12,6 +12,7 @@ from app.agents.policies.budget_policy import BudgetGuard, BudgetLimits
 from app.agents.runtime.crewai_runtime import CrewAIRuntime
 from app.agents.schemas import BudgetExceeded
 from app.agents.token_budget import PromptAdmissionError
+from app.core.config import Settings
 
 
 class FakeCrewAILLM:
@@ -99,6 +100,30 @@ async def test_budget_proxy_gates_every_internal_async_model_turn():
         await wrapped.acall(messages=[{"role": "user", "content": "two"}])
 
     assert len(underlying.async_calls) == 1
+
+
+async def test_default_shared_budget_allows_research_then_final_answer(monkeypatch):
+    # The live document-overview request stopped on its ninth shared model
+    # step, before Writer. Exercise that boundary through the real LLM gate.
+    monkeypatch.delenv("AGENT_MAX_STEPS", raising=False)
+    limits = BudgetLimits.from_settings(Settings(_env_file=None))
+    assert limits.max_agent_steps == BudgetLimits().max_agent_steps
+    underlying = FakeCrewAILLM(model="gpt-4o")
+    guard = BudgetGuard(limits)
+    wrapped = llm_adapter.wrap_crewai_llm_with_budget(
+        underlying, _config(), budget_guard=guard
+    )
+    for index in range(9):
+        await wrapped.acall(messages=[{"role": "user", "content": f"research {index}"}])
+    await wrapped.acall(messages=[{"role": "user", "content": "analyse evidence"}])
+    assert await wrapped.acall(messages=[{"role": "user", "content": "write answer"}]) == "async-result"
+    assert len(underlying.async_calls) == 11
+    # Raising the default retains a finite bound across all stages.
+    for _ in range(limits.max_agent_steps - 11):
+        await wrapped.acall(messages=[{"role": "user", "content": "followup"}])
+    with pytest.raises(BudgetExceeded, match="max agent steps"):
+        await wrapped.acall(messages=[{"role": "user", "content": "over limit"}])
+    assert len(underlying.async_calls) == limits.max_agent_steps
 
 
 async def test_budget_proxy_charges_each_call_before_next_dispatch():

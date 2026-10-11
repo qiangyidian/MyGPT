@@ -71,6 +71,7 @@ const CODE_ZH: Record<string, string> = {
   insufficient_credits: "积分不足，请先兑换后再继续对话",
   turn_in_progress: "上一条回复还在生成中，请先停止或稍候再发送",
   run_queue_unavailable: "后台队列暂不可用，请稍后重试",
+  agent_budget_exceeded: "Agent 已达到执行额度上限，请重新生成或缩小任务范围",
   no_model_configured: "还没有可用模型，请先在设置中添加模型",
   model_not_found: "所选模型已不存在，请重新选择",
   conversation_not_found: "会话不存在或已被删除",

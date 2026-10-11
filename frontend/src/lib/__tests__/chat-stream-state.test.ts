@@ -212,6 +212,17 @@ describe("重复 / 乱序事件（幂等）", () => {
 });
 
 describe("终态：done 帧之后", () => {
+  it("budget error before done keeps an empty retryable result and the correct cause", () => {
+    const state = feed(
+      initialStreamState(CONV),
+      { kind: "meta", conversationId: CONV, messageId: "a-1" },
+      { kind: "error", code: "agent_budget_exceeded", message: "Agent execution budget exceeded: max agent steps (8) reached" },
+      { kind: "done", finishReason: "budget" }
+    );
+    expect(state.commit?.content).toBe("");
+    expect(state.commit?.finishReason).toBe("budget");
+    expect(state.error).toBe("Agent 已达到执行额度上限，请重新生成或缩小任务范围");
+  });
   it("done 落一条消息，且带的是 meta 给的 messageId", () => {
     const s = answered("全部", "正文");
     expect(s.commit).toMatchObject({
@@ -272,6 +283,7 @@ describe("终态：done 帧之后", () => {
     expect(errorFinishReason("provider_timeout")).toBe("timeout");
     expect(errorFinishReason("stream_disconnected")).toBe("stream_disconnected");
     expect(errorFinishReason("provider_error")).toBe("provider_error");
+    expect(errorFinishReason("agent_budget_exceeded")).toBe("budget");
     expect(errorFinishReason("credits_exhausted")).toBe("error");
     expect(errorFinishReason(undefined)).toBe("error");
     const s = feed(

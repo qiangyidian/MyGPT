@@ -57,6 +57,7 @@ import type {
   ResearchStep,
 } from "@/lib/types";
 import { getMessageStatus } from "@/lib/types";
+import { getMessageTerminationNotice } from "@/lib/message-termination";
 import { sanitizeSourceMarkers } from "@/lib/citations";
 import { collectArtifactIds } from "@/lib/artifacts";
 import { MemoryUsage } from "@/components/memory/memory-entry-point";
@@ -146,51 +147,45 @@ function CopyButton({ text }: { text: string }) {
 }
 
 const STATUS_CONFIG: Partial<
-  Record<GenerationStatus, { label: string; className: string; action: "continue" | "retry"; Icon: LucideIcon }>
+  Record<GenerationStatus, { className: string; Icon: LucideIcon }>
 > = {
   truncated: {
-    label: "输出达到长度上限，内容可能不完整",
     className: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
-    action: "continue",
     Icon: Scissors,
   },
   interrupted: {
-    label: "连接中断，已保留已生成内容",
     className: "border-orange-500/40 bg-orange-500/10 text-orange-700 dark:text-orange-400",
-    action: "continue",
     Icon: WifiOff,
   },
   cancelled: {
-    label: "已停止，已保留已生成内容",
     className: "border-border bg-muted/50 text-muted-foreground",
-    action: "continue",
     Icon: Square,
   },
   error: {
-    label: "生成失败",
     className: "border-destructive/40 bg-destructive/10 text-destructive",
-    action: "retry",
     Icon: AlertTriangle,
   },
 };
 
-function StatusBanner({
-  status,
+export function MessageStatusBanner({
+  message,
   onContinue,
   onRegenerate,
 }: {
-  status: GenerationStatus;
+  message: Message;
   onContinue?: () => void;
   onRegenerate?: () => void;
 }) {
-  const cfg = STATUS_CONFIG[status];
-  if (!cfg) return null;
+  const status = getMessageStatus(message);
+  const cfg = status ? STATUS_CONFIG[status] : undefined;
+  const notice = getMessageTerminationNotice(message);
+  if (!cfg || !notice) return null;
   const Icon = cfg.Icon;
   return (
     <div className={cn("mt-1.5 flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs", cfg.className)}>
       <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-      <span>{cfg.label}</span>
-      {cfg.action === "continue" && onContinue && (
+      <span>{notice.label}</span>
+      {notice.action === "continue" && onContinue && (
         <button
           type="button"
           onClick={onContinue}
@@ -199,13 +194,13 @@ function StatusBanner({
           继续生成
         </button>
       )}
-      {cfg.action === "retry" && onRegenerate && (
+      {notice.action === "retry" && onRegenerate && (
         <button
           type="button"
           onClick={onRegenerate}
           className="ml-auto font-medium underline-offset-2 hover:underline"
         >
-          重试
+          重新生成
         </button>
       )}
     </div>
@@ -595,7 +590,7 @@ export const MessageBubble = memo(function MessageBubble({
 
         {/* Termination status banner (truncated / interrupted / cancelled / error). */}
         {!isUser && status && status !== "complete" && (
-          <StatusBanner status={status} onContinue={onContinue} onRegenerate={onRegenerate} />
+          <MessageStatusBanner message={message} onContinue={onContinue} onRegenerate={onRegenerate} />
         )}
 
         {/* Action row */}
