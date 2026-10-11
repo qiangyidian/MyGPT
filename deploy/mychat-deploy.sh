@@ -50,7 +50,9 @@ fi
 
 git -C "$REPO" fetch --quiet origin main deploy || fatal "cannot fetch origin main/deploy"
 SIGNAL=$(git -C "$REPO" show origin/deploy:SIGNAL 2>/dev/null || true)
-TARGET_SHA=$(printf '%s\n' "$SIGNAL" | awk '$1 == "commit:" {print $2; exit}')
+# Consume the full signal so awk cannot close the pipe while printf is still
+# writing; pipefail would otherwise abort a valid deployment with SIGPIPE.
+TARGET_SHA=$(printf '%s\n' "$SIGNAL" | awk '$1 == "commit:" && !found {print $2; found = 1}')
 [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fatal "deploy signal is missing a valid commit SHA"
 git -C "$REPO" cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null || \
     fatal "deploy signal commit is not available locally: $TARGET_SHA"
