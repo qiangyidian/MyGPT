@@ -2047,8 +2047,12 @@ async def run_durable_turn(
       * Intent recognition (extra model call; the route is derived from the
         run's stored ``execution_mode`` instead).
       * Context-enrichment fragments (behavior / project instructions / skills).
-      * Cross-turn rolling-summary write-back (``_maybe_summarize``).
       * Goal upsert.
+
+    NOT deferred any more (changed by the memory three-layer work): the
+    cross-turn rolling-summary write-back (formerly ``_maybe_summarize``) is now
+    carried by :func:`app.agents.memory.facade.commit_turn`, which this executor
+    awaits in its ``done`` branch — the same entry point the inline path uses.
 
     Attachment handling is NOT deferred: binding happens in
     :meth:`create_and_enqueue_durable_run` (metadata summaries for the UI +
@@ -2370,6 +2374,21 @@ async def run_durable_turn(
                 assistant_msg.latency_ms = int((time.monotonic() - turn_started) * 1000)
                 conversation.last_message_preview = (assistant_msg.content or "")[:280]
                 await commit_with_rollback(db)
+                # 回合级记忆写入。durable 路径此前完全不写记忆（只读），而这里才是
+                # 真正产记忆的地方 —— worker 里的长任务。直接 await：run 的生命周期
+                # 就在本进程内结束，没有"谁等一下"的问题。
+                try:
+                    from app.agents.memory.facade import commit_turn
+
+                    await commit_turn(
+                        conversation_id=conversation.id,
+                        user_id=user.id,
+                        assistant_message_id=assistant_msg.id,
+                        cfg_id=cfg.id,
+                        mode=run_input.get("mode") or "speed",
+                    )
+                except Exception:
+                    logger.warning("durable memory commit failed", exc_info=True)
                 yield evt
                 return
             if evt.kind == "error":
