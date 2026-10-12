@@ -432,6 +432,10 @@ class Settings(BaseSettings):
     # store them INACTIVE for the user to review/enable in settings. Dedup is
     # content-exact; candidates never enter the prompt until manually enabled.
     MEMORY_AUTO_PROPOSE: bool = True
+    # 记忆侧 LLM（抽取 / consolidation / 滚动摘要）使用的模型 id。留空 = 沿用会话
+    # 模型（现状行为）。设置它的动机是成本与计费隔离：会话跑贵模型时，一次滚动摘要
+    # 吃整段历史，不该按会话模型计价，更不该记在用户头上。
+    MEMORY_MODEL_ID: str = ""
     # Workflow engine routing (Task 6b): when set to a truthy value ("1" / "true")
     # AND the route's agent_profile is "deep_research", that turn runs through the
     # durable WorkflowEngine (plan -> execute -> verify -> bounded replan) instead
