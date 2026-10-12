@@ -2215,7 +2215,7 @@ import pytest
 
 from tests.conftest import auth_headers
 from tests.memory.helpers import create_mock_model, drive_durable_worker, no_crew, wait_for_commit
-from tests.memory.test_inline_hook import _turn_conversation_id
+from tests.memory.test_inline_hook import _drain_bg_tasks, _turn_conversation_id
 
 
 @pytest.mark.asyncio
@@ -2594,7 +2594,7 @@ from tests.memory.helpers import (
     user_memories_for_conversation,
     wait_for_commit,
 )
-from tests.memory.test_inline_hook import _turn_conversation_id
+from tests.memory.test_inline_hook import _drain_bg_tasks, _turn_conversation_id
 
 # 每个测试（以及同一测试的每个 parametrize 分支）必须用**互不相同**的候选内容：
 # propose_candidate 的去重键是 (user_id, content) —— 全局按用户去重，不按会话。同一个
@@ -2617,6 +2617,9 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode, mo
     )
     assert response.status_code == 200
     conversation_id = await _turn_conversation_id(response)
+    # 必须先排空 fire-and-forget 任务再读库：测试库是 StaticPool（全进程一条连接），
+    # 读回用的辅助 session 一关就会 rollback 掉 detached 写入未提交的事务（T5 踩过）。
+    await _drain_bg_tasks()
     assert await wait_for_commit(conversation_id) == 1
 
     rows = await user_memories_for_conversation(conversation_id)
@@ -2640,6 +2643,7 @@ async def test_same_turn_never_double_commits(client, offline_model, monkeypatch
     )
     assert response.status_code == 200
     conversation_id = await _turn_conversation_id(response)
+    await _drain_bg_tasks()   # 先排空 detached 写入，再读库（StaticPool 回滚陷阱）
     assert await wait_for_commit(conversation_id) == 1
 
     # 兜底扫描再跑一遍，本会话仍应只有一条提交事件（全局返回值不作断言：
