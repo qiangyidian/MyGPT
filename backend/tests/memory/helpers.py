@@ -122,6 +122,25 @@ async def conversation_of_message(message_id: uuid.UUID) -> uuid.UUID:
         return msg.conversation_id
 
 
+def no_crew(monkeypatch) -> None:
+    """让 expert 模式的一轮不拉起 deep_research crew（抄 tests/test_chat_stream.py:59-77）。
+
+    ``CREWAI_ENABLED`` 默认 True 且测试环境没有关它，而 expert + 非寒暄内容会被
+    ``decide_route`` 路由到 ``use_multi_agent=True`` 的 research crew —— 不桩住的话每个
+    用例都要等一个多 Agent 流程在 MockProvider 上跑完（慢且不确定）。桩成"crew 不可用"
+    后编排器走原生回答，与 test_chat_stream 的既有做法一致。
+    """
+    from unittest.mock import AsyncMock, Mock
+
+    from app.agents.intent_service import intent_service
+    from app.agents.orchestrator import ChatOrchestrator
+
+    monkeypatch.setattr(intent_service, "judge", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ChatOrchestrator, "_crewai_status", Mock(return_value=(False, "unexpected_crew"))
+    )
+
+
 async def user_memories_for_conversation(conversation_id: uuid.UUID) -> list:
     """该会话产出的候选，返回 ``(id, content, active, source)`` 普通行元组。"""
     from sqlalchemy import select

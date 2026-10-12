@@ -54,15 +54,13 @@ from app.agents.planning import (
     extract_goal,
     is_casual_question,
     should_recognize_intent,
-    should_summarize,
-    summarize_history,
 )
 from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
     ExecutionMode,
 )
-from app.agents.state_store import load_state, save_summary, upsert_goal
+from app.agents.state_store import load_state, upsert_goal
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.db import AsyncSessionLocal
@@ -77,7 +75,9 @@ from app.models import (
     User,
     UserMemory,
 )
-from app.providers.registry import get_provider_for_config
+# 静态看似乎未用（本模块某函数内的同名局部 import 会遮蔽它），但 tests/conftest.py 的
+# offline_model 夹具按名 patch 本模块的该属性（raising=True），删掉它夹具会 AttributeError。
+from app.providers.registry import get_provider_for_config  # noqa: F401
 from app.quotas import QuotaExceeded, get_quota_service
 from app.services.chat_context import (
     _CHARS_PER_TOKEN,
@@ -85,7 +85,9 @@ from app.services.chat_context import (
     _admit_and_trim_history,
     _estimate_available_tool_schema_tokens,
     _estimate_message_tokens as _estimate_message_tokens,  # noqa: PLC0414
-    _estimate_tokens,
+    # 刻意 re-export：adapters/llm_adapter、providers/base、runtime/native_runtime、
+    # services/speech_service 都从本模块取它（历史入口），删掉会 ImportError。
+    _estimate_tokens,  # noqa: F401
 )
 from app.services.chat_accounting import (
     _finish_for_error_code,
@@ -145,6 +147,11 @@ logger = logging.getLogger(__name__)
 # Strong references to fire-and-forget tasks: asyncio keeps only weak refs, so
 # an unreferenced created task can be garbage-collected before it completes.
 _BG_TASKS: set[asyncio.Task[None]] = set()
+
+async def _commit_memory_after_turn(**kwargs: Any) -> None:
+    from app.agents.memory.facade import commit_turn_detached
+
+    await commit_turn_detached(**kwargs)
 
 def _log_turn_outcome(
     label: str,
@@ -596,53 +603,6 @@ async def _history_attachment_map(
     except Exception as exc:
         logger.warning("history attachment re-hydration failed: %s", exc)
         return {}
-
-
-async def propose_user_memory(
-    db: AsyncSession,
-    user: Any,
-    content: str,
-    *,
-    memory_type: str = "fact",
-    confidence: float = 0.5,
-    source_message_id: uuid.UUID | None = None,
-    source_conversation_id: uuid.UUID | None = None,
-) -> None:
-    """Insert an INACTIVE candidate user memory (B7 auto-proposal).
-
-    Thin direct-DB twin of the /api/memories propose endpoint so the chat turn
-    doesn't need a MemoryService (embedder/Qdrant): candidates are inert rows
-    until the user activates them (activation embeds them via the endpoint).
-    Exact-content dedup keeps repeat mentions from piling up.
-    """
-    from app.models import UserMemory
-
-    user_id = getattr(user, "id", user)
-    content = (content or "").strip()
-    if not content:
-        return
-    existing = (
-        await db.execute(
-            select(UserMemory).where(
-                UserMemory.user_id == user_id,
-                UserMemory.content == content,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return
-    db.add(
-        UserMemory(
-            user_id=user_id,
-            memory_type=memory_type,
-            content=content,
-            confidence=confidence,
-            source_message_id=source_message_id,
-            source_conversation_id=source_conversation_id,
-            active=False,  # opt-in: never active on creation
-        )
-    )
-    await db.flush()
 
 
 def _context_enrichment_block(stable_block: str, skill_block: str) -> str:
@@ -1101,31 +1061,6 @@ class ChatService:
                         )
                     except Exception:
                         logger.debug("auto-title (fallback) failed", exc_info=True)
-
-                # Auto memory proposal (B7): extract 0-3 candidate memories
-                # (rule-based, no model calls) and persist them INACTIVE for
-                # review in settings. Best-effort — never blocks the turn.
-                if get_settings().MEMORY_AUTO_PROPOSE:
-                    try:
-                        from app.agents.memory_auto_propose import (
-                            extract_memory_candidates,
-                        )
-
-                        for cand in extract_memory_candidates(request.content or ""):
-                            try:
-                                await propose_user_memory(
-                                    db,
-                                    user,
-                                    cand.content,
-                                    memory_type=cand.memory_type,
-                                    confidence=cand.confidence,
-                                    source_message_id=user_msg.id,
-                                    source_conversation_id=conversation.id,
-                                )
-                            except Exception:
-                                logger.debug("memory candidate rejected", exc_info=True)
-                    except Exception:
-                        logger.debug("auto memory proposal skipped", exc_info=True)
 
         # 3. System prompt + optional RAG retrieval.
         # RAG is SKIPPED for social/capability chit-chat ("你好", "你是谁",
@@ -1614,12 +1549,19 @@ class ChatService:
                     )
                     _BG_TASKS.add(_title_task)
                     _title_task.add_done_callback(_BG_TASKS.discard)
-                    # Rolling summary: if history grew past the budget, roll the
-                    # older messages into a summary memory for future turns.
-                    try:
-                        await self._maybe_summarize(db, conversation, cfg, user.id)
-                    except Exception:  # pragma: no cover - never block done on summary
-                        logger.warning("post-turn summary failed", exc_info=True)
+                    # 回合级记忆写入：与 durable 路径调同一个 commit_turn，只是这里
+                    # fire-and-forget（写是回合后的，不该拖 SSE 关闭）。
+                    _memory_task = asyncio.create_task(
+                        _commit_memory_after_turn(
+                            conversation_id=conversation.id,
+                            user_id=user.id,
+                            cfg_id=cfg.id,
+                            assistant_message_id=assistant_msg.id,
+                            mode=request.mode or "speed",
+                        )
+                    )
+                    _BG_TASKS.add(_memory_task)
+                    _memory_task.add_done_callback(_BG_TASKS.discard)
                     yield evt.to_sse_envelope()
                     return
                 if evt.kind == "error":
@@ -1767,36 +1709,6 @@ class ChatService:
                 exc_info=True,
             )
         await _persist_partial(db, assistant_msg)
-
-    async def _maybe_summarize(
-        self,
-        db: AsyncSession,
-        conversation: Conversation,
-        cfg: ModelConfig,
-        user_id: uuid.UUID,
-    ) -> None:
-        """Roll older history into a summary memory when the prompt is large.
-
-        Best-effort: a summarization failure is logged and swallowed so it can
-        never block the turn. The summary is picked up by ``load_state`` on the
-        next turn and injected into the system prompt.
-        """
-        history = await _load_history(db, conversation.id)
-        messages = _messages_to_dicts(None, history)  # no system prompt
-        if not messages:
-            return
-        total = sum(
-            _estimate_tokens(str(m.get("content") or ""), cfg.model_name)
-            for m in messages
-        )
-        max_ctx = _safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
-        if not should_summarize(total, max_ctx):
-            return
-        provider = get_provider_for_config(cfg)
-        summary = await summarize_history(provider, messages, keep_recent=6)
-        if summary:
-            await save_summary(db, conversation.id, user_id, summary)
-            await db.commit()
 
     # ------------------------------------------------------------------ #
     # Task 5: durable dispatch (additive — inline path unchanged)

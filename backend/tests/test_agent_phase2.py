@@ -17,7 +17,6 @@ from app.agents.state_store import load_state, save_summary, upsert_goal
 from app.model_capabilities import ModelCapabilities
 from app.models import Conversation, ConversationMemory, Message, ModelConfig
 from app.providers.mock import MockProvider
-from app.services.chat_service import ChatService
 from tests.conftest import auth_headers
 
 _SEEDED_USER = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -139,7 +138,10 @@ async def test_summarize_history_rejects_oversized_payload_before_custom_provide
 
 
 async def test_maybe_summarize_persists_summary(db_session):
-    """A large history triggers _maybe_summarize to write a summary memory."""
+    """A large history triggers a summary write (原走 ChatService._maybe_summarize，
+    行为迁到 memory/facade 后本测试随之迁移)."""
+    from app.agents.memory.facade import _maybe_summarize
+
     conv = Conversation(user_id=_SEEDED_USER, title="big")
     db_session.add(conv)
     await db_session.flush()
@@ -162,8 +164,15 @@ async def test_maybe_summarize_persists_summary(db_session):
         max_context_tokens=100,  # tiny -> forces summarization
         max_tokens=64,
     )
-    svc = ChatService()
-    await svc._maybe_summarize(db_session, conv, cfg, _SEEDED_USER)
+    # **必须落库**：facade 按 cfg_id 解析模型（旧签名直接吃 cfg 对象），不落库就解析不到 →
+    # 不会写摘要 → 断言失败。
+    db_session.add(cfg)
+    await db_session.flush()
+
+    wrote = await _maybe_summarize(
+        db_session, conversation=conv, user_id=_SEEDED_USER, cfg_id=cfg.id
+    )
+    assert wrote is True
 
     summaries = (
         await db_session.execute(
