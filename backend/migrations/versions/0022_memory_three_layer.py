@@ -12,6 +12,11 @@ Create Date: 2026-10-12
 回填按 ``(conversation_id, memory_type)`` 取**最新一条**：历史数据里同一会话可能存在
 两行 task（``upsert_goal`` 用的 ``scalar_one_or_none`` 挡不住并发），全量回填会直接
 撞新加的唯一键。多余的行保持 NULL —— 它们本来就没有读者。
+
+**SQLite 上的 downgrade 是部分回退**（只删两张新表 + 新索引，不动列与约束）：SQLite
+不支持 ALTER 约束，也删不掉参与约束的列，硬删会抛 NotImplementedError（见 ``_is_sqlite``）。
+生产是 Postgres，走完整路径；测试里重跑 upgrade 时 ``_has_column`` 守卫会跳过保留的列，
+所以留在原地没有代价。
 """
 from __future__ import annotations
 
@@ -38,6 +43,19 @@ def _has_column(table: str, column: str) -> bool:
     if context.is_offline_mode():
         return False
     return any(c["name"] == column for c in sa.inspect(op.get_bind()).get_columns(table))
+
+
+def _is_sqlite() -> bool:
+    """SQLite 不支持 ALTER 约束（要 batch 模式的表重建），也删不掉参与索引/约束的列。
+
+    这个迁移的 downgrade 只在测试里跑在 SQLite 上（tests/test_*_migration.py 用子进程
+    alembic + 临时 sqlite 文件），生产是 Postgres。所以 SQLite 上只回退"能回退的部分"：
+    两张新表 + 新索引。列与约束留原样 —— 重跑 upgrade 时 ``_has_column`` 守卫会跳过它们，
+    所以留着的代价是零；而硬删会直接抛 NotImplementedError。
+    """
+    if context.is_offline_mode():
+        return False
+    return op.get_bind().dialect.name == "sqlite"
 
 
 def upgrade() -> None:
@@ -194,6 +212,10 @@ def downgrade() -> None:
         op.drop_index("ix_memory_events_conversation_id", table_name="memory_events")
         op.drop_index("ix_memory_events_user_id", table_name="memory_events")
         op.drop_table("memory_events")
+    # SQLite 不支持 ALTER 约束（batch 表重建才行），也删不掉参与约束的列 —— 只回退
+    # 上面两张表 + 它们的索引。列与约束留原样（upgrade 的 _has_column 守卫会跳过它们）。
+    if _is_sqlite():
+        return
     if _has_column("conversation_memories", "block_key"):
         op.drop_constraint(
             "uq_conversation_memories_block", "conversation_memories", type_="unique"
