@@ -1185,12 +1185,21 @@ def downgrade() -> None:
 Run: `pytest tests/memory/test_schema.py -q --tb=short`
 Expected: 6 passed。（测试库由 `create_all` 建表，不跑迁移；迁移单独验，见下一步。）
 
-- [ ] **Step 10: 验证迁移两条路径**
+- [ ] **Step 10: 验证迁移（本机走 offline SQL）**
+
+本机 **Docker 守护进程不可用**，且 `scripts/verify_migrations.sh` 在非 GitHub Actions 环境下主动拒绝 `PG_EXTERNAL=1`（脚本 44-46 行："reserved for the isolated GitHub Actions service"），所以 CLAUDE.md §5 那条脚本**在本机跑不了**。替代路径（已实测可用）：
 
 ```bash
-cd /d/Gitee/MyGPT && ./scripts/verify_migrations.sh
+cd backend
+python -m alembic heads
+python -m alembic upgrade 0021_tool_toggles:0022_memory_three_layer --sql | grep -E "CREATE TABLE|ALTER TABLE|CREATE INDEX|CREATE UNIQUE|UPDATE"
 ```
-Expected: 两条路径 PASS（空库 → head；`0021_tool_toggles` → head）。若路径 2 被 SKIP，说明 `PRIOR_REV` 求值顺序被改坏了，先修脚本再看结果。
+
+Expected: `heads` 只有一行且是 `0022_memory_three_layer`；offline SQL 里能看到 `memory_events` / `memory_settings` 两张表、`ALTER TABLE user_memories` 的 8 列、`ALTER TABLE conversation_memories` 的 3 列、`uq_conversation_memories_block` 唯一约束、`uq_memory_events_dedup` 唯一索引，以及回填 `block_key` 的 `UPDATE`。
+
+**这条替代证明不了"在带数据的真实 PG 上能升级"**：合入 main 之前必须有人启动 Docker 跑一次 `./scripts/verify_migrations.sh`（那是验证真实部署路径的唯一手段）。**在报告里明确写出这个缺口**，别写成"迁移已验证"。
+
+（若某段 DDL 没出现，先看 offline 模式的 `_has_table` / `_has_column` 短路 —— 它们 offline 一律返回 False，正是为了发全量 DDL。）
 
 - [ ] **Step 11: 提交**
 
@@ -1662,10 +1671,12 @@ async def propose_candidate(
 `_load_history`（`chat_service.py:1313` 附近）等 helper 现在住在 `chat_service.py` 里；`memory` 包不能 import `chat_service`（会成环：`chat_service` 要 import `facade`）。搬运步骤：
 
 1. 在 `backend/app/agents/chat_helpers.py` 新建模块，把 `chat_service._load_history` 的**函数体原样**搬过去，改名 `load_history`（保留原 docstring）。
-2. `chat_service.py` 把它改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点不动（`_load_history` 这个名字继续可用）。
-3. 同样搬 `chat_service._safe_int` → `safe_int`，以及 `chat_service._DEFAULT_MAX_CONTEXT_TOKENS` → `DEFAULT_MAX_CONTEXT_TOKENS`（`chat_service.py:1888-1891` 那两处用到的）。**这一步不是可选项**：facade 的 `_maybe_summarize` 依赖它们复现 inline 路径的摘要阈值。
-4. `_estimate_tokens` / `should_summarize`：优先用 `app.agents.token_budget` 里已有的同名实现；若那里没有，同样搬到 `chat_helpers.py`。
-5. **以仓库现状为准照搬函数体，不要重写逻辑。** 搬完立刻跑 `pytest tests/test_chat_stream.py -q --tb=short` 确认行为未变。
+2. 同样把 `chat_service._safe_int`（`chat_service.py:325`）搬成 `chat_helpers.safe_int`；`chat_service.py` 里两处调用点（`635`、`1891`）改成从 `chat_helpers` 导入，其余不动。
+3. `chat_service.py` 的 `_load_history` 改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点保留原名（`_load_history` 仍可用）。
+4. **`_estimate_tokens` / `_DEFAULT_MAX_CONTEXT_TOKENS` 不用搬** —— 它们本来就在 `app/services/chat_context.py`（`_estimate_tokens(text, model_name)` 在第 53 行，`_DEFAULT_MAX_CONTEXT_TOKENS = 8192` 在第 21 行），`memory` 包直接 import 即可。**别和 `app/agents/context_compaction.estimate_tokens(text)` 混淆**：后者只收一个参数、签名不同，facade 用的是前者。
+5. `should_summarize` 在 `app/agents/planning.py:478`，`summarize_history` 在 `app/agents/context_compaction.py`，都是现成的，直接 import。
+6. `memory` 包**不能** import `app.services.chat_service`（会成环：`chat_service` 要 import `facade`）。上面几处搬动的唯一目的就是这个。
+7. **以仓库现状为准照搬函数体，不要重写逻辑。** 搬完立刻跑 `pytest tests/test_chat_stream.py -q --tb=short` 确认行为未变。
 
 - [ ] **Step 9: 实现 `facade.py`**
 
@@ -1836,15 +1847,12 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
     失败一律吞掉：摘要不是这一轮的结果，绝不能因此让回合写入整体失败。
     """
     try:
-        from app.agents.chat_helpers import (
-            DEFAULT_MAX_CONTEXT_TOKENS,
-            load_history,
-            safe_int,
-        )
+        from app.agents.chat_helpers import load_history, safe_int
         from app.agents.context_compaction import summarize_history
+        from app.agents.planning import should_summarize
         from app.agents.state_store import save_summary
-        from app.agents.token_budget import estimate_tokens, should_summarize
         from app.providers.registry import get_provider_for_config
+        from app.services.chat_context import _DEFAULT_MAX_CONTEXT_TOKENS, _estimate_tokens
 
         cfg = await resolve_memory_model(
             db, conversation_cfg_id=cfg_id or conversation.model_id
@@ -1856,12 +1864,12 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
         if not messages:
             return False
         total = sum(
-            estimate_tokens(str(m.get("content") or ""), cfg.model_name) for m in messages
+            _estimate_tokens(str(m.get("content") or ""), cfg.model_name) for m in messages
         )
         # 默认值必须与 inline 路径一致：传字面 0 会让 should_summarize 的判定完全变样
-        # （要么永不触发，要么每轮触发）。原先 inline 用的是
+        # （要么永不触发，要么每轮触发）。inline 用的是
         # ``_safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)``。
-        max_ctx = safe_int(cfg.max_context_tokens, DEFAULT_MAX_CONTEXT_TOKENS)
+        max_ctx = safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)
         if not should_summarize(total, max_ctx):
             return False
         provider = get_provider_for_config(cfg)
@@ -2550,9 +2558,9 @@ Expected: 5 passed。
 ```bash
 cd backend && ruff check app tests
 cd backend && pytest tests -q --tb=short --deselect tests/test_agent_phase2.py::test_agent_mode_emits_plan_created --deselect tests/test_agent_phase5.py::test_full_native_agent_path
-cd /d/Gitee/MyGPT && ./scripts/verify_migrations.sh
+cd backend && python -m alembic heads && python -m alembic upgrade 0021_tool_toggles:0022_memory_three_layer --sql | grep -c "CREATE\|ALTER\|UPDATE"
 ```
-Expected: 全部通过。
+Expected: 全部通过。最后一行是 R9 的替代迁移验证（本机无 Docker，`verify_migrations.sh` 跑不了）——**它不等于真实 PG 的迁移验证**，合入 main 前需人工补跑。
 
 - [ ] **Step 4: 提交并推送 feature 分支**
 
