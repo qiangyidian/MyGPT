@@ -1,6 +1,8 @@
 """S1 验收（spec §13 在 S1 范围内的可判定条目）。"""
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from tests.conftest import TestSessionLocal, auth_headers
@@ -10,6 +12,7 @@ from tests.memory.helpers import (
     commit_events,
     create_conversation,
     create_mock_model,
+    meta_from_sse,
     no_crew,
     user_memories_for_conversation,
     wait_for_commit,
@@ -51,7 +54,8 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode, mo
 
 @pytest.mark.asyncio
 async def test_same_turn_never_double_commits(client, offline_model, monkeypatch):
-    """sweeper 与 detached 任务并发也不会重复：幂等锚点在数据库层。"""
+    """同一回合提交两次也只有一条事件：幂等锚点在数据库层。"""
+    from app.agents.memory.facade import commit_turn
     from app.agents.memory.sweeper import MemorySweeper
 
     no_crew(monkeypatch)   # expert + 非寒暄内容会拉起 research crew，见 helpers.no_crew
@@ -67,6 +71,20 @@ async def test_same_turn_never_double_commits(client, offline_model, monkeypatch
     conversation_id = await _turn_conversation_id(response)
     assert await wait_for_commit(conversation_id) == 1
 
+    # 真正去撞幂等锚点：对**同一条 assistant 消息**再提交一次。
+    # （只跑 sweeper 撞不到 —— 它的查询本身就排除了"最新 assistant 消息已有 commit_turn
+    # 事件"的会话，那条断言恒真。见 T8 评审 F2。）
+    assistant_id = uuid.UUID(meta_from_sse(response.text)["message_id"])
+    again = await commit_turn(
+        conversation_id=conversation_id,
+        user_id=SEEDED_USER_ID,
+        assistant_message_id=assistant_id,
+        mode="expert",
+        session_factory=TestSessionLocal,
+    )
+    assert again.committed is False
+    assert again.skipped_reason == "already_committed"
+
     # 兜底扫描再跑一遍，本会话仍应只有一条提交事件（全局返回值不作断言：
     # 扫描面包含同进程其它测试留下的会话）。
     sweeper = MemorySweeper(TestSessionLocal, leader_name=None, interval_seconds=600)
@@ -75,27 +93,39 @@ async def test_same_turn_never_double_commits(client, offline_model, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_memory_side_calls_do_not_touch_billing(db_session, offline_model, monkeypatch):
-    """G7：记忆侧调用不写 usage、不计 credit。"""
-    from app.agents.memory.facade import commit_turn
-    from app.services import chat_service
+async def test_memory_side_calls_create_no_credit_ledger_rows(db_session):
+    """G7：记忆写入不产生任何计费流水。
 
-    calls: list = []
-    monkeypatch.setattr(
-        chat_service, "settle_turn_usage", lambda *a, **k: calls.append((a, k)), raising=True
-    )
+    按**可观测副作用**断言，而不是 spy 某个名字：memory 包根本不 import chat_service，spy
+    `chat_service.settle_turn_usage` 的断言恒真，也拦不住"facade 自己 import 计费"这类回归
+    （那是另一个绑定点）。按库断言与 import 方式无关，真能失败。
+    """
+    from sqlalchemy import func, select
+
+    from app.agents.memory.facade import commit_turn
+    from app.models import CreditLedger
 
     conversation_id = await create_conversation(db_session)
-    await add_message(db_session, conversation_id, "user", "我喜欢用 Python 写脚本")
+    await add_message(db_session, conversation_id, "user", "我喜欢用 Java 写批处理")
     assistant_id = await add_message(db_session, conversation_id, "assistant", "好的")
     await db_session.commit()
 
-    await commit_turn(
+    async def _ledger_rows() -> int:
+        async with TestSessionLocal() as session:
+            return int(
+                (await session.execute(
+                    select(func.count()).select_from(CreditLedger)
+                )).scalar_one()
+            )
+
+    before = await _ledger_rows()
+    result = await commit_turn(
         conversation_id=conversation_id, user_id=SEEDED_USER_ID,
         assistant_message_id=assistant_id, mode="expert",
         session_factory=TestSessionLocal,
     )
-    assert calls == [], "记忆写入不该触发计费结算"
+    assert result.committed is True
+    assert await _ledger_rows() == before
 
 
 @pytest.mark.asyncio
