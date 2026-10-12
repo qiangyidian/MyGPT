@@ -44,7 +44,7 @@
 - **G4** 读取有排序、有阈值、有 token 预算；检索无果就不注入。
 - **G5** 新增 agent 工作记忆层（模型自维护 goal / plan / notes / findings），取代 `extract_goal` 截断器。
 - **G6** 新增长尾语料检索层（历史会话 + 附件原文建索引，按需检索片段注入，不做抽取）。
-- **G7** 记忆侧 LLM 调用有独立的模型解析，不继承会话模型、不计入用户 credit。
+- **G7** 记忆侧 LLM 调用有独立的模型解析：可由 `MEMORY_MODEL_ID` 指定专用（便宜）模型，未配置则沿用会话模型（即现状，零意外变更）；且记忆侧调用一律**不计入用户 credit**。
 
 ### 非目标（明确划出）
 
@@ -65,7 +65,7 @@
 | D4 | 极速模式 | **不读，但后台仍写** | 用户拍板。读路径拖首字；写路径是回合后异步，对首字零影响。（备选：不读不写；彻底零记忆） |
 | D5 | `user_memories` 形态 | **加列，不新建表** | 不破前端 `UserMemory` 契约；代价是 `active`/`source`/`invalid_at` 三套状态共存，用 §5.5 的派生规则消歧。 |
 | D6 | `memory_events` 审计表 | **要** | consolidation 是 LLM 判断，必须可追溯（抽取错还是合并错）；线上指标也出自此表。 |
-| D7 | 回合后写入的执行方式 | **投递 worker 队列**，不在回合内 `await` | k8s 多副本下 `asyncio.create_task` 随进程死掉；队列有重试与可观测性（`app/worker.py` + `agents/workflow/queue.py` 已有）。 |
+| D7 | 回合后写入的执行方式 | **三条腿**：inline 路径脱离流的 detached 任务（best-effort）；durable 路径在 `run_durable_turn` 尾部直接 await；`MemorySweeper` 兜底补做 | `RunQueue` 是**按 AgentRun id 的专用队列**（`queue.py:48` `enqueue(run_id)`），没有通用作业类型，硬塞记忆作业要么造假 run 行要么新建队列。`RetentionSweeper`（`worker.py:120`）已提供 leader-gated 周期扫描的先例，且 API 与 worker 共享同一 advisory lock——照它做。丢失一轮记忆的代价是"少一条候选"，可接受；sweep 保证不长期漏。 |
 | D8 | 层② 存储 | `conversation_memories` 扩语义 + `UNIQUE(conversation_id, block_key)` | 复用既有表；唯一键顺带修掉 §1.2-8 的崩溃。 |
 | D9 | 层③ 检索首版 | **dense + 时间窗**，不做关键词/BM25 | YAGNI：原文片段的关键词召回可用向量近似；等评估显示漏召回再加第二条检索栈。 |
 | D10 | 关键词/BM25 常量复用 | 复用 `RAG_RRF_K` / `RAG_MIN_SCORE` 的**语义与默认值**，实现放 `memory/ranking.py` | `RagService.retrieve` 的接口绑定 KB 与 `Citation` 语义，硬套会污染两边。 |
@@ -93,17 +93,30 @@
                     │
   一次回合 ─────────┤    ContextManager.assemble_system_prompt(..., working_blocks, memories, episodes)
                     │
-                    └─ commit_turn() ─ 回合结束（两条路径共用，投递 worker）
+                    └─ commit_turn() ─ 回合结束（两条路径共用同一个函数）
                          ① 抽取（LLM）→ ② 近邻召回 → ③ consolidation → 落库
                          ④ 工作记忆兜底（模型已写则跳过）
                          ⑤ episodes 索引（本轮 user+assistant+附件正文）
+
+  调用点：inline = 流结束后的 detached 任务（best-effort）；
+          durable = run_durable_turn 尾部直接 await（已在 worker 进程内）。
+  漏做的轮次由 MemorySweeper 周期补做（幂等，见 §9.6）。
 ```
 
 `gather()` 与 `commit_turn()` 是 `memory/facade.py` 的两个公开入口，`chat_service` 只调这两个。
 
+### 4.2.1 为什么不是"投递队列"
+
+`RunQueue` 的载荷是 `AgentRun` 的 uuid（`queue.py:48` `enqueue(run_id)`、`dequeue`、`ack`），没有通用作业类型——加记忆作业要么伪造 run 行，要么新建一套队列与消费循环。而 `RetentionSweeper` 已经证明"leader-gated 周期扫描 + `session_factory`"这个模式在本仓库可行且与 API 进程共享 advisory lock（`worker.py:120-123`）。所以：
+
+- **idempotency 由数据库保证**：`memory_events` 上有 `UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'`；重复 commit 直接命中冲突返回，不重复抽取。
+- **sweep 的判定**：最近 `MEMORY_SWEEP_WINDOW_HOURS=6` 内有 assistant 消息、但其最新 assistant 消息 id 无对应 `commit_turn` 事件的会话，每轮最多补 `MEMORY_SWEEP_BATCH=20` 个。这同时覆盖"API 进程重启丢掉的 detached 任务"与"durable run 中途崩溃"。
+
+**可测试性约束（新模块必须遵守）**：`facade` 自己开 session，所以它必须留一个模块级的、可被测试 patch 的 session 工厂（仓库既有先例：`tests/conftest.py:222` 对 `credit_service._default_session_factory` 的处理）。不这么做，测试里的 detached/durable 提交会打到生产引擎上。后续计划 B/C/D 新增的模块同样遵守这条。
+
 ### 4.3 模式矩阵
 
-判定函数 `memory_enabled_for_mode(mode) -> MemoryMode`（`agents/intent_router.py`，与 `VALID_MODES` 同处）：
+判定函数 `memory_mode(mode) -> MemoryMode`（`agents/intent_router.py`，与 `VALID_MODES` 同处；未知值按 `hermes` 处理——不认识的路由不该悄悄获得写权）：
 
 | mode | 注入 summary | 注入 ② 工作块 | 注入 ① 用户事实 | 注入 ③ episodes | 写入 | 模型记忆工具 |
 |---|---|---|---|---|---|---|
@@ -392,7 +405,9 @@ final_score = 0.55*sim + 0.20*recency + 0.15*importance + 0.10*confidence
 
 ### 9.6 审计
 
-`memory_events(id, user_id, conversation_id, kind, memory_id?, payload jsonb, created_at)`，`kind ∈ {extracted, proposed, activated, superseded, noop, rejected, deleted, model_wrote, parse_error}`。写入在 `commit_turn` 的同一事务内。
+`memory_events(id, user_id, conversation_id, message_id?, kind, memory_id?, payload jsonb, created_at)`，`kind ∈ {extracted, proposed, activated, superseded, noop, rejected, deleted, model_wrote, parse_error, commit_turn}`。写入在 `commit_turn` 的同一事务内。
+
+`commit_turn` 事件是**幂等锚点**：`UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'`（partial unique index）。重复 commit 命中冲突即返回，不重复抽取；sweeper 也靠它判定"哪一轮还没做"（§4.2.1）。
 
 ## 10. 关键文件清单
 
@@ -407,7 +422,10 @@ final_score = 0.55*sim + 0.20*recency + 0.15*importance + 0.10*confidence
 | `backend/app/agents/memory/episodic.py` | 新增 |
 | `backend/app/agents/memory/ranking.py` | 新增：`fuse()` / `trim()` |
 | `backend/app/agents/memory_auto_propose.py` | 保留（降级替身），仅加注释说明新位置 |
+| `backend/app/agents/chat_helpers.py` | 新增：`load_history` 等 helper 的可复用落位（由 `chat_service` 迁出，避免 memory ↔ chat_service 循环依赖） |
 | `backend/app/agents/state_store.py` | 删除（内容迁入 `memory/working.py`）；全仓唯一导入点是 `chat_service.py:61` |
+| `backend/tests/memory/` | 测试包：`helpers.py`（共用夹具）、`eval_cases.yaml`（评估语料）、各任务测试 |
+| `backend/tests/conftest.py` | `offline_model` 补一条 patch（`facade` 是新消费者）；新增 memory session 工厂 autouse 夹具 |
 | `backend/app/agents/context_manager.py` | `assemble_system_prompt` 加 `working_blocks` / `episodes`，删 `goal` |
 | `backend/app/agents/intent_router.py` | 加 `memory_enabled_for_mode()` |
 | `backend/app/agents/planning.py` | 删 `extract_goal` |
@@ -423,7 +441,9 @@ final_score = 0.55*sim + 0.20*recency + 0.15*importance + 0.10*confidence
 | `backend/app/services/chat_service.py` | 两路径改调 `facade`；删 `extract_goal`/`upsert_goal` 调用；模式闸门 |
 | `backend/app/services/retention.py` | episodes 连带删除 |
 | `backend/app/core/config.py` | 新 settings（§11） |
-| `backend/app/worker.py` | 新作业类型 `memory_commit` |
+| `backend/app/agents/memory/sweeper.py` | 新增：`MemorySweeper`（仿 `services/retention.py::RetentionSweeper`，leader-gated） |
+| `backend/app/worker.py` | 启动 `MemorySweeper`（紧挨 `RetentionSweeper` 那段） |
+| `backend/app/main.py` | API 侧启动 `MemorySweeper`（紧挨 `main.py:154-156` 那段，两侧共享 advisory lock） |
 | `frontend/src/lib/types.ts` / `lib/api.ts` | 字段 + settings + working-memory |
 | `frontend/src/components/memory/memory-manager.tsx` | 来源标记（你说"记住" / 模型推断 / 你手写）、取代链跳转、per-layer 开关 |
 | `frontend/src/components/memory/memory-entry-point.tsx` | 分组展示（记忆 / 笔记 / 历史片段） |
@@ -435,7 +455,7 @@ final_score = 0.55*sim + 0.20*recency + 0.15*importance + 0.10*confidence
 ## 11. 配置项（`core/config.py`）
 
 ```
-MEMORY_MODEL_ID: str | None = None          # 记忆侧 LLM（抽取/consolidation/兜底）；空则退系统 config，再退会话 cfg + warning
+MEMORY_MODEL_ID: str = ""                    # 记忆侧 LLM（抽取/consolidation/摘要）；空 = 沿用会话模型（现状），不自动挑系统 config
 MEMORY_AUTO_PROPOSE: bool = True            # 现有
 MEMORY_EXTRACT_LLM: bool = True             # False → 抽取回退正则实现（S2 的回退开关）
 MEMORY_EXTRACT_MAX: int = 3
@@ -453,10 +473,12 @@ MEMORY_RANK_W_RECENCY: float = 0.20
 MEMORY_RANK_W_IMPORTANCE: float = 0.15
 MEMORY_RANK_W_CONFIDENCE: float = 0.10
 MEMORY_NO_EMBEDDER_FALLBACK: str = ""       # "" | "importance_recency"（默认关，§8.4）
+MEMORY_SWEEP_WINDOW_HOURS: int = 6          # sweeper 回看窗口（§4.2.1）
+MEMORY_SWEEP_BATCH: int = 20                # sweeper 每轮补做上限
 MODE_INJECT_SUMMARY_IN_SPEED: bool = True   # §4.3，字面零记忆时置 False
 ```
 
-**计费**：记忆侧调用（抽取 / consolidation / 兜底 / episodes embed）由 `MEMORY_MODEL_ID` 或系统 config 承担，**不计入用户 credit、不写 usage 到 assistant message**——用户没有请求这次推理。若要计入，改 `commit_turn` 一处结算点。
+**计费**：记忆侧调用（抽取 / consolidation / 兜底 / episodes embed）由 `MEMORY_MODEL_ID` 指定的模型承担（未配置则沿用会话模型），**不计入用户 credit、不写 usage 到 assistant message**——用户没有请求这次推理。若要计入，改 `commit_turn` 一处结算点。
 
 ## 12. 测试
 
@@ -476,6 +498,8 @@ MODE_INJECT_SUMMARY_IN_SPEED: bool = True   # §4.3，字面零记忆时置 Fals
 
 - **模式矩阵**：`speed` / `expert` / 遗留 / `hermes` 四组，断言注入片段的有无（§4.3 表逐格）。
 - **两路径等价**：同一轮分别走 inline 与 durable，断言 `user_memories` / `conversation_memories` / `memory_events` 产出集合一致（这是 §1.2-1 的回归测试）。
+- **幂等**：对同一轮重复 `commit_turn` 两次 → 第二次命中 `commit_turn` 唯一键冲突，不产生重复候选与重复 episodes。
+- **sweep 补做**：构造一个"有 assistant 消息但无 `commit_turn` 事件"的会话 → 跑一轮 sweeper → 事件补齐、候选产出；已在窗口外的会话不被补（防雪崩）。
 - **迁移**：`0022` up → down 干净回退；`scripts/verify_migrations.sh` 两条路径（空库 → head、prior → head）。
 - 无 embedding 配置：层① 与 ③ 不注入、层② 仍注入（§8.4）。
 - 无 `MEMORY_MODEL_ID`：退系统 config；两者都无 → 退会话 cfg 且日志含 warning。
@@ -517,7 +541,7 @@ MODE_INJECT_SUMMARY_IN_SPEED: bool = True   # §4.3，字面零记忆时置 Fals
 | 阶段 | 内容 | 行为变更 | 回退 |
 |---|---|---|---|
 | **S0** 评估集与基线 | `tests/memory/eval_cases.yaml` + 指标骨架 + 测出当前基线数字 | 无 | 纯测试，删文件 |
-| **S1** 写入收拢 | `0022` 迁移**一次性全量**（新表 + 新列，纯 additive）；`facade.commit_turn`；两路径共用；`MEMORY_MODEL_ID` 解析器；worker 作业类型 | durable 开始产候选（默认 inactive，零注入风险） | 摘掉 durable 侧调用（迁移与列保留，无副作用） |
+| **S1** 写入收拢 | `0022` 迁移**一次性全量**（新表 + 新列，纯 additive）；`facade.commit_turn`；两路径共用（inline detached + durable 尾部 await）；`MemorySweeper`；`MEMORY_MODEL_ID` 解析器 | durable 开始产候选（默认 inactive，零注入风险） | 摘掉 durable 侧调用与 sweeper 启动（迁移与列保留，无副作用） |
 | **S2** 抽取换 LLM | `memory/extract.py`，正则降级 | 候选质量提升，仍全 inactive | `MEMORY_EXTRACT_LLM=False` 回正则 |
 | **S3** Consolidation + 双时态 | 五种动作 + 双时态语义（列已在 S1 就位）、`source=explicit` 立即 active | 候选量下降（NOOP）、冲突正确消解 | 关闭 `MEMORY_CONSOLIDATE`，回精确去重 |
 | **S4** 读取路径 | 排序 / 阈值 / 预算 / 模式矩阵 / 删 recency 回退 / 层③ 的 `gather` 通道（无数据时为空） | §15 的 §8.4 与 speed 变更生效 | 回旧 `_load_active_user_memory_rows` |
