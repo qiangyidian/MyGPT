@@ -1,24 +1,33 @@
 "use client";
 
-import { Loader2 } from "lucide-react";
+import { Loader2, Settings2 } from "lucide-react";
+import { useRouter } from "next/navigation";
 
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
 import { useModels } from "@/hooks/useModels";
 import { filterModelsByModality } from "@/lib/multimodal";
+import { groupModelsForMenu } from "@/lib/model-groups";
 import { cn } from "@/lib/utils";
+
+const DEFAULT_MODEL_VALUE = "__none__";
 
 interface ModelSelectorProps {
   value: string | null;
   onChange: (modelId: string | null) => void;
   className?: string;
   /**
-   * Attachment mime types currently in the composer. When provided, the dropdown
+   * Attachment mime types currently in the composer. When provided, the menu
    * filters to models that support every requested modality (image → vision,
    * audio → audio_input). Undefined / empty → all chat models (default path).
    */
@@ -26,9 +35,11 @@ interface ModelSelectorProps {
 }
 
 /**
- * A dropdown that lists chat-capable (non-embedding) models. When `mimes` is
- * provided, only models whose capability flags support every requested
- * modality are listed (Task 12 multimodal composer).
+ * 两级模型选择器（供应商 → 模型），图二式级联菜单：
+ *
+ * 第一级是用户命名的模型配置（按 name 分组，见 lib/model-groups），第二级才是
+ * 具体模型。顶部保留「默认模型」——选它（null）等于让后端自己挑；底部入口
+ * 跳设置页的「管理模型」。mimes 过滤逻辑与旧 Select 版本完全一致。
  */
 export function ModelSelector({
   value,
@@ -37,13 +48,16 @@ export function ModelSelector({
   mimes,
 }: ModelSelectorProps) {
   const { chatModels, isLoading } = useModels();
+  const router = useRouter();
 
-  const filtered =
+  const groupSource =
     mimes && mimes.length > 0 ? filterModelsByModality(chatModels, mimes) : chatModels;
+  const groups = groupModelsForMenu(groupSource);
 
-  const handleSelect = (val: string) => {
-    onChange(val === "__none__" ? null : val);
-  };
+  const selected = chatModels.find((m) => m.id === value);
+  const triggerLabel = value === null ? "默认模型" : selected
+    ? selected.name
+    : "选择模型";
 
   if (isLoading) {
     return (
@@ -60,22 +74,68 @@ export function ModelSelector({
   }
 
   return (
-    <Select
-      value={value ?? "__none__"}
-      onValueChange={handleSelect}
-    >
-      <SelectTrigger className={cn("w-[200px] font-medium", className)}>
-        <SelectValue placeholder="选择模型" />
-      </SelectTrigger>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className={cn("h-9 max-w-[220px] gap-1.5 text-sm font-medium", className)}
+          title="选择模型"
+        >
+          <span className="truncate">{triggerLabel}</span>
+        </Button>
+      </DropdownMenuTrigger>
       {/* Composer sits at the bottom of the chat column — always open upward. */}
-      <SelectContent side="top">
-        <SelectItem value="__none__">默认模型</SelectItem>
-        {filtered.map((m) => (
-          <SelectItem key={m.id} value={m.id}>
-            {m.name}
-          </SelectItem>
+      <DropdownMenuContent align="start" side="top" className="w-[240px]">
+        <DropdownMenuItem
+          onSelect={() => onChange(null)}
+          className={cn(value === null && "bg-accent")}
+        >
+          <span className={cn("min-w-0 flex-1 truncate", value === null && "font-semibold")}>
+            默认模型
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+          按供应商
+        </DropdownMenuLabel>
+        {groups.map((group) => (
+          <DropdownMenuSub key={group.providerName}>
+            <DropdownMenuSubTrigger className="gap-2">
+              <span className="min-w-0 flex-1 truncate">{group.providerName}</span>
+              <span className="text-[11px] text-muted-foreground">
+                {group.models.length}
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="max-h-[300px] overflow-y-auto">
+              {group.models.map((leaf) => {
+                const active = leaf.id === value;
+                return (
+                  <DropdownMenuItem
+                    key={leaf.id}
+                    onSelect={() => onChange(leaf.id)}
+                    className={cn(active && "bg-accent")}
+                  >
+                    <span
+                      className={cn(
+                        "min-w-0 flex-1 truncate",
+                        active && "font-semibold"
+                      )}
+                    >
+                      {leaf.displayName}
+                    </span>
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         ))}
-      </SelectContent>
-    </Select>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => router.push("/settings/models")}>
+          <Settings2 className="mr-2 h-4 w-4" />
+          管理模型
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

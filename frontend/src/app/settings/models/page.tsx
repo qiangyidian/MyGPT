@@ -14,6 +14,7 @@ import {
   normalizeParallelTools,
   validateModelConfigNumbers,
 } from "@/lib/model-config-validation";
+import { groupModelsForMenu } from "@/lib/model-groups";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -197,65 +198,131 @@ export default function ModelsPage() {
       ) : models.length === 0 ? (
         <p className="text-sm text-muted-foreground">还没有模型，点击右上角新建。</p>
       ) : (
-        <div className="grid gap-3">
-          {models.map((m) => (
-            <div
-              key={m.id}
-              className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card p-4"
-            >
-              <div className="flex h-9 w-9 items-center justify-center rounded-md bg-secondary">
-                <Bot className="h-4 w-4" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-medium">{m.name}</span>
-                  {m.user_id === null && <Badge variant="secondary">系统</Badge>}
-                  {m.is_embedding ? (
-                    <Badge variant="outline">向量</Badge>
-                  ) : (
-                    <Badge variant="outline">对话</Badge>
-                  )}
-                  {m.supports_stream && (
-                    <Badge variant="outline" className="gap-1">
-                      <Zap className="h-3 w-3" /> 流式
-                    </Badge>
-                  )}
-                  {m.supports_tools && <Badge variant="outline">工具</Badge>}
-                  {m.supports_vision && <Badge variant="outline">视觉</Badge>}
-                  {m.supports_structured_output && <Badge variant="outline">结构化输出</Badge>}
-                </div>
-                <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                  {m.provider} · {m.model_name} · {m.api_base_url}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  Key: {m.has_key ? m.api_key_masked : "未设置"}
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="gap-1"
-                  disabled={testMut.isPending}
-                  onClick={() => testMut.mutate(m.id)}
-                >
-                  <FlaskConical className="h-3.5 w-3.5" /> 测试
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => openEdit(m)}>
-                  <Pencil className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    if (confirm(`删除模型「${m.name}」？`)) deleteMut.mutate(m.id);
-                  }}
-                >
-                  <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                </Button>
+        <div className="space-y-6">
+          {/* 与选择器同一分组语义（lib/model-groups）：同名配置 = 同一供应商节点。 */}
+          {groupModelsForMenu(models.filter((m) => !m.is_embedding)).map((group) => (
+            <div key={group.providerName} className="space-y-3">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                {group.providerName}
+                <Badge variant="secondary">{group.models.length}</Badge>
+              </h2>
+              <div className="grid gap-3">
+                {group.models.map((leaf) => {
+                  const m = models.find((x) => x.id === leaf.id);
+                  if (!m) return null;
+                  return (
+                    <div
+                      key={m.id}
+                      className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card p-4"
+                    >
+                      <div className="flex h-9 w-9 items-center justify-center rounded-md bg-secondary">
+                        <Bot className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{m.model_name || m.name}</span>
+                          {m.user_id === null && <Badge variant="secondary">系统</Badge>}
+                          <Badge variant="outline">对话</Badge>
+                          {m.supports_stream && (
+                            <Badge variant="outline" className="gap-1">
+                              <Zap className="h-3 w-3" /> 流式
+                            </Badge>
+                          )}
+                          {m.supports_tools && <Badge variant="outline">工具</Badge>}
+                          {m.supports_vision && <Badge variant="outline">视觉</Badge>}
+                          {m.supports_structured_output && (
+                            <Badge variant="outline">结构化输出</Badge>
+                          )}
+                        </div>
+                        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                          {m.provider} · {m.api_base_url}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Key: {m.has_key ? m.api_key_masked : "未设置"}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="gap-1"
+                          disabled={testMut.isPending}
+                          onClick={() => testMut.mutate(m.id)}
+                        >
+                          <FlaskConical className="h-3.5 w-3.5" /> 测试
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => openEdit(m)}>
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            if (confirm(`删除模型「${m.name}」？`)) deleteMut.mutate(m.id);
+                          }}
+                        >
+                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ))}
+          {/* 向量模型不是对话选择器的一部分，单独平铺一块。 */}
+          {models.filter((m) => m.is_embedding).length > 0 && (
+            <div className="space-y-3">
+              <h2 className="text-sm font-semibold text-muted-foreground">向量模型</h2>
+              <div className="grid gap-3">
+                {models
+                  .filter((m) => m.is_embedding)
+                  .map((m) => (
+                    <div
+                      key={m.id}
+                      className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card p-4"
+                    >
+                      <div className="flex h-9 w-9 items-center justify-center rounded-md bg-secondary">
+                        <Bot className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{m.name}</span>
+                          {m.user_id === null && <Badge variant="secondary">系统</Badge>}
+                          <Badge variant="outline">向量</Badge>
+                        </div>
+                        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                          {m.provider} · {m.model_name} · {m.api_base_url}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="gap-1"
+                          disabled={testMut.isPending}
+                          onClick={() => testMut.mutate(m.id)}
+                        >
+                          <FlaskConical className="h-3.5 w-3.5" /> 测试
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => openEdit(m)}>
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            if (confirm(`删除模型「${m.name}」？`)) deleteMut.mutate(m.id);
+                          }}
+                        >
+                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -266,15 +333,15 @@ export default function ModelsPage() {
             <DialogTitle>{editing ? "编辑模型" : "新建模型"}</DialogTitle>
           </DialogHeader>
           <div className="grid gap-4 py-2">
-            <Field label="名称">
+            <Field label="供应商名称" hint="对话输入框的模型选择器里，同名配置会归入同一个供应商分组（第一级菜单）。">
               <Input
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
-                placeholder="例如：GPT-4o"
+                placeholder="例如：opencode / SiliconFlow / OpenRouter"
               />
             </Field>
             <div className="grid grid-cols-2 gap-4">
-              <Field label="Provider">
+              <Field label="Provider 类型">
                 <Select
                   value={form.provider}
                   onValueChange={(v) => {
@@ -489,11 +556,20 @@ export default function ModelsPage() {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="grid gap-1.5">
       <Label className="text-xs text-muted-foreground">{label}</Label>
       {children}
+      {hint && <p className="text-[11px] leading-4 text-muted-foreground">{hint}</p>}
     </div>
   );
 }
