@@ -362,6 +362,8 @@ export interface DocFile {
     | "failed";
   error_message: string | null;
   chunk_count: number;
+  /** 原件是否还在存储目录。False 时预览/下载必然 404（检索索引仍可用）。 */
+  file_available: boolean;
   /** Attempts spent in the ingestion queue (``INGEST_MAX_ATTEMPTS`` bounds it). */
   ingest_attempts: number;
   /** Set while a failed ingestion waits to be retried; null = not scheduled. */

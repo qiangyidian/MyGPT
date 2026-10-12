@@ -15,10 +15,10 @@
  * markup-heavy content.
  */
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { Download, FileText, Loader2 } from "lucide-react";
+import { Download, FileWarning, FileText, Loader2 } from "lucide-react";
 
 import { api } from "@/lib/api";
-import { userErrorMessage } from "@/lib/api-error";
+import { toUserError, userErrorMessage } from "@/lib/api-error";
 import { formatBytes } from "@/lib/utils";
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
@@ -55,6 +55,9 @@ export function DocumentPreviewDialog({
   // Concatenate fetched pages into one continuous document body.
   const content = data?.pages.map((p) => p.content).join("") ?? "";
   const first = data?.pages[0];
+
+  // 原件已被清理（后端 code=storage_gone）：如实解释，且不渲染下载按钮。
+  const fileGone = toUserError(error).code === "storage_gone";
 
   async function handleDownload() {
     if (!first) return;
@@ -111,12 +114,32 @@ export function DocumentPreviewDialog({
           )}
 
           {error && (
-            <div className="p-6 text-sm text-destructive">
-              预览加载失败：{userErrorMessage(error)}
+            <div
+              className={
+                fileGone
+                  ? "space-y-2 p-6 text-sm"
+                  : "p-6 text-sm text-destructive"
+              }
+            >
+              {fileGone ? (
+                <>
+                  <p className="flex items-center gap-2 font-medium">
+                    <FileWarning className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                    文档原件已被存储清理
+                  </p>
+                  <p className="text-muted-foreground">
+                    这篇文档的原始文件已从服务器清理（历史上的孤儿清扫误删过一批），
+                    数据库记录与向量索引仍在：问答检索不受影响，但无法预览或下载原件。
+                    如需原件请重新上传。
+                  </p>
+                </>
+              ) : (
+                <>预览加载失败：{userErrorMessage(error)}</>
+              )}
             </div>
           )}
 
-          {first && (
+          {first && !fileGone && (
             <>
               {first.render_as === "markdown" ? (
                 <div className="px-6 py-4">
@@ -148,7 +171,7 @@ export function DocumentPreviewDialog({
           )}
         </div>
 
-        {first && (
+        {first && !fileGone && (
           <div className="flex-none border-t border-border px-6 py-3">
             <Button variant="outline" size="sm" onClick={handleDownload}>
               <Download className="mr-2 h-4 w-4" />

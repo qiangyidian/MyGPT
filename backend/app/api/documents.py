@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.knowledge_bases import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.exceptions import AppException
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
 from app.models import Document, KnowledgeBase, User
@@ -125,7 +126,9 @@ async def upload_document(
     kb = await _load_owned_kb(db, kb_id, user)
     doc = await document_service.upload(db, kb, user, file)
     await _queue_for_ingestion(db, doc)
-    return DocumentOut.model_validate(doc)
+    item = DocumentOut.model_validate(doc)
+    item.file_available = True  # 刚写完盘
+    return item
 
 
 @router.get("/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
@@ -139,7 +142,14 @@ async def list_documents(
     """One page of the KB's documents, newest first (see the KB list's cap)."""
     await _load_owned_kb(db, kb_id, user)
     docs = await document_service.list_for_kb(db, kb_id, limit=limit, offset=offset)
-    return [DocumentOut.model_validate(d) for d in docs]
+    out = []
+    for d in docs:
+        item = DocumentOut.model_validate(d)
+        # 原件在不在磁盘（列表页只调一次 exists，量级 = 每页几十条）。False 时
+        # 前端隐藏预览/下载入口——预览/下载接口本身会 404 code=storage_gone。
+        item.file_available = bool(d.file_path) and os.path.exists(d.file_path)
+        out.append(item)
+    return out
 
 
 @router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -215,7 +225,13 @@ async def preview_document(
 
     doc = await _load_owned_doc(db, document_id, user)
     if not doc.file_path or not os.path.exists(doc.file_path):
-        raise HTTPException(NOT_FOUND, "原始文件不存在或已被清理，无法预览")
+        # 机器可读 code=storage_gone：前端据此显示「原件已被清理（检索索引仍可用）」
+        # 并隐藏下载入口，而不是一个需要用户猜因由的笼统 404。
+        raise AppException(
+            status_code=NOT_FOUND,
+            code="storage_gone",
+            message="文档原件已不存在（数据库记录与检索索引仍在），无法预览",
+        )
     if doc.status == "failed":
         raise HTTPException(BAD, f"文档解析失败：{doc.error_message or '未知错误'}")
     if doc.status in ("pending", "parsing", "chunking", "embedding"):
@@ -265,7 +281,11 @@ async def download_document(
     """Stream the original upload back to the owner (preview → 下载原文件)."""
     doc = await _load_owned_doc(db, document_id, user)
     if not doc.file_path or not os.path.exists(doc.file_path):
-        raise HTTPException(NOT_FOUND, "原始文件不存在或已被清理")
+        raise AppException(
+            status_code=NOT_FOUND,
+            code="storage_gone",
+            message="文档原件已不存在（可能已被存储清理），无法下载",
+        )
 
     media_type = mimetypes.guess_type(doc.filename)[0] or "application/octet-stream"
     return FileResponse(

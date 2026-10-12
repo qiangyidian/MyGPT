@@ -17,6 +17,9 @@ class DocumentOut(ORMModel):
     status: str            # pending|parsing|chunking|embedding|indexed|failed
     error_message: str | None
     chunk_count: int
+    # 原件是否还在 STORAGE_DIR。False 时前端隐藏预览/下载入口（检索索引仍
+    # 可用）；历史上孤儿的清扫（已修复）删过一批活文件，DB 行与向量都还在。
+    file_available: bool = True
     # Queue state, so a document that is *waiting to be retried* can be told
     # apart from one that is finished failing — with neither, a stuck document
     # looked identical in the UI in both cases.

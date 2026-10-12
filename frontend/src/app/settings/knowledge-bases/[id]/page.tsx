@@ -9,7 +9,7 @@ import { RefreshCw, Trash2, Upload, Search, Eye } from "lucide-react";
 import { api } from "@/lib/api";
 import { userErrorMessage } from "@/lib/api-error";
 import type { Citation, DocFile } from "@/lib/types";
-import { formatBytes } from "@/lib/utils";
+import { cn, formatBytes } from "@/lib/utils";
 import { describeIngestQueue } from "@/lib/kb-ingest";
 import {
   describeKbUpload,
@@ -230,14 +230,22 @@ function KbDetailContent() {
                   <td className="p-3">
                     <button
                       type="button"
-                      className="max-w-[22rem] truncate text-left font-medium hover:underline"
+                      className={cn(
+                        "max-w-[22rem] truncate text-left font-medium",
+                        d.file_available ? "hover:underline" : "text-muted-foreground"
+                      )}
                       onClick={() => setPreviewId(d.id)}
-                      title="点击预览"
+                      title={d.file_available ? "点击预览" : "原件已被清理，仅剩检索索引"}
                     >
                       {d.filename}
                     </button>
                     {d.error_message && (
                       <div className="text-xs text-destructive">{d.error_message}</div>
+                    )}
+                    {!d.file_available && (
+                      <div className="text-xs text-muted-foreground">
+                        原件已被存储清理，仅剩检索索引
+                      </div>
                     )}
                   </td>
                   <td className="hidden p-3 text-muted-foreground md:table-cell">{d.file_type}</td>
@@ -256,9 +264,9 @@ function KbDetailContent() {
                         size="sm"
                         onClick={() => setPreviewId(d.id)}
                         aria-label={`预览 ${d.filename}`}
-                        title="在线预览"
+                        title={d.file_available ? "在线预览" : "原件已被清理，无法预览（检索仍可用）"}
                       >
-                        <Eye className="h-3.5 w-3.5" />
+                        <Eye className={cn("h-3.5 w-3.5", !d.file_available && "opacity-40")} />
                       </Button>
                       <Button
                         variant="ghost"

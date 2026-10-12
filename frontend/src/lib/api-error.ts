@@ -85,6 +85,7 @@ const CODE_ZH: Record<string, string> = {
   attachment_mime_mismatch: "附件内容与所选类型不一致，请重新上传",
   attachment_limit: "附件数量已达上限，请先删除部分附件",
   artifact_not_found: "文件不存在或已被清理",
+  storage_gone: "文档原件已被存储清理；检索索引仍在，可继续用于问答",
   artifact_too_large: "文件过大，请精简后重试",
   artifact_checksum_mismatch: "文件校验失败，请重新上传",
   project_not_found: "项目不存在或已被删除",
