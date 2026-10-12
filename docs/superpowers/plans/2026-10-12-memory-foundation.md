@@ -668,6 +668,28 @@ async def user_memories_for_conversation(conversation_id: uuid.UUID) -> list:
             )
         )
         return list(rows.all())
+
+
+def no_crew(monkeypatch) -> None:
+    """让 expert 模式的一轮不拉起 deep_research crew（抄 tests/test_chat_stream.py:59-77）。
+
+    ``CREWAI_ENABLED`` 默认 True，测试环境没有关它；而 ``decide_route("expert", …)`` 会把
+    任何"非寒暄、非代码"的消息路由到 ``execution_mode=agent, use_multi_agent=True,
+    agent_profile="deep_research"``。不桩住的话，每个 expert 模式用例都要等一个多 Agent 流程
+    在 MockProvider 上跑完 —— 慢、不确定，且与该用例要验的东西无关；而"某句话恰好触发了
+    `looks_like_code_request`"会让用例时快时慢，属于靠运气。
+
+    桩成"crew 不可用"后编排器走原生回答，与 test_chat_stream 的既有做法一致。
+    """
+    from unittest.mock import AsyncMock, Mock
+
+    from app.agents.intent_service import intent_service
+    from app.agents.orchestrator import ChatOrchestrator
+
+    monkeypatch.setattr(intent_service, "judge", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ChatOrchestrator, "_crewai_status", Mock(return_value=(False, "unexpected_crew"))
+    )
 ```
 
 **回读一律走新 session**：测试库是 StaticPool（单一共享连接），``commit_turn`` 用的是它自己的 session。断言时**不要从测试自己那个还开着的 ``db_session`` 里读**——用上面这些 helpers（每个都新开 session）。既有测试同款写法见 ``tests/test_chat_stream.py:120``。
@@ -1966,6 +1988,7 @@ from tests.memory.helpers import (
     conversation_of_message,
     create_mock_model,
     meta_from_sse,
+    no_crew,
     wait_for_commit,
 )
 
@@ -1981,7 +2004,8 @@ async def _turn_conversation_id(response) -> uuid.UUID:
 
 
 @pytest.mark.asyncio
-async def test_inline_turn_commits_memory_once(client, offline_model):
+async def test_inline_turn_commits_memory_once(client, offline_model, monkeypatch):
+    no_crew(monkeypatch)   # expert + 非寒暄内容会拉起 research crew，见 helpers.no_crew
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
     response = await client.post(
@@ -2153,7 +2177,7 @@ import asyncio
 import pytest
 
 from tests.conftest import auth_headers
-from tests.memory.helpers import create_mock_model, drive_durable_worker, wait_for_commit
+from tests.memory.helpers import create_mock_model, drive_durable_worker, no_crew, wait_for_commit
 from tests.memory.test_inline_hook import _turn_conversation_id
 
 
@@ -2163,6 +2187,7 @@ async def test_durable_turn_commits_memory(client, monkeypatch, offline_model):
     from app.core.config import get_settings
 
     monkeypatch.setattr(get_settings(), "BACKGROUND_WORKER", "durable")
+    no_crew(monkeypatch)   # expert + 非寒暄内容会拉起 research crew，见 helpers.no_crew
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
 
@@ -2528,6 +2553,7 @@ from tests.memory.helpers import (
     commit_events,
     create_conversation,
     create_mock_model,
+    no_crew,
     user_memories_for_conversation,
     wait_for_commit,
 )
@@ -2542,8 +2568,9 @@ _CONTENT_BY_MODE = {"speed": "我喜欢用 Go 写服务", "expert": "我喜欢�
 
 @pytest.mark.parametrize("mode", ["speed", "expert"])
 @pytest.mark.asyncio
-async def test_candidates_are_never_active_in_s1(client, offline_model, mode):
+async def test_candidates_are_never_active_in_s1(client, offline_model, mode, monkeypatch):
     """S1 不改治理：候选一律 inactive（显式"记住"的自动生效在 S2）。"""
+    no_crew(monkeypatch)   # expert 分支会拉起 research crew，见 helpers.no_crew
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
     response = await client.post(
@@ -2562,10 +2589,11 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode):
 
 
 @pytest.mark.asyncio
-async def test_same_turn_never_double_commits(client, offline_model):
+async def test_same_turn_never_double_commits(client, offline_model, monkeypatch):
     """sweeper 与 detached 任务并发也不会重复：幂等锚点在数据库层。"""
     from app.agents.memory.sweeper import MemorySweeper
 
+    no_crew(monkeypatch)   # expert + 非寒暄内容会拉起 research crew，见 helpers.no_crew
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
     response = await client.post(
