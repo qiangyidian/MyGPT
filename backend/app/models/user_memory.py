@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -73,3 +73,33 @@ class UserMemory(Base, TimestampMixin):
     # Opaque id of this memory's vector in the user-scoped collection. Set on
     # activate / edit; cleared on deactivate / delete.
     embedding_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ---- 三层记忆（spec §5.1）----
+    # 谁写的：显式"记住" / 抽取器推断 / 用户在设置页手写。决定写入后是否立即 active。
+    source: Mapped[str] = mapped_column(
+        String(16), default="inferred", nullable=False, index=True
+    )
+    author: Mapped[str] = mapped_column(String(16), default="extractor", nullable=False)
+    # "这值得记住"（confidence 是"我确定这是真的"）—— 两者都进排序，含义不同。
+    importance: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    # 双时态：事实在世界上的成立区间。冲突时失效而非删除（spec §5.4）。
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    invalid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user_memories.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    use_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_user_memories_user_invalid", "user_id", "invalid_at"),
+        Index("ix_user_memories_user_superseded", "user_id", "superseded_by"),
+    )

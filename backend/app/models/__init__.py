@@ -18,6 +18,8 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.message import Message
 from app.models.message_feedback import MessageFeedback
 from app.models.message_version import MessageVersion
+from app.models.memory_event import MemoryEvent
+from app.models.memory_settings import MemorySettings
 from app.models.model_config import ModelConfig
 from app.models.project import Project
 from app.models.prompt_template import PromptTemplate
@@ -75,4 +77,7 @@ __all__ = [
     "RedeemCode",
     # ---- 提示词库（个人模板 + 系统预置） ----
     "PromptTemplate",
+    # ---- 三层长期记忆（审计事件 / per-user 分层开关） ----
+    "MemoryEvent",
+    "MemorySettings",
 ]
