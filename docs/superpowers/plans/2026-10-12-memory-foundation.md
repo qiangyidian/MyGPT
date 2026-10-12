@@ -1002,6 +1002,10 @@ Create Date: 2026-10-12
 回填按 ``(conversation_id, memory_type)`` 取**最新一条**：历史数据里同一会话可能存在
 两行 task（``upsert_goal`` 用的 ``scalar_one_or_none`` 挡不住并发），全量回填会直接
 撞新加的唯一键。多余的行保持 NULL —— 它们本来就没有读者。
+
+**downgrade 在 SQLite 上是部分回退**（只删两张新表 + 新索引，保留列与唯一约束）：
+SQLite 不支持 ALTER 约束，而仓库的迁移测试正是在 SQLite 上走 downgrade 路径
+（见 ``_is_sqlite``）。生产是 Postgres，走完整回退。
 """
 from __future__ import annotations
 
@@ -1028,6 +1032,20 @@ def _has_column(table: str, column: str) -> bool:
     if context.is_offline_mode():
         return False
     return any(c["name"] == column for c in sa.inspect(op.get_bind()).get_columns(table))
+
+
+def _is_sqlite() -> bool:
+    """SQLite 不支持 ALTER 约束（要 batch 模式的表重建），也删不掉参与索引/约束的列。
+
+    这个迁移的 downgrade 只在测试里跑在 SQLite 上（``tests/test_*_migration.py`` 用子进程
+    alembic + 临时 sqlite 文件走 downgrade 路径），生产是 Postgres。所以 SQLite 上只回退
+    "能回退的部分"：两张新表 + 新索引。列与唯一约束留原样 —— 重跑 upgrade 时
+    ``_has_column`` 守卫会跳过它们，留着的代价是零；而硬删会直接
+    ``NotImplementedError: No support for ALTER of constraints in SQLite dialect``。
+    """
+    if context.is_offline_mode():
+        return False
+    return op.get_bind().dialect.name == "sqlite"
 
 
 def upgrade() -> None:
@@ -1184,6 +1202,12 @@ def downgrade() -> None:
         op.drop_index("ix_memory_events_conversation_id", table_name="memory_events")
         op.drop_index("ix_memory_events_user_id", table_name="memory_events")
         op.drop_table("memory_events")
+
+    # SQLite 到此为止：下面全是 ALTER 约束/删列，SQLite 两边都做不到（见 _is_sqlite）。
+    # 生产是 Postgres，走完整回退。
+    if _is_sqlite():
+        return
+
     if _has_column("conversation_memories", "block_key"):
         op.drop_constraint(
             "uq_conversation_memories_block", "conversation_memories", type_="unique"
@@ -1223,6 +1247,19 @@ Expected: `heads` 只有一行且是 `0022_memory_three_layer`；offline SQL 里
 **这条替代证明不了"在带数据的真实 PG 上能升级"**：合入 main 之前必须有人启动 Docker 跑一次 `./scripts/verify_migrations.sh`（那是验证真实部署路径的唯一手段）。**在报告里明确写出这个缺口**，别写成"迁移已验证"。
 
 （若某段 DDL 没出现，先看 offline 模式的 `_has_table` / `_has_column` 短路 —— 它们 offline 一律返回 False，正是为了发全量 DDL。）
+
+**offline `--sql` 不够，必须再跑一次真的 SQLite 往返 + 仓库既有的迁移测试。** offline 生成只编译 SQL，**不执行** DDL，也**完全不覆盖 downgrade** —— R17 就是这么漏过去的（`op.drop_constraint` 在 SQLite 上抛 `NotImplementedError`，两个既有迁移测试因此变红，而 offline 验证全绿）：
+
+```bash
+cd backend
+mkdir -p .tmp_mig
+DB="sqlite+aiosqlite:///D:/Gitee/MyGPT/backend/.tmp_mig/t.sqlite3"
+DATABASE_URL="$DB" ENV=test python -m alembic upgrade head
+DATABASE_URL="$DB" ENV=test python -m alembic downgrade 0021_tool_toggles
+rm -rf .tmp_mig
+python -m pytest tests/test_model_capabilities_migration.py tests/test_wechat_password_backfill_migration.py -q --tb=short
+```
+Expected: 两条 alembic 命令都退出码 0；两个迁移测试通过（它们会子进程跑 `upgrade head` → `downgrade <旧版本>` → 再 `upgrade`，正好覆盖本迁移的 downgrade 路径）。**跑完删掉 `.tmp_mig`，别提交它。**
 
 - [ ] **Step 11: 提交**
 
