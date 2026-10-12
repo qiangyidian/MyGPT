@@ -504,7 +504,7 @@ MODE_INJECT_SUMMARY_IN_SPEED: bool = True   # §4.3，字面零记忆时置 Fals
 - **sweep 补做**：构造一个"有 assistant 消息但无 `commit_turn` 事件"的会话 → 跑一轮 sweeper → 事件补齐、候选产出；已在窗口外的会话不被补（防雪崩）。
 - **迁移**：`0022` up → down 干净回退；`scripts/verify_migrations.sh` 两条路径（空库 → head、prior → head）。
 - 无 embedding 配置：层① 与 ③ 不注入、层② 仍注入（§8.4）。
-- 无 `MEMORY_MODEL_ID`：退系统 config；两者都无 → 退会话 cfg 且日志含 warning。
+- 无 `MEMORY_MODEL_ID`：直接用会话 cfg（**现状行为，不自动挑系统 config** —— 见 §11 计费段）；`conversation_cfg_id` 也为空 → 返回 `None`，调用方降级（抽取回退正则、摘要跳过）。日志：未配置时 `info` 一次/进程；配置了但解析不到时每次 `warning`。
 - 计费：记忆侧调用不产生 `usage` 结算记录。
 
 ### 12.3 评估集（离线门禁）

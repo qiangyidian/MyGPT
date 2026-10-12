@@ -1937,6 +1937,7 @@ cd backend && ruff check app tests && cd .. && git add backend/app backend/tests
 
 **Files:**
 - Modify: `backend/app/services/chat_service.py`
+- Modify: `backend/tests/test_agent_phase2.py`（迁移直接调用 `_maybe_summarize` 的那个测试，见 Step 3）
 - Test: `backend/tests/memory/test_inline_hook.py`
 
 **Interfaces:**
@@ -2044,15 +2045,69 @@ async def _commit_memory_after_turn(**kwargs: Any) -> None:
     await commit_turn_detached(**kwargs)
 ```
 
-6. 清理因删除而失效的 import（`propose_user_memory` / `_maybe_summarize` 用到的名字）。`_load_history` 按 T4 Step 8 已改为从 `chat_helpers` 导入。
+6. **迁移 `tests/test_agent_phase2.py::test_maybe_summarize_persists_summary`（不是删掉它）。** 该测试（`test_agent_phase2.py:141-176`）**直接调用** `ChatService._maybe_summarize(db_session, conv, cfg, _SEEDED_USER)`；删掉方法会让它 AttributeError，而它是**没被 deselect 的、当前通过的测试** —— 直接删就是自己制造新回归。改成调用 facade 的同名函数，保留原意图与原断言：
+
+```python
+async def test_maybe_summarize_persists_summary(db_session):
+    """A large history triggers a summary write (原走 ChatService._maybe_summarize，
+    行为迁到 memory/facade 后本测试随之迁移)."""
+    from app.agents.memory.facade import _maybe_summarize
+
+    conv = Conversation(user_id=_SEEDED_USER, title="big")
+    db_session.add(conv)
+    await db_session.flush()
+    # 8 messages, tiny context budget -> exceeds 70% -> summarize (older 2 rolled).
+    for i in range(8):
+        db_session.add(
+            Message(
+                conversation_id=conv.id,
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"this is message number {i} with some padding text " * 20,
+            )
+        )
+    await db_session.flush()
+
+    cfg = ModelConfig(
+        name="mock",
+        provider="openai-compatible",
+        api_base_url="http://localhost/v1",
+        model_name="mock-model",
+        max_context_tokens=100,  # tiny -> forces summarization
+        max_tokens=64,
+    )
+    # **必须落库**：facade 按 cfg_id 解析模型（旧签名直接吃 cfg 对象），不落库就解析不到 →
+    # 不会写摘要 → 断言失败。
+    db_session.add(cfg)
+    await db_session.flush()
+
+    wrote = await _maybe_summarize(
+        db_session, conversation=conv, user_id=_SEEDED_USER, cfg_id=cfg.id
+    )
+    assert wrote is True
+
+    summaries = (
+        await db_session.execute(
+            __import__("sqlalchemy").select(ConversationMemory).where(
+                ConversationMemory.conversation_id == conv.id,
+                ConversationMemory.memory_type == "summary",
+            )
+        )
+    ).scalars().all()
+    assert len(summaries) == 1
+```
+
+顺手清掉该文件里因迁移而失效的 import：`ChatService`（`test_agent_phase2.py:17`）只有这一个测试在用，删完代码要把这行 import 也删掉。**但先 grep 再删** —— 同一文件里 `load_state` / `save_summary` / `upsert_goal` / `summarize_history` 等 import 在别的测试里还在用，别连带删。
 
 - [ ] **Step 4: 跑测试与全量回归**
 
 Run: `pytest tests/memory -q --tb=short`
 Expected: 全部通过。
 
+Run: `pytest tests/test_agent_phase2.py tests/test_chat_stream.py -q --tb=short`
+Expected: 通过（含迁移后的 `test_maybe_summarize_persists_summary`）。
+
 Run: `pytest tests -q --tb=short --deselect tests/test_agent_phase2.py::test_agent_mode_emits_plan_created --deselect tests/test_agent_phase5.py::test_full_native_agent_path`
-Expected: 通过。（若 `test_multi_agent_approval_pauses_then_resumes` 死锁级联，按 Global Constraints 追加 deselect 后重跑。）
+Expected: **对比改动前基线**（`2 failed + 4 errors`，全在 `test_agent_phase0` / `test_agent_graph_lifecycle` / `test_prompts_api` / `test_tool_toggles`），不要期待全绿；出现新失败先单文件复跑。（全量约 11 分钟。）
 
 - [ ] **Step 5: 提交**
 
@@ -2148,6 +2203,8 @@ Expected: FAIL —— commit 事件数为 0（durable 路径还没接）。
                 except Exception:
                     logger.warning("durable memory commit failed", exc_info=True)
 ```
+
+顺手更新 `run_durable_turn` 的 docstring：它现在列着"Intentionally deferred vs. the inline `stream`"的几条，其中 **`Cross-turn rolling-summary write-back (``_maybe_summarize``)` 从本任务起不再 deferred**（摘要写入由 `commit_turn` 在 durable 路径上承担），要把它从那份清单里移除或改成"已由 commit_turn 承担"（`chat_service.py:2237` 附近）。留着不改会让下一个读这段注释的人得出错误结论。
 
 - [ ] **Step 4: 跑测试与回归**
 
