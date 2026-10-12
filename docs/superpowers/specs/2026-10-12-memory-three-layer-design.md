@@ -109,7 +109,7 @@
 
 `RunQueue` 的载荷是 `AgentRun` 的 uuid（`queue.py:48` `enqueue(run_id)`、`dequeue`、`ack`），没有通用作业类型——加记忆作业要么伪造 run 行，要么新建一套队列与消费循环。而 `RetentionSweeper` 已经证明"leader-gated 周期扫描 + `session_factory`"这个模式在本仓库可行且与 API 进程共享 advisory lock（`worker.py:120-123`）。所以：
 
-- **idempotency 由数据库保证**：`memory_events` 上有 `UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'`；重复 commit 直接命中冲突返回，不重复抽取。
+- **idempotency 由数据库保证**：`memory_events.dedup_key` 唯一（`kind=commit_turn` 时非空，见 §9.6）；重复 commit 直接命中冲突返回，不重复抽取。
 - **sweep 的判定**：最近 `MEMORY_SWEEP_WINDOW_HOURS=6` 内有 assistant 消息、但其最新 assistant 消息 id 无对应 `commit_turn` 事件的会话，每轮最多补 `MEMORY_SWEEP_BATCH=20` 个。这同时覆盖"API 进程重启丢掉的 detached 任务"与"durable run 中途崩溃"。
 
 **可测试性约束（新模块必须遵守）**：`facade` 自己开 session，所以它必须留一个模块级的、可被测试 patch 的 session 工厂（仓库既有先例：`tests/conftest.py:222` 对 `credit_service._default_session_factory` 的处理）。不这么做，测试里的 detached/durable 提交会打到生产引擎上。后续计划 B/C/D 新增的模块同样遵守这条。
@@ -407,7 +407,9 @@ final_score = 0.55*sim + 0.20*recency + 0.15*importance + 0.10*confidence
 
 `memory_events(id, user_id, conversation_id, message_id?, kind, memory_id?, payload jsonb, created_at)`，`kind ∈ {extracted, proposed, activated, superseded, noop, rejected, deleted, model_wrote, parse_error, commit_turn}`。写入在 `commit_turn` 的同一事务内。
 
-`commit_turn` 事件是**幂等锚点**：`UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'`（partial unique index）。重复 commit 命中冲突即返回，不重复抽取；sweeper 也靠它判定"哪一轮还没做"（§4.2.1）。
+`commit_turn` 事件是**幂等锚点**：靠专用列 `dedup_key` + 普通唯一索引 `uq_memory_events_dedup`。`kind=commit_turn` 时 `dedup_key = f"commit_turn:{conversation_id}:{message_id}"`，其余 kind 为 `NULL`（NULL 在 Postgres 与 SQLite 都不互撞）。重复 commit 命中冲突即返回，不重复抽取；sweeper 也靠它判定"哪一轮还没做"（§4.2.1）。
+
+**为什么不用 `UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'` 的 partial index**：测试库是内存 SQLite（`tests/conftest.py:1-15`），SQLAlchemy 对非 PG 方言会忽略 `postgresql_where` 但仍建 `unique=True` —— 索引在 SQLite 上退化成 (conversation_id, message_id) 的**无条件唯一**。那样"同一轮的多个 noop/superseded 事件"（S3 起必然出现）会在 SQLite 上凭空失败而生产正常，是最坏的一类方言分歧。`dedup_key` 两个方言语义一致，代价只有一列。
 
 ## 10. 关键文件清单
 

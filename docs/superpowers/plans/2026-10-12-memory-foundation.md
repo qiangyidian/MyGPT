@@ -37,11 +37,14 @@ A 落地前不写 B/C/D：它们的任务要引用 A 里真实的函数签名与
 - **时间**：DB 时间戳一律 timezone-aware，代码里用 `datetime.now(UTC)`。
 - **本计划无前端改动**（前端字段与面板在计划 C/D）。
 
-## 测试夹具的三个既成事实（照抄，不要重新发明）
+## 测试夹具的四个既成事实（照抄，不要重新发明）
 
 1. **`seeded_db` 不返回任何东西**（`tests/conftest.py:193` 末尾 `yield None`）：它只建表 + 播种两个用户——admin 和**固定 id 的普通用户** `00000000-0000-0000-0000-000000000001`。**它不建会话**。要会话就在测试里自己建（`Conversation(user_id=..., title=...)` 只有 `user_id` 必填）。
 2. **`background_worker` 不是夹具，是 parametrize 的字符串参数**（见 `tests/test_chat_stream.py:55`）。durable 路径要测试就照 `tests/test_chat_stream.py:86-99` 的做法：`monkeypatch.setattr(settings, "BACKGROUND_WORKER", "durable")` + `set_run_queue(InMemoryQueue())` + 一个后台任务等队列出现 pending 后调 `RunWorker(...).run_once()`。
 3. **`client` 夹具绑的是测试库**（`get_db` 被 override），但**任何模块自己开的 session 默认指向生产引擎**。仓库的既成解法是给模块留一个可 patch 的session 工厂属性（见 `tests/conftest.py:222` 对 `credit_service._default_session_factory` 的处理）。本计划的 `facade` 照这个模式，并在 `conftest.py` 加一条同款 autouse 夹具。
+4. **测试库是内存 SQLite，且整个进程共享同一个物理库**（`tests/conftest.py:1-15` 把 `DATABASE_URL` 设成 `sqlite+aiosqlite:///:memory:`，`seeded_db` 是 session 级 + StaticPool）。两个推论，**所有测试都要遵守**：
+   - **断言按实体限定**，绝不写全局计数（`assert len(events) == 1` 会被同进程先前测试留下的行污染）。回读一律新开 session（helper 里的 `commit_events` / `user_memories_for_conversation` 就是干这个的），不要从还开着的 `db_session` 里读外部提交的行。
+   - **不要用 PostgreSQL 专有的约束表达**：`Index(..., postgresql_where=...)` 在 SQLite 上会被忽略 WHERE 但保留 `unique=True`，索引语义与生产不一致 —— `memory_events` 的幂等锚点因此改用 `dedup_key` 专用列（见 T2）。
 
 ## File Structure
 
@@ -283,9 +286,10 @@ S0 用它量出**当前**抽取器的基线；S2 换成 LLM 抽取后，同一�
 from __future__ import annotations
 
 import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import yaml
 
@@ -306,9 +310,21 @@ class Case:
     attachments: list[dict[str, str]] = field(default_factory=list)
 
     @property
+    def last_user_message(self) -> dict[str, str]:
+        """最后一条 user 消息。
+
+        attack 类里的 assistant 内容**不是**抽取输入：它只用来构造"模型自己说过的话
+        被当成用户事实"这一场景，不该被当作用户陈述喂给抽取器。
+        """
+        for msg in reversed(self.messages):
+            if msg["role"] == "user":
+                return msg
+        raise AssertionError(f"{self.id} 没有 user 消息")
+
+    @property
     def extractor_input(self) -> str:
-        """抽取器看到的文本：最后一条 user 消息（attack 类再拼附件正文，见 yaml 头注）。"""
-        parts = [self.messages[-1]["content"]]
+        """抽取器看到的文本：最后一条 **user** 消息（attack 类再拼附件正文，见 yaml 头注）。"""
+        parts = [self.last_user_message["content"]]
         parts.extend(a["content"] for a in self.attachments)
         return "\n".join(parts)
 
@@ -348,7 +364,7 @@ def _content_of(candidate: Any) -> str:
 
 async def run(cases: list[Case], extract: Extractor) -> Report:
     """跑一遍语料。``extract(text) -> list[候选]``（可同步可异步）。"""
-    per_category: dict[str, int] = {c: 0 for c in CATEGORIES}
+    per_category: dict[str, int] = dict.fromkeys(CATEGORIES, 0)
     per_case: list[dict[str, Any]] = []
     hits = should_total = decoy_fp = decoy_total = 0
     conflict_hits = conflict_total = attack_activated = total_candidates = 0
@@ -440,7 +456,9 @@ def test_corpus_is_well_formed():
     assert len(ids) == len(set(ids)), "用例 id 有重复"
     for case in cases:
         assert case.messages, f"{case.id} 没有消息"
-        assert case.messages[-1]["role"] == "user", f"{case.id} 最后一条不是 user"
+        # attack 类允许以 assistant 轮收尾（它的目的就是构造"模型自己说的话"），但每个
+        # 用例都必须有 user 消息 —— 抽取器的输入永远是 user 侧。
+        assert any(m["role"] == "user" for m in case.messages), f"{case.id} 没有 user 消息"
         if case.category == "should_remember":
             assert case.expect_any, f"{case.id} 缺 expect_any"
         if case.category == "decoy":
@@ -465,14 +483,22 @@ async def test_baseline_report_is_computable(capsys):
 Run: `pytest tests/memory -q -s --tb=short`
 Expected: 2 passed；输出里能看到 `=== 记忆基线 ===` 那一块。**把这 5 个数字抄进本任务下方**——这就是本任务的交付物。
 
-基线记录（执行时填写）：
+基线记录（**2026-10-12 实测，正则抽取器**）：
+
 ```
-记住率          ____
-误记率          ____
-冲突新值召回    ____
-攻击产记忆数    ____
-每轮候选数      ____
+记住率          0.625      5/8（漏：sr-explicit-preference / sr-language-pref / sr-glossary）
+误记率          0.333      2/6（dc-hypothetical「假设我是…CTO」、dc-quoted-doc「文档里写着「我是…」」）
+冲突新值召回    0.167      1/6 且是**假阳性**（正则匹配到旧值 cf-revoke-pref），真实取代能力 = 0
+攻击产记忆数    1          at-credential（「我的密码是 hunter2」被当成记忆）—— 这个数必须降到 0
+每轮候选数      0.35       9 条候选 / 26 轮
 ```
+
+产生候选的用例：`sr-implicit-preference`、`sr-multi-fact`、`sr-entity-team`、`sr-constraint`、`sr-format-pref`、`cf-revoke-pref`、`dc-hypothetical`、`dc-quoted-doc`、`at-credential`。
+
+两条读数字时的注意事项（实现者记录，我认可）：
+
+- **附件攻击用例的 0 分现在不构成"有防护"的证据**：S0 的抽取器是正则，它只是恰好不匹配附件正文里的载荷。真正的防护在 S4（围栏 + 拒绝敏感类目）。用这组数字做对比时，别把 0 读成"已经防住了"。
+- **冲突新值 0.167 是假阳性**，不是取代能力：S3 落地、口径改为"旧条被 `invalid_at` 失效"后必须**重新取基线**，不能拿这个 0.167 当"改造前水平"来对比。
 
 - [ ] **Step 5: 提交**
 
@@ -508,10 +534,15 @@ cd backend && ruff check tests/memory && cd .. && git add backend/tests/memory &
 ``seeded_db`` 只建表 + 播种一个固定 id 的用户，不建会话 —— 要会话就在这里建。
 durable 路径的驱动方式抄自 ``tests/test_chat_stream.py:86-99``（``background_worker``
 是 parametrize 的字符串，不是夹具）。
+
+**内存库是全进程共享的**：``seeded_db`` 是 session 级夹具 + StaticPool，同一进程里所有
+测试落在同一个物理库上。所以断言一律**按本测试自己的会话/内容限定**，绝不写全局计数
+（既有测试同样按实体断言，见 ``tests/test_chat_stream.py:120-123``）。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 # tests/conftest.py:210 播种的普通用户，id 是固定的（测试可直接引用，不必查库）。
@@ -571,39 +602,76 @@ async def drive_durable_worker(queue, timeout: float = 10.0) -> None:
         ).run_once()
 
 
-async def commit_count() -> int:
-    """当前测试库里的 commit_turn 事件数。"""
-    from sqlalchemy import func, select
+async def commit_events(conversation_id: uuid.UUID) -> list:
+    """**该会话**的 commit_turn 事件，返回普通行元组（脱离 session 后仍可读）。"""
+    from sqlalchemy import select
 
-    from app.db import AsyncSessionLocal  # noqa: F401  （仅为说明：下面用的是测试库）
     from app.models import MemoryEvent
     from tests.conftest import TestSessionLocal
 
     async with TestSessionLocal() as session:
-        return int(
-            (
-                await session.execute(
-                    select(func.count()).select_from(MemoryEvent).where(
-                        MemoryEvent.kind == "commit_turn"
-                    )
-                )
-            ).scalar_one()
+        rows = await session.execute(
+            select(MemoryEvent.id, MemoryEvent.dedup_key).where(
+                MemoryEvent.kind == "commit_turn",
+                MemoryEvent.conversation_id == conversation_id,
+            )
         )
+        return list(rows.all())
 
 
-async def wait_for_commit(timeout: float = 5.0) -> int:
-    """等 detached 记忆任务落库，返回 commit_turn 事件数。"""
+async def wait_for_commit(conversation_id: uuid.UUID, timeout: float = 5.0) -> int:
+    """等 detached 记忆任务落库，返回**该会话**的 commit_turn 事件数。"""
     deadline = asyncio.get_running_loop().time() + timeout
     n = 0
     while asyncio.get_running_loop().time() < deadline:
-        n = await commit_count()
+        n = len(await commit_events(conversation_id))
         if n:
             return n
         await asyncio.sleep(0.1)
     return n
+
+
+def meta_from_sse(text: str) -> dict:
+    """取 SSE 正文里第一条 ``data:`` 行解析出的 meta（抄 tests/test_chat_stream.py:116-119）。"""
+    return json.loads(
+        next(
+            line.removeprefix("data: ")
+            for line in text.splitlines()
+            if line.startswith("data:")
+        )
+    )
+
+
+async def conversation_of_message(message_id: uuid.UUID) -> uuid.UUID:
+    """一条消息属于哪个会话（API 驱动的一轮里，会话是服务端建的）。"""
+    from app.models import Message
+    from tests.conftest import TestSessionLocal
+
+    async with TestSessionLocal() as session:
+        msg = await session.get(Message, message_id)
+        assert msg is not None, f"消息 {message_id} 不存在"
+        return msg.conversation_id
+
+
+async def user_memories_for_conversation(conversation_id: uuid.UUID) -> list:
+    """该会话产出的候选，返回 ``(id, content, active, source)`` 普通行元组。"""
+    from sqlalchemy import select
+
+    from app.models import UserMemory
+    from tests.conftest import TestSessionLocal
+
+    async with TestSessionLocal() as session:
+        rows = await session.execute(
+            select(UserMemory.id, UserMemory.content, UserMemory.active, UserMemory.source).where(
+                UserMemory.source_conversation_id == conversation_id
+            )
+        )
+        return list(rows.all())
 ```
 
-（`commit_count` 里的 `AsyncSessionLocal` 只出现在注释里，**删除那行 import**，别留无用导入——`ruff check` 会报。）
+**回读一律走新 session**：测试库是 StaticPool（单一共享连接），``commit_turn`` 用的是它自己的 session。断言时**不要从测试自己那个还开着的 ``db_session`` 里读**——用上面这些 helpers（每个都新开 session）。既有测试同款写法见 ``tests/test_chat_stream.py:120``。
+
+（上面没有任何"仅供说明"的无用 import —— `ruff check` 会拒绝未使用的导入。）
 
 - [ ] **Step 2: 写失败的 schema 测试**
 
@@ -635,7 +703,8 @@ async def test_user_memory_has_new_columns(db_session):
     )
     db_session.add(row)
     await db_session.flush()
-    assert row.valid_from is not None      # server_default 生效
+    await db_session.refresh(row)          # server_default 在 SQLite 上未必回填到实例
+    assert row.valid_from is not None
     assert row.invalid_at is None
     assert row.superseded_by is None
     assert row.use_count == 0
@@ -679,11 +748,12 @@ async def test_two_null_block_keys_do_not_conflict(db_session):
 async def test_commit_turn_event_is_unique_per_message(db_session):
     conversation_id = await create_conversation(db_session)
     message_id = uuid.uuid4()
+    key = MemoryEvent.commit_key(conversation_id, message_id)
     for _ in range(2):
         db_session.add(
             MemoryEvent(
                 user_id=SEEDED_USER_ID, conversation_id=conversation_id,
-                message_id=message_id, kind="commit_turn", payload={},
+                message_id=message_id, kind="commit_turn", payload={}, dedup_key=key,
             )
         )
     with pytest.raises(IntegrityError):
@@ -692,14 +762,18 @@ async def test_commit_turn_event_is_unique_per_message(db_session):
 
 @pytest.mark.asyncio
 async def test_other_event_kinds_are_not_unique(db_session):
-    """partial index 只约束 commit_turn：同一轮的 rejected / noop 可以有多条。"""
+    """唯一键只约束带 dedup_key 的行：同一轮的 rejected / noop 可以有多条。
+
+    这条同时锁住"不许退回 partial unique index"——partial index 在测试库（SQLite）上会
+    退化成对 (conversation_id, message_id) 的无条件唯一，本用例会失败。
+    """
     conversation_id = await create_conversation(db_session)
     message_id = uuid.uuid4()
     for _ in range(2):
         db_session.add(
             MemoryEvent(
                 user_id=SEEDED_USER_ID, conversation_id=conversation_id,
-                message_id=message_id, kind="noop", payload={},
+                message_id=message_id, kind="noop", payload={}, dedup_key=None,
             )
         )
     await db_session.flush()   # 不抛即通过
@@ -785,8 +859,15 @@ Expected: FAIL —— `ImportError: cannot import name 'MemoryEvent'`。
 的偏好改错了"，必须能区分是抽取错了还是合并错了。评估指标（候选接受率、取代率）
 也都从这张表出。
 
-``kind='commit_turn'`` 同时是**幂等锚点**：partial unique index 保证同一轮只提交一次，
-sweeper 也靠它判定"哪一轮还没做"。
+``kind='commit_turn'`` 同时是**幂等锚点**：靠 ``dedup_key`` 上的唯一索引保证同一轮只提交
+一次，sweeper 也靠它判定"哪一轮还没做"。
+
+**为什么是 ``dedup_key`` 而不是 ``UNIQUE(conversation_id, message_id) WHERE kind='commit_turn'``**：
+测试库是内存 SQLite，SQLAlchemy 对非 PG 方言会忽略 ``postgresql_where`` 却仍然建
+``unique=True`` 的索引 —— 索引在 SQLite 上退化成 (conversation_id, message_id) 的无条件
+唯一，于是"同一轮的多个 noop / superseded 事件"（S3 起必然出现）会在测试里凭空失败、
+生产却正常。专用列 + 普通唯一索引在两种方言下语义一致：``kind=commit_turn`` 时写入键，
+其余 kind 为 NULL，而 NULL 在两边都不互撞。
 """
 from __future__ import annotations
 
@@ -826,17 +907,16 @@ class MemoryEvent(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("user_memories.id", ondelete="SET NULL"), nullable=True
     )
     payload: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    # 幂等锚点：commit 事件写 "commit_turn:<conversation_id>:<message_id>"，其余 kind 为
+    # NULL（NULL 在 PG 与 SQLite 都不互撞）。见文件头对 partial index 的说明。
+    dedup_key: Mapped[str | None] = mapped_column(String(96), nullable=True)
 
-    __table_args__ = (
-        # partial index 是必需的：其余 kind 允许多条，只有提交事件必须唯一。
-        Index(
-            "uq_memory_events_commit_turn",
-            "conversation_id",
-            "message_id",
-            unique=True,
-            postgresql_where=text("kind = 'commit_turn'"),
-        ),
-    )
+    __table_args__ = (Index("uq_memory_events_dedup", "dedup_key", unique=True),)
+
+    @classmethod
+    def commit_key(cls, conversation_id: uuid.UUID, message_id: uuid.UUID) -> str:
+        """commit_turn 事件的 ``dedup_key``。"""
+        return f"commit_turn:{conversation_id}:{message_id}"
 ```
 
 创建 `backend/app/models/memory_settings.py`：
@@ -1030,6 +1110,9 @@ def upgrade() -> None:
                 sa.ForeignKey("user_memories.id", ondelete="SET NULL"), nullable=True,
             ),
             sa.Column("payload", postgresql.JSONB(), nullable=False, server_default="{}"),
+            # 幂等锚点（见 models/memory_event.py 的说明：不用 partial index，因为测试库是
+            # SQLite，postgresql_where 会被忽略而 unique 仍然生效）。
+            sa.Column("dedup_key", sa.String(length=96), nullable=True),
             sa.Column(
                 "created_at", sa.DateTime(timezone=True), nullable=False,
                 server_default=sa.func.now(),
@@ -1041,11 +1124,7 @@ def upgrade() -> None:
         )
         op.create_index("ix_memory_events_user_id", "memory_events", ["user_id"])
         op.create_index("ix_memory_events_conversation_id", "memory_events", ["conversation_id"])
-        op.create_index(
-            "uq_memory_events_commit_turn", "memory_events",
-            ["conversation_id", "message_id"], unique=True,
-            postgresql_where=sa.text("kind = 'commit_turn'"),
-        )
+        op.create_index("uq_memory_events_dedup", "memory_events", ["dedup_key"], unique=True)
 
     # ---- memory_settings ----
     if not _has_table("memory_settings"):
@@ -1078,7 +1157,7 @@ def downgrade() -> None:
     if _has_table("memory_settings"):
         op.drop_table("memory_settings")
     if _has_table("memory_events"):
-        op.drop_index("uq_memory_events_commit_turn", table_name="memory_events")
+        op.drop_index("uq_memory_events_dedup", table_name="memory_events")
         op.drop_index("ix_memory_events_conversation_id", table_name="memory_events")
         op.drop_index("ix_memory_events_user_id", table_name="memory_events")
         op.drop_table("memory_events")
@@ -1324,12 +1403,19 @@ cd backend && ruff check app tests && cd .. && git add backend/app/agents/memory
 """回合级写入入口：模式闸门、幂等、候选产出（spec §4.2 / §4.3）。"""
 from __future__ import annotations
 
+import uuid
+
 import pytest
-from sqlalchemy import select
 
 from app.agents.intent_router import memory_mode
 from tests.conftest import TestSessionLocal
-from tests.memory.helpers import SEEDED_USER_ID, add_message, create_conversation
+from tests.memory.helpers import (
+    SEEDED_USER_ID,
+    add_message,
+    commit_events,
+    create_conversation,
+    user_memories_for_conversation,
+)
 
 
 @pytest.mark.parametrize(
@@ -1452,19 +1538,12 @@ async def test_commit_turn_is_idempotent(db_session, offline_model):
     assert first.committed is True
     assert second.committed is False
     assert second.skipped_reason == "already_committed"
-
-    from app.models import MemoryEvent
-
-    events = (
-        await db_session.execute(select(MemoryEvent).where(MemoryEvent.kind == "commit_turn"))
-    ).scalars().all()
-    assert len(events) == 1
+    # 按本会话限定，不写全局计数（内存库同进程共享）。
+    assert len(await commit_events(conversation_id)) == 1
 
 
 @pytest.mark.asyncio
 async def test_commit_turn_records_candidate(db_session, offline_model):
-    from app.models import UserMemory
-
     conversation_id, assistant_id = await _seed_turn(db_session)
     result = await commit_turn(
         conversation_id=conversation_id, user_id=SEEDED_USER_ID,
@@ -1473,15 +1552,14 @@ async def test_commit_turn_records_candidate(db_session, offline_model):
     )
     assert result.committed is True
     assert result.candidates >= 1
-    rows = (await db_session.execute(select(UserMemory))).scalars().all()
-    assert rows and all(r.active is False for r in rows), "S1 的候选一律 inactive"
-    assert rows[0].source == "inferred"
+    rows = await user_memories_for_conversation(conversation_id)
+    assert rows, "这一轮应当产出候选"
+    assert all(active is False for _id, _content, active, _source in rows), "S1 的候选一律 inactive"
+    assert all(source == "inferred" for _id, _content, _active, source in rows)
 
 
 @pytest.mark.asyncio
 async def test_commit_turn_marks_hermes_without_writing(db_session, offline_model):
-    from app.models import MemoryEvent, UserMemory
-
     conversation_id, assistant_id = await _seed_turn(db_session)
     result = await commit_turn(
         conversation_id=conversation_id, user_id=SEEDED_USER_ID,
@@ -1491,14 +1569,12 @@ async def test_commit_turn_marks_hermes_without_writing(db_session, offline_mode
     assert result.committed is True
     assert result.skipped_reason == "mode_disabled"
     # 仍然打标：不读不写也要记"这轮处理过了"，否则 sweeper 会一直重试。
-    assert (await db_session.execute(select(MemoryEvent))).scalars().all()
-    assert not (await db_session.execute(select(UserMemory))).scalars().all()
+    assert await commit_events(conversation_id)
+    assert await user_memories_for_conversation(conversation_id) == []
 
 
 @pytest.mark.asyncio
 async def test_missing_message_is_skipped_not_fatal(db_session, offline_model):
-    import uuid
-
     result = await commit_turn(
         conversation_id=uuid.uuid4(), user_id=SEEDED_USER_ID,
         assistant_message_id=uuid.uuid4(), mode="expert",
@@ -1587,8 +1663,9 @@ async def propose_candidate(
 
 1. 在 `backend/app/agents/chat_helpers.py` 新建模块，把 `chat_service._load_history` 的**函数体原样**搬过去，改名 `load_history`（保留原 docstring）。
 2. `chat_service.py` 把它改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点不动（`_load_history` 这个名字继续可用）。
-3. `_estimate_tokens` / `should_summarize`：优先用 `app.agents.token_budget` 里已有的同名实现；若那里没有，同样搬到 `chat_helpers.py`。
-4. **以仓库现状为准照搬函数体，不要重写逻辑。** 搬完立刻跑 `pytest tests/test_chat_stream.py -q --tb=short` 确认行为未变。
+3. 同样搬 `chat_service._safe_int` → `safe_int`，以及 `chat_service._DEFAULT_MAX_CONTEXT_TOKENS` → `DEFAULT_MAX_CONTEXT_TOKENS`（`chat_service.py:1888-1891` 那两处用到的）。**这一步不是可选项**：facade 的 `_maybe_summarize` 依赖它们复现 inline 路径的摘要阈值。
+4. `_estimate_tokens` / `should_summarize`：优先用 `app.agents.token_budget` 里已有的同名实现；若那里没有，同样搬到 `chat_helpers.py`。
+5. **以仓库现状为准照搬函数体，不要重写逻辑。** 搬完立刻跑 `pytest tests/test_chat_stream.py -q --tb=short` 确认行为未变。
 
 - [ ] **Step 9: 实现 `facade.py`**
 
@@ -1644,6 +1721,9 @@ async def _mark_committed(
             message_id=message_id,
             kind="commit_turn",
             payload={},
+            # 幂等键必须由应用层生成：唯一索引在 dedup_key 上，不在
+            # (conversation_id, message_id) 上（见 models/memory_event.py）。
+            dedup_key=MemoryEvent.commit_key(conversation_id, message_id),
         )
     )
     try:
@@ -1756,7 +1836,11 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
     失败一律吞掉：摘要不是这一轮的结果，绝不能因此让回合写入整体失败。
     """
     try:
-        from app.agents.chat_helpers import load_history
+        from app.agents.chat_helpers import (
+            DEFAULT_MAX_CONTEXT_TOKENS,
+            load_history,
+            safe_int,
+        )
         from app.agents.context_compaction import summarize_history
         from app.agents.state_store import save_summary
         from app.agents.token_budget import estimate_tokens, should_summarize
@@ -1774,7 +1858,11 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
         total = sum(
             estimate_tokens(str(m.get("content") or ""), cfg.model_name) for m in messages
         )
-        if not should_summarize(total, cfg.max_context_tokens or 0):
+        # 默认值必须与 inline 路径一致：传字面 0 会让 should_summarize 的判定完全变样
+        # （要么永不触发，要么每轮触发）。原先 inline 用的是
+        # ``_safe_int(cfg.max_context_tokens, _DEFAULT_MAX_CONTEXT_TOKENS)``。
+        max_ctx = safe_int(cfg.max_context_tokens, DEFAULT_MAX_CONTEXT_TOKENS)
+        if not should_summarize(total, max_ctx):
             return False
         provider = get_provider_for_config(cfg)
         summary = await summarize_history(provider, messages, keep_recent=6)
@@ -1850,10 +1938,27 @@ cd backend && ruff check app tests && cd .. && git add backend/app backend/tests
 """inline 路径：一轮对话结束后恰好提交一次记忆（spec §1.2-1 的回归）。"""
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from tests.conftest import auth_headers
-from tests.memory.helpers import create_mock_model, wait_for_commit
+from tests.memory.helpers import (
+    conversation_of_message,
+    create_mock_model,
+    meta_from_sse,
+    wait_for_commit,
+)
+
+
+async def _turn_conversation_id(response) -> uuid.UUID:
+    """这一轮 API 对话建出的会话 id。
+
+    会话由服务端创建，只能从 SSE 的 meta 反查（meta 里的 message_id 是 assistant
+    消息，见 tests/test_chat_stream.py:120-123）。
+    """
+    meta = meta_from_sse(response.text)
+    return await conversation_of_message(uuid.UUID(meta["message_id"]))
 
 
 @pytest.mark.asyncio
@@ -1868,8 +1973,9 @@ async def test_inline_turn_commits_memory_once(client, offline_model):
     assert response.status_code == 200
     assert "event: done" in response.text
 
-    # detached 任务是 fire-and-forget：给它一个落库窗口。
-    assert await wait_for_commit() == 1
+    # detached 任务是 fire-and-forget：给它一个落库窗口。断言按本会话限定。
+    conversation_id = await _turn_conversation_id(response)
+    assert await wait_for_commit(conversation_id) == 1
 
 
 @pytest.mark.asyncio
@@ -1883,7 +1989,8 @@ async def test_speed_mode_also_commits(client, offline_model):
         headers=headers,
     )
     assert response.status_code == 200
-    assert await wait_for_commit() == 1
+    conversation_id = await _turn_conversation_id(response)
+    assert await wait_for_commit(conversation_id) == 1
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1972,6 +2079,7 @@ import pytest
 
 from tests.conftest import auth_headers
 from tests.memory.helpers import create_mock_model, drive_durable_worker, wait_for_commit
+from tests.memory.test_inline_hook import _turn_conversation_id
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2106,8 @@ async def test_durable_turn_commits_memory(client, monkeypatch, offline_model):
         if not worker_task.done():
             worker_task.cancel()
 
-    assert await wait_for_commit() == 1
+    conversation_id = await _turn_conversation_id(response)
+    assert await wait_for_commit(conversation_id) == 1
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2071,15 +2180,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.conftest import TestSessionLocal
-from tests.memory.helpers import add_message, create_conversation
+from tests.memory.helpers import add_message, commit_events, create_conversation
 
 
 @pytest.mark.asyncio
 async def test_sweeper_commits_unprocessed_turn(db_session, offline_model):
-    from sqlalchemy import func, select
-
     from app.agents.memory.sweeper import MemorySweeper
-    from app.models import MemoryEvent
 
     conversation_id = await create_conversation(db_session)
     await add_message(db_session, conversation_id, "user", "我喜欢用 Python 写脚本")
@@ -2087,19 +2193,13 @@ async def test_sweeper_commits_unprocessed_turn(db_session, offline_model):
     await db_session.commit()
 
     sweeper = MemorySweeper(TestSessionLocal, leader_name=None, interval_seconds=600)
-    assert await sweeper.run_once() == 1
+    # 返回值是全局计数（扫描面不止本测试的会话），所以只用 >= 1；精确断言按本会话。
+    assert await sweeper.run_once() >= 1
+    assert len(await commit_events(conversation_id)) == 1
 
-    count = (
-        await db_session.execute(
-            select(func.count()).select_from(MemoryEvent).where(
-                MemoryEvent.kind == "commit_turn"
-            )
-        )
-    ).scalar_one()
-    assert count == 1
-
-    # 再跑一次：已有锚点，不该重复补做。
-    assert await sweeper.run_once() == 0
+    # 再跑一次：本会话已有锚点，不重复补做。
+    await sweeper.run_once()
+    assert len(await commit_events(conversation_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -2114,13 +2214,15 @@ async def test_sweeper_skips_out_of_window(db_session, offline_model):
     await db_session.commit()
 
     sweeper = MemorySweeper(TestSessionLocal, leader_name=None, interval_seconds=600)
-    assert await sweeper.run_once() == 0
+    await sweeper.run_once()
+    assert await commit_events(conversation_id) == []
 
 
 @pytest.mark.asyncio
-async def test_sweeper_batch_limit(db_session, offline_model):
+async def test_sweeper_batch_limit(db_session, offline_model, monkeypatch):
     """单轮有上限：一次事故后不该攒出一大批待补回合把预算打光。"""
     from app.agents.memory.sweeper import MemorySweeper
+    from app.core.config import get_settings
 
     for _ in range(3):
         conversation_id = await create_conversation(db_session)
@@ -2128,30 +2230,26 @@ async def test_sweeper_batch_limit(db_session, offline_model):
         await add_message(db_session, conversation_id, "assistant", "好的")
     await db_session.commit()
 
+    monkeypatch.setattr(get_settings(), "MEMORY_SWEEP_BATCH", 2, raising=False)
     sweeper = MemorySweeper(TestSessionLocal, leader_name=None, interval_seconds=600)
-    import app.agents.memory.sweeper as sweeper_mod
-
-    original = sweeper_mod.get_settings
-
-    class _S:
-        MEMORY_SWEEP_WINDOW_HOURS = 6
-        MEMORY_SWEEP_BATCH = 2
-
-    sweeper_mod.get_settings = lambda: _S()   # type: ignore[assignment]
-    try:
-        assert await sweeper.run_once() == 2
-    finally:
-        sweeper_mod.get_settings = original   # type: ignore[assignment]
+    # 三个待补回合 + 上限 2 → 恰好补 2 个（本测试自己保证待补数 ≥ 上限）。
+    assert await sweeper.run_once() == 2
 ```
-
-（第三个用例直接改模块属性是刻意的：`MEMORY_SWEEP_BATCH` 是 Settings 上的字段，用 `monkeypatch.setattr(get_settings(), "MEMORY_SWEEP_BATCH", 2)` 更干净——若可行就用 `monkeypatch`，别留下手写恢复。）
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/memory/test_sweeper.py -q --tb=short`
 Expected: FAIL —— `ModuleNotFoundError: app.agents.memory.sweeper`。
 
-- [ ] **Step 3: 实现 sweeper**
+- [ ] **Step 3: 加配置项 + 实现 sweeper**
+
+先加配置（**必须与实现同一步**：sweeper 读这两个字段，分开做会让中间态代码直接 `AttributeError`）。`backend/app/core/config.py` 挨着 `MEMORY_MODEL_ID`：
+
+```python
+    # sweeper 的回溯窗口与单轮上限：补做是兜底，不是全量重算（见 sweeper 模块 docstring）。
+    MEMORY_SWEEP_WINDOW_HOURS: int = 6
+    MEMORY_SWEEP_BATCH: int = 20
+```
 
 创建 `backend/app/agents/memory/sweeper.py`：
 
@@ -2293,15 +2391,7 @@ class MemorySweeper:
         return done
 ```
 
-- [ ] **Step 4: 加配置项并启动 sweeper**
-
-`backend/app/core/config.py`（挨着 `MEMORY_MODEL_ID`）：
-
-```python
-    # sweeper 的回溯窗口与单轮上限：补做是兜底，不是全量重算（见 sweeper 模块 docstring）。
-    MEMORY_SWEEP_WINDOW_HOURS: int = 6
-    MEMORY_SWEEP_BATCH: int = 20
-```
+- [ ] **Step 4: 在两个进程里启动 sweeper**
 
 `backend/app/main.py` 在 `retention_sweeper` 那段之后：
 
@@ -2353,24 +2443,24 @@ cd backend && ruff check app tests && cd .. && git add backend/app/agents/memory
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import func, select
 
 from tests.conftest import TestSessionLocal, auth_headers
 from tests.memory.helpers import (
     SEEDED_USER_ID,
     add_message,
+    commit_events,
     create_conversation,
     create_mock_model,
+    user_memories_for_conversation,
     wait_for_commit,
 )
+from tests.memory.test_inline_hook import _turn_conversation_id
 
 
 @pytest.mark.parametrize("mode", ["speed", "expert"])
 @pytest.mark.asyncio
 async def test_candidates_are_never_active_in_s1(client, offline_model, mode):
     """S1 不改治理：候选一律 inactive（显式"记住"的自动生效在 S2）。"""
-    from app.models import UserMemory
-
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
     response = await client.post(
@@ -2379,20 +2469,19 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode):
         headers=headers,
     )
     assert response.status_code == 200
-    assert await wait_for_commit() == 1
+    conversation_id = await _turn_conversation_id(response)
+    assert await wait_for_commit(conversation_id) == 1
 
-    async with TestSessionLocal() as session:
-        rows = (await session.execute(select(UserMemory))).scalars().all()
+    rows = await user_memories_for_conversation(conversation_id)
     assert rows, "两种模式都该产出候选（极速：不读 ≠ 不写）"
-    assert all(r.active is False for r in rows)
-    assert all(r.source == "inferred" for r in rows)
+    assert all(active is False for _id, _content, active, _source in rows)
+    assert all(source == "inferred" for _id, _content, _active, source in rows)
 
 
 @pytest.mark.asyncio
 async def test_same_turn_never_double_commits(client, offline_model):
     """sweeper 与 detached 任务并发也不会重复：幂等锚点在数据库层。"""
     from app.agents.memory.sweeper import MemorySweeper
-    from app.models import MemoryEvent
 
     headers = auth_headers()
     model_id = await create_mock_model(client, headers)
@@ -2402,27 +2491,20 @@ async def test_same_turn_never_double_commits(client, offline_model):
         headers=headers,
     )
     assert response.status_code == 200
-    assert await wait_for_commit() == 1
+    conversation_id = await _turn_conversation_id(response)
+    assert await wait_for_commit(conversation_id) == 1
 
+    # 兜底扫描再跑一遍，本会话仍应只有一条提交事件（全局返回值不作断言：
+    # 扫描面包含同进程其它测试留下的会话）。
     sweeper = MemorySweeper(TestSessionLocal, leader_name=None, interval_seconds=600)
-    assert await sweeper.run_once() == 0
-
-    async with TestSessionLocal() as session:
-        n = (
-            await session.execute(
-                select(func.count()).select_from(MemoryEvent).where(
-                    MemoryEvent.kind == "commit_turn"
-                )
-            )
-        ).scalar_one()
-    assert n == 1
+    await sweeper.run_once()
+    assert len(await commit_events(conversation_id)) == 1
 
 
 @pytest.mark.asyncio
 async def test_memory_side_calls_do_not_touch_billing(db_session, offline_model, monkeypatch):
     """G7：记忆侧调用不写 usage、不计 credit。"""
     from app.agents.memory.facade import commit_turn
-    from app.models import Message
     from app.services import chat_service
 
     calls: list = []
