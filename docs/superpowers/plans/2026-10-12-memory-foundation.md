@@ -1708,6 +1708,10 @@ from app.agents.memory.service import propose_candidate
 from app.core.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models import Conversation, MemoryEvent, Message, User
+# 必须**模块级** import：仓库的 offline_model 夹具是按"名字绑在消费模块上"来 patch 的
+# （见 tests/conftest.py 里 offline_model 的 docstring）。写成函数内 import 的话夹具
+# patch 不到，测试里摘要会去打真实端点（连接被拒 → 被 try/except 吞掉但拖慢并有噪声）。
+from app.providers.registry import get_provider_for_config
 
 logger = logging.getLogger(__name__)
 
@@ -1853,8 +1857,8 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
         from app.agents.chat_helpers import load_history, safe_int
         from app.agents.planning import should_summarize, summarize_history
         from app.agents.state_store import save_summary
-        from app.providers.registry import get_provider_for_config
         from app.services.chat_context import _DEFAULT_MAX_CONTEXT_TOKENS, _estimate_tokens
+        # get_provider_for_config 见模块顶部：必须模块级 import 才能被 offline_model patch。
 
         cfg = await resolve_memory_model(
             db, conversation_cfg_id=cfg_id or conversation.model_id
@@ -1891,14 +1895,12 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
 
 `backend/tests/conftest.py`：
 
-1. `offline_model` 夹具（`conftest.py:318`）末尾追加一行 —— `facade` 是新消费者，不 patch 它的话记忆侧的 provider 解析会打到真实端点：
+1. `offline_model` 夹具（`conftest.py:318`）末尾追加两行 —— `facade` 是新消费者，它的 `get_provider_for_config` 是模块级 import，所以这样 patch 生效（`raising=True`：写错名字要当场炸，而不是静默不生效）：
 
 ```python
     import app.agents.memory.facade as _mem_facade
-    monkeypatch.setattr(_mem_facade, "get_provider_for_config", _offline, raising=False)
+    monkeypatch.setattr(_mem_facade, "get_provider_for_config", _offline, raising=True)
 ```
-
-（`facade` 里 `get_provider_for_config` 是函数内 import；若 `raising=False` 不生效，就把该 import 提到模块顶部再 patch。）
 
 2. 新增 autouse 夹具，紧挨 `_credit_hold_uses_test_database`：
 
