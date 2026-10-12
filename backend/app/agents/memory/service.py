@@ -1,8 +1,8 @@
 """记忆写入的数据库操作（纯直连，不需要 embedder/Qdrant）。
 
-``propose_candidate`` 是 ``chat_service.propose_user_memory`` 的搬家版：多了返回值与
-``source``/``author`` —— 候选与"用户明确要求记住"的行在治理上是两种东西，写入时必须
-区分，否则前端无法解释"这条是谁写的"。
+``propose_candidate`` 取代了原先 chat_service 里的 ``propose_user_memory``（该函数已随
+写入路径收拢删除）：多了返回值与 ``source``/``author`` —— 候选与"用户明确要求记住"的行
+在治理上是两种东西，写入时必须区分，否则前端无法解释"这条是谁写的"。
 """
 from __future__ import annotations
 

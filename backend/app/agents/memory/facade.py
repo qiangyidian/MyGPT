@@ -89,11 +89,18 @@ async def commit_turn(
     cfg_id: uuid.UUID | None = None,
     session_factory: Any | None = None,
 ) -> CommitResult:
-    """一个回合结束后的记忆写入。自身不抛（调用方仍应 try/except 兜底）。
+    """一个回合结束后的记忆写入。**可能抛**（数据库层错误、非 IntegrityError 的 flush
+    失败都会往外传）—— 调用方必须兜底：inline 走 ``commit_turn_detached``，durable 在
+    worker 里包 try/except，sweeper 也是逐行 try/except。
 
-    顺序是刻意的：**先打幂等锚点，再做实际工作**。锚点先写 = at-most-once（进程在
-    抽取途中被杀，这一轮不会重来），代价是极端情况下丢一条候选；反过来则会在 sweeper
-    与 detached 任务并发时重复抽取。丢一条候选可接受，重复写不可接受。
+    顺序是刻意的：**先打幂等锚点，再做实际工作**。它买到的是**并发写者之间的 at-most-once**
+    —— 同一轮被两条路径（detached 任务与 sweeper）同时处理时，唯一索引让后来者拿到
+    IntegrityError 直接返回 ``already_committed``，不会重复抽取。
+
+    但它**不是**崩溃语义上的 at-most-once：锚点与工作在同一事务里、最后一起 commit，
+    所以进程在抽取途中被杀会把锚点一起回滚，这一轮**会**被 sweeper 重做（at-least-once）。
+    重复抽取的代价由 ``propose_candidate`` 的内容去重兜住；要改这个取舍，就得让锚点独立
+    提交，那会反过来引入"锚点在、工作没了"的静默丢数据。
     """
     factory = session_factory or _default_session_factory
     gate = memory_mode(mode)

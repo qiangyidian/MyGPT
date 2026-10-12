@@ -42,9 +42,18 @@ async def resolve_memory_model(
             cfg = await db.get(ModelConfig, uuid.UUID(raw))
         except ValueError:
             cfg = None
-        if cfg is not None:
+        if cfg is not None and not cfg.is_embedding:
             return cfg
-        logger.warning("MEMORY_MODEL_ID=%r 找不到对应模型，退回会话模型", raw)
+        if cfg is not None:
+            # 指到了 embedding 配置：记忆维护要的是能跑 chat/completions 的模型，用它只会在
+            # 调用点以一个难懂的错收场 —— 在这里就拦下并退回会话模型。
+            logger.warning(
+                "MEMORY_MODEL_ID=%r 指向的是 embedding 配置（%s），不能用于记忆维护；退回会话模型",
+                raw,
+                cfg.name,
+            )
+        else:
+            logger.warning("MEMORY_MODEL_ID=%r 找不到对应模型，退回会话模型", raw)
 
     if conversation_cfg_id is not None:
         cfg = await db.get(ModelConfig, conversation_cfg_id)
