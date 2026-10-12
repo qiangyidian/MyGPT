@@ -166,7 +166,7 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
     失败一律吞掉：摘要不是这一轮的结果，绝不能因此让回合写入整体失败。
     """
     try:
-        from app.agents.chat_helpers import load_history, safe_int
+        from app.agents.chat_helpers import load_history, messages_to_dicts, safe_int
         from app.agents.planning import should_summarize, summarize_history
         from app.agents.state_store import save_summary
         from app.services.chat_context import _DEFAULT_MAX_CONTEXT_TOKENS, _estimate_tokens
@@ -178,7 +178,11 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
         if cfg is None:
             return False
         history = await load_history(db, conversation.id)
-        messages = [{"role": m.role, "content": m.content} for m in history]
+        # 必须用与 inline 路径**同一个** flattener：它跳过持久化的 ``system`` 行
+        # （否则 system prompt 的正文会被滚进 summary、再回注进 system prompt，形成自我
+        # 放大），并保留 tool_calls / tool_call_id 关联（丢了会给摘要器一堆孤儿工具消息，
+        # 严格 provider 会 400）。手搓 ``[{role, content}]`` 两条都做不到。
+        messages = messages_to_dicts(None, history)
         if not messages:
             return False
         total = sum(

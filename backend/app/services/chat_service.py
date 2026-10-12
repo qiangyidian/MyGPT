@@ -37,7 +37,9 @@ from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agents.chat_helpers import augment_with_attachments as _augment_with_attachments
 from app.agents.chat_helpers import load_history as _load_history
+from app.agents.chat_helpers import messages_to_dicts as _messages_to_dicts
 from app.agents.chat_helpers import safe_int as _safe_int
 from app.agents.context_manager import ContextManager
 from app.agents.db_mutation import (
@@ -416,53 +418,6 @@ def _finalize_prompt_messages(
     )
 
 
-def _messages_to_dicts(
-    system: str | None,
-    history: list[Message],
-    extra: list[dict[str, Any]] | None = None,
-    attachment_text_by_id: dict[uuid.UUID, str] | None = None,
-) -> list[dict[str, Any]]:
-    """Flatten persisted Message rows + a system prompt into provider message dicts.
-
-    ``extra`` carries already-shaped dicts (e.g. tool turns appended during the
-    current turn) that are appended verbatim after the persisted history.
-    ``attachment_text_by_id`` carries per-message bounded attachment context
-    (keyed by Message.id): user messages with bound files get the extracted
-    text appended so the model actually SEES the uploads — both the current
-    turn and follow-up turns (cross-turn file memory). The persisted
-    ``Message.content`` itself stays clean so the UI bubble never shows the
-    spliced text.
-    """
-    out: list[dict[str, Any]] = []
-    if system:
-        out.append({"role": "system", "content": system})
-
-    for msg in history:
-        role = msg.role
-        # Skip persisted system rows — we synthesized the system prompt above
-        # (possibly with RAG context). Avoids a duplicate system turn.
-        if role == "system":
-            continue
-        content = msg.content or ""
-        if role == "user" and attachment_text_by_id and msg.id in attachment_text_by_id:
-            content = _augment_with_attachments(
-                content, attachment_text_by_id[msg.id], max_chars=None
-            )
-        entry: dict[str, Any] = {"role": role, "content": content}
-        meta = msg.metadata_ or {}
-        # Preserve tool-call linkage so the model sees a coherent transcript.
-        if role == "assistant" and meta.get("tool_calls"):
-            entry["tool_calls"] = meta["tool_calls"]
-        if role == "tool" and meta.get("tool_call_id"):
-            entry["tool_call_id"] = meta["tool_call_id"]
-            entry["name"] = meta.get("tool_name") or meta.get("name") or ""
-        out.append(entry)
-
-    if extra:
-        out.extend(extra)
-    return out
-
-
 def _resolve_turn_route(
     request: ChatRequest,
     *,
@@ -688,33 +643,6 @@ async def propose_user_memory(
         )
     )
     await db.flush()
-
-
-def _augment_with_attachments(
-    user_content: str, attachment_text: str, max_chars: int | None = 8000
-) -> str:
-    """Append parsed attachment text to the user content for this turn.
-
-    The attachment bytes live in storage; only the extracted text is spliced in
-    so a text-only model can reason over the file. Larger files / structured
-    data are meant to go through file tools in data_analysis mode; here we keep
-    a bounded inline snippet so it never blows the context budget.
-    ``max_chars=None`` means the caller already bounded the text (the
-    history-rehydration path caps per message) — do not truncate again.
-
-    这里是附件文本进模型上下文的**最后一个**拼接点（当前轮与跨轮记忆两条路径都走
-    它），所以围栏只加一次：文件正文属外部数据，包进不可信内容围栏后再拼上去。
-    """
-    snippet = (attachment_text or "").strip()
-    if not snippet:
-        return user_content
-    # Bound the inline injection; full text stays on the attachment row.
-    if max_chars is not None and len(snippet) > max_chars:
-        snippet = snippet[:max_chars] + "\n…（内容已截断，完整内容见附件）"
-    fenced = apply_untrusted_boundary("attachment", snippet)
-    if not fenced:
-        return user_content
-    return f"{user_content}\n\n[附件内容]\n{fenced}"
 
 
 def _context_enrichment_block(stable_block: str, skill_block: str) -> str:
