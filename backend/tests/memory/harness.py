@@ -30,9 +30,18 @@ class Case:
     attachments: list[dict[str, str]] = field(default_factory=list)
 
     @property
+    def last_user_message(self) -> str:
+        """最后一条 user 消息的正文。抽取器只应看到用户自己的话——assistant 的
+        自述（at-assistant-side）不是用户证词，不该进抽取器。"""
+        for message in reversed(self.messages):
+            if message["role"] == "user":
+                return message["content"]
+        raise AssertionError(f"{self.id} 没有 user 消息")
+
+    @property
     def extractor_input(self) -> str:
         """抽取器看到的文本：最后一条 user 消息（attack 类再拼附件正文，见 yaml 头注）。"""
-        parts = [self.messages[-1]["content"]]
+        parts = [self.last_user_message]
         parts.extend(a["content"] for a in self.attachments)
         return "\n".join(parts)
 
