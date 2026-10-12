@@ -1454,7 +1454,9 @@ Expected: FAIL —— `ImportError: cannot import name 'memory_mode'`。
 
 - [ ] **Step 3: 实现 `memory_mode()`**
 
-在 `backend/app/agents/intent_router.py`（`VALID_MODES` 定义之后）加，并把 `dataclass` 补进 imports：
+在 `backend/app/agents/intent_router.py`（`VALID_MODES` 那块之后，现第 27-30 行）加。**`dataclass` 已经 import 过**（第 20 行 `from dataclasses import dataclass`），不要再加一次 —— 重复导入会被 ruff 判 F811。
+
+`VALID_MODES` 的现值是 `{"speed", "expert", "hermes", "auto", "search", "deep_research", "create", "data_analysis", "debate"}`，所以"遗留模式"（`auto` / `search` / `deep_research` / `create` / `data_analysis` / `debate`）都落在"返回 `_FULL`"那一支：
 
 ```python
 # --------------------------------------------------------------------------- #
