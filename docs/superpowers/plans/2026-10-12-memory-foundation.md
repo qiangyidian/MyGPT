@@ -1675,7 +1675,8 @@ async def propose_candidate(
 
 1. 在 `backend/app/agents/chat_helpers.py` 新建模块，把 `chat_service._load_history` 的**函数体原样**搬过去，改名 `load_history`（保留原 docstring）。
 2. 同样把 `chat_service._safe_int`（`chat_service.py:325`）搬成 `chat_helpers.safe_int`；`chat_service.py` 里两处调用点（`635`、`1891`）改成从 `chat_helpers` 导入，其余不动。
-3. `chat_service.py` 的 `_load_history` 改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点保留原名（`_load_history` 仍可用）。
+3. **还要搬 `chat_service._messages_to_dicts`（`chat_service.py:419`）→ `chat_helpers.messages_to_dicts`，连同它唯一依赖的 `_augment_with_attachments`（`chat_service.py:720` 附近）→ `chat_helpers.augment_with_attachments`。** 理由：facade 的摘要路径必须用同一个扁平化函数（它跳过持久化 system 行、保留 tool 关联，见 facade 里的注释），而 `memory` 不能 import `chat_service`。`chat_service.py` 两处调用点（`1323` 的 `_messages_to_dicts`、`1334` 的 `_augment_with_attachments`）改成从 `chat_helpers` 导入（`as _messages_to_dicts` / `as _augment_with_attachments`，其余调用点不动）。
+4. `chat_service.py` 的 `_load_history` 改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点保留原名（`_load_history` 仍可用）。
 4. **`_estimate_tokens` / `_DEFAULT_MAX_CONTEXT_TOKENS` 不用搬** —— 它们本来就在 `app/services/chat_context.py`（`_estimate_tokens(text, model_name)` 在第 53 行，`_DEFAULT_MAX_CONTEXT_TOKENS = 8192` 在第 21 行），`memory` 包直接 import 即可。**别和 `app/agents/context_compaction.estimate_tokens(text)` 混淆**：后者只收一个参数、签名不同，facade 用的是前者。
 5. `should_summarize` 与 `summarize_history` **都在 `app/agents/planning.py`**（分别在第 478 行与第 523 行；`summarize_history(provider, messages, *, keep_recent=...)` 是 async 的），直接 import。**别去 `context_compaction` 找 `summarize_history`** —— 它在 `planning`；`context_compaction` 只有 `estimate_tokens` / `compact_messages` 那一套（那套是另一条路径，facade 不用）。
 6. `memory` 包**不能** import `app.services.chat_service`（会成环：`chat_service` 要 import `facade`）。上面几处搬动的唯一目的就是这个。
@@ -1854,7 +1855,7 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
     失败一律吞掉：摘要不是这一轮的结果，绝不能因此让回合写入整体失败。
     """
     try:
-        from app.agents.chat_helpers import load_history, safe_int
+        from app.agents.chat_helpers import load_history, messages_to_dicts, safe_int
         from app.agents.planning import should_summarize, summarize_history
         from app.agents.state_store import save_summary
         from app.services.chat_context import _DEFAULT_MAX_CONTEXT_TOKENS, _estimate_tokens
@@ -1866,7 +1867,12 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
         if cfg is None:
             return False
         history = await load_history(db, conversation.id)
-        messages = [{"role": m.role, "content": m.content} for m in history]
+        # 必须复用 inline 路径同一个扁平化函数，**不要手搓 [{"role","content"}]**：
+        # ``messages_to_dicts`` 会跳过持久化的 system 行（否则 system prompt 正文会被写进
+        # 摘要，再随摘要被注回 system prompt）并保留 tool_calls / tool_call_id 关联（否则
+        # 严格的 provider 会因孤立的 tool 消息报错）。inline 的 `_maybe_summarize` 当年就是
+        # 这么调的，摘要内容必须逐字不变。
+        messages = messages_to_dicts(None, history)
         if not messages:
             return False
         total = sum(
@@ -2525,6 +2531,12 @@ from tests.memory.helpers import (
 )
 from tests.memory.test_inline_hook import _turn_conversation_id
 
+# 每个测试（以及同一测试的每个 parametrize 分支）必须用**互不相同**的候选内容：
+# propose_candidate 的去重键是 (user_id, content) —— 全局按用户去重，不按会话。同一个
+# seeded 用户 + 同一句话，第二个测试的插入会被去重成 0 条，于是"本会话应有候选"的断言
+# 随机失败（T4 实现时已经踩到过这个坑）。
+_CONTENT_BY_MODE = {"speed": "我喜欢用 Go 写服务", "expert": "我喜欢用 Python 写脚本"}
+
 
 @pytest.mark.parametrize("mode", ["speed", "expert"])
 @pytest.mark.asyncio
@@ -2534,7 +2546,7 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode):
     model_id = await create_mock_model(client, headers)
     response = await client.post(
         "/api/chat/stream",
-        json={"content": "我喜欢用 Python 写脚本", "model_id": model_id, "mode": mode},
+        json={"content": _CONTENT_BY_MODE[mode], "model_id": model_id, "mode": mode},
         headers=headers,
     )
     assert response.status_code == 200
@@ -2556,7 +2568,7 @@ async def test_same_turn_never_double_commits(client, offline_model):
     model_id = await create_mock_model(client, headers)
     response = await client.post(
         "/api/chat/stream",
-        json={"content": "我喜欢用 Python 写脚本", "model_id": model_id, "mode": "expert"},
+        json={"content": "我喜欢用 Rust 写工具", "model_id": model_id, "mode": "expert"},
         headers=headers,
     )
     assert response.status_code == 200
