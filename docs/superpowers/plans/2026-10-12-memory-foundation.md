@@ -36,6 +36,7 @@ A 落地前不写 B/C/D：它们的任务要引用 A 里真实的函数签名与
 - **文案与注释**：面向用户文案用中文；注释/文档允许全角标点（`RUF001/RUF002/RUF003` 已关，不是笔误）。
 - **时间**：DB 时间戳一律 timezone-aware，代码里用 `datetime.now(UTC)`。
 - **本计划无前端改动**（前端字段与面板在计划 C/D）。
+- **全量套件在改动前就不是绿的（实测基线，2026-10-12）**：`2 failed, 1884 passed, 6 skipped, 3 deselected, 4 errors in 658.79s`（约 11 分钟）。失败与报错的文件是 `tests/test_agent_phase0.py`、`tests/test_agent_graph_lifecycle.py`、`tests/test_prompts_api.py`、`tests/test_tool_toggles.py`（`test_multi_agent_approval_rejected_continues`、`test_agent_turn_emits_new_events_and_audits` 失败；prompts_api / tool_toggles 各 2 个 `RuntimeError`）。**这四个文件单独跑 69/69 全过**（44s）→ 它们是**顺序/状态依赖的既有 flakiness**，不是任何人的改动引入的。判定标准因此是"没有基线之外的新失败"，不要期待全绿；发现新失败时，先单独跑该文件确认是否真回归。
 
 ## 测试夹具的四个既成事实（照抄，不要重新发明）
 
@@ -2560,7 +2561,7 @@ cd backend && ruff check app tests
 cd backend && pytest tests -q --tb=short --deselect tests/test_agent_phase2.py::test_agent_mode_emits_plan_created --deselect tests/test_agent_phase5.py::test_full_native_agent_path
 cd backend && python -m alembic heads && python -m alembic upgrade 0021_tool_toggles:0022_memory_three_layer --sql | grep -c "CREATE\|ALTER\|UPDATE"
 ```
-Expected: 全部通过。最后一行是 R9 的替代迁移验证（本机无 Docker，`verify_migrations.sh` 跑不了）——**它不等于真实 PG 的迁移验证**，合入 main 前需人工补跑。
+Expected: **不是"全绿"** —— 全量套件在本仓库本来就不绿（见 Global Constraints 的基线）。判定标准是**没有出现基线之外的新失败**。最后一行是 R9 的替代迁移验证（本机无 Docker，`verify_migrations.sh` 跑不了）——**它不等于真实 PG 的迁移验证**，合入 main 前需人工补跑。
 
 - [ ] **Step 4: 提交并推送 feature 分支**
 
