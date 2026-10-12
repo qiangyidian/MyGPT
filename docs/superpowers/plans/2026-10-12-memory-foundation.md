@@ -1677,7 +1677,7 @@ async def propose_candidate(
 2. 同样把 `chat_service._safe_int`（`chat_service.py:325`）搬成 `chat_helpers.safe_int`；`chat_service.py` 里两处调用点（`635`、`1891`）改成从 `chat_helpers` 导入，其余不动。
 3. `chat_service.py` 的 `_load_history` 改成 `from app.agents.chat_helpers import load_history as _load_history`，其余调用点保留原名（`_load_history` 仍可用）。
 4. **`_estimate_tokens` / `_DEFAULT_MAX_CONTEXT_TOKENS` 不用搬** —— 它们本来就在 `app/services/chat_context.py`（`_estimate_tokens(text, model_name)` 在第 53 行，`_DEFAULT_MAX_CONTEXT_TOKENS = 8192` 在第 21 行），`memory` 包直接 import 即可。**别和 `app/agents/context_compaction.estimate_tokens(text)` 混淆**：后者只收一个参数、签名不同，facade 用的是前者。
-5. `should_summarize` 在 `app/agents/planning.py:478`，`summarize_history` 在 `app/agents/context_compaction.py`，都是现成的，直接 import。
+5. `should_summarize` 与 `summarize_history` **都在 `app/agents/planning.py`**（分别在第 478 行与第 523 行；`summarize_history(provider, messages, *, keep_recent=...)` 是 async 的），直接 import。**别去 `context_compaction` 找 `summarize_history`** —— 它在 `planning`；`context_compaction` 只有 `estimate_tokens` / `compact_messages` 那一套（那套是另一条路径，facade 不用）。
 6. `memory` 包**不能** import `app.services.chat_service`（会成环：`chat_service` 要 import `facade`）。上面几处搬动的唯一目的就是这个。
 7. **以仓库现状为准照搬函数体，不要重写逻辑。** 搬完立刻跑 `pytest tests/test_chat_stream.py -q --tb=short` 确认行为未变。
 
@@ -1851,8 +1851,7 @@ async def _maybe_summarize(db, *, conversation, user_id, cfg_id) -> bool:
     """
     try:
         from app.agents.chat_helpers import load_history, safe_int
-        from app.agents.context_compaction import summarize_history
-        from app.agents.planning import should_summarize
+        from app.agents.planning import should_summarize, summarize_history
         from app.agents.state_store import save_summary
         from app.providers.registry import get_provider_for_config
         from app.services.chat_context import _DEFAULT_MAX_CONTEXT_TOKENS, _estimate_tokens
