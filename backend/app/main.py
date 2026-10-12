@@ -156,6 +156,13 @@ async def lifespan(app: FastAPI):
     retention_sweeper = RetentionSweeper(AsyncSessionLocal)
     retention_sweeper.start()
     app.state.retention_sweeper = retention_sweeper
+    # 记忆写入的兜底补做（spec §4.2.1）：inline 的 detached 任务会随本进程重启丢掉，
+    # durable run 也可能在写记忆前崩掉。与 retention 同一个 leader 机制，且与 worker
+    # 侧共用 advisory lock 名 "memory"，所以两个进程只会有一个真的在补。
+    from app.agents.memory.sweeper import MemorySweeper
+
+    memory_sweeper = MemorySweeper(AsyncSessionLocal)
+    memory_sweeper.start()
     # Queue-depth gauges for /metrics + Alertmanager (finding 38). Runs in the
     # API process on purpose: the worker exposes no scrape surface, so a queue
     # metric only it observed would be invisible to a scrape. Every replica
@@ -194,6 +201,7 @@ async def lifespan(app: FastAPI):
         ingestion_queue.set_active_worker(None)
         await ingestion_worker.stop()
         await retention_sweeper.stop()
+        await memory_sweeper.stop()
         await stale_sweeper.stop()
         await approval_bus.stop()
         # Close MCP sessions so their subprocesses/HTTP pools don't leak.

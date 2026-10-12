@@ -122,6 +122,13 @@ async def main() -> None:
     retention_sweeper = RetentionSweeper(AsyncSessionLocal, leader_name="retention")
     retention_sweeper.start()
 
+    # 记忆补做与 API 侧共用 advisory lock 名 "memory"，所以即使两个进程都起，也只有一个
+    # 真的在扫。worker 常常是唯一活着的进程（API 在滚动重启），这一份不能少。
+    from app.agents.memory.sweeper import MemorySweeper
+
+    memory_sweeper = MemorySweeper(AsyncSessionLocal, leader_name="memory")
+    memory_sweeper.start()
+
     check_task = asyncio.create_task(_self_check(queue, stop_event))
     try:
         await worker.run_forever(stop_event=stop_event)
@@ -132,6 +139,7 @@ async def main() -> None:
         check_task.cancel()
         await asyncio.gather(check_task, return_exceptions=True)
         await retention_sweeper.stop()
+        await memory_sweeper.stop()
     logger.info("worker stopped")
 
 

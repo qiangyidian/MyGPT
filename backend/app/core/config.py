@@ -436,6 +436,9 @@ class Settings(BaseSettings):
     # 模型（现状行为）。设置它的动机是成本与计费隔离：会话跑贵模型时，一次滚动摘要
     # 吃整段历史，不该按会话模型计价，更不该记在用户头上。
     MEMORY_MODEL_ID: str = ""
+    # sweeper 的回溯窗口与单轮上限：补做是兜底，不是全量重算（见 sweeper 模块 docstring）。
+    MEMORY_SWEEP_WINDOW_HOURS: int = 6
+    MEMORY_SWEEP_BATCH: int = 20
     # Workflow engine routing (Task 6b): when set to a truthy value ("1" / "true")
     # AND the route's agent_profile is "deep_research", that turn runs through the
     # durable WorkflowEngine (plan -> execute -> verify -> bounded replan) instead
