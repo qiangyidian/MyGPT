@@ -29,6 +29,58 @@ VALID_MODES = {
     "auto", "search", "deep_research", "create", "data_analysis", "debate",
 }
 
+# --------------------------------------------------------------------------- #
+# 记忆模式矩阵（spec §4.3）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class MemoryMode:
+    """一个 mode 下记忆的读/写边界。
+
+    读写分开是关键：``speed`` **不读**（不跑向量检索、不搭长上下文，首字最快）但
+    **照常写**（写是回合后的，对首字零影响；否则用户在极速里说过的偏好永远不会成为
+    候选）。
+    """
+
+    inject_summary: bool
+    inject_working: bool
+    inject_facts: bool
+    inject_episodes: bool
+    write: bool
+    model_tool: bool
+
+
+_SPEED = MemoryMode(
+    inject_summary=True,   # summary 是历史压缩的载体，去掉会让长会话被裁掉的信息彻底丢失
+    inject_working=False,
+    inject_facts=False,
+    inject_episodes=False,
+    write=True,
+    model_tool=False,      # 不往极速的工具 schema 里塞记忆工具
+)
+_FULL = MemoryMode(
+    inject_summary=True, inject_working=True, inject_facts=True,
+    inject_episodes=True, write=True, model_tool=True,
+)
+_OFF = MemoryMode(
+    inject_summary=False, inject_working=False, inject_facts=False,
+    inject_episodes=False, write=False, model_tool=False,
+)
+
+
+def memory_mode(mode: str) -> MemoryMode:
+    """把用户可见的 mode 映射到记忆读/写边界。
+
+    ``hermes`` 不读不写：本模块已明文约定"Hermes 有自己的记忆与检索"。未知值按
+    ``hermes`` 处理 —— 不认识的路由不该悄悄获得写权。
+    """
+    m = (mode or "").strip().lower()
+    if m == "speed":
+        return _SPEED
+    if m == "hermes" or m not in VALID_MODES:
+        return _OFF
+    return _FULL
+
+
 # Tools considered "web" — disabled in create mode to keep it focused.
 _WEB_TOOLS = {"web_search", "http_get"}
 

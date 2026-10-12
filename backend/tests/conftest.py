@@ -234,6 +234,18 @@ def _credit_hold_uses_test_database(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _memory_commit_uses_test_database(monkeypatch):
+    """记忆的下沉任务/durable 提交自己开 session——测试里必须指向共享测试库。
+
+    与 ``_credit_hold_uses_test_database`` 同理由：``commit_turn`` 的默认工厂是生产
+    引擎，不 patch 就会在测试里连生产库。
+    """
+    from app.agents.memory import facade
+
+    monkeypatch.setattr(facade, "_default_session_factory", TestSessionLocal)
+
+
 @pytest_asyncio.fixture
 async def db_session(seeded_db) -> AsyncIterator[AsyncSession]:
     """Per-test session sharing the seeded in-memory database."""
@@ -336,3 +348,5 @@ def offline_model(monkeypatch):
     import app.services.chat_service as _chat_svc
     monkeypatch.setattr(_chat_svc, "get_provider_for_config", _offline)
     monkeypatch.setattr(_native_rt, "get_provider_for_config", _offline)
+    import app.agents.memory.facade as _mem_facade
+    monkeypatch.setattr(_mem_facade, "get_provider_for_config", _offline, raising=True)

@@ -37,6 +37,8 @@ from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agents.chat_helpers import load_history as _load_history
+from app.agents.chat_helpers import safe_int as _safe_int
 from app.agents.context_manager import ContextManager
 from app.agents.db_mutation import (
     commit_with_rollback,
@@ -322,14 +324,6 @@ def _event(name: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"event": name, "data": data or {}}
 
 
-def _safe_int(value: Any, default: int) -> int:
-    try:
-        v = int(value)
-        return v if v > 0 else default
-    except (TypeError, ValueError):
-        return default
-
-
 async def _resolve_model_config(
     db: AsyncSession, request: ChatRequest, conversation: Conversation | None, user: User | None = None
 ) -> ModelConfig:
@@ -393,27 +387,6 @@ async def _get_or_create_conversation(
     db.add(conv)
     await db.flush()  # populate conv.id without committing
     return conv
-
-
-async def _load_history(
-    db: AsyncSession, conversation_id: uuid.UUID, *, limit: int = 500
-) -> list[Message]:
-    """Return the most recent ``limit`` conversation messages, oldest-first.
-
-    Capped so a very long conversation doesn't load every message row (with full
-    content/metadata) into memory on every turn — trimming + summarization then
-    operate within this recent window. ``limit`` defaults high enough that normal
-    conversations are unaffected; it's a backstop against pathological histories.
-    """
-    result = await db.execute(
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(limit)
-    )
-    rows = list(result.scalars().all())
-    rows.reverse()  # restore oldest-first for callers
-    return rows
 
 
 def _finalize_prompt_messages(
