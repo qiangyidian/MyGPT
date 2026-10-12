@@ -2019,6 +2019,8 @@ Expected: FAIL —— `assert 0 == 1`（还没有任何提交）。
 
 - [ ] **Step 3: 接上 inline 路径，删掉旧写入点**
 
+> **行号已失准，按文本锚点定位。** T4 把 `_load_history` / `_safe_int` / `_messages_to_dicts` / `_augment_with_attachments` 四个 helper 搬到了 `chat_helpers.py`，`chat_service.py` 因此**少了约 100 行**——下面提到的 1204-1227 之类的行号是搬运前抓的。请用**唯一文本**定位每一处：旧抽取块以注释 `# Auto memory proposal (B7)` 开头、以内层 `logger.debug("auto memory candidate rejected")` 结束；滚动摘要那块以 `# Rolling summary:` 开头；插入点紧跟在 `_title_task = asyncio.create_task(` 那个块的 `add_done_callback(_BG_TASKS.discard)` 之后。
+
 在 `backend/app/services/chat_service.py`：
 
 1. **删** 1204-1227 的整段 `# Auto memory proposal (B7)` 块。
