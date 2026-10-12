@@ -598,6 +598,11 @@ async def drive_durable_worker(queue, timeout: float = 10.0) -> None:
     async with asyncio.timeout(timeout):
         while not await queue.pending_ids():
             await asyncio.sleep(0.01)
+        # 让发起请求那边的 session 先把写事务落完：测试库是 StaticPool（全进程一条连接），
+        # worker 立刻在同一连接上开新事务会撞 "SQL statements in progress"，表现为这个
+        # helper 在"进程内首次驱动 durable"时挂到超时（R18）。仓库既有做法见
+        # tests/test_durable_dispatch.py:88-98 与 :281-290。
+        await asyncio.sleep(0.2)
         await RunWorker(
             queue=queue, execute_fn=execute_run, session_factory=TestSessionLocal
         ).run_once()
