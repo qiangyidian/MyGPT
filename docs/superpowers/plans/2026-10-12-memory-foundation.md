@@ -2621,10 +2621,11 @@ async def test_candidates_are_never_active_in_s1(client, offline_model, mode, mo
         headers=headers,
     )
     assert response.status_code == 200
-    conversation_id = await _turn_conversation_id(response)
-    # 必须先排空 fire-and-forget 任务再读库：测试库是 StaticPool（全进程一条连接），
-    # 读回用的辅助 session 一关就会 rollback 掉 detached 写入未提交的事务（T5 踩过）。
+    # **顺序要命**：`_turn_conversation_id` 本身就是一次读库（它会开 session），所以必须先排空
+    # fire-and-forget 任务，再做任何读库。否则那次读取关闭 session 时会 rollback 掉 detached
+    # 写入未提交的事务（测试库是 StaticPool，全进程一条连接），提交事件数恒为 0。
     await _drain_bg_tasks()
+    conversation_id = await _turn_conversation_id(response)
     assert await wait_for_commit(conversation_id) == 1
 
     rows = await user_memories_for_conversation(conversation_id)
@@ -2647,8 +2648,8 @@ async def test_same_turn_never_double_commits(client, offline_model, monkeypatch
         headers=headers,
     )
     assert response.status_code == 200
+    await _drain_bg_tasks()   # 顺序：排空先于**任何**读库，包括 `_turn_conversation_id`
     conversation_id = await _turn_conversation_id(response)
-    await _drain_bg_tasks()   # 先排空 detached 写入，再读库（StaticPool 回滚陷阱）
     assert await wait_for_commit(conversation_id) == 1
 
     # 兜底扫描再跑一遍，本会话仍应只有一条提交事件（全局返回值不作断言：
