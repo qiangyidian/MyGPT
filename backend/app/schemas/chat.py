@@ -48,6 +48,20 @@ class FilePart(BaseModel):
     size: int = 0
 
 
+class CitationValidation(BaseModel):
+    """生成后校验（RAG-13）对一条引用的结论。
+
+    三项都是 ``bool | None``，**``None`` 表示「还没查」**，与 ``False`` 是两件事：
+    引用在检索阶段产生时是未校验的，只有跑过 ``authorization_recheck`` 之后才会有值。
+    用 ``True`` 当初值等于把「没查」伪装成「查过了」，而这一层存在的全部意义就是不
+    让那种伪装成立。
+    """
+
+    exists: bool | None = None
+    authorized: bool | None = None
+    supports_claim: bool | None = None
+
+
 class Citation(BaseModel):
     """A source backing an assistant answer.
 
@@ -71,6 +85,8 @@ class Citation(BaseModel):
     accessed_at: datetime | None = None
     # Reranker score (debug/eval only; None when no reranker ran).
     rerank_score: float | None = None
+    # 生成后校验的结论。默认「全未校验」—— 见 CitationValidation 的说明。
+    validation: CitationValidation = CitationValidation()
     metadata: dict[str, Any] = {}
 
 

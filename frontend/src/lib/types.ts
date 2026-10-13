@@ -315,7 +315,46 @@ export interface Citation {
   accessed_at?: string | null;
   /** Reranker score (debug/eval only; not shown to regular users). */
   rerank_score?: number | null;
+  /**
+   * 生成后校验（RAG-13）的结论。三项都是 `boolean | null`，**`null` 表示「还没查」**，
+   * 与 `false` 是两件事 —— 引用在检索阶段产生时是未校验的。
+   */
+  validation?: CitationValidation;
   metadata?: Record<string, unknown>;
+}
+
+/** 单条引用的校验结论。见 {@link Citation.validation}。 */
+export interface CitationValidation {
+  exists?: boolean | null;
+  authorized?: boolean | null;
+  supports_claim?: boolean | null;
+}
+
+/** 确定性检查链里的一项（RAG-13 的 `ValidationResult.checks[]`）。 */
+export interface ValidationCheck {
+  name: string;
+  status: "pass" | "fail" | "skip" | "audit";
+  detail?: string;
+}
+
+/**
+ * 一回合的门禁结论（RAG-13），由 SSE 的 `validation` 帧送达。
+ *
+ * `action` 说明门禁做了什么决定，`corrected_text` 是**低风险回合**下经校验的正文
+ * （流式已经把原文发出去了，只能靠它覆盖渲染）；`status` 为 `refused` /
+ * `insufficient_evidence` 时正文已经是拒答文案。
+ */
+export interface ValidationNotice {
+  traceId: string;
+  status: string;
+  action: string;
+  checks: ValidationCheck[];
+  message: string;
+  correctedText: string | null;
+  droppedClaimCount: number;
+  refusalReason: string | null;
+  /** RAG-13 的风险判定：`is_high_risk` / `categories` / `certainty`。 */
+  risk: { is_high_risk?: boolean; categories?: string[]; certainty?: string };
 }
 
 /** Per-KB retrieval / chunking overrides. ``null`` means "inherit the platform

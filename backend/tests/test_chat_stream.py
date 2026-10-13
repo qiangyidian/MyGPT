@@ -63,16 +63,19 @@ async def test_casual_research_turn_answers_without_crew_or_retrieval(
     from app.agents.workflow.worker import RunWorker
     from app.core.config import get_settings
     from app.models import KnowledgeBase, Message
-    from app.services.chat_service import rag_service
+    from app.rag.rag_service import rag_service
     from tests.conftest import TestSessionLocal
 
     settings = get_settings()
     monkeypatch.setattr(settings, "BACKGROUND_WORKER", background_worker)
     monkeypatch.setattr(settings, "RAG_SKIP_CASUAL", True)
-    retrieve = AsyncMock(return_value=("", []))
+    # 检索的接缝现在是 ``retrieve_with_trace``（``retrieve`` 只是它的薄包装，已不在
+    # 调用路径上）。补丁打在不生效的方法上会让 ``assert_not_awaited`` 变成恒真断言 ——
+    # 那比没有断言更糟，因为它看起来还在守这条规则。
+    retrieve = AsyncMock(side_effect=AssertionError("casual turn must not retrieve"))
     judge = AsyncMock(return_value=None)
     crew_status = Mock(return_value=(False, "unexpected_crew"))
-    monkeypatch.setattr(rag_service, "retrieve", retrieve)
+    monkeypatch.setattr(rag_service, "retrieve_with_trace", retrieve)
     monkeypatch.setattr(intent_service, "judge", judge)
     monkeypatch.setattr(ChatOrchestrator, "_crewai_status", crew_status)
     kb = KnowledgeBase(

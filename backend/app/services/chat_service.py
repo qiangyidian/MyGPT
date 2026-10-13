@@ -59,6 +59,7 @@ from app.agents.schemas import (
     AgentEvent,
     AgentTurnContext,
     ExecutionMode,
+    ev_validation,
 )
 from app.agents.state_store import load_state, upsert_goal
 from app.core.config import get_settings
@@ -77,7 +78,7 @@ from app.models import (
 )
 # 静态看似乎未用（本模块某函数内的同名局部 import 会遮蔽它），但 tests/conftest.py 的
 # offline_model 夹具按名 patch 本模块的该属性（raising=True），删掉它夹具会 AttributeError。
-from app.providers.registry import get_provider_for_config  # noqa: F401
+from app.providers.registry import get_provider_for_config
 from app.quotas import QuotaExceeded, get_quota_service
 from app.services.chat_context import (
     _CHARS_PER_TOKEN,
@@ -97,7 +98,16 @@ from app.services.chat_accounting import (
 from app.services import credit_service, tool_toggles
 from app.services.message_versions import snapshot_message
 from app.rag.citations import sanitize_unbacked_source_markers
-from app.rag.rag_service import rag_service
+from app.rag.prompts import count_tokens
+from app.rag.postprocess import gate_answer
+from app.rag.trace import build_trace_summary
+from app.services.answer_gate import (
+    PROMPT_VERSION,
+    TurnGate,
+    open_turn_gate,
+    retrieve_for_gate,
+    stream_gated,
+)
 from app.security.prompt_boundary import apply_untrusted_boundary
 from app.schemas import ChatRequest, Citation
 from app.schemas.chat import MAX_KB_PER_REQUEST
@@ -706,6 +716,93 @@ async def _delete_last_assistant_message(
     return last.content or ""
 
 
+async def _refuse_before_generation(
+    db: AsyncSession,
+    *,
+    conversation: Conversation,
+    assistant_msg: Message,
+    user: User,
+    cfg: ModelConfig,
+    gate: TurnGate,
+    refusal: str,
+    citations: list[Citation],
+    rag_requested: bool,
+    rag_used: bool,
+    rag_skipped_reason: str | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """检索为空时**在生成之前**收口，产出「拒答」而不是一个编出来的答案。
+
+    文档 5.1 要求 ACL 过滤后候选为空时回 ``insufficient_evidence``、**不得根据模型
+    常识补写答案**。不调模型是本路径与「生成后再丢弃」的关键差别：后者仍要为那句
+    注定被扔掉的话付费，而且答案有机会先流到用户屏幕上。
+
+    门禁结论由 ``gate_answer`` 用 ``answer=""`` 统一产出，这样检查项名称与 policy
+    版本只有一处定义，两条路径不会各写一份。
+    """
+    outcome = await gate_answer(
+        db,
+        answer="",
+        request_id=gate.trace_id,
+        trace_id=gate.trace_id,
+        source_index=gate.source_index,
+        is_high_risk=gate.risk.is_high_risk,
+        kb_explicit=gate.kb_explicit,
+        retrieval_insufficient=True,
+        user_id=user.id,
+    )
+    # 显式引用知识库 = 用户要求「从这里面找」，没有就是没有；高风险类别则是门禁
+    # 主动拦下。两种拒答对用户是同一件事，在数据里必须分得开。
+    status = "insufficient_evidence" if gate.kb_explicit else "refused"
+
+    assistant_msg.content = refusal
+    assistant_msg.metadata_ = ChatService._meta(cfg, citations, "stop", assistant_msg.metadata_)
+    assistant_msg.metadata_.update(
+        {
+            "answer_status": status,
+            "trace_id": gate.trace_id,
+            "risk": gate.risk.to_metadata(),
+            "validation": outcome.to_metadata(),
+            "rag_requested": rag_requested,
+            "rag_used": rag_used,
+        }
+    )
+    if rag_skipped_reason:
+        assistant_msg.metadata_["rag_skipped_reason"] = rag_skipped_reason
+    assistant_msg.metadata_["rag_trace"] = build_trace_summary(
+        trace_id=gate.trace_id,
+        timings=gate.timer.timings(),
+        snapshot=gate.retrieval.trace.snapshot if gate.retrieval is not None else None,
+        risk=gate.risk,
+        validation=outcome,
+        outcome=status,
+        model=cfg.model_name,
+        prompt_version=PROMPT_VERSION,
+    ).to_metadata()
+    conversation.last_message_preview = refusal[:280]
+    await settle_turn_usage(db, user.id, assistant_msg, cfg.model_name, None)
+    await commit_with_rollback(db)
+
+    # 拒答没有引用，所以不发 citations 帧 —— 发了就等于声称有来源。
+    # 产出 ``AgentEvent``（durable 路径的既有事件类型），内联路径负责转成 SSE 信封：
+    # 两条路径的事件类型本来就不一致，这里对齐多的那一边，免得再引入第三种形状。
+    yield ev_validation(
+        trace_id=gate.trace_id,
+        status=status,
+        action="refuse",
+        checks=[c.model_dump(mode="json") for c in outcome.validation.checks],
+        message=refusal,
+        refusal_reason=outcome.refusal_reason,
+        risk=gate.risk.to_metadata(),
+    )
+    # ``replace``：这是**整段**正文而不是增量。拒答文案既是校验结论里那句 message，
+    # 也是最终正文，前端两条路都会渲染它 —— 不打这个标记就会看到同样一段话说两遍。
+    yield AgentEvent(kind="token", data={"delta": refusal, "replace": True})
+    yield AgentEvent(
+        kind="done",
+        data={"message_id": str(assistant_msg.id), "finish_reason": "stop"},
+    )
+
+
 async def _persist_partial(db: AsyncSession, assistant_msg: Message) -> None:
     """Best-effort flush of the assistant message's current content/metadata.
 
@@ -1073,6 +1170,14 @@ class ChatService:
         rag_context = ""
         rag_requested = False
         rag_skipped_reason: str | None = None
+        # 门禁在检索之前开门：风险档位（高风险 → 缓冲答案，普通 → 保持流式）必须在
+        # 生成**之前**定死（见 app/services/answer_gate.py）。
+        turn_gate = await open_turn_gate(
+            question=user_content,
+            cfg=cfg,
+            kb_ids=kb_ids,
+            kb_explicit=kb_explicit,
+        )
         if not kb_ids:
             rag_skipped_reason = "no_knowledge_base"
         elif get_settings().RAG_SKIP_CASUAL and is_casual_question(user_content):
@@ -1080,17 +1185,30 @@ class ChatService:
         else:
             rag_requested = True
             try:
-                # No request-wide top_k: each knowledge base contributes its OWN
-                # recall window (``kb.top_k``, NULL = the platform default), and
-                # the merged list is cut globally (RRF order → per-KB cap → the
-                # RAG_CONTEXT_TOKENS budget). Hard-coding a single k here — as this
-                # call used to — silently overrode every per-KB tuning.
-                rag_context, citations = await rag_service.retrieve(
+                # 门禁在**检索之前**开门：档位（流式 / 缓冲）必须在生成前定死，否则
+                # 缓冲没有意义。检索本身也走带 trace 的入口，把 QueryPlan /
+                # CandidateSet / ContextPack 一并取回来 —— 生成后的引用校验只有靠
+                # 「本次请求到底给过模型哪几段证据」这张表才能判「引用属于本次请求」。
+                _outcome = await retrieve_for_gate(
+                    turn_gate,
                     db,
-                    user_content,
-                    kb_ids,
+                    question=user_content,
+                    kb_ids=kb_ids,
                     document_ids=mention_doc_ids or None,
+                    user_id=user.id,
+                    # No request-wide top_k: each knowledge base contributes its OWN
+                    # recall window (``kb.top_k``, NULL = the platform default), and
+                    # the merged list is cut globally (RRF order → per-KB cap → the
+                    # context token budget). Hard-coding a single k here — as this
+                    # call used to — silently overrode every per-KB tuning.
+                    #
+                    # ``reserved_system=0`` 是已知的保守偏差：系统提示词在本步**之后**
+                    # 才组装（它要把 rag_context 折进去），所以这里数不出来。多留的那
+                    # 部分由 ``RAG_CONTEXT_TOKENS`` 这个运维硬上限兜住，不会凭空膨胀。
+                    reserved_query=count_tokens(user_content or ""),
                 )
+                rag_context = _outcome.context_text
+                citations = _outcome.citations
             except Exception as exc:
                 # RAG is best-effort: a retrieval failure must not kill the chat.
                 logger.warning("RAG retrieval failed, continuing without context: %s", exc)
@@ -1365,6 +1483,27 @@ class ChatService:
             },
         )
 
+        # 7b. 生成前拒答。检索为空且（用户显式要求从知识库找答案 / 本轮属高风险类别）
+        # 时，不生成任何答案 —— 「拒答」的全部意义就是那条没有依据的答案**从未产生**。
+        # 生成完再丢掉等于花钱买一句要扔的话，还要冒「已经被流出去」的风险。
+        _pre_refusal = turn_gate.pre_generation_refusal()
+        if _pre_refusal is not None:
+            async for _evt in _refuse_before_generation(
+                db,
+                conversation=conversation,
+                assistant_msg=assistant_msg,
+                user=user,
+                cfg=cfg,
+                gate=turn_gate,
+                refusal=_pre_refusal,
+                citations=citations,
+                rag_requested=rag_requested,
+                rag_used=rag_used,
+                rag_skipped_reason=rag_skipped_reason,
+            ):
+                yield _evt.to_sse_envelope()
+            return
+
         # 8. Build turn context and delegate to the orchestrator/runtime.
         db_mutation_lock = asyncio.Lock()
         persistence_lock = asyncio.Lock()
@@ -1433,13 +1572,48 @@ class ChatService:
 
         ctx.extra["persist_continuation_checkpoint"] = persist_continuation
 
+        # 判官（RAG-13 的语义审查，仅审计）需要 provider。它只写结论、不改写答案，
+        # 所以拿不到 provider 就跳过审计 —— 绝不能让一个辅助路径把回合搞失败。
         try:
-            async for evt in chat_orchestrator.stream(ctx):
+            _gate_provider = get_provider_for_config(cfg)
+        except Exception:
+            _gate_provider = None
+
+        async def _finalize_gated_answer(
+            answer: str, finish_reason: str, usage: dict[str, Any]
+        ) -> Any:
+            """生成结束后的门禁回调（见 app/services/answer_gate.py）。"""
+            return await turn_gate.finalize(
+                db,
+                answer=answer,
+                finish_reason=finish_reason,
+                usage=usage,
+                user_id=user.id,
+                provider=_gate_provider,
+            )
+
+        try:
+            async for evt in stream_gated(
+                chat_orchestrator.stream(ctx),
+                gate=turn_gate,
+                finalize=_finalize_gated_answer,
+            ):
                 if evt.kind == "done":
                     finish = evt.data.get("finish_reason", "stop")
                     assistant_msg.metadata_ = self._meta(
                         cfg, citations, finish, assistant_msg.metadata_
                     )
+                    # 门禁结论覆盖 orchestrator 落下的正文：拒答时换成拒答文案，
+                    # 降级时换成摘除过无依据主张的版本。它必须在这里做而不是在
+                    # stream_gated 里，因为这一处是所有 metadata 的收口点。
+                    _gated = turn_gate.result
+                    if _gated is not None:
+                        assistant_msg.content = _gated.answer
+                        assistant_msg.metadata_.update(
+                            _gated.metadata(
+                                trace_id=turn_gate.trace_id, risk=turn_gate.risk
+                            )
+                        )
                     # Citation integrity: strip any [source N] in the final
                     # answer that has no real backing citation (a model may
                     # hallucinate a marker). The persisted text is cleaned so a
@@ -1505,6 +1679,27 @@ class ChatService:
                     if rag_skipped_reason:
                         assistant_msg.metadata_["rag_skipped_reason"] = rag_skipped_reason
                     assistant_msg.metadata_["citation_count"] = len(citations)
+                    # RAG-15：一次请求的 Trace 摘要。只含 ID / 版本 / 计数 / 耗时 /
+                    # 枚举，**没有任何正文** —— 它比消息活得久，也会被导出到观测平台。
+                    _trace_summary = build_trace_summary(
+                        trace_id=turn_gate.trace_id,
+                        timings=turn_gate.timer.timings(),
+                        snapshot=(
+                            turn_gate.retrieval.trace.snapshot
+                            if turn_gate.retrieval is not None
+                            else None
+                        ),
+                        risk=turn_gate.risk,
+                        validation=_gated.outcome if _gated is not None else None,
+                        outcome=(
+                            _gated.status
+                            if _gated is not None
+                            else ("answered" if rag_used else "no_rag")
+                        ),
+                        model=cfg.model_name,
+                        prompt_version=PROMPT_VERSION,
+                    )
+                    assistant_msg.metadata_["rag_trace"] = _trace_summary.to_metadata()
                     # Token / cost accounting: persist usage from the provider
                     # (propagated through the runtime's done event). The provider
                     # parses usage; it used to be discarded — now it answers
@@ -1527,7 +1722,7 @@ class ChatService:
                         rag_used=rag_used,
                         rag_skipped_reason=rag_skipped_reason,
                         citation_count=len(citations),
-                        extra={"finish_reason": finish},
+                        extra={"finish_reason": finish, **_trace_summary.to_log_fields()},
                     )
                     # Refresh the sidebar preview with the final assistant text.
                     conversation.last_message_preview = (assistant_msg.content or "")[:280]
@@ -2148,6 +2343,11 @@ async def run_durable_turn(
     # filter can only REMOVE context, and the KB set above is already owner-
     # filtered, so a foreign document id can never pull its chunks in.
     mention_doc_ids = _mention_document_ids(run_input.get("mentions"))
+    # 与内联路径同一语义：本轮**显式**带了知识库选择（相对「沿用会话绑定的库」）。
+    # 只有显式选择时检索为空才 fail-closed —— 见 answer_gate.pre_generation_refusal。
+    kb_explicit = bool(
+        run_input.get("knowledge_base_ids") or run_input.get("knowledge_base_id")
+    )
     # Bind the selection to the conversation (single-KB semantics) so the
     # client's detail refetch restores the picker state after the turn.
     if kb_ids and conversation.knowledge_base_id != kb_ids[0]:
@@ -2198,6 +2398,13 @@ async def run_durable_turn(
     # conversation doesn't leak into greetings.
     citations: list[Citation] = []
     rag_context = ""
+    # 门禁在检索之前开门：风险档位决定答案是否缓冲，而档位必须在生成前定死。
+    turn_gate = await open_turn_gate(
+        question=user_content,
+        cfg=cfg,
+        kb_ids=kb_ids,
+        kb_explicit=kb_explicit,
+    )
     if not kb_ids:
         rag_skipped_reason = "no_knowledge_base"
     elif get_settings().RAG_SKIP_CASUAL and is_casual_question(user_content):
@@ -2208,12 +2415,19 @@ async def run_durable_turn(
             # Same rule as the inline path: no request-wide top_k, so every
             # knowledge base keeps its own recall window and the merge is cut
             # globally; ``mention_doc_ids`` scopes it to the @-referenced files.
-            rag_context, citations = await rag_service.retrieve(
+            # 走带 trace 的入口，把本次请求真的给过模型的那批证据取回来 ——
+            # 生成后的引用校验只能靠它判「引用属于本次请求」。
+            _outcome = await retrieve_for_gate(
+                turn_gate,
                 db,
-                user_content,
-                kb_ids,
+                question=user_content,
+                kb_ids=kb_ids,
                 document_ids=mention_doc_ids or None,
+                user_id=user.id,
+                reserved_query=count_tokens(user_content or ""),
             )
+            rag_context = _outcome.context_text
+            citations = _outcome.citations
         except Exception as exc:
             logger.warning("durable RAG retrieval failed, continuing without context: %s", exc)
             rag_context, citations = "", []
@@ -2236,6 +2450,24 @@ async def run_durable_turn(
         **(assistant_msg.metadata_ or {}),
         "user_memories": _memory_usage_metadata(_active_user_memory_rows),
     }
+    # 生成前拒答，与内联路径同一规则同一条实现（见 _refuse_before_generation）。
+    _pre_refusal = turn_gate.pre_generation_refusal()
+    if _pre_refusal is not None:
+        async for _evt in _refuse_before_generation(
+            db,
+            conversation=conversation,
+            assistant_msg=assistant_msg,
+            user=user,
+            cfg=cfg,
+            gate=turn_gate,
+            refusal=_pre_refusal,
+            citations=citations,
+            rag_requested=True,
+            rag_used=bool(rag_context),
+            rag_skipped_reason=rag_skipped_reason,
+        ):
+            yield _evt
+        return
     system_prompt = _build_system_prompt(conversation, rag_context=rag_context)
     system_prompt = _CONTEXT_MANAGER.assemble_system_prompt(
         base=system_prompt,
@@ -2338,7 +2570,29 @@ async def run_durable_turn(
                 kind="citations",
                 data={"citations": [c.model_dump(mode="json") for c in citations]},
             )
-        async for evt in chat_orchestrator.stream(ctx):
+        # 判官（RAG-13 的语义审查，仅审计）需要 provider；拿不到就跳过，绝不阻断回合。
+        try:
+            _gate_provider = get_provider_for_config(cfg)
+        except Exception:
+            _gate_provider = None
+
+        async def _finalize_gated_answer(
+            answer: str, finish_reason: str, usage: dict[str, Any]
+        ) -> Any:
+            return await turn_gate.finalize(
+                db,
+                answer=answer,
+                finish_reason=finish_reason,
+                usage=usage,
+                user_id=user.id,
+                provider=_gate_provider,
+            )
+
+        async for evt in stream_gated(
+            chat_orchestrator.stream(ctx),
+            gate=turn_gate,
+            finalize=_finalize_gated_answer,
+        ):
             # M5: the durable worker already appended ``run.started`` (dotted,
             # Task-4 scheme) when it acquired the lease. Suppress the
             # orchestrator's ``run_started`` (underscore) AgentEvent on the
@@ -2352,6 +2606,34 @@ async def run_durable_turn(
                 )
                 # Drop live tool_calls trace (same rationale as the inline path).
                 assistant_msg.metadata_.pop("tool_calls", None)
+                # 门禁结论覆盖正文与 metadata（与内联路径同一处收口理由）。
+                _gated = turn_gate.result
+                if _gated is not None:
+                    assistant_msg.content = _gated.answer
+                    assistant_msg.metadata_.update(
+                        _gated.metadata(
+                            trace_id=turn_gate.trace_id, risk=turn_gate.risk
+                        )
+                    )
+                assistant_msg.metadata_["citation_count"] = len(citations)
+                assistant_msg.metadata_["rag_trace"] = build_trace_summary(
+                    trace_id=turn_gate.trace_id,
+                    timings=turn_gate.timer.timings(),
+                    snapshot=(
+                        turn_gate.retrieval.trace.snapshot
+                        if turn_gate.retrieval is not None
+                        else None
+                    ),
+                    risk=turn_gate.risk,
+                    validation=_gated.outcome if _gated is not None else None,
+                    outcome=(
+                        _gated.status
+                        if _gated is not None
+                        else ("answered" if rag_context else "no_rag")
+                    ),
+                    model=cfg.model_name,
+                    prompt_version=PROMPT_VERSION,
+                ).to_metadata()
                 sel = ctx.extra.get("runtime_selection")
                 if sel is not None:
                     assistant_msg.metadata_["requested_mode"] = sel.requested_mode

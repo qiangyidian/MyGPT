@@ -6,7 +6,7 @@ import { ArrowDown, BarChart3, FileSearch, MessageSquare, PenLine, Search } from
 import { cn } from "@/lib/utils";
 import { getVisibleMessages } from "@/lib/message-visibility";
 import { MessageBubble } from "@/components/message-bubble";
-import type { Citation, Message, ResearchStep } from "@/lib/types";
+import type { Citation, Message, ResearchStep, ValidationNotice } from "@/lib/types";
 
 const SUGGESTIONS = [
   { icon: FileSearch, title: "总结文档", prompt: "请帮我总结一份文档的主要观点。" },
@@ -27,6 +27,8 @@ interface MessageListProps {
   isStreaming?: boolean;
   streamingCitations?: Citation[];
   streamingSteps?: ResearchStep[];
+  /** Live RAG-13 gate verdict for the turn being streamed (refusal / dropped claims). */
+  streamingValidation?: ValidationNotice | null;
   canRegenerate?: boolean;
   onRegenerate?: () => void;
   /** Continue a truncated/interrupted/cancelled answer (new turn, no repeat). */
@@ -57,6 +59,7 @@ export function MessageList({
   isStreaming,
   streamingCitations,
   streamingSteps,
+  streamingValidation,
   canRegenerate,
   onRegenerate,
   onContinue,
@@ -315,6 +318,7 @@ export function MessageList({
               }}
               citations={streamingCitations}
               steps={streamingSteps}
+              validation={streamingValidation}
               isStreaming
               isLast
               onSourceClick={onSourceClick}

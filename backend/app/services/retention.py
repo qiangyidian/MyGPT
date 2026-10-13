@@ -11,6 +11,8 @@ Config (all optional, all defaulted on):
   * ``RUN_EVENT_RETENTION_DAYS``  — run_events of TERMINAL runs older than this
                                     are deleted (non-terminal runs keep their
                                     event log — recovery replays it).
+  * ``RAG_TRACE_RETENTION_DAYS``  — the ``rag_trace`` block is stripped from
+                                    assistant messages older than this.
   * ``ORPHAN_SWEEP_ENABLED``      — scan the local upload dir for files no
                                     attachment/artifact row references.
 """
@@ -78,6 +80,62 @@ async def prune_terminal_run_events(session_factory: Any, days: int | None = Non
     if deleted:
         logger.info("retention: pruned %d run event(s) from %d terminal run(s)", deleted, len(terminal_ids))
     return deleted
+
+
+async def prune_rag_traces(
+    session_factory: Any, days: int | None = None, *, batch: int = 500
+) -> int:
+    """把过了留存期的 ``rag_trace`` 从 assistant 消息的 metadata 里摘掉。
+
+    Trace 是**回执**不是内容：答案要留，逐条候选 / 耗时 / 版本 / collection 名的
+    记录过了排查窗口就只剩体积与暴露面。文档 RAG-15 要求 trace「可追溯 N 天」，
+    不是要求它永久存在。
+
+    只摘 ``rag_trace``，**不摘 ``validation``** —— 后者是给用户看的那句「为什么
+    拒答 / 摘掉了哪几条主张」，删了历史消息的角标就消失了（那是产品行为，不是
+    观测数据）。
+
+    ``days <= 0`` 表示关闭（与其余留存项同一约定：0 是「不清理」，不是「立刻删」）。
+    每轮最多处理 ``batch`` 条，避免一次扫全表把库锁住。
+    """
+    settings = get_settings()
+    keep_days = int(
+        days if days is not None else getattr(settings, "RAG_TRACE_RETENTION_DAYS", 30)
+    )
+    if keep_days <= 0:
+        return 0
+    from app.models.message import Message
+
+    cutoff = datetime.now(UTC) - timedelta(days=keep_days)
+    async with session_factory() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(Message)
+                    .where(Message.role == "assistant", Message.created_at < cutoff)
+                    .order_by(Message.created_at)
+                    .limit(batch)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # 在 Python 里判 ``rag_trace`` 是否存在：JSONB 的 ``?`` 运算符在测试用的
+        # SQLite 上不存在，写进 SQL 就会让这条 sweep 只在生产能跑、在测试里静默
+        # 变成 no-op —— 那正是「没人发现它坏了」的形状。
+        pruned = 0
+        for row in rows:
+            md = dict(row.metadata_ or {})
+            if "rag_trace" not in md:
+                continue
+            md.pop("rag_trace", None)
+            row.metadata_ = md
+            pruned += 1
+        if pruned:
+            await db.commit()
+    if pruned:
+        logger.info("retention: stripped rag_trace from %d message(s)", pruned)
+    return pruned
 
 
 def _resolve_key(base: Path, value: str) -> str:
@@ -347,6 +405,7 @@ class RetentionSweeper:
     async def run_once(self) -> None:
         await prune_audit_events(self._session_factory)
         await prune_terminal_run_events(self._session_factory)
+        await prune_rag_traces(self._session_factory)
         await sweep_orphan_uploads(self._session_factory)
         await sweep_orphan_collections(self._session_factory)
         await self._release_holds()

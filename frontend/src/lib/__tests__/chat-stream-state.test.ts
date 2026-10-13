@@ -13,6 +13,7 @@ import {
   type Citation,
   type GenerationStatus,
   type Message,
+  type ValidationNotice,
 } from "@/lib/types";
 
 // 这里钉的是「用户会感知到的后果」：气泡里出现什么字、来源 tab 少了几条、半截
@@ -656,5 +657,117 @@ describe("空流", () => {
     expect(s.finishReason).toBeNull();
     expect(s.status).toBe("complete");
     expect(s.stepsSinceTextFrom).toBe(0);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// 生成后校验（RAG-13）：拒答与降级怎么落到气泡上
+// --------------------------------------------------------------------------- //
+describe("校验结论帧（validation）", () => {
+  /** 只跑到「还在流」为止 —— `answered()` 自带 done，终态闸门之后事件全是空操作。 */
+  function streaming(...deltas: string[]): StreamState {
+    return feed(
+      initialStreamState(CONV),
+      { kind: "meta", conversationId: CONV, messageId: "a-1" },
+      ...deltas.map((delta): StreamEvent => ({ kind: "token", delta }))
+    );
+  }
+
+  const notice = (
+    over: Partial<ValidationNotice> = {}
+  ): ValidationNotice => ({
+    traceId: "tr-1",
+    status: "answered",
+    action: "return_answer",
+    checks: [],
+    message: "",
+    correctedText: null,
+    droppedClaimCount: 0,
+    refusalReason: null,
+    risk: { is_high_risk: false },
+    ...over,
+  });
+
+  it("干净的回合只记结论，一个字都不动", () => {
+    const s = streaming("正常");
+    const next = feed(s, { kind: "validation", notice: notice() });
+    expect(next.text).toBe("正常");
+    expect(next.validation?.traceId).toBe("tr-1");
+  });
+
+  it("低风险流式档：corrected_text 覆盖已经渲染出去的原文", () => {
+    const s = streaming("有依据的结论。凭空捏造的结论。");
+    const next = feed(s, {
+      kind: "validation",
+      notice: notice({
+        action: "drop_claims",
+        droppedClaimCount: 1,
+        correctedText: "有依据的结论。",
+        message: "有 1 条主张没有通过依据核查，已从回答中移除。",
+      }),
+    });
+    expect(next.text).toBe("有依据的结论。");
+    // 覆盖发生在 done 之前，所以落库的也是校验后的版本 —— 刷新不会变样。
+    const done = feed(next, { kind: "done", finishReason: "stop" });
+    expect(done.commit?.content).toBe("有依据的结论。");
+  });
+
+  it("流式档下被拒答：原文被拒答文案顶掉，不能留在气泡里", () => {
+    const s = streaming("这段没有依据的答案已经流出去了。");
+    const next = feed(s, {
+      kind: "validation",
+      notice: notice({
+        status: "refused",
+        action: "refuse",
+        message: "这类问题需要逐条核对依据……",
+        refusalReason: "high_risk_grounding",
+      }),
+    });
+    expect(next.text).toBe("这类问题需要逐条核对依据……");
+  });
+
+  it("拒答帧后面跟的整段正文是替换，不是续写（否则同一段话显示两遍）", () => {
+    const s = streaming("原文");
+    const next = feed(
+      s,
+      {
+        kind: "validation",
+        notice: notice({
+          status: "refused",
+          action: "refuse",
+          message: "这类问题不作答复。",
+        }),
+      },
+      { kind: "token", delta: "这类问题不作答复。", replace: true },
+      { kind: "done", finishReason: "stop" }
+    );
+    expect(next.text).toBe("这类问题不作答复。");
+    expect(next.commit?.content).toBe("这类问题不作答复。");
+  });
+
+  it("高风险缓冲档：正文被扣到校验之后才到，且是整段替换", () => {
+    // 缓冲档下一个字的 token 都没转发（后端扣住了），这里模拟校验通过那一步。
+    const s = feed(initialStreamState(CONV), {
+      kind: "meta",
+      conversationId: CONV,
+      messageId: "a-1",
+    });
+    const next = feed(
+      s,
+      { kind: "validation", notice: notice() },
+      { kind: "token", delta: "完整答案", replace: true },
+      { kind: "done", finishReason: "stop" }
+    );
+    expect(next.text).toBe("完整答案");
+    expect(next.commit?.content).toBe("完整答案");
+  });
+
+  it("没有 corrected_text 的降级不猜文本：按原样保留", () => {
+    const s = streaming("原文仍在");
+    const next = feed(s, {
+      kind: "validation",
+      notice: notice({ action: "retry_format_once" }),
+    });
+    expect(next.text).toBe("原文仍在");
   });
 });

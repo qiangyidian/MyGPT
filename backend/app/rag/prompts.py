@@ -73,6 +73,20 @@ def _token_counter():
     return lambda text: _count_tokens(text, "gpt-3.5-turbo")
 
 
+def count_tokens(text: str) -> int:
+    """Token count for **budget reservations**（与 fit_context 用同一个计数器）。
+
+    预留量必须和打包用的是同一个计数器，否则「留了 3000 token 给 system」和
+    「system 实际占 4200」会各自算各自的，预算就不成立了。
+    """
+    if not text:
+        return 0
+    try:
+        return int(_token_counter()(text))
+    except Exception:  # pragma: no cover - 计数器自身缺失时按字符粗估
+        return max(1, len(text) // 4)
+
+
 def _head_to_tokens(text: str, budget: int, counter) -> str:
     """Longest prefix of ``text`` within ``budget`` tokens (binary search on chars)."""
     if budget <= 0 or not text or counter(text) <= budget:

@@ -141,6 +141,7 @@ class KeywordRetriever:
         query: str,
         kb_id: uuid.UUID,
         top_k: int = 5,
+        document_ids: Sequence[uuid.UUID | str] | None = None,
     ) -> list[SearchHit]:
         latin, cjk = _tokenize(query)
         terms = latin + cjk
@@ -155,13 +156,20 @@ class KeywordRetriever:
             # the best chunk for an arbitrary one) — never the oldest rows, as
             # the old ``order_by created_at ASC`` + limit 400 did.
             conditions = _candidate_conditions(terms)
+            scope = [
+                DocumentChunk.knowledge_base_id == kb_id,
+                or_(*conditions),
+            ]
+            if document_ids:
+                scope.append(
+                    DocumentChunk.document_id.in_(
+                        [uuid.UUID(str(document_id)) for document_id in document_ids]
+                    )
+                )
             stmt = (
                 select(DocumentChunk, Document)
                 .join(Document, Document.id == DocumentChunk.document_id)
-                .where(
-                    DocumentChunk.knowledge_base_id == kb_id,
-                    or_(*conditions),
-                )
+                .where(*scope)
                 .order_by(
                     _coverage(conditions).desc(),
                     DocumentChunk.document_id,
@@ -195,6 +203,8 @@ class KeywordRetriever:
                     "text": chunk.content,
                     "page": (chunk.metadata_ or {}).get("page"),
                     "heading": (chunk.metadata_ or {}).get("heading"),
+                    "char_start": (chunk.metadata_ or {}).get("char_start"),
+                    "char_end": (chunk.metadata_ or {}).get("char_end"),
                     "retriever": "keyword",
                 },
             ))

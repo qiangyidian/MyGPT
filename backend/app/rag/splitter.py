@@ -156,15 +156,29 @@ class RecursiveTextSplitter(TextSplitter):
             if i == 0:
                 result.append(chunk)
                 continue
-            prev = result[-1]
+            # Always take overlap from the original preceding chunk. Taking it
+            # from result[-1] compounds overlap on every chunk and can make
+            # later chunks grow well past the configured window.
+            prev = chunks[i - 1]
             tail = self._take_tail_tokens(prev, self.chunk_overlap)
             result.append((tail + chunk) if tail else chunk)
         return result
 
     def _take_tail_tokens(self, text: str, n_tokens: int) -> str:
-        # Approximate tail by characters proportional to n_tokens; good enough
-        # for overlap continuity without re-tokenising both halves.
         if n_tokens <= 0 or not text:
             return ""
-        approx_chars = n_tokens * 4
-        return text[-approx_chars:] if len(text) > approx_chars else text
+        try:
+            enc = tiktoken.encoding_for_model(self.model)
+        except Exception:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                # Match _count_tokens' fallback when tokenizer data is absent.
+                approx_chars = n_tokens * 4
+                return text[-approx_chars:] if len(text) > approx_chars else text
+        try:
+            tokens = enc.encode(text)
+            return enc.decode(tokens[-n_tokens:]) if len(tokens) > n_tokens else text
+        except Exception:
+            approx_chars = n_tokens * 4
+            return text[-approx_chars:] if len(text) > approx_chars else text

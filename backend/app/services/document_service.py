@@ -293,6 +293,8 @@ async def index_document(
                         "collection": collection,
                         "page": (c.metadata_ or {}).get("page"),
                         "heading": (c.metadata_ or {}).get("heading"),
+                        "char_start": (c.metadata_ or {}).get("char_start"),
+                        "char_end": (c.metadata_ or {}).get("char_end"),
                     },
                 )
                 for c, vec in zip(batch, vectors, strict=False)

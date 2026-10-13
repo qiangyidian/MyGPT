@@ -88,22 +88,26 @@ def _parse_markdown(path: str, _ext: str) -> ParsedDocument:
 # ---------------------------------------------------------------------------
 # PDF (PyMuPDF primary: text + tables + scanned-page OCR fallback)
 # ---------------------------------------------------------------------------
-def _ocr_pdf_pages(doc: Any, max_pages: int) -> list[str]:
-    """Render each page to an image and OCR it (scanned-PDF fallback)."""
+def _ocr_pdf_pages(
+    doc: Any, max_pages: int, page_indices: list[int] | None = None
+) -> list[tuple[int, str]]:
+    """OCR selected zero-based pages, returning each result with its page index."""
     from app.rag import ocr
 
-    pages: list[str] = []
-    limit = min(len(doc), max(1, max_pages))
-    for i in range(limit):
+    indices = page_indices if page_indices is not None else list(range(len(doc)))
+    pages: list[tuple[int, str]] = []
+    for i in indices[:max(1, max_pages)]:
+        if i < 0 or i >= len(doc):
+            continue
         try:
             page = doc[i]
             # Render at a modest DPI — 150 is a good accuracy/size tradeoff.
             pix = page.get_pixmap(dpi=150)
             img_bytes = pix.tobytes("png")
-            pages.append(ocr.image_to_text(img_bytes))
+            pages.append((i, ocr.image_to_text(img_bytes)))
         except Exception as exc:
             logger.debug("OCR page %d failed: %s", i, exc)
-            pages.append("")
+            pages.append((i, ""))
     return pages
 
 
@@ -142,16 +146,34 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
     if tables:
         full_text = (full_text + "\n\n" + "\n\n".join(tables)).strip()
 
-    # Scanned-PDF fallback: near-empty text → OCR each rendered page.
-    if settings.OCR_SCANNED_PDF and len(full_text.strip()) < 20:
+    # OCR blank pages individually as well as fully scanned documents. Real
+    # PDFs often mix selectable text pages with scanned appendices; checking
+    # only the whole-document character count silently lost those pages.
+    low_text_pages = [
+        i for i, page_text in enumerate(pages) if len(page_text.strip()) < 20
+    ]
+    if settings.OCR_SCANNED_PDF and (len(full_text.strip()) < 20 or low_text_pages):
+        ocr_doc = None
         try:
-            ocr_pages = _ocr_pdf_pages(pymupdf.open(path), settings.OCR_SCANNED_PDF_MAX_PAGES)
+            ocr_doc = pymupdf.open(path)
+            targets = low_text_pages if low_text_pages else list(range(len(ocr_doc)))
+            ocr_pages = _ocr_pdf_pages(
+                ocr_doc, settings.OCR_SCANNED_PDF_MAX_PAGES, targets
+            )
         except Exception as exc:
             logger.warning("scanned-PDF OCR failed: %s", exc)
             ocr_pages = []
-        if any(p.strip() for p in ocr_pages):
-            pages = ocr_pages
-            full_text = "\n\n".join(p for p in ocr_pages if p.strip())
+        finally:
+            if ocr_doc is not None:
+                ocr_doc.close()
+        ocr_by_page = {index: text for index, text in ocr_pages if text.strip()}
+        if ocr_by_page:
+            for index, text in ocr_by_page.items():
+                if index < len(pages) and len(pages[index].strip()) < 20:
+                    pages[index] = text
+            full_text = "\n\n".join(p for p in pages if p.strip())
+            if tables:
+                full_text = (full_text + "\n\n" + "\n\n".join(tables)).strip()
             ocr_used = True
             parser_used = "pymupdf+ocr"
 

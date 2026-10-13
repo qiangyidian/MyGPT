@@ -40,7 +40,7 @@ from app.schemas.auth import (
     WechatBindingOut,
     WechatCodeLoginRequest,
 )
-from app.schemas.chat import ChatRequest, Citation
+from app.schemas.chat import ChatRequest, Citation, CitationValidation
 from app.schemas.chat_attachment import ChatAttachmentOut, SaveToKbRequest
 from app.schemas.common import ORMModel
 from app.schemas.connector import (
@@ -134,7 +134,7 @@ __all__ = [
     "ConversationBranchRequest",
     "MessageOut",
     # chat
-    "ChatRequest", "Citation",
+    "ChatRequest", "Citation", "CitationValidation",
     # chat attachments + feedback (Phase 1)
     "ChatAttachmentOut", "SaveToKbRequest",
     "MessageFeedbackOut", "MessageFeedbackRequest",

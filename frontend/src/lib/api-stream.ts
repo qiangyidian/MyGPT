@@ -9,6 +9,7 @@ import type {
   FinishReason,
   PendingApproval,
   ResearchPlanStep,
+  ValidationNotice,
 } from "./types";
 
 // ===========================================================================
@@ -48,8 +49,18 @@ export interface ChatStreamHandlers {
   }) => void;
   onAgentEdge?: (e: { runId: string; edgeId: string; status: string; label?: string }) => void;
   onRunStatus?: (e: { runId: string; status: string; currentAgentIds?: string[] }) => void;
-  onToken?: (delta: string) => void;
+  /**
+   * 正文增量。``replace`` 为真时它是**整段**正文而不是续写 —— 门禁改写过答案
+   * （高风险缓冲档第一次交付、或流式档下把原文换成拒答文案）的帧都带它。
+   */
+  onToken?: (delta: string, opts?: { replace?: boolean }) => void;
   onCitations?: (citations: Citation[]) => void;
+  /**
+   * 生成后校验（RAG-13）的结论帧。它可能带 ``corrected_text``：低风险回合是流式的，
+   * 用户已经看到了原文，这一帧把经校验的版本交回来覆盖渲染。不覆盖的话界面显示的是
+   * 未校验文本，而库里存的是校验后文本 —— 刷新一下就变了。
+   */
+  onValidation?: (e: ValidationNotice) => void;
   onToolCall?: (e: { id: string; name: string; arguments: Record<string, unknown>; dangerous?: boolean; approval_id?: string; agent_id?: string; task_id?: string }) => void;
   onToolResult?: (e: { id: string; name: string; ok: boolean; result: unknown; error: string | null; agent_id?: string; task_id?: string }) => void;
   onApprovalRequired?: (e: PendingApproval) => void;
@@ -179,10 +190,23 @@ export function dispatchChatStreamEvent(
           handlers.onRunStatus?.({ runId: data.run_id, status: data.status, currentAgentIds: data.current_agent_ids });
           break;
         case "token":
-          handlers.onToken?.(data.delta ?? "");
+          handlers.onToken?.(data.delta ?? "", { replace: data.replace === true });
           break;
         case "citations":
           handlers.onCitations?.(data.citations);
+          break;
+        case "validation":
+          handlers.onValidation?.({
+            traceId: data.trace_id ?? "",
+            status: data.status ?? "",
+            action: data.action ?? "",
+            checks: (data.checks ?? []) as ValidationNotice["checks"],
+            message: data.message ?? "",
+            correctedText: data.corrected_text ?? null,
+            droppedClaimCount: data.dropped_claim_count ?? 0,
+            refusalReason: data.refusal_reason ?? null,
+            risk: data.risk ?? {},
+          });
           break;
         case "tool_call":
           handlers.onToolCall?.(data);

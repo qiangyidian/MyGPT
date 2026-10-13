@@ -21,6 +21,7 @@ import type {
   Message,
   PendingApproval,
   UserChatMode,
+  ValidationNotice,
 } from "@/lib/types";
 
 /** 流结束的原因：只有 `user_stop` 有权取消后端 run，只有它之外才需要「保留半截」。 */
@@ -57,6 +58,11 @@ export interface StreamState {
   error: string | null;
   status: GenerationStatus;
   finishReason: FinishReason | null;
+  /**
+   * 本回合的生成后校验结论（RAG-13）。它同时承担两件事：拒答时说明「为什么没有
+   * 答案」，降级时给出经校验的正文。为 `null` 表示这一轮没有跑门禁（没有知识库）。
+   */
+  validation: ValidationNotice | null;
   /** 终态闸门：一条消息只提交一次。 */
   terminated: boolean;
   commit: AssistantCommit | null;
@@ -84,8 +90,9 @@ export type StreamEvent =
       dangerous?: boolean;
     }
   | { kind: "tool_result"; id: string; name: string; ok: boolean; result: unknown }
-  | { kind: "token"; delta: string }
+  | { kind: "token"; delta: string; replace?: boolean }
   | { kind: "citations"; citations: Citation[] | null | undefined }
+  | { kind: "validation"; notice: ValidationNotice }
   | { kind: "approval_required"; approval: PendingApproval }
   | { kind: "approval_resolved"; approvalId: string }
   | { kind: "done"; messageId?: string; finishReason: FinishReason }
@@ -113,6 +120,7 @@ export function initialStreamState(conversationId: string | null = null): Stream
     error: null,
     status: "complete",
     finishReason: null,
+    validation: null,
     terminated: false,
     commit: null,
     stepSeq: 0,
@@ -286,7 +294,9 @@ export function reduce(
     case "token":
       return {
         ...state,
-        text: state.text + event.delta,
+        // `replace` = 这一帧是整段正文，不是续写。门禁改写过的答案（拒答文案、缓冲档
+        // 交付的完整答案）走这条路；按增量拼接会把同一段话叠两遍。
+        text: event.replace ? event.delta : state.text + event.delta,
         // 正文续上就意味着此前那批工具卡片已被读完，下一批从当前长度起算。
         stepsSinceTextFrom: state.steps.length,
       };
@@ -295,6 +305,23 @@ export function reduce(
       const incoming = event.citations;
       if (!Array.isArray(incoming)) return state;
       return { ...state, citations: mergeCitations(state.citations, incoming) };
+    }
+
+    case "validation": {
+      const notice = event.notice;
+      // 拒答是**唯一**必须无条件覆盖正文的情形：流式档下原文已经渲染出去了，
+      // 收不回来，只能顶掉；缓冲档下正文还没开始流，这里覆盖等于什么都没发生。
+      // 两种档位下库里存的都是拒答文案，界面不能是别的。
+      const refused = notice.status === "refused" || notice.status === "insufficient_evidence";
+      if (refused) {
+        return { ...state, validation: notice, text: notice.message };
+      }
+      // 摘除主张是「同一个答案的修正版」，只在服务端给了版本时才覆盖 —— 没给的
+      // 时候按原样保留，不能凭 status 猜一个空字符串出来。
+      if (typeof notice.correctedText === "string") {
+        return { ...state, validation: notice, text: notice.correctedText };
+      }
+      return { ...state, validation: notice };
     }
 
     case "approval_required":

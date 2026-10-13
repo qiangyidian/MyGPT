@@ -55,8 +55,11 @@ import type {
   GenerationStatus,
   Message,
   ResearchStep,
+  ValidationNotice,
 } from "@/lib/types";
 import { getMessageStatus } from "@/lib/types";
+import { noticeFromMetadata } from "@/lib/validation-notice";
+import { ValidationNoticeBar } from "@/components/chat/validation-notice-bar";
 import { getMessageTerminationNotice } from "@/lib/message-termination";
 import { sanitizeSourceMarkers, citedCitations } from "@/lib/citations";
 import { collectArtifactIds } from "@/lib/artifacts";
@@ -107,6 +110,11 @@ interface MessageBubbleProps {
   isLast: boolean;
   citations?: Citation[];
   steps?: ResearchStep[];
+  /**
+   * 本回合的门禁结论（RAG-13），只在**实时**传递时有值（来自 SSE 的 `validation`
+   * 帧）；历史消息从 `message.metadata.validation` 里还原，见 `noticeFromMetadata`。
+   */
+  validation?: ValidationNotice | null;
   isStreaming?: boolean;
   canRegenerate?: boolean;
   onRegenerate?: () => void;
@@ -298,6 +306,7 @@ export const MessageBubble = memo(function MessageBubble({
   isLast,
   citations,
   steps,
+  validation,
   isStreaming,
   canRegenerate,
   onRegenerate,
@@ -380,6 +389,12 @@ export const MessageBubble = memo(function MessageBubble({
     ? sanitizeSourceMarkers(message.content, citationCount)
     : message.content;
   const citationFlagged = !isUser && meta.citation_validation_failed === true;
+
+  // 生成后校验（RAG-13）的结论。实时帧优先（它带 `message` 与 `corrected_text`），
+  // 没有就回落到持久化的 metadata —— 刷新之后角标不能消失。
+  const validationNotice = isUser
+    ? null
+    : (validation ?? noticeFromMetadata(message.metadata));
 
   // Real-citation chips: the retrieval candidates arrive BEFORE the first
   // token; only sources the answer actually marked ([source N]) get a chip,
@@ -601,6 +616,9 @@ export const MessageBubble = memo(function MessageBubble({
         {!isUser && status && status !== "complete" && (
           <MessageStatusBanner message={message} onContinue={onContinue} onRegenerate={onRegenerate} />
         )}
+
+        {/* 生成后校验的结论（拒答 / 摘除无依据主张）。干净的回合不渲染。 */}
+        {!isUser && <ValidationNoticeBar notice={validationNotice} />}
 
         {/* Action row */}
         {!editing && (

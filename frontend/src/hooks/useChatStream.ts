@@ -34,6 +34,7 @@ import type {
   GenerationStatus,
   Message,
   PendingApproval,
+  ValidationNotice,
 } from "@/lib/types";
 import type { AgentEdgeStatus, AgentGraphNode } from "@/lib/agent-graph-types";
 import { coerceGraph } from "@/hooks/useAgentRunGraph";
@@ -86,6 +87,12 @@ export interface ChatStreamState {
   status: GenerationStatus;
   /** Raw finish_reason of the last turn (null until the turn ends). */
   finishReason: FinishReason | null;
+  /**
+   * 本回合的门禁结论（RAG-13）：拒答原因、被摘除的主张数、以及失败的那几条检查。
+   * 为 `null` 表示这一轮没有跑门禁。刷新后的历史消息不带它 —— 那从消息 metadata
+   * 里读（后端把同一份结论写进了 metadata）。
+   */
+  validation: ValidationNotice | null;
   /** Re-send the last user message to get a new assistant reply. */
   regenerate: () => Promise<void>;
   /** Continue a truncated/interrupted/cancelled answer (new turn, no repeat). */
@@ -171,6 +178,8 @@ export function useChatStream(): ChatStreamState {
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<GenerationStatus>("complete");
   const [finishReason, setFinishReason] = useState<FinishReason | null>(null);
+  /** 本回合的生成后校验结论（RAG-13）；同时供实时气泡与状态条渲染。 */
+  const [validation, setValidation] = useState<ValidationNotice | null>(null);
 
   // ---- Streaming token throttle ------------------------------------------- #
   // Each SSE token delta used to setState immediately, re-rendering the whole
@@ -341,6 +350,8 @@ export function useChatStream(): ChatStreamState {
         setStatus(state.status);
       if (!published || published.finishReason !== state.finishReason)
         setFinishReason(state.finishReason);
+      if (!published || published.validation !== state.validation)
+        setValidation(state.validation);
       published = state;
       // 终态闸门在 reducer 里；这里的身份比较只防「同一个终态被重复 publish」。
       if (state.commit && state.commit !== appliedCommit) {
@@ -513,11 +524,16 @@ export function useChatStream(): ChatStreamState {
       onStepCompleted: (e) => {
         apply({ kind: "step_completed", stepId: e.stepId, status: e.status });
       },
-      onToken: (delta) => {
-        apply({ kind: "token", delta });
+      onToken: (delta, opts) => {
+        apply({ kind: "token", delta, replace: opts?.replace });
       },
       onCitations: (cits) => {
         apply({ kind: "citations", citations: cits });
+      },
+      // 生成后校验（RAG-13）。它可能在 done 之前把正文换成经校验的版本或拒答文案
+      // —— 覆盖与终态闸门都在 reducer 里，这里只把帧喂进去。
+      onValidation: (e) => {
+        apply({ kind: "validation", notice: e });
       },
       onToolCall: (e) => {
         apply({
@@ -605,6 +621,7 @@ export function useChatStream(): ChatStreamState {
     setStatus,
     setSteps,
     setStepsSinceTextFrom,
+    setValidation,
   ]);
 
   const run = useCallback(
@@ -901,6 +918,7 @@ export function useChatStream(): ChatStreamState {
     error,
     status,
     finishReason,
+    validation,
     regenerate,
     continueGeneration,
     approveTool,

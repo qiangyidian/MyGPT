@@ -237,6 +237,13 @@ class Settings(BaseSettings):
     RAG_CHUNK_SIZE: int = 500
     RAG_CHUNK_OVERLAP: int = 80
     RAG_TOP_K: int = 5
+    # Per-retriever recall window for hybrid search. This is independent from
+    # RAG_TOP_K, which limits how many chunks reach the final context.
+    RAG_RETRIEVAL_CANDIDATES: int = 30
+    # Bound the union passed to reranking/context selection, including multi-KB turns.
+    RAG_MAX_FUSED_CANDIDATES: int = 60
+    # Avoid filling the final context with adjacent chunks from one source doc.
+    RAG_MAX_CHUNKS_PER_DOCUMENT: int = 3
     # Hard ceiling on the retrieved-context block, in tokens. top_k alone never
     # bounded prompt size: 12 chunks of a long-document KB is an ~18k-token
     # context paid for on every turn. 0 disables the budget (historic shape).
@@ -264,6 +271,45 @@ class Settings(BaseSettings):
     # casual conversation. Explicit "根据知识库回答" still retrieves (the casual
     # detector honours an explicit KB ask).
     RAG_SKIP_CASUAL: bool = True
+
+    # ---- RAG 在线安全链路（设计文档 RAG-06 / 09 / 12 / 13 / 15）----
+    # Platform ceiling on how many chunks ONE knowledge base may contribute to
+    # the answer context (设计文档 RAG-08/09: 「默认 Context 取 5 个 Chunk，最多 8 个」).
+    # This is a *ceiling*, not a default: RAG_TOP_K=5 already sits inside the
+    # doc's 5–8 band, so this only catches a KB configured past it.
+    # 0 = no platform ceiling (each KB's own top_k governs, as before).
+    RAG_MAX_CHUNKS_PER_KB: int = 8
+    # Cap on how many per-retriever candidates land in the trace's CandidateSet.
+    # The union is already bounded by RAG_MAX_FUSED_CANDIDATES; this bounds the
+    # per-channel record (diagnostics need the tail, metadata does not).
+    RAG_TRACE_MAX_CANDIDATES: int = 120
+    # Corrective/high-risk answers are buffered instead of streamed, so a claim
+    # that fails validation can actually be withheld (文档 RAG-13: 引用 ID 不属于
+    # 本次请求 / ACL 失败 / PII 命中 → 摘除受影响主张，否则拒答 —— 流式下「拒答」
+    # 在物理上不可能，用户已经逐字看完了).
+    RAG_HIGH_RISK_BUFFER: bool = True
+    # Grounding judge (rag/grounding.py). AUDIT ONLY in this slice: 文档 RAG-12
+    # 规定未在人工标注集上校准到 precision/recall ≥0.90 的 Judge 只能作审核提示。
+    # 'off' 完全不跑；'audit' 跑并把逐 claim 判定写进 trace，但不改写答案。
+    RAG_GROUNDING_AUDIT: str = "audit"
+    # Normal (non-high-risk) turns below the full-check claim count are audited
+    # only this fraction of the time (文档 RAG-13: 其余普通答案至少抽检 10%).
+    RAG_GROUNDING_SAMPLE_RATIO: float = 0.1
+    # Hard ceiling on the answer length, in characters. 0 = no ceiling (the
+    # provider's max_tokens already bounds it). Enforcement blocks rather than
+    # truncates: silently cutting an answer short is indistinguishable from a
+    # truncated generation, which 文档 5.1 requires be treated as failure.
+    RAG_MAX_ANSWER_CHARS: int = 0
+    # Extra high-risk terms, "category:term" comma-separated. APPEND-ONLY by
+    # design: the frozen lexicon in rag/risk.py can shed a term only by editing
+    # code (i.e. through review), and config can only add (文档 5.2: 安全负责人可
+    # 增加类别，不可未经评审删除默认类别).
+    RAG_HIGH_RISK_EXTRA_TERMS: str = ""
+    # RAG-15 retention: `rag_trace`（只含 ID / 版本 / 计数 / 耗时，没有任何正文）从
+    # assistant 消息的 metadata 里被摘除的期限，由 services/retention.py 的例行
+    # sweep 执行。0 = 不清理。指标本身的留存不在这里 —— 那是 Prometheus 侧的
+    # retention 参数，我们这一层没有指标表可清。
+    RAG_TRACE_RETENTION_DAYS: int = 30
 
     # ---- Background worker ----
     BACKGROUND_WORKER: str = "inprocess"

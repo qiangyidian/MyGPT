@@ -420,6 +420,7 @@ function ChatPanel({
           streamingText={isThisConvStreaming ? chat.streamingText : undefined}
           isStreaming={isThisConvStreaming}
           streamingCitations={isThisConvStreaming ? chat.citations : undefined}
+          streamingValidation={isThisConvStreaming ? chat.validation : undefined}
           streamingSteps={
             isThisConvStreaming
               ? chat.steps.slice(chat.stepsSinceTextFrom)

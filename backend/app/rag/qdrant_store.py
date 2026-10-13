@@ -33,9 +33,12 @@ def _to_filter(filters: dict[str, Any] | None, models: Any):
         return None
     conditions = []
     for key, value in filters.items():
-        conditions.append(
-            models.FieldCondition(key=key, match=models.MatchValue(value=str(value)))
-        )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            values = [str(item) for item in value]
+            match = models.MatchAny(any=values)
+        else:
+            match = models.MatchValue(value=str(value))
+        conditions.append(models.FieldCondition(key=key, match=match))
     return models.Filter(must=conditions) if conditions else None
 
 

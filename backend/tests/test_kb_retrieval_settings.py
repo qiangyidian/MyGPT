@@ -213,6 +213,9 @@ async def test_admin_may_patch_another_users_kb(client, db_session):
 class _Settings:
     RAG_TOP_K = 5
     RAG_MIN_SCORE = 0.3
+    # 必须显式给出：``from_kb`` 会读它，替身漏掉就等于那条上限在测试里从未生效
+    # （``getattr`` 的默认值会把「没设」和「设为 0 = 关闭」混成同一件事）。
+    RAG_MAX_CHUNKS_PER_KB = 8
 
 
 def _kb(**over):
@@ -239,11 +242,26 @@ def test_a_tuned_kb_overrides_only_the_columns_it_sets():
 
 
 @pytest.mark.parametrize(
-    "raw,expected", [(0, 5), (-3, 5), (12, 12)]
+    "raw,expected", [(0, 5), (-3, 5), (12, 8), (8, 8), (3, 3)]
 )
 def test_a_nonsensical_top_k_falls_back_instead_of_disabling_retrieval(raw, expected):
+    """无意义的值回落到平台默认；有意义的值被**平台上限**夹住后原样生效。
+
+    ``12 -> 8`` 而不是 ``12 -> 12``：设计文档 RAG-08/09 规定上下文「默认取 5 个
+    Chunk，最多 8 个」，所以一个配成 12 的知识库不再能骑到上限之上。这条断言原先
+    写的是「12 原样通过」——那是平台上限引入之前的行为。
+    """
     ks = _KbRetrieval.from_kb(_kb(top_k=raw), _Settings)
     assert ks.top_k == expected
+
+
+def test_the_platform_ceiling_can_be_switched_off():
+    """``RAG_MAX_CHUNKS_PER_KB=0`` = 不设平台上限，每库自己的 top_k 说了算。"""
+
+    class _NoCeiling(_Settings):
+        RAG_MAX_CHUNKS_PER_KB = 0
+
+    assert _KbRetrieval.from_kb(_kb(top_k=12), _NoCeiling).top_k == 12
 
 
 def test_threshold_and_cap_are_read_per_hit_from_its_own_kb():

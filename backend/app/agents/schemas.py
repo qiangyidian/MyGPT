@@ -175,6 +175,44 @@ def ev_meta(*, message_id: uuid.UUID | str, conversation_id: uuid.UUID | str) ->
     return AgentEvent(kind="meta", data={"message_id": str(message_id), "conversation_id": str(conversation_id)})
 
 
+def ev_validation(
+    *,
+    trace_id: str,
+    status: str,
+    action: str,
+    checks: list[dict[str, Any]] | None = None,
+    message: str = "",
+    corrected_text: str | None = None,
+    dropped_claim_count: int = 0,
+    refusal_reason: str | None = None,
+    risk: dict[str, Any] | None = None,
+) -> AgentEvent:
+    """生成后校验（RAG-13）的结论帧。
+
+    它同时承担两件事，因为它们必然同时发生、分两个事件只会让前端有中间态：
+
+    * **纠正已经流出去的文字**：低风险回合是流式的，用户已经看到了原文，所以
+      ``corrected_text`` 把经校验后的版本交给前端覆盖渲染。不这么做，界面显示的是
+      未经校验的文本，而库里存的是校验后的文本 —— 刷新一下就变了。
+    * **说明为什么被拒答**：``status`` 为 ``insufficient_evidence`` / ``refused``
+      时，``message`` 是给用户看的中文说明，``action`` 说明是哪条门禁拦下的。
+    """
+    return AgentEvent(
+        kind="validation",
+        data={
+            "trace_id": trace_id,
+            "status": status,
+            "action": action,
+            "checks": list(checks or []),
+            "message": message,
+            "corrected_text": corrected_text,
+            "dropped_claim_count": int(dropped_claim_count),
+            "refusal_reason": refusal_reason,
+            "risk": dict(risk or {}),
+        },
+    )
+
+
 def ev_runtime_selected(
     *,
     run_id: uuid.UUID | str,
