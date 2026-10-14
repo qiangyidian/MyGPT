@@ -22,7 +22,15 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.rag.base import DocumentParser, ParsedDocument
-from app.rag.layout import DocumentLayout, LineBox, PageLines, page_bases, pdf_lines
+from app.rag.layout import (
+    DocumentLayout,
+    LineBox,
+    PageLines,
+    SheetLayout,
+    SheetRow,
+    page_bases,
+    pdf_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +66,30 @@ def _df_to_text(df: Any, sheet: str | None = None) -> str:
     for _, row in df.iterrows():
         lines.append(" | ".join("" if pd.isna(v) else str(v) for v in row.tolist()))
     return "\n".join(lines)
+
+
+def _df_to_text_with_rows(
+    df: Any, sheet: str | None = None
+) -> tuple[str, int, list[tuple[int, int]]]:
+    """``_df_to_text`` 的带偏移版本 → (块文本, 表头行号, 每个数据行的字符区间)。
+
+    表头行号必须**算出来交给调用方**：``_df_to_text`` 在有 sheet 名时会在块首插
+    一行 ``## Sheet: 名称``，表头因此不在第 0 行。写死 0 会让工作表的表头取到那
+    行标题、整张表的列全部错位 —— 而错位的结果看起来只是"表头有点怪"。
+    """
+    text = _df_to_text(df, sheet=sheet)
+    lines = text.splitlines()
+    offsets: list[int] = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line) + 1  # "\n"
+    header_line = 1 if sheet else 0
+    spans = [
+        (offsets[i], offsets[i] + len(lines[i]))
+        for i in range(header_line + 1, len(lines))
+    ]
+    return text, header_line, spans
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +338,15 @@ def _parse_table(path: str, ext: str) -> ParsedDocument:
 
     if ext == ".csv":
         df = pd.read_csv(path)
-        text = _df_to_text(df)
+        text, header_line, spans = _df_to_text_with_rows(df)
         return ParsedDocument(
             text=text,
             tables=[text],
             metadata={"format": "csv", "columns": list(df.columns), "rows": len(df),
                       "parser_used": "pandas"},
+            layout=DocumentLayout(
+                sheets=(_sheet_layout("csv", header_line, spans, base=0),)
+            ),
         )
 
     # Workbooks (.xlsx via openpyxl, legacy .xls via xlrd).
@@ -319,20 +354,52 @@ def _parse_table(path: str, ext: str) -> ParsedDocument:
     xl = pd.ExcelFile(path, engine=engine) if engine else pd.ExcelFile(path)
     try:
         sheets = xl.sheet_names
-        frames: list[str] = []
-        for s in sheets:
-            frames.append(_df_to_text(pd.read_excel(xl, sheet_name=s), sheet=s))
+        blocks = [
+            _df_to_text_with_rows(pd.read_excel(xl, sheet_name=s), sheet=s)
+            for s in sheets
+        ]
     finally:
         try:
             xl.close()
         except Exception:
             pass
+    frames = [block for block, _header, _spans in blocks]
     text = "\n\n".join(frames)
+    # 各 sheet 块在全文里的起始偏移：走一遍 join 记账，不靠 find 反推。
+    bases: list[int] = []
+    cursor = 0
+    for i, frame in enumerate(frames):
+        if i:
+            cursor += 2  # "\n\n"
+        bases.append(cursor)
+        cursor += len(frame)
     return ParsedDocument(
         text=text,
         tables=frames,
         pages=frames,
         metadata={"format": ext.lstrip("."), "sheets": sheets, "parser_used": "pandas"},
+        layout=DocumentLayout(
+            sheets=tuple(
+                _sheet_layout(name, header_line, spans, base=bases[i])
+                for i, (name, (_text, header_line, spans)) in enumerate(
+                    zip(sheets, blocks, strict=False)
+                )
+            )
+        ),
+    )
+
+
+def _sheet_layout(
+    name: str, header_line: int, spans: list[tuple[int, int]], base: int
+) -> SheetLayout:
+    """块内的行偏移 + 块在全文里的基准 → 一份表格布局。"""
+    return SheetLayout(
+        name=name,
+        header_line=header_line,
+        rows=tuple(
+            SheetRow(row=i, char_start=base + start, char_end=base + end)
+            for i, (start, end) in enumerate(spans)
+        ),
     )
 
 

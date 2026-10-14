@@ -40,7 +40,7 @@ class PageLines:
 
 @dataclass(frozen=True)
 class SheetRow:
-    """表格里的一行。``row`` 是 0-based，0 是表头行。"""
+    """表格里的一行**数据**。``row`` 是 0-based 的数据行号（表头不算行）。"""
 
     row: int
     char_start: int
@@ -50,6 +50,10 @@ class SheetRow:
 @dataclass(frozen=True)
 class SheetLayout:
     name: str
+    #: 表头那一行在块文本里的行号。csv 是 0；xlsx 因为 ``_df_to_text`` 会在块首
+    #: 插一行 ``## Sheet: 名称`` 而是 1。写死 0 会让工作表的表头取到那行标题、
+    #: 整张表的列全错位。
+    header_line: int
     rows: tuple[SheetRow, ...]
 
 

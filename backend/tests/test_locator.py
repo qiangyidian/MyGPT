@@ -26,18 +26,24 @@ def _pdf(path) -> str:
 
 
 def _sheet_fixture():
-    """一份两列四行的表格 + 它的逐行字符区间。"""
+    """一份两列四行的表格 + 它的逐行字符区间（表头单列，数据行从 0 编号）。"""
     text = "h1 | h2\nr1 | a\nr2 | b\nr3 | c"
-    rows: list[SheetRow] = []
+    lines = text.split("\n")
+    offsets: list[int] = []
     cursor = 0
-    for i, line in enumerate(text.split("\n")):
-        rows.append(SheetRow(row=i, char_start=cursor, char_end=cursor + len(line)))
+    for line in lines:
+        offsets.append(cursor)
         cursor += len(line) + 1
+    rows: list[SheetRow] = []
+    for i, line in enumerate(lines[1:]):  # 跳过表头
+        rows.append(
+            SheetRow(row=i, char_start=offsets[i + 1], char_end=offsets[i + 1] + len(line))
+        )
     parsed = ParsedDocument(
         text=text,
         tables=[text],
         layout=DocumentLayout(
-            sheets=(SheetLayout(name="Sheet1", rows=tuple(rows)),)
+            sheets=(SheetLayout(name="Sheet1", header_line=0, rows=tuple(rows)),)
         ),
     )
     return parsed, rows
@@ -96,15 +102,14 @@ def test_locate_returns_none_when_page_has_no_lines(tmp_path):
 
 def test_locate_sheet_range_highlights_the_covering_rows():
     parsed, rows = _sheet_fixture()
-    # 落在第二、三行（r1 / r2）上
+    # 落在前两行数据（r1 / r2）上
     loc = locate(
-        parsed, page=None, char_start=rows[1].char_start, char_end=rows[2].char_end
+        parsed, page=None, char_start=rows[0].char_start, char_end=rows[1].char_end
     )
 
     assert loc is not None and loc.kind == "sheet_range"
     assert loc.sheet == "Sheet1"
     assert loc.header == ("h1", "h2")
-    # 表头不算 body 行：命中的是 row 1、row 2 → body 下标 0、1 → 区间 [0, 2)
     assert loc.highlight == (0, 2)
     start, end = loc.highlight
     assert [r[0] for r in loc.rows[start:end]] == ["r1", "r2"]

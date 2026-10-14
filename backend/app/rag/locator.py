@@ -128,17 +128,16 @@ def _locate_sheet(
         if not hits:
             return None
         lines = blocks[index].splitlines()
-        if not lines:
+        if sheet.header_line >= len(lines):
             return None
-        columns = len(lines[0].split(" | "))
-        # 行号含表头（row 0），body 下标要减掉表头那一行。
-        first, last = hits[0].row - 1, hits[-1].row  # [起, 止)
+        columns = len(lines[sheet.header_line].split(" | "))
         return SheetRangeLocator(
             kind="sheet_range",
             sheet=sheet.name,
-            header=_row_cells(lines[0], columns),
-            rows=tuple(_row_cells(ln, columns) for ln in lines[1:]),
-            highlight=(max(0, first), max(0, last)),
+            header=_row_cells(lines[sheet.header_line], columns),
+            rows=tuple(_row_cells(ln, columns) for ln in lines[sheet.header_line + 1 :]),
+            # 数据行号就是 body 下标，不需要再减表头。
+            highlight=(hits[0].row, hits[-1].row + 1),
         )
     return None
 
