@@ -26,8 +26,10 @@ from app.rag.layout import (
     DocumentLayout,
     LineBox,
     PageLines,
+    ShapeBox,
     SheetLayout,
     SheetRow,
+    SlideLayout,
     page_bases,
     pdf_lines,
 )
@@ -299,6 +301,17 @@ def _parse_pptx(path: str, _ext: str) -> ParsedDocument:
     prs = Presentation(path)
     slides: list[str] = []
     tables: list[str] = []
+    # OOXML 的长度单位是 EMU（English Metric Unit），1pt = 12700 EMU。
+    emu_per_pt = 12700.0
+
+    def emu(value: Any) -> float:
+        """EMU → pt。缺省的 left/top（形状没定位）按 0 处理，不给 None 算术。"""
+        return float(value) / emu_per_pt if value is not None else 0.0
+
+    # 形状暂存：(幻灯片号, 该形状文本所在 block 的下标, x, y, w, h)。字符偏移要等
+    # 全部 slide 拼成完整 text 之后才知道，所以先记下标。
+    pending: list[tuple[int, int, float, float, float, float]] = []
+    slide_sizes: list[tuple[float, float]] = []
     for idx, slide in enumerate(prs.slides, 1):
         blocks: list[str] = [f"# 幻灯片 {idx}"]
         for shape in slide.shapes:
@@ -307,6 +320,16 @@ def _parse_pptx(path: str, _ext: str) -> ParsedDocument:
                     txt = "".join(run.text for run in para.runs).strip()
                     if txt:
                         blocks.append(txt)
+                        pending.append(
+                            (
+                                idx,
+                                len(blocks) - 1,
+                                emu(shape.left),
+                                emu(shape.top),
+                                emu(shape.width),
+                                emu(shape.height),
+                            )
+                        )
             if getattr(shape, "has_table", False) and shape.has_table:
                 tbl = shape.table
                 rows = [[cell.text for cell in row.cells] for row in tbl.rows]
@@ -320,12 +343,64 @@ def _parse_pptx(path: str, _ext: str) -> ParsedDocument:
             if notes:
                 blocks.append(f"[备注] {notes}")
         slides.append("\n".join(blocks))
+        slide_sizes.append((emu(prs.slide_width), emu(prs.slide_height)))
     text = "\n\n".join(slides)
+
+    # 幻灯片块在全文里的基准，以及与块内行号的对应关系 —— 都走一遍 join 记账，
+    # 不靠 find 反推（重复标题页会命中错误的副本）。
+    slide_bases: list[int] = []
+    cursor = 0
+    for i, block in enumerate(slides):
+        if i:
+            cursor += 2  # "\n\n"
+        slide_bases.append(cursor)
+        cursor += len(block)
+
+    def line_offsets(block: str, base: int) -> list[int]:
+        out: list[int] = []
+        local = 0
+        for line in block.split("\n"):
+            out.append(base + local)
+            local += len(line) + 1  # "\n"
+        return out
+
+    by_slide: dict[int, list[ShapeBox]] = {}
+    for slide_no, block_index, x, y, w, h in pending:
+        block = slides[slide_no - 1]
+        lines = block.split("\n")
+        if block_index >= len(lines):
+            continue
+        line = lines[block_index]
+        at = line_offsets(block, slide_bases[slide_no - 1])[block_index]
+        by_slide.setdefault(slide_no, []).append(
+            ShapeBox(
+                x=x,
+                y=y,
+                w=w,
+                h=h,
+                text=line,
+                char_start=at,
+                char_end=at + len(line),
+            )
+        )
+
+    rendered_slides = [
+        SlideLayout(
+            slide_no=no,
+            width=slide_sizes[no - 1][0],
+            height=slide_sizes[no - 1][1],
+            shapes=tuple(by_slide.get(no, ())),
+        )
+        for no in range(1, len(slides) + 1)
+        if by_slide.get(no)
+    ]
+
     return ParsedDocument(
         text=text,
         pages=slides,
         tables=tables or None,
         metadata={"parser_used": "python-pptx", "slides": len(prs.slides), "tables": len(tables)},
+        layout=DocumentLayout(slides=tuple(rendered_slides)) if rendered_slides else None,
     )
 
 
