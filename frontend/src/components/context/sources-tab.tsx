@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { useContextPanelStore } from "@/stores/context-panel-store";
+import { useHighlightDrawerStore } from "@/stores/highlight-drawer-store";
 import type { Citation } from "@/lib/types";
 
 /**
@@ -84,6 +85,22 @@ function SourceRow({ c, index, focused }: { c: Citation; index: number; focused:
           </a>
         )}
       </div>
+      {/* 只在有 chunk 锚点时才给入口：没有可定位的对象，按钮只会是死路。
+          而"这篇文档有没有坐标"**故意不预判** —— 由点击后的响应说话，不支持时
+          给明确文案，比把按钮藏起来让人以为功能没做要诚实。 */}
+      {c.chunk_id && c.document_id && c.source_type !== "web" && (
+        <button
+          type="button"
+          className="mt-1.5 text-[11px] font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+          onClick={() =>
+            useHighlightDrawerStore
+              .getState()
+              .show(c.document_id as string, c.chunk_id as string, c.document_name || "原文位置")
+          }
+        >
+          查看原文位置
+        </button>
+      )}
     </div>
   );
 }

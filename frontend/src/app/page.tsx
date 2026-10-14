@@ -11,6 +11,7 @@ import { Composer, type ComposerSendOpts } from "@/components/composer";
 import { AttachmentDropzone } from "@/components/attachments/attachment-dropzone";
 import { ApprovalCard } from "@/components/approval-card";
 import { ContextPanel } from "@/components/context/context-panel";
+import { HighlightDrawer } from "@/components/context/highlight-drawer";
 import { ContextPanelTrigger } from "@/components/context/context-panel-trigger";
 import { AgentPanelTrigger } from "@/components/agents/agent-panel-trigger";
 import { ArtifactPreviewPanel } from "@/components/artifacts/artifact-preview-panel";
@@ -467,6 +468,7 @@ function ChatPanel({
       </AttachmentDropzone>
 
       <ContextPanel conversationId={activeConversationId} />
+      <HighlightDrawer />
       <ArtifactPreviewPanel />
     </div>
   );
