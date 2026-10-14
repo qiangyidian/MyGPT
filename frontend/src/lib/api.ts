@@ -78,6 +78,7 @@ import type {
   VersionActivateResult,
 } from "./types";
 import type { RedeemBatchQuery } from "./redeem-batch";
+import type { Locator } from "./locator";
 
 export interface PageParams {
   limit?: number;
@@ -457,6 +458,28 @@ export const api = {
       "GET",
       `/api/documents/${id}/preview?offset=${offset}`
     ),
+  /** chunk 在原件里的位置。404 code=no_locator 表示这个片段无法定位。 */
+  locateChunk: (documentId: string, chunkId: string) =>
+    request<Locator>("GET", `/api/documents/${documentId}/chunks/${chunkId}/locator`),
+  /**
+   * 渲染文档某一页的**干净整页图**（不含高亮框；框由 locateChunk 单独给）。
+   *
+   * 走 blob 而不是 `<img src="...">`：端点要 Bearer token，而 img 标签带不上
+   * Authorization 头 —— 直接写 src 会 401。
+   */
+  documentPageImage: async (
+    documentId: string,
+    page: number,
+    dpi = 150
+  ): Promise<Blob> => {
+    const res = await request<Response>(
+      "GET",
+      `/api/documents/${documentId}/pages/${page}/image?dpi=${dpi}`,
+      undefined,
+      { raw: true }
+    );
+    return res.blob();
+  },
   /** Download the original upload (authenticated). */
   downloadDocument: async (id: string): Promise<Blob> => {
     // Route through the central request() so an expired access token is
