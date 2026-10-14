@@ -15,7 +15,7 @@ its ``content_sha256`` remain the source of truth.
 from __future__ import annotations
 
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Any
 from collections.abc import Sequence
@@ -23,6 +23,8 @@ from collections.abc import Sequence
 from app.rag.base import ParsedDocument
 
 _HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+#: 非空白片段。切块器的接缝会归一空白，所以"对齐"必须按非空白内容来算。
+_TOKEN_RE = re.compile(r"\S+")
 
 
 @dataclass(frozen=True)
@@ -47,9 +49,64 @@ class ChunkSpan:
         return out
 
 
+class _CompactIndex:
+    """全文去掉空白后的字符序列 + 每个字符在原位置，用于跨接缝对齐。
+
+    为什么按**非空白字符**而不是按 token：切块器的接缝会以任意方式改动空白 ——
+    跨页的 ``"\\n\\n"`` 可能变成 ``"\\n"``，也可能整块消失（上一页的最后一行与
+    下一页的第一行被直接粘成一个 token）。按 token 对齐对"两个 token 粘成一个"
+    无能为力；按非空白字符对齐则对这些情况一视同仁。
+
+    只在精确 ``find`` 失败时才建（懒建），因为它要遍历全文，而绝大多数 chunk
+    都在快路径上就命中了。
+    """
+
+    __slots__ = ("compact", "positions")
+
+    def __init__(self, text: str) -> None:
+        chars: list[str] = []
+        positions: list[int] = []
+        for i, ch in enumerate(text):
+            if ch.isspace():
+                continue
+            chars.append(ch)
+            positions.append(i)
+        self.compact = "".join(chars)
+        self.positions = positions
+
+    def find(self, chunk: str, from_char: int) -> tuple[int, int] | None:
+        """chunk 在原文里的字符区间 [起, 止)。以 ``from_char`` 为搜索起点。
+
+        返回的边界是 chunk **首个/末个非空白字符**的位置：chunk 首尾的空白不属于
+        它的内容，把它算进去只会让区间多盖到前一块的尾巴。
+        """
+        needle = "".join(ch for ch in chunk if not ch.isspace())
+        if not needle:
+            return None
+        at = self.compact.find(needle, bisect_left(self.positions, from_char))
+        if at < 0:
+            # 重叠窗口会让本块的起点落在上一块之前，退回全文再找一次。
+            at = self.compact.find(needle)
+        if at < 0:
+            return None
+        return self.positions[at], self.positions[at + len(needle) - 1] + 1
+
+
 def _offsets(chunks: Sequence[str], text: str) -> list[tuple[int | None, int | None]]:
-    """Forward-moving ``find``: chunks arrive in document order, so one pass is enough."""
+    """按文档顺序把每个 chunk 对回原文的字符区间。
+
+    两级策略：
+
+    1. **精确 ``find`` 快路径。** 命中就用 ``start + len(chunk)``，语义与历史行为
+       一字不差 —— 已经能定位的 chunk 不受本函数改动的影响。
+    2. **忽略空白对齐的慢路径。** 真切块器的输出不是精确切片：重叠窗口跨过分页
+       接缝时空白会被改写（``"\\n\\n"`` → ``"\\n"``，甚至整个消失），``find`` 因此
+       失败。从前这条路径直接放弃，于是接缝上的 chunk 同时丢掉 char 锚点、页号
+       与 heading —— 而那正是引用上「第 N 页」与原文定位的全部输入。
+    3. 两级都失败就是 ``None``：**不猜**。真正的"不在原文里"仍然是找不到。
+    """
     out: list[tuple[int | None, int | None]] = []
+    index: _CompactIndex | None = None
     cursor = 0
     for chunk in chunks:
         if not chunk:
@@ -57,14 +114,22 @@ def _offsets(chunks: Sequence[str], text: str) -> list[tuple[int | None, int | N
             continue
         start = text.find(chunk, cursor)
         if start < 0:
-            # Overlap can glue a previous tail onto a chunk that is not a
-            # contiguous slice; fall back to a whole-text search before giving up.
+            # 重叠会把上一块的尾巴粘进来，使本块不再是连续切片；
+            # 退回全文搜索再试一次。
             start = text.find(chunk)
-        if start < 0:
+        if start >= 0:
+            out.append((start, start + len(chunk)))
+            cursor = start + 1
+            continue
+
+        if index is None:
+            index = _CompactIndex(text)
+        span = index.find(chunk, cursor)
+        if span is None:
             out.append((None, None))
             continue
-        out.append((start, start + len(chunk)))
-        cursor = start + 1
+        out.append(span)
+        cursor = span[0] + 1
     return out
 
 

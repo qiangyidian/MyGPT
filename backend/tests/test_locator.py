@@ -116,6 +116,34 @@ def test_locate_sheet_range_highlights_the_covering_rows():
     assert [r[0] for r in loc.rows[:start] + loc.rows[end:]] == ["r3"]
 
 
+def test_normalised_box_round_trips_back_onto_the_target_line(tmp_path):
+    """中心承诺的回归：归一化框反算回页面坐标后，必须**盖住目标行、且只盖它**。
+
+    这是整个功能的立身之本 —— 框错一行，用户看到的就是"依据在这里"而其实不在。
+    刻度走一遍 归一化 → 反归一化，任何比例写反/写错位都会在这一步暴露。
+    """
+    parsed = default_parser.parse(_pdf(tmp_path / "round.pdf"), ".pdf")
+    page = parsed.layout.pages[0]
+    target = page.lines[2]
+
+    loc = locate(parsed, page=1, char_start=target.char_start, char_end=target.char_end)
+    assert loc is not None and loc.kind == "page_image"
+    assert len(loc.boxes) == 1
+
+    x0, y0, x1, y1 = loc.boxes[0]
+    box = (x0 * page.width, y0 * page.height, x1 * page.width, y1 * page.height)
+    # 与目标行重合（留 1pt 容差吸收浮点）
+    assert abs(box[0] - target.x0) < 1.0
+    assert abs(box[1] - target.y0) < 1.0
+    assert abs(box[2] - target.x1) < 1.0
+    assert abs(box[3] - target.y1) < 1.0
+
+    # 与相邻行**不相交** —— 上下各一行都必须干净
+    for neighbour in (page.lines[1], page.lines[3]):
+        disjoint = box[3] <= neighbour.y0 or box[1] >= neighbour.y1
+        assert disjoint, f"框越界盖到了相邻行 {neighbour.text!r}"
+
+
 def test_normalised_boxes_are_clamped_into_unit_range():
     # 解析器偶尔给出略微越界的 bbox（旋转页、裁剪框），归一化必须夹住
     lines = (
