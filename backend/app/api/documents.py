@@ -10,6 +10,7 @@ base.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import mimetypes
 import os
 import uuid
@@ -19,6 +20,8 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
+    Response,
     UploadFile,
     status,
 )
@@ -31,8 +34,14 @@ from app.core.deps import get_current_user
 from app.core.exceptions import AppException
 from app.core.rate_limit import rate_limit_user
 from app.db import get_db
-from app.models import Document, KnowledgeBase, User
-from app.schemas import DocumentOut, DocumentPreview, ReindexResult, UploadCapabilities
+from app.models import Document, DocumentChunk, KnowledgeBase, User
+from app.schemas import (
+    DocumentOut,
+    DocumentPreview,
+    LocatorOut,
+    ReindexResult,
+    UploadCapabilities,
+)
 from app.services import document_service
 from app.services.ingestion_queue import enqueue as enqueue_ingestion
 from app.services.ingestion_queue import notify_ingestion_worker
@@ -293,3 +302,188 @@ async def download_document(
         media_type=media_type,
         filename=doc.filename,
     )
+
+
+# ---------------------------------------------------------------------------
+# 引用原文定位：chunk 在原件里的位置，以及它底下的那页图
+# ---------------------------------------------------------------------------
+#: 单页渲染的 dpi 上下限。上限存在的理由是内存：A4 在 300dpi 下已经是约
+#: 2500×3500 的位图，再往上一次请求就能吃掉几百 MB。
+_MIN_DPI, _MAX_DPI = 72, 300
+#: 单页面积上限（pt²）。超出的页（工程图、超长海报）不渲染，避免拖垮进程。
+_MAX_PAGE_AREA_PT = 2_000_000.0
+
+
+def _render_page_png(path: str, page_no: int, dpi: int) -> bytes:
+    """渲染一页为 PNG。**不带任何高亮** —— 框由 locator 单独给。
+
+    这样图只依赖（文档, 页号, dpi），不依赖是哪个 chunk 被点开，才能长期缓存。
+    """
+    import pymupdf
+
+    doc = pymupdf.open(path)
+    try:
+        if page_no < 1 or page_no > doc.page_count:
+            raise IndexError(page_no)
+        page = doc[page_no - 1]
+        rect = page.rect
+        if rect.width * rect.height > _MAX_PAGE_AREA_PT:
+            raise ValueError("page too large to render")
+        zoom = dpi / 72.0
+        return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes("png")
+    finally:
+        doc.close()
+
+
+def _page_image_etag(doc: Document, page_no: int, dpi: int) -> str:
+    """ETag = 原件指纹 + 页号 + dpi。
+
+    指纹取文件本身的 (路径, 大小, mtime) 而不是 ``doc.id``：重新上传会换文档行，
+    但**覆盖同一个 file_path**（重索引、存储迁移）不会 —— 那时 doc.id 不变而图
+    已经变了，只用 id 做 ETag 会把旧图一直发给用户。
+    """
+    try:
+        stat = os.stat(doc.file_path)
+        fingerprint = f"{doc.file_path}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:  # pragma: no cover - 文件在检查与 stat 之间消失
+        fingerprint = doc.file_path
+    digest = hashlib.sha256(f"{fingerprint}:{page_no}:{dpi}".encode()).hexdigest()
+    return f'"{digest}"'
+
+
+@router.get("/documents/{document_id}/pages/{page_no}/image")
+async def document_page_image(
+    document_id: uuid.UUID,
+    page_no: int,
+    request: Request,
+    dpi: int = Query(default=150, ge=_MIN_DPI, le=_MAX_DPI),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """渲染文档的某一页，作为引用定位的底图。"""
+    doc = await _load_owned_doc(db, document_id, user)
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise AppException(
+            status_code=NOT_FOUND,
+            code="storage_gone",
+            message="文档原件已不存在，无法渲染原页",
+        )
+
+    etag = _page_image_etag(doc, page_no, dpi)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+
+    try:
+        payload = await asyncio.to_thread(_render_page_png, doc.file_path, page_no, dpi)
+    except IndexError:
+        raise HTTPException(NOT_FOUND, "页码超出范围") from None
+    except Exception as exc:
+        raise HTTPException(500, f"渲染失败: {exc}") from exc
+
+    return Response(
+        content=payload,
+        media_type="image/png",
+        # private：这是某个用户的文档，绝不能被共享缓存留存。
+        headers={"ETag": etag, "Cache-Control": "private, max-age=86400"},
+    )
+
+
+def _locator_to_out(loc: object, document_id: uuid.UUID) -> LocatorOut:
+    """Locator → 响应模型。四个分支对应四种 kind，前端按 kind 分派渲染器。"""
+    kind = loc.kind  # type: ignore[attr-defined]
+    if kind == "page_image":
+        return LocatorOut(
+            kind=kind,
+            page=loc.page,  # type: ignore[attr-defined]
+            total_pages=loc.total_pages,  # type: ignore[attr-defined]
+            image_url=f"/api/documents/{document_id}/pages/{loc.page}/image",  # type: ignore[attr-defined]
+            boxes=[[float(v) for v in box] for box in loc.boxes],  # type: ignore[attr-defined]
+        )
+    if kind == "sheet_range":
+        return LocatorOut(
+            kind=kind,
+            sheet=loc.sheet,  # type: ignore[attr-defined]
+            header=list(loc.header),  # type: ignore[attr-defined]
+            rows=[list(r) for r in loc.rows],  # type: ignore[attr-defined]
+            highlight=[loc.highlight[0], loc.highlight[1]],  # type: ignore[attr-defined]
+        )
+    if kind == "slide":
+        return LocatorOut(
+            kind=kind,
+            slide_no=loc.slide_no,  # type: ignore[attr-defined]
+            width=loc.width,  # type: ignore[attr-defined]
+            height=loc.height,  # type: ignore[attr-defined]
+            shapes=[
+                {"rect": list(s.rect), "text": s.text, "hit": s.hit}
+                for s in loc.shapes  # type: ignore[attr-defined]
+            ],
+        )
+    return LocatorOut(
+        kind=kind,
+        text=loc.text,  # type: ignore[attr-defined]
+        start=loc.start,  # type: ignore[attr-defined]
+        end=loc.end,  # type: ignore[attr-defined]
+    )
+
+
+@router.get(
+    "/documents/{document_id}/chunks/{chunk_id}/locator",
+    response_model=LocatorOut,
+)
+async def locate_document_chunk(
+    document_id: uuid.UUID,
+    chunk_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> LocatorOut:
+    """一个 chunk 在原件里的位置。
+
+    坐标是**请求时现算**的：用 chunk 库里已有的字符锚点，在刚刚重解析出的原件上
+    定位。这样定位结果永远与当前解析器自洽，而坐标不必随解析器版本一起落库、
+    也就不会静默过期（parsers.py 是高频改动的文件）。代价是一次重解析 —— 与
+    ``/documents/{id}/preview`` 同一个取舍，那条路径早就在这么做了。
+    """
+    doc = await _load_owned_doc(db, document_id, user)
+    chunk = await db.get(DocumentChunk, chunk_id)
+    if chunk is None or chunk.document_id != doc.id:
+        # 不区分"片段不存在"与"片段属于别的文档"：后者会变成他人在文档里的
+        # 内容探测器（沿用 _load_owned_doc 的同款理由）。
+        raise HTTPException(NOT_FOUND, "片段不存在")
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise AppException(
+            status_code=NOT_FOUND,
+            code="storage_gone",
+            message="文档原件已不存在，无法定位原文位置",
+        )
+    if doc.status in ("pending", "parsing", "chunking", "embedding"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "文档正在解析中，请稍后再试")
+
+    from app.rag.locator import locate
+    from app.rag.parsers import default_parser
+
+    try:
+        parsed = await asyncio.to_thread(
+            default_parser.parse, doc.file_path, doc.file_type
+        )
+    except ValueError as exc:
+        raise HTTPException(BAD, f"该格式暂不支持定位: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(500, f"解析失败: {exc}") from exc
+
+    meta = chunk.metadata_ or {}
+    loc = locate(
+        parsed,
+        page=meta.get("page"),
+        char_start=meta.get("char_start"),
+        char_end=meta.get("char_end"),
+    )
+    if loc is None:
+        raise AppException(
+            status_code=NOT_FOUND,
+            code="no_locator",
+            message=(
+                "该文档无法定位到原文位置（原件格式不含坐标，"
+                "或这个片段入库时没有记录位置）"
+            ),
+        )
+    return _locator_to_out(loc, doc.id)

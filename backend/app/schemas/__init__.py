@@ -76,6 +76,7 @@ from app.schemas.conversation import (
 from app.schemas.document import (
     DocumentOut,
     DocumentPreview,
+    LocatorOut,
     ReindexResult,
     UploadCapabilities,
 )
@@ -150,7 +151,7 @@ __all__ = [
     "ProviderManifestOut",
     # knowledge base / documents
     "KnowledgeBaseCreate", "KnowledgeBaseOut", "KnowledgeBaseUpdate",
-    "DocumentOut", "DocumentPreview", "ReindexResult", "UploadCapabilities",
+    "DocumentOut", "DocumentPreview", "LocatorOut", "ReindexResult", "UploadCapabilities",
     # tools
     "ToolInfo", "ToolParameter", "ToolTestRequest", "ToolTestResult",
     "ToolToggleRequest",

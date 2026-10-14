@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -69,3 +70,35 @@ class DocumentPreview(BaseModel):
     total_chars: int          # chars in the full parsed text
     truncated: bool = False   # True if the full text was not fully returned
     content: str
+
+
+class LocatorOut(BaseModel):
+    """一个 chunk 在原件里的位置。
+
+    扁平的可选字段而不是判别式联合：前端按 ``kind`` 取用，多出来的字段一律忽略。
+    这与 ``Citation`` 的既有风格一致，也让加新 kind 不需要改老客户端。
+    """
+
+    kind: str                       # page_image | sheet_range | slide | text_range
+    # page_image
+    page: int | None = None
+    total_pages: int | None = None
+    image_url: str | None = None
+    # 归一化框 [x0, y0, x1, y1]（相对页面宽高的 0~1 比例），**一行一个，绝不合并**。
+    # 用比例而不是像素：图与框因此解耦，同页多引用只渲染一次图，前端缩放也不
+    # 需要重算，更不存在"坐标系翻转"这件事（比例与原点在哪无关）。
+    boxes: list[list[float]] = []
+    # sheet_range
+    sheet: str | None = None
+    header: list[str] = []
+    rows: list[list[str]] = []
+    highlight: list[int] | None = None   # 相对 rows 的 [起, 止)，表头不算行
+    # slide
+    slide_no: int | None = None
+    width: float | None = None
+    height: float | None = None
+    shapes: list[dict[str, Any]] = []
+    # text_range
+    text: str | None = None
+    start: int | None = None
+    end: int | None = None
