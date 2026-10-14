@@ -22,6 +22,7 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.rag.base import DocumentParser, ParsedDocument
+from app.rag.layout import DocumentLayout, LineBox, PageLines, page_bases, pdf_lines
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +123,19 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
     tables: list[str] = []
     ocr_used = False
     parser_used = "pymupdf"
+    # 页局部行框（偏移相对该页文本）+ 页尺寸。OCR 之后才知道哪些页要作废，所以
+    # 先收着，等全文拼好再换算成全文偏移 —— 反过来说，任何页一旦被 OCR 替换，
+    # 它的行偏移就指向一段已经不是该页内容的文本，必须整页丢弃。
+    local_lines: dict[int, list[LineBox]] = {}
+    page_sizes: dict[int, tuple[float, float]] = {}
+    ocr_replaced: set[int] = set()
 
     doc = pymupdf.open(path)
     try:
-        for page in doc:
+        for number, page in enumerate(doc, start=1):
             text = (page.get_text("text") or "").strip()
+            local_lines[number] = pdf_lines(page, text, base=0)
+            page_sizes[number] = (float(page.rect.width), float(page.rect.height))
             # Table extraction (PyMuPDF >= 1.23). Best-effort; some pages raise.
             try:
                 finder = page.find_tables()
@@ -171,11 +180,44 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
             for index, text in ocr_by_page.items():
                 if index < len(pages) and len(pages[index].strip()) < 20:
                     pages[index] = text
+                    ocr_replaced.add(index + 1)  # 记账用 1-based 页号
             full_text = "\n\n".join(p for p in pages if p.strip())
             if tables:
                 full_text = (full_text + "\n\n" + "\n\n".join(tables)).strip()
             ocr_used = True
             parser_used = "pymupdf+ocr"
+
+    # 版面索引：行偏移从「页局部」换算成「全文偏移」。页基准走一遍 join 记账拿到，
+    # 不靠 find 反推（重复页会命中错误的副本）。被 OCR 替换过的页整页丢弃。
+    bases = page_bases(pages)
+    rendered_pages: list[PageLines] = []
+    for number, lines in local_lines.items():
+        if number in ocr_replaced or not lines:
+            continue
+        base = bases.get(number)
+        size = page_sizes.get(number)
+        if base is None or size is None:
+            continue
+        rendered_pages.append(
+            PageLines(
+                page=number,
+                width=size[0],
+                height=size[1],
+                lines=tuple(
+                    LineBox(
+                        text=ln.text,
+                        x0=ln.x0,
+                        y0=ln.y0,
+                        x1=ln.x1,
+                        y1=ln.y1,
+                        char_start=base + ln.char_start,
+                        char_end=base + ln.char_end,
+                    )
+                    for ln in lines
+                ),
+            )
+        )
+    layout = DocumentLayout(pages=tuple(rendered_pages)) if rendered_pages else None
 
     return ParsedDocument(
         text=full_text,
@@ -187,6 +229,7 @@ def _parse_pdf(path: str, _ext: str) -> ParsedDocument:
             "ocr_used": ocr_used,
             "parser_used": parser_used,
         },
+        layout=layout,
     )
 
 

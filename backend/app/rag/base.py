@@ -43,6 +43,10 @@ class ParsedDocument:
     pages: list[str] | None = None
     tables: list[str] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 版面索引（``app/rag/layout.py``）：能做坐标的解析器才填（PDF / 表格 /
+    # 幻灯片）。``None`` 表示这个格式没有坐标可言 —— 引用定位会退到「原文文本
+    # 片段」那一层，而不是报错。它**不参与**切块与 embedding，只服务引用定位。
+    layout: Any = None
 
     @property
     def chars(self) -> int:
