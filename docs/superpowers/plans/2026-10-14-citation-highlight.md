@@ -2251,3 +2251,37 @@ Expected: 全绿
 **已知缺口（有意为之）**：§7.3 PyMuPDF 内存上限只做了页面积与 dpi 限幅，没做进程级隔离——PyMuPDF 崩溃会带走 worker 进程。这是既有风险（`/preview` 今天就在重解析不可信 PDF），本计划不扩大它，也不在本轮修。
 
 **类型一致性**：`locate()` 的关键字参数在 Task 2 定义为 `(parsed, *, page, char_start, char_end, text_context=)`，Task 3 的调用点一致；`SheetRangeLocator.highlight` 是 `tuple[int,int]`，前端类型是 `[number, number] | null`（JSON 把 tuple 序列化成数组，null 覆盖字段缺失）；`ShapeBox`（后端 layout）与 `SlideShape`（后端 locator）是两个类型，前端只见到后者序列化后的 `{rect, text, hit}`。
+
+---
+
+## 执行偏差（实施后回填，供后续照此执行的人参考）
+
+计划里以下五处在实施中被证明是错的或有缺的，代码按修正后的做法落地：
+
+1. **前端测试栈**：计划写的是 `@testing-library/react` + `render()`/`screen`/`container.querySelectorAll`。
+   仓库**没有装 testing-library，也没有 jsdom**（`vitest.config.ts` 是 `environment: "node"`，
+   既有组件测试一律 `renderToString`）。四个渲染器因此都做成**纯 props 进、纯 DOM 出**的组件，
+   取数逻辑单独留在 `PageImageLocatorView` 里；测试改为 `renderToString` + 字符串断言，
+   落在 `src/components/__tests__/locator-views.test.tsx`（一个文件覆盖四个渲染器）。
+
+2. **表格的表头不在第 0 行**：`_df_to_text(df, sheet=…)` 会在块首插一行 `## Sheet: 名称`，
+   所以 xlsx 的表头在第 1 行、csv 在第 0 行。计划里 `_locate_sheet` 写死 `lines[0]` 当表头，
+   在 xlsx 上会让整张表列错位。修正：`SheetLayout` 增加 `header_line` 字段，由
+   `_df_to_text_with_rows` 算出交给下游；`SheetRow.row` 改为**数据行**下标（表头不算行），
+   `highlight` 因此不需要再减表头。
+
+3. **归一化换算会产生浮点尾巴**：`0.6 - 0.5` 是 `0.09999999999999998`，直接乘 100 会写出
+   `9.999999999999998%`。`percent()` 里取到小数后 4 位。不这么做的话每个断言和快照都会被
+   浮点噪声弄脏。
+
+4. **ETag 不能用 `doc.content_sha256`**（计划里写的）：`Document` 模型**没有这一列**。
+   改用文件本身的 `(路径, 大小, mtime_ns)` 做指纹——`doc.id` 不够：重索引/存储迁移会覆盖
+   同一个 `file_path` 而文档行不变，那时 id 不变但图已经变了。
+
+5. **`test_locator.py` 里那条 sheet 断言的期望值本身算错了**（计划写 `(1, 3)`，实际语义是
+   `(0, 2)`）。修正 2 之后 `SheetRow.row` 的语义变了，测试夹具也一并改成"跳过表头、数据行从 0 编号"。
+
+另有一处**未按计划做**：Task 9 Step 3 的"真机验收"（起前后端、上传真 PDF/xlsx/pptx/docx 各点一遍）
+在本轮**没有执行**——见最终报告。它被 `test_document_locator_api.py` 里那条
+"真解析 → 定位 → HTTP 返回归一化框"的端到端用例部分覆盖，但浏览器里的实际观感（框是否精确盖住
+正文、抽屉宽度是否够读）仍需人工确认。
