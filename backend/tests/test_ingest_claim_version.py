@@ -118,6 +118,27 @@ async def test_claim_hands_back_a_monotonic_version(db_session):
     assert (await _row(db_session, doc.id)).ingest_claim_version == 3
 
 
+async def test_claim_job_returning_path_does_not_read_rowcount(
+    db_session, monkeypatch
+):
+    """Postgres 的 ``UPDATE ... RETURNING`` 分支：抢到没有，由返回的行回答。
+
+    测试库是 SQLite，``_supports_update_returning`` 返回 False，生产走的那条
+    RETURNING 分支在这里一步都跑不到 —— 于是 ``result.rowcount`` 这个在行
+    结果集上并不存在的属性把生产摄取 worker 打成了崩溃循环（2026-10-15 实测
+    892 次/30 分钟，任何文档都领不到租约、永远不被索引）。这里强制打开该
+    分支，把「行结果集没有 rowcount」钉死。
+    """
+    from app.services import ingestion_queue
+
+    monkeypatch.setattr(ingestion_queue, "_supports_update_returning", lambda db: True)
+    doc = await _doc(db_session)
+    job = await claim_job(db_session, worker_id="w1", settings=_settings())
+    assert isinstance(job, Claim)
+    assert job.document_id == doc.id
+    assert job.version == (await _row(db_session, doc.id)).ingest_claim_version == 1
+
+
 # --------------------------------------------------------------------------- #
 # 僵尸写回
 # --------------------------------------------------------------------------- #

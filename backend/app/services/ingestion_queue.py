@@ -269,12 +269,19 @@ async def claim_job(
             .execution_options(synchronize_session=False)
         )
         if returning:
-            result = await db.execute(stmt.returning(Document.ingest_claim_version))
-            if result.rowcount != 1:
+            # 「抢到没有」由返回的行自己回答：条件不成立时一行都不返回。
+            # 这里不能读 ``result.rowcount`` —— ORM 的 UPDATE ... RETURNING
+            # 回来的是行结果集（ChunkedIteratorResult），没有这个属性；生产
+            # 走的正是这条分支，读它等于每轮 claim 都抛 AttributeError，
+            # worker 崩溃循环、任何文档都领不到租约（2026-10-15 实测）。
+            # 测试库是 SQLite，默认跑不到这条分支，故另有回归测试强制打开它。
+            version = (
+                await db.execute(stmt.returning(Document.ingest_claim_version))
+            ).scalar_one_or_none()
+            if version is None:
                 continue
-            version = int(result.scalar_one())
             await db.commit()
-            return Claim(document_id, version)
+            return Claim(document_id, int(version))
         result = await db.execute(stmt)
         if result.rowcount != 1:
             continue
