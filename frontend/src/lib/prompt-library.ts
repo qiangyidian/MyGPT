@@ -1,18 +1,16 @@
 /** 提示词库「放进输入框」这一侧的纯逻辑（不读表单、不发请求，所以能单测）。
  *
- * 分工：占位符插值、本地筛选/排序、表单校验在 `@/lib/prompt-apply`（选择弹窗与设置
- * 页共用那份）。这里只管两件别处没有的事 ——
+ * 分工：占位符插值、本地筛选/排序、表单校验在 `@/lib/prompt-apply`（设置页共用
+ * 那份）。这里持有的是别处没有的几件小事中**仍在用**的那些 —— 目前只剩
+ * ``extractVariables``：按 ``prompt-apply.ts`` 的 ``extractPlaceholders`` 同一口径
+ * 识别占位符，但额外带上每个占位符的原文写法与下标（编辑表单要按它渲染「待填格子」
+ * 的清单与位置）。
  *
- * 1. 把一段模板放进 textarea 的**光标处**，并把光标落到第一个待填占位符上（错一点
- *    就很难看：光标乱跳、模板挤进半句话中间，而它跟界面毫无关系，所以配一份 vitest）；
- * 2. 从输入框草稿反向生成「存为模板」的表单初值（标题按首行猜、副本标题加后缀）。
+ * 说明：原先还有「插进 textarea 光标处」与「从草稿反向生成表单初值」两组函数，
+ * 它们唯一的调用方是输入框工具栏的提示词库入口；该入口已按产品决定移除（模板只在
+ * 设置页管理），那两组随之删掉，不再留在库里等一个不存在的消费者。
  */
-import {
-  EMPTY_PROMPT_FORM,
-  PLACEHOLDER_SOURCE,
-  PROMPT_LIMITS,
-  type PromptForm,
-} from "@/lib/prompt-apply";
+import { PLACEHOLDER_SOURCE, PROMPT_LIMITS } from "@/lib/prompt-apply";
 import type { PromptTemplate, PromptTemplateInput } from "@/lib/types";
 
 export type VariableSyntax = "curly" | "dollar";
@@ -25,20 +23,6 @@ export interface PromptVariable {
   syntax: VariableSyntax;
   /** 在原文中的起始下标。 */
   index: number;
-}
-
-export interface TextRange {
-  start: number;
-  end: number;
-}
-
-export interface InsertResult {
-  /** 插入后的完整文本。 */
-  value: string;
-  /** 插入后光标应落在的下标。 */
-  caret: number;
-  /** 第一个待填占位符的区间；没有占位符时为 null。 */
-  selection: TextRange | null;
 }
 
 /**
@@ -103,82 +87,10 @@ export function insertAtCaret(
   };
 }
 
-/**
- * 把模板插进输入框：有选区就替换选中的文字，否则落在光标处；没给光标就接在末尾。
- *
- * 只在「会挤在一起」时补空行（前面不是行尾、后面不是行首），所以连着插两个模板不会
- * 长出一串空行。返回的 ``selection`` 交给 ``setSelectionRange``：第一个占位符整段选中，
- * 用户直接打字就能覆盖掉 ``{{文风}}``。
- */
-export function insertTemplate(
-  current: string,
-  template: string,
-  at?: TextRange,
-): InsertResult {
-  const from = clampIndex(at?.start ?? current.length, current.length);
-  const to = Math.max(from, clampIndex(at?.end ?? from, current.length));
-  const before = current.slice(0, from);
-  const after = current.slice(to);
-  const leading = before.length > 0 && !before.endsWith("\n") ? "\n\n" : "";
-  const trailing = after.length > 0 && !after.startsWith("\n") ? "\n\n" : "";
-  const value = before + leading + template + trailing + after;
-  // 模板起点在最终文本里的位置（leading 的空行插在它前面）。
-  const offset = before.length + leading.length;
-  const first = extractVariables(template)[0];
-  if (!first) {
-    return { value, caret: offset + template.length, selection: null };
-  }
-  const start = offset + first.index;
-  return {
-    value,
-    caret: start,
-    selection: { start, end: start + first.raw.length },
-  };
-}
-
-/**
- * 把插入结果落到 textarea 上：聚焦 + 选中第一个待填占位符。
- *
- * 调用方先更新自己的受控 value（``setValue(result.value)``）再调这里；下一帧是为了
- * 等 React 把新值写进 DOM —— 否则 selectionRange 会被随后的 value 复位到末尾。输入框
- * 若带自适应高度，记得在 setValue 之后顺手量一次（composer 的 handleInput）。
- */
-export function applyInsertionToTextarea(
-  el: HTMLTextAreaElement | null,
-  result: InsertResult,
-): void {
-  if (!el) return;
-  const start = result.selection?.start ?? result.caret;
-  const end = result.selection?.end ?? result.caret;
-  requestAnimationFrame(() => {
-    el.focus();
-    el.setSelectionRange(start, end);
-  });
-}
-
 /** 列表里的一行摘要：折叠空白再截断，免得整段正文撑爆卡片。 */
 export function previewText(content: string, max = 80): string {
   const flat = content.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat;
-}
-
-/** 从草稿首行猜个标题：让用户少填一格，但随时能改。 */
-export function titleFromDraft(
-  draft: string,
-  max: number = PROMPT_LIMITS.title.max,
-): string {
-  const line = draft
-    .split("\n")
-    .map((row) => row.trim())
-    .find((row) => row.length > 0);
-  const cleaned = (line ?? "").replace(/^[#>\-*\d.、\s]+/, "").trim();
-  if (!cleaned) return "";
-  return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
-}
-
-/** 把输入框里的草稿存成新模板：标题按首行猜一个，分类落在默认值上先让用户能存。 */
-export function promptFormFromDraft(draft: string): PromptForm {
-  return { ...EMPTY_PROMPT_FORM, title: titleFromDraft(draft), content: draft };
 }
 
 /** 副本标题：加后缀，免得和原来的预置分不清；先按上限截断再接后缀。 */

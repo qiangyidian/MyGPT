@@ -12,10 +12,14 @@ export function AdvancedModelSelector({
   value,
   onChange,
   mimes,
+  className,
 }: {
   value: string | null;
   onChange: (id: string | null) => void;
   mimes?: string[];
+  className?: string;
 }) {
-  return <ModelSelector value={value} onChange={onChange} mimes={mimes} />;
+  return (
+    <ModelSelector value={value} onChange={onChange} mimes={mimes} className={className} />
+  );
 }

@@ -1,19 +1,17 @@
-// 提示词库「放进输入框」这一侧的纯函数。占位符插值本身在 prompt-apply.test.ts 里
-// 钉过了，这里钉的是另一半：插在哪、光标落在哪、什么时候补空行 —— 这些错了不会报错，
-// 只会让用户每次插入都要手动挪光标，所以必须用断言代替肉眼验收。
+// 提示词库剩在 lib/prompt-library 里的纯函数。占位符插值本身在
+// prompt-apply.test.ts 里钉过了，这里管的是这一侧特有的口径：占位符怎么认、
+// 下标怎么夹紧。原先「插进输入框光标处」「从草稿反推表单初值」两组已随输入框
+// 工具栏的提示词库入口一并删除（模板只在设置页管理），对应断言同步移除。
 import { describe, expect, it } from "vitest";
 
-import { EMPTY_PROMPT_FORM, PROMPT_LIMITS, validatePromptForm } from "@/lib/prompt-apply";
+import { PROMPT_LIMITS } from "@/lib/prompt-apply";
 import {
   copyTitle,
   duplicateAsOwnInput,
   extractVariables,
   formatVariable,
   insertAtCaret,
-  insertTemplate,
   previewText,
-  promptFormFromDraft,
-  titleFromDraft,
 } from "@/lib/prompt-library";
 import type { PromptTemplate } from "@/lib/types";
 
@@ -95,48 +93,6 @@ describe("insertAtCaret", () => {
   });
 });
 
-describe("insertTemplate", () => {
-  it("空输入框：整段落下，光标选中第一个占位符", () => {
-    const result = insertTemplate("", "请用{{语气}}改写：");
-    expect(result.value).toBe("请用{{语气}}改写：");
-    expect(result.selection).toEqual({ start: 2, end: 8 });
-    expect(result.value.slice(2, 8)).toBe("{{语气}}");
-    expect(result.caret).toBe(2);
-  });
-
-  it("没有占位符时把光标放在模板末尾", () => {
-    const result = insertTemplate("", "纯文本");
-    expect(result).toEqual({ value: "纯文本", caret: 3, selection: null });
-  });
-
-  it("替换选区，并且只在会挤在一起时补空行", () => {
-    const result = insertTemplate("AAA-BBB-CCC", "T{{x}}", { start: 4, end: 7 });
-    expect(result.value).toBe("AAA-\n\nT{{x}}\n\n-CCC");
-    expect(result.value.slice(7, 12)).toBe("{{x}}");
-    expect(result.selection).toEqual({ start: 7, end: 12 });
-  });
-
-  it("前面已经是行尾时不再补空行（连着插不会长出一串空行）", () => {
-    const result = insertTemplate("第一行\n", "{{a}}", { start: 4, end: 4 });
-    expect(result.value).toBe("第一行\n{{a}}");
-    expect(result.value.slice(4, 9)).toBe("{{a}}");
-    expect(result.selection).toEqual({ start: 4, end: 9 });
-  });
-
-  it("插在行首时后面的正文换行保持原样", () => {
-    const result = insertTemplate("帮我写周报", "{{语气}}", { start: 0, end: 0 });
-    expect(result.value).toBe("{{语气}}\n\n帮我写周报");
-    expect(result.value.slice(0, 6)).toBe("{{语气}}");
-    expect(result.selection).toEqual({ start: 0, end: 6 });
-  });
-
-  it("下标越界只夹紧到末尾，不会切出残缺文本", () => {
-    const result = insertTemplate("abc", "X", { start: 99, end: 99 });
-    // 夹紧成「接在末尾」之后，规则照旧：前面不是行尾就补一个空行。
-    expect(result).toEqual({ value: "abc\n\nX", caret: 6, selection: null });
-  });
-});
-
 describe("previewText", () => {
   it("折叠空白，超长时按上限截断并补省略号", () => {
     expect(previewText("a\n\n  b   c")).toBe("a b c");
@@ -145,19 +101,6 @@ describe("previewText", () => {
     const cut = previewText(long);
     expect(cut.length).toBe(80);
     expect(cut.endsWith("…")).toBe(true);
-  });
-});
-
-describe("titleFromDraft", () => {
-  it("取第一个非空行，并去掉开头的标记符号", () => {
-    expect(titleFromDraft("\n\n# 标题行\n正文")).toBe("标题行");
-    expect(titleFromDraft("- 列表开头")).toBe("列表开头");
-    expect(titleFromDraft("   \n  ")).toBe("");
-  });
-
-  it("超出上限时截断并补省略号", () => {
-    expect(titleFromDraft("标题", 1)).toBe("…");
-    expect(titleFromDraft("标".repeat(200), 10).length).toBe(10);
   });
 });
 
@@ -185,19 +128,5 @@ describe("副本标题与另存为", () => {
     });
     // 标签是新数组：改副本不该动到源模板。
     expect(body.tags).not.toBe(source.tags);
-  });
-});
-
-describe("promptFormFromDraft", () => {
-  it("正文就是草稿原文，标题按首行猜，其余落在默认表单上", () => {
-    expect(promptFormFromDraft("整理这份周报\n细节")).toEqual({
-      ...EMPTY_PROMPT_FORM,
-      title: "整理这份周报",
-      content: "整理这份周报\n细节",
-    });
-  });
-
-  it("存草稿生成的表单能直接通过校验（否则弹窗会亮一个红叉）", () => {
-    expect(validatePromptForm(promptFormFromDraft("整理这份周报"))).toEqual({});
   });
 });

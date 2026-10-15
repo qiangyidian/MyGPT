@@ -1,12 +1,9 @@
 "use client";
 
 import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
 import { Send, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { api } from "@/lib/api";
-import { userErrorMessage } from "@/lib/api-error";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ComposerToolbar } from "@/components/chat/composer-toolbar";
@@ -17,7 +14,6 @@ import {
   useMentionPopover,
 } from "@/components/chat/mention-popover";
 import { MentionChips } from "@/components/chat/mention-chips";
-import { PromptLibraryDialog } from "@/components/chat/prompt-library-dialog";
 import { AttachmentList } from "@/components/attachments/attachment-list";
 import { useChatAttachments } from "@/hooks/useChatAttachments";
 import { useModels } from "@/hooks/useModels";
@@ -33,12 +29,6 @@ import {
   insertMention,
   type MentionLimits,
 } from "@/lib/mention-insert";
-import { promptCreateBody } from "@/lib/prompt-apply";
-import {
-  applyInsertionToTextarea,
-  insertTemplate,
-  promptFormFromDraft,
-} from "@/lib/prompt-library";
 import {
   filterModelsByModality,
   requiredModalitiesFor,
@@ -112,9 +102,6 @@ export function Composer({
   };
   /** 服务端随候选下发的上限；没拿到之前用 inline-refs 的同源兜底。 */
   const [limits, setLimits] = useState<MentionLimits>(FALLBACK_LIMITS);
-  /** 输入框里的选区：「把选中文字存为模板」要用，别再去读一遍 DOM。 */
-  const [selection, setSelection] = useState({ start: 0, end: 0 });
-  const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const mode = useChatUiStore((s) => s.mode);
   const modeMeta = getModeMeta(mode);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -224,9 +211,7 @@ export function Composer({
     if (composingRef.current) return;
     const el = textareaRef.current;
     if (!el) return;
-    const start = el.selectionStart ?? el.value.length;
-    setSelection({ start, end: el.selectionEnd ?? start });
-    mention.sync(el.value, start);
+    mention.sync(el.value, el.selectionStart ?? el.value.length);
   };
 
   // 受控 value 落地后才写回光标，否则插入点会停在插入前的位置。
@@ -324,45 +309,6 @@ export function Composer({
     textareaRef.current?.focus();
   };
 
-  /** 提示词库交回的文本插到光标处（有选区就替换选区），并把光标落到第一个占位符。 */
-  const insertPromptText = (text: string) => {
-    if (!text) return;
-    const el = textareaRef.current;
-    const current = el?.value ?? value;
-    const range = el
-      ? { start: el.selectionStart ?? current.length, end: el.selectionEnd ?? current.length }
-      : undefined;
-    const result = insertTemplate(current, text, range);
-    setValue(result.value);
-    applyInsertionToTextarea(el, result);
-    if (typeof requestAnimationFrame === "function") {
-      requestAnimationFrame(handleInput);
-    }
-  };
-
-  const selectedText = value.slice(
-    Math.min(selection.start, selection.end),
-    Math.max(selection.start, selection.end),
-  );
-  /** 只有一行的选中文字当模板没什么价值：要求是多行，用户显然是挑了一整段。 */
-  const canSaveSelection = selectedText.includes("\n") && !!selectedText.trim();
-
-  const saveSelection = useMutation({
-    mutationFn: async (draft: string) => {
-      const form = promptFormFromDraft(draft);
-      if (!form.title.trim()) {
-        throw new Error("选中的文字里没有可当标题的首行，请先写一行标题。");
-      }
-      return api.createPrompt(promptCreateBody(form));
-    },
-    onSuccess: () => toast.success("已存为我的模板，可在「提示词库」里改标题与分类"),
-    onError: (err: unknown) =>
-      toast.error("存为模板失败", {
-        description:
-          err instanceof Error && err.message ? err.message : userErrorMessage(err),
-      }),
-  });
-
   return (
     <div className={cn("bg-background", className)}>
       <div className="mx-auto w-full max-w-3xl px-4 pb-3 pt-2">
@@ -373,10 +319,6 @@ export function Composer({
           onKnowledgeBaseIdsChange={onKnowledgeBaseIdsChange}
           knowledgeBases={knowledgeBases}
           attachmentMimes={attachmentMimes}
-          onOpenPromptLibrary={() => setPromptLibraryOpen(true)}
-          onSaveSelectionAsTemplate={() => saveSelection.mutate(selectedText)}
-          canSaveSelectionAsTemplate={canSaveSelection && !saveSelection.isPending}
-          savingSelectionAsTemplate={saveSelection.isPending}
           className="mb-2"
         />
 
@@ -478,12 +420,6 @@ export function Composer({
           </p>
         )}
       </div>
-
-      <PromptLibraryDialog
-        open={promptLibraryOpen}
-        onOpenChange={setPromptLibraryOpen}
-        onPick={insertPromptText}
-      />
     </div>
   );
 }

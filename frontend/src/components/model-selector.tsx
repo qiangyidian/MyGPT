@@ -1,6 +1,6 @@
 "use client";
 
-import { Loader2, Settings2 } from "lucide-react";
+import { Boxes, Loader2, Settings2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
 import {
@@ -40,6 +40,9 @@ interface ModelSelectorProps {
  * 第一级是用户命名的模型配置（按 name 分组，见 lib/model-groups），第二级才是
  * 具体模型。顶部保留「默认模型」——选它（null）等于让后端自己挑；底部入口
  * 跳设置页的「管理模型」。mimes 过滤逻辑与旧 Select 版本完全一致。
+ *
+ * 外观交给调用方：唯一消费者是输入框工具栏的设置组，组内每一项都不带自己的
+ * 边框与圆角（边框归整个组），所以 className 默认被沿用而不在此硬编码。
  */
 export function ModelSelector({
   value,
@@ -60,15 +63,17 @@ export function ModelSelector({
     : "选择模型";
 
   if (isLoading) {
+    // 组内的一项，所以不带自己的边框：一个转圈 + 一句短文案就够，别在组里
+    // 再画一个矩形出来。
     return (
       <div
         className={cn(
-          "flex h-9 items-center gap-2 rounded-md border border-input bg-background px-3 text-sm text-muted-foreground",
+          "flex h-9 items-center gap-1.5 px-2.5 text-sm text-muted-foreground",
           className
         )}
       >
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-        加载模型...
+        <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+        <span className="truncate">加载模型…</span>
       </div>
     );
   }
@@ -80,8 +85,9 @@ export function ModelSelector({
           variant="outline"
           size="sm"
           className={cn("h-9 max-w-[220px] gap-1.5 text-sm font-medium", className)}
-          title="选择模型"
+          title={`模型：${triggerLabel}`}
         >
+          <Boxes className="h-4 w-4 shrink-0" />
           <span className="truncate">{triggerLabel}</span>
         </Button>
       </DropdownMenuTrigger>

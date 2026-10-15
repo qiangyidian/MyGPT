@@ -21,6 +21,10 @@ import type { UserChatMode } from "@/lib/types";
  * descriptions; the selected value is the stable ``UserChatMode`` wire enum the
  * backend IntentRouter consumes. Internal runtime names (Native/CrewAI) are
  * never exposed here.
+ *
+ * 它在输入框工具栏里是**唯一**的实心块（secondary）：模式决定这一轮是不是要
+ * 拉起多 Agent，是后果最大的那个选择，所以由它当视觉锚点，其余设置退到描边
+ * 的设置组里。别把它也改成描边——那样工具栏又变回一排等重按钮。
  */
 export function ChatModeSelector({ className }: { className?: string }) {
   const mode = useChatUiStore((s) => s.mode);
@@ -33,7 +37,7 @@ export function ChatModeSelector({ className }: { className?: string }) {
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
-          variant="outline"
+          variant="secondary"
           size="sm"
           className={cn("h-9 gap-1.5 text-sm font-medium", className)}
           aria-label={`当前模式：${meta.label}。点击切换`}

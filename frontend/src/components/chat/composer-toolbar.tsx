@@ -1,6 +1,6 @@
 "use client";
 
-import { Database, Save, Sparkles, X } from "lucide-react";
+import { Database, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
@@ -20,6 +20,33 @@ import { useChatUiStore } from "@/stores/chat-ui-store";
 import { MAX_KB_PER_REQUEST, toggleKnowledgeBase } from "@/lib/inline-refs";
 import type { KnowledgeBase } from "@/lib/types";
 
+/**
+ * 组内每一项：边框与圆角归整个组（见 SETTINGS_GROUP_CLASS），项自己一律不带
+ * （border-0 把子组件自带的 outline 外观中性化），否则又是一排各自带框的按钮
+ * ——那正是这次要消掉的「乱」。
+ *
+ * 焦点环用 ring-inset：组的 overflow-hidden 会把外扩的 ring 裁掉，只有内嵌的
+ * 看得见。别把 focus-visible 改成只有背景色，键盘用户就找不着焦点了。
+ *
+ * 窄屏（< sm）三项平分整行宽度，故 flex-1 + min-w-0（min-w-0 是让 truncate
+ * 生效的前提）；sm 以上组是 auto 宽，项各自按内容撑开。
+ */
+const GROUP_ITEM_CLASS =
+  "h-9 min-w-0 flex-1 basis-0 gap-1.5 rounded-none border-0 px-2.5 text-sm font-medium focus-visible:ring-inset focus-visible:ring-offset-0 sm:flex-none";
+
+/**
+ * 请求设置组：不是三个并列按钮，而是**一个**控件——共用一层边框，项与项之间
+ * 一条竖线。视觉上的「一体」即信息：这三项共同描述「这一轮怎么答」。
+ *
+ * 分隔用 divide-x 而不是 `[&>*+*]:border-l`：后者与子项的 border-0 同特异度，
+ * 谁赢取决于 Tailwind 内部发射顺序；divide 生成的选择器带 :not([hidden]) 伪类，
+ * 特异度更高，不靠顺序。
+ *
+ * w-full 是为了窄屏换行后独占一行（父级 flex-wrap）；sm 以上收成 auto 宽。
+ */
+const SETTINGS_GROUP_CLASS =
+  "flex h-9 w-full items-center divide-x divide-input overflow-hidden rounded-lg border border-input bg-background sm:w-auto";
+
 interface ComposerToolbarProps {
   modelId: string | null;
   onModelChange: (id: string | null) => void;
@@ -28,20 +55,13 @@ interface ComposerToolbarProps {
   knowledgeBases?: KnowledgeBase[];
   /** Attachment mime types — drives modality-aware model filtering. */
   attachmentMimes?: string[];
-  /** 提示词库：打开选择器（选中的模板由宿主插到输入框光标处）。 */
-  onOpenPromptLibrary?: () => void;
-  /** 把输入框里选中的多行文字存成我的模板。 */
-  onSaveSelectionAsTemplate?: () => void;
-  /** 选区是否够格当模板（多行且非空）；不勾上就别让用户点了没反应。 */
-  canSaveSelectionAsTemplate?: boolean;
-  savingSelectionAsTemplate?: boolean;
   className?: string;
 }
 
 /**
- * Compact toolbar above the textarea: mode picker (primary), knowledge-base
- * selector (compact), and the advanced model selector (hidden unless opted in).
- * Kept to a single row on mobile by design.
+ * Compact toolbar above the textarea: mode (the one filled element) + a single
+ * grouped control holding the per-request settings (knowledge base, model,
+ * reasoning effort).
  *
  * 知识库选择是真多选：勾一个不顶掉已勾的、菜单不收起，触发器上写清「已选 N
  * 个」并把名字放在 title 里；上限与服务端同源（inline-refs 的
@@ -58,10 +78,6 @@ export function ComposerToolbar({
   onKnowledgeBaseIdsChange,
   knowledgeBases,
   attachmentMimes,
-  onOpenPromptLibrary,
-  onSaveSelectionAsTemplate,
-  canSaveSelectionAsTemplate,
-  savingSelectionAsTemplate,
   className,
 }: ComposerToolbarProps) {
   const hasKbs = !!knowledgeBases && knowledgeBases.length > 0;
@@ -75,15 +91,16 @@ export function ComposerToolbar({
     .filter((n): n is string => !!n);
   // 选中项被别处删掉时不能假装没发生：计数照实，名字标成不可用。
   const missingCount = knowledgeBaseIds.length - selectedNames.length;
+  const kbCount = knowledgeBaseIds.length;
   const kbLabel =
-    selectedNames.length === 0 && missingCount === 0
+    kbCount === 0
       ? "知识库"
-      : knowledgeBaseIds.length === 1
+      : kbCount === 1
         ? (selectedNames[0] ?? "已选 1 个")
-        : `知识库 · 已选 ${knowledgeBaseIds.length} 个`;
+        : `已选 ${kbCount} 个`;
   const kbTitle =
-    knowledgeBaseIds.length === 0
-      ? undefined
+    kbCount === 0
+      ? "为本轮请求绑定知识库（可多选）"
       : `${selectedNames.join("、")}${missingCount > 0 ? `（${missingCount} 个已不可用）` : ""}`;
 
   const toggleKb = (id: string) => {
@@ -98,101 +115,73 @@ export function ComposerToolbar({
 
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
-      <ChatModeSelector />
-
-      {!isHermes && hasKbs && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-9 max-w-[220px] gap-1.5 text-sm font-medium"
-              title={kbTitle}
-            >
-              <Database className="h-4 w-4 shrink-0" />
-              <span className="truncate">{kbLabel}</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" side="top" className="w-[260px]">
-            {knowledgeBases.map((kb) => (
-              <DropdownMenuCheckboxItem
-                key={kb.id}
-                checked={knowledgeBaseIds.includes(kb.id)}
-                // 勾一个就收起的话多选等于没有：连着勾完再关。
-                onSelect={(e) => e.preventDefault()}
-                onCheckedChange={() => toggleKb(kb.id)}
-                className="items-start"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate">{kb.name}</span>
-                  {/* 每库自己的检索参数（条目 23）：多库查询里不存在一个全局 k。 */}
-                  <span className="block truncate text-[11px] font-normal text-muted-foreground">
-                    {kbRetrievalHint(kb)}
-                  </span>
-                </span>
-              </DropdownMenuCheckboxItem>
-            ))}
-            {knowledgeBaseIds.length > 0 && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={() => onKnowledgeBaseIdsChange([])}
-                >
-                  <X className="mr-2 h-4 w-4" />
-                  清空已选（{knowledgeBaseIds.length}）
-                </DropdownMenuItem>
-              </>
-            )}
-            <p className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
-              {`最多同时选 ${MAX_KB_PER_REQUEST} 个。每库按自己的参数召回，再合并成一份全局上下文。`}
-            </p>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+      <ChatModeSelector className="shrink-0" />
 
       {!isHermes && (
-        <AdvancedModelSelector
-          value={modelId}
-          onChange={onModelChange}
-          mimes={attachmentMimes}
-        />
-      )}
+        <div role="group" aria-label="本轮请求设置" className={SETTINGS_GROUP_CLASS}>
+          {hasKbs && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn(GROUP_ITEM_CLASS, "max-w-[180px]")}
+                  title={kbTitle}
+                >
+                  <Database className="h-4 w-4 shrink-0" />
+                  {/* 没绑库时它是「可以绑」的提示，不是当前值——弱化处理，别让
+                      空值和「测试知识库」长得一样重。 */}
+                  <span
+                    className={cn("truncate", kbCount === 0 && "text-muted-foreground")}
+                  >
+                    {kbLabel}
+                  </span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="top" className="w-[260px]">
+                {knowledgeBases.map((kb) => (
+                  <DropdownMenuCheckboxItem
+                    key={kb.id}
+                    checked={knowledgeBaseIds.includes(kb.id)}
+                    // 勾一个就收起的话多选等于没有：连着勾完再关。
+                    onSelect={(e) => e.preventDefault()}
+                    onCheckedChange={() => toggleKb(kb.id)}
+                    className="items-start"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate">{kb.name}</span>
+                      {/* 每库自己的检索参数（条目 23）：多库查询里不存在一个全局 k。 */}
+                      <span className="block truncate text-[11px] font-normal text-muted-foreground">
+                        {kbRetrievalHint(kb)}
+                      </span>
+                    </span>
+                  </DropdownMenuCheckboxItem>
+                ))}
+                {knowledgeBaseIds.length > 0 && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => onKnowledgeBaseIdsChange([])}>
+                      <X className="mr-2 h-4 w-4" />
+                      清空已选（{knowledgeBaseIds.length}）
+                    </DropdownMenuItem>
+                  </>
+                )}
+                <p className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
+                  {`最多同时选 ${MAX_KB_PER_REQUEST} 个。每库按自己的参数召回，再合并成一份全局上下文。`}
+                </p>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
-      {!isHermes && <ReasoningEffortSelectorStoreBridge modelId={modelId} />}
+          <AdvancedModelSelector
+            value={modelId}
+            onChange={onModelChange}
+            mimes={attachmentMimes}
+            className={cn(GROUP_ITEM_CLASS, "max-w-[200px]")}
+          />
 
-      {/* 提示词库和模式无关（Hermes 也要能插模板），所以不参与 isHermes 的隐藏。 */}
-      {onOpenPromptLibrary && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-9 gap-1.5 text-sm font-medium"
-              title="从提示词库挑一个模板插入输入框，或把选中文字存为模板"
-            >
-              <Sparkles className="h-4 w-4 shrink-0" />
-              提示词库
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" side="top" className="w-[240px]">
-            <DropdownMenuItem onSelect={() => onOpenPromptLibrary()}>
-              <Sparkles className="mr-2 h-4 w-4" />
-              插入模板…
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={!canSaveSelectionAsTemplate || savingSelectionAsTemplate}
-              onSelect={() => onSaveSelectionAsTemplate?.()}
-            >
-              <Save className="mr-2 h-4 w-4" />
-              {savingSelectionAsTemplate ? "保存中…" : "把选中文字存为模板"}
-            </DropdownMenuItem>
-            <p className="px-2 py-1.5 text-[11px] leading-4 text-muted-foreground">
-              {canSaveSelectionAsTemplate
-                ? "将把输入框里选中的多行文字存为你的模板。"
-                : "先在输入框里选中多行文字，才能存为模板。"}
-            </p>
-          </DropdownMenuContent>
-        </DropdownMenu>
+          <ReasoningEffortSelectorStoreBridge modelId={modelId} />
+        </div>
       )}
     </div>
   );
@@ -222,7 +211,7 @@ function ReasoningEffortSelectorStoreBridge({ modelId }: { modelId: string | nul
       modelId={modelId}
       value={effort}
       onChange={setEffort}
-      className="h-9 gap-1.5 text-sm font-medium"
+      className={cn(GROUP_ITEM_CLASS, "max-w-[140px]")}
     />
   );
 }
