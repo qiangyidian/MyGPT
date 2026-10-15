@@ -135,34 +135,47 @@ async def lifespan(app: FastAPI):
     from app.db import AsyncSessionLocal
     from app.services.stale_job_recovery import StaleJobSweeper
 
-    stale_sweeper = StaleJobSweeper(AsyncSessionLocal)
-    stale_sweeper.start()
-    app.state.stale_job_sweeper = stale_sweeper
-    # Knowledge-base ingestion: a durable queue whose rows are claimed under a
-    # lease, so an upload that outlives its process is picked up by whoever next
-    # polls and a permanently bad document stops being retried. Running the loop
-    # here means a single-process deployment indexes without a dedicated worker;
-    # a worker process may run the same loop concurrently (the claim is atomic).
-    from app.services import ingestion_queue
+    # 下面四个角色都会写共享数据（认领文档、删留存数据、重排在途任务、补写记忆），
+    # 各自都假设「只有我在做这件事」。CLIENT_ONLY 的实例（本机跑前后端、数据直连
+    # 共享库）一个都不起：多开一份就是多一个抢活的进程，会去认领别人的文档、
+    # 删别人的留存数据。
+    stale_sweeper = None
+    ingestion_worker = None
+    retention_sweeper = None
+    memory_sweeper = None
+    if get_settings().CLIENT_ONLY:
+        logging.getLogger(__name__).info(
+            "CLIENT_ONLY=1: 跳过摄取 worker / 陈旧任务恢复 / 数据保留清理 / 记忆补做"
+        )
+    else:
+        stale_sweeper = StaleJobSweeper(AsyncSessionLocal)
+        stale_sweeper.start()
+        app.state.stale_job_sweeper = stale_sweeper
+        # Knowledge-base ingestion: a durable queue whose rows are claimed under a
+        # lease, so an upload that outlives its process is picked up by whoever next
+        # polls and a permanently bad document stops being retried. Running the loop
+        # here means a single-process deployment indexes without a dedicated worker;
+        # a worker process may run the same loop concurrently (the claim is atomic).
+        from app.services import ingestion_queue
 
-    ingestion_worker = await ingestion_queue.build_worker()
-    ingestion_queue.set_active_worker(ingestion_worker)
-    ingestion_worker.start()
-    app.state.ingestion_worker = ingestion_worker
-    # Data-retention pass (audit TTL, terminal run-event pruning, orphan
-    # upload cleanup) — data previously grew without bound.
-    from app.services.retention import RetentionSweeper
+        ingestion_worker = await ingestion_queue.build_worker()
+        ingestion_queue.set_active_worker(ingestion_worker)
+        ingestion_worker.start()
+        app.state.ingestion_worker = ingestion_worker
+        # Data-retention pass (audit TTL, terminal run-event pruning, orphan
+        # upload cleanup) — data previously grew without bound.
+        from app.services.retention import RetentionSweeper
 
-    retention_sweeper = RetentionSweeper(AsyncSessionLocal)
-    retention_sweeper.start()
-    app.state.retention_sweeper = retention_sweeper
-    # 记忆写入的兜底补做（spec §4.2.1）：inline 的 detached 任务会随本进程重启丢掉，
-    # durable run 也可能在写记忆前崩掉。与 retention 同一个 leader 机制，且与 worker
-    # 侧共用 advisory lock 名 "memory"，所以两个进程只会有一个真的在补。
-    from app.agents.memory.sweeper import MemorySweeper
+        retention_sweeper = RetentionSweeper(AsyncSessionLocal)
+        retention_sweeper.start()
+        app.state.retention_sweeper = retention_sweeper
+        # 记忆写入的兜底补做（spec §4.2.1）：inline 的 detached 任务会随本进程重启丢掉，
+        # durable run 也可能在写记忆前崩掉。与 retention 同一个 leader 机制，且与 worker
+        # 侧共用 advisory lock 名 "memory"，所以两个进程只会有一个真的在补。
+        from app.agents.memory.sweeper import MemorySweeper
 
-    memory_sweeper = MemorySweeper(AsyncSessionLocal)
-    memory_sweeper.start()
+        memory_sweeper = MemorySweeper(AsyncSessionLocal)
+        memory_sweeper.start()
     # Queue-depth gauges for /metrics + Alertmanager (finding 38). Runs in the
     # API process on purpose: the worker exposes no scrape surface, so a queue
     # metric only it observed would be invisible to a scrape. Every replica
@@ -198,11 +211,12 @@ async def lifespan(app: FastAPI):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        ingestion_queue.set_active_worker(None)
-        await ingestion_worker.stop()
-        await retention_sweeper.stop()
-        await memory_sweeper.stop()
-        await stale_sweeper.stop()
+        if ingestion_worker is not None:
+            ingestion_queue.set_active_worker(None)
+            await ingestion_worker.stop()
+        for sweeper in (retention_sweeper, memory_sweeper, stale_sweeper):
+            if sweeper is not None:
+                await sweeper.stop()
         await approval_bus.stop()
         # Close MCP sessions so their subprocesses/HTTP pools don't leak.
         try:

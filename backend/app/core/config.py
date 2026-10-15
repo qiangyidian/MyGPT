@@ -802,6 +802,13 @@ class Settings(BaseSettings):
     # Multi-axis per-tenant caps. Disabled in test (see QuotaLimits.from_settings)
     # so the suite is never blocked; production opts in via QUOTAS_ENABLED=true.
     QUOTAS_ENABLED: bool = False
+    # ---- 客户端模式 ----
+    # 本实例只当客户端，不起任何会写共享数据的后台角色（摄取 worker / 陈旧任务
+    # 恢复 / 数据保留清理 / 记忆补做）。用途：本机跑前后端、数据直连**共享**（生产）
+    # 库的调试形态 —— 那些角色都假设自己独占数据，多开一份就会去认领别人的文档、
+    # 删除别人的留存数据、重排别人的在途任务。
+    # 默认 false：单机/容器部署照旧（生产行为完全不变）。
+    CLIENT_ONLY: bool = False
     QUOTA_MAX_CONCURRENT_RUNS: int = 8
     QUOTA_MAX_TOKENS: int = 1_000_000
     QUOTA_MAX_COST_USD: float = 50.0
