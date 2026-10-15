@@ -274,9 +274,24 @@ class CrewAILLMFactory:
 
         api_key = decrypt_secret(cfg.api_key_encrypted or "") or "dummy"
 
-        # LiteLLM convention: openai-compatible providers use the "openai/" prefix.
+        # LiteLLM 约定：OpenAI 兼容端点走 "openai/" 前缀。
+        #
+        # 但不能用「名字里有 "/" 就当它已带 provider 前缀」来判断：CrewAI 只按
+        # **第一个** "/" 切 provider 与 model，于是带命名空间的模型 id ——
+        # commandcode 的 deepseek/deepseek-v4.1-flash、OpenRouter 的
+        # openai/gpt-4o、SiliconFlow 的 Pro/BAAI/bge-m3 —— 首段被当成 LiteLLM
+        # 的提供方选择吃掉，端点收到裸 id 就回 400 unsupported_model。命名空间
+        # 属于模型 id，必须原样发出去（2026-10-15 生产专家模式 Coordinator
+        # 卡死即此）。
+        #
+        # 判据取 config 的 provider 列：它写的就是走哪条协议。
+        # openai-compatible 一律加前缀，其余命名空间原样透传，与原生路径
+        # （OpenAICompatibleProvider 直接发 cfg.model_name）逐字一致。
+        # 与 capabilities_from_config 同约：config 是 ORM/鸭子类型两种形状，
+        # 一律 getattr 带默认值读，别用严格属性访问。
         model_name = cfg.model_name
-        if "/" not in model_name:
+        provider_type = (getattr(cfg, "provider", "") or "").strip().lower()
+        if provider_type == "openai-compatible" or "/" not in model_name:
             model_name = f"openai/{model_name}"
 
         kwargs: dict[str, Any] = dict(

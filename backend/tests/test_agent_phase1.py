@@ -102,6 +102,32 @@ def test_crewai_llm_factory_from_model_config():
     assert llm.api_key == "sk-test"  # decrypted, not the ciphertext
 
 
+def test_crewai_llm_factory_keeps_namespaced_model_id():
+    """聚合网关的模型 id 自带命名空间，必须原样发出去。
+
+    CrewAI 只按**第一个** ``/`` 切分 provider 与 model：给
+    ``deepseek/deepseek-v4.1-flash`` 这种 id（commandcode / OpenRouter /
+    SiliconFlow 的写法）不加 ``openai/`` 前缀时，``deepseek`` 被当成 LiteLLM
+    的提供方选择、前缀被吞掉，端点收到裸 id ``deepseek-v4.1-flash`` 并回
+    400 unsupported_model —— 2026-10-15 生产专家模式下 Coordinator 卡死的
+    真实故障。原生路径（OpenAICompatibleProvider）发的是原样 model_name，
+    两条路径必须对同一个 ModelConfig 发同一个 id。
+    """
+    cfg = ModelConfig(
+        name="commandcode",
+        provider="openai-compatible",
+        api_base_url="https://api.commandcode.ai/provider/v1",
+        api_key_encrypted=encrypt_secret("sk-test"),
+        model_name="deepseek/deepseek-v4.1-flash",
+        temperature=0.7,
+        max_tokens=8192,
+    )
+    llm = CrewAILLMFactory.from_model_config(cfg)
+    assert llm.provider == "openai"  # openai-compatible routing
+    # 命名空间留在 model 上 —— 它属于模型 id，不是 LiteLLM 的 provider 段。
+    assert llm.model == "deepseek/deepseek-v4.1-flash"
+
+
 @pytest.mark.parametrize(
     ("parameter", "expected_key"),
     [
