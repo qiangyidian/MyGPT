@@ -29,9 +29,16 @@ from app.providers.openai_compatible import opencode_request_headers
 
 _USAGE_LOCK_POLL_SECONDS = 0.005
 # CrewAI agents need short handoff artifacts, not a full chat-length answer at
-# every stage. Large per-model limits (for example 8192) can make a single
-# Researcher generation consume the entire run budget before later agents start.
-_CREWAI_STAGE_OUTPUT_TOKEN_CAP = 2048
+# every stage, so a per-stage ceiling stays — but 2048 is below what a
+# **reasoning** model needs once the context is big: the thinking tokens are
+# billed against the same cap, so a context-heavy stage (Analyst 拿到全部上游
+# 证据) 会把 2048 全烧在思维链上、正文为空，CrewAI 随即抛
+# "Invalid response from LLM call - None or empty."，整轮 run 失败。
+# 实测（deepseek/deepseek-v4.1-flash，同一长上下文提示词）：2048 → 正文 0 字符；
+# 8192 → 正文 806 字符。运行级成本仍由 run guard 兜底（AGENT_MAX_TOTAL_TOKENS /
+# AGENT_MAX_RUNTIME_SECONDS，每次调用后 check），所以这里放宽到 8192 不再有
+# 「一个 stage 吃光整轮预算」的风险。
+_CREWAI_STAGE_OUTPUT_TOKEN_CAP = 8192
 
 
 def _final_payload_parts(

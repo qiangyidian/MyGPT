@@ -128,6 +128,53 @@ def test_crewai_llm_factory_keeps_namespaced_model_id():
     assert llm.model == "deepseek/deepseek-v4.1-flash"
 
 
+def test_crewai_stage_cap_keeps_a_reasoning_model_able_to_answer(monkeypatch):
+    """stage 输出上限必须容得下模型配置里声明的正常预算。
+
+    推理模型的思维链与正文共用同一个输出上限。2048 时实测：长上下文 stage
+    （Analyst 拿到全部上游证据）把额度全花在思维链上、正文 0 字符，CrewAI 随即抛
+    "Invalid response from LLM call - None or empty."，整轮 run 失败；同一个长上下文
+    提示词在 8192 下返回 806 字符（2026-10-15，model_name=deepseek/deepseek-v4.1-flash）。
+
+    上限本身要保留（一个 stage 不该无限输出），只是不能被模型声明的 max_tokens 撞上。
+    """
+    captured = {}
+
+    class FakeLLM(types.SimpleNamespace):
+        def call(self, *args, **kwargs):
+            return "ok"
+
+        async def acall(self, *args, **kwargs):
+            return "ok"
+
+    def fake_llm(**kwargs):
+        captured.update(kwargs)
+        return FakeLLM(**kwargs)
+
+    import crewai
+
+    monkeypatch.setattr(crewai, "LLM", fake_llm)
+
+    def build(max_tokens: int):
+        captured.clear()
+        return ModelConfig(
+            name="reasoner",
+            provider="openai-compatible",
+            api_base_url="http://localhost:8000/v1",
+            api_key_encrypted=encrypt_secret("sk-test"),
+            model_name="deepseek/deepseek-v4.1-flash",
+            temperature=0.7,
+            max_tokens=max_tokens,
+        )
+
+    CrewAILLMFactory.from_model_config(build(8192))
+    assert captured["max_tokens"] == 8192, "正常输出预算不该被 stage 上限砍掉"
+
+    # 超大配置仍然被封顶：stage 上限没有消失，只是不再卡在推理模型够不着的高度。
+    CrewAILLMFactory.from_model_config(build(32768))
+    assert captured["max_tokens"] < 32768
+
+
 @pytest.mark.parametrize(
     ("parameter", "expected_key"),
     [
